@@ -29,13 +29,16 @@ just can no longer *act* (no code execution, no file mutation, no external
 contact) — this closes the RCE-class risk while leaving a narrower,
 output-integrity-only residual risk, tracked in `DEBT.md`.
 
-One related attack vector **is** fully closed, at the workflow level: rule
-files (`.tgd-review/rules/*.md`) are loaded from the PR's **base** branch,
-never from the PR's own checkout — see "Rule files are sourced from the
-base branch" below. Before that fix, a PR could simply add its own rule
-file and get attacker-authored instructions executed as a *trusted*
-subagent prompt with an attacker-chosen provider/model; that specific hole
-is now closed.
+One related attack vector **is** fully closed, natively by the CLI itself:
+rule files (`.tgd-review/rules/*.md`) are loaded from the PR's **base**
+branch via the VCS provider's API, never from the PR's own checkout — see
+"Rule files are sourced from the base branch" below. Before that fix, a PR
+could simply add its own rule file and get attacker-authored instructions
+executed as a *trusted* subagent prompt with an attacker-chosen
+provider/model; that specific hole is now closed, and closed the same way
+whether you run this in the shipped GitHub Actions workflow, from your own
+terminal, or (once built) from any other CI system `gh`/`glab` can
+authenticate against.
 
 **Additional defense-in-depth if you run this in CI** (worthwhile even now
 that the tool-access risk is closed — the output-integrity residual risk
@@ -97,11 +100,11 @@ a consuming repo's `.github/workflows/` directory (adjusting the checkout
 target if `tgd-review-agent` isn't vendored into that repo directly) and add
 the provider secrets described below.
 
-Note the workflow's `git worktree add`/`--rules-dir` steps before the
-`review` command — those exist to source rule files from the PR's base
-branch rather than the PR's own checkout, and are load-bearing for the
-security fix described in "Rule files are sourced from the base branch"
-below. Preserve them if you adapt the workflow.
+The `review` command needs no special workflow-YAML wiring to source rule
+files safely from the PR's base branch — that's now handled inside the CLI
+itself (see "Rule files are sourced from the base branch" below). Do **not**
+pass `--trust-local-rules` in this workflow; that flag reopens the exact
+hole this design closes by reading `--rules-dir` off the PR's own checkout.
 
 ### CLI flags
 
@@ -111,10 +114,17 @@ The real flags, as parsed by `src/cli.ts`:
 tgd-review-agent review \
   --pr <number>                  # required: PR number
   --vcs github|gitlab            # default: github (gitlab adapter is Phase 2, not yet implemented)
-  --rules-dir <path>             # default: .tgd-review/rules
+  --rules-dir <path>             # default: .tgd-review/rules — a REPO-RELATIVE path looked up on
+                                  # the PR's BASE branch via the VCS provider's API (not a local
+                                  # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
   --dry-run                      # print the synthesized comment body to stdout instead of posting it
+  --trust-local-rules            # optional: read --rules-dir directly off the local filesystem
+                                  # instead of fetching from the base branch — a developer
+                                  # convenience for iterating on an uncommitted rule file, NOT a
+                                  # security bypass to use in CI (see "Rule files are sourced from
+                                  # the base branch" below)
 ```
 
 Exit codes: `0` success (posted, or skipped because the head SHA was already
@@ -201,36 +211,51 @@ works, including custom/self-hosted providers you register yourself (see
 
 ### Rule files are sourced from the base branch, not the PR (security design decision)
 
-`loadRules()` itself just reads whatever `--rules-dir` it's given — it has
-no opinion about which commit that directory belongs to. The **workflow**
-is what enforces the trust boundary: in
-[`.github/workflows/tgd-review.yml`](.github/workflows/tgd-review.yml), a
-dedicated step checks out `.tgd-review/rules/` from
-`github.event.pull_request.base.sha` (the PR's *base* branch) into a
-separate `git worktree`, and `--rules-dir` is pointed at that checkout —
-**not** at the PR's own `.tgd-review/rules/`, even though `actions/checkout@v4`
-in the same job also checks out the PR's merge ref (needed for building the
-CLI and reading the diff).
+This is enforced **inside the CLI itself** (see ADR-002 and its follow-up
+CLI-native fix), not by any workflow-YAML ceremony. By default (no
+`--trust-local-rules`), `review()` never reads `--rules-dir` off the local
+filesystem at all — instead it:
+
+1. Fetches the PR's `baseSha` (already resolved via `gh pr view` as part of
+   `getPullRequest`).
+2. Calls `vcsAdapter.getRuleFilesFromBase(baseSha, rulesDir)`, which lists
+   and fetches `<rulesDir>/*.md` **as it exists on the base branch** via the
+   VCS provider's own API — `gh api repos/{owner}/{repo}/contents/...` for
+   `GitHubAdapter` — never via a local git checkout/worktree.
+3. Writes the fetched files into a fresh, isolated temp directory and points
+   `loadRules()` at that directory (cleaned up afterward).
+
+`--rules-dir`'s default value (`.tgd-review/rules`) is therefore a
+**repo-relative lookup key**, not a local filesystem path, in this default
+mode — see "CLI flags" above.
 
 This is deliberate, not an oversight. `dispatchRules` sends every rule
 file's `body` verbatim as a **trusted** agent-instruction prompt, with an
 attacker-chosen `provider`/`model` if the rule file itself is
 attacker-controlled. Without this indirection, a PR author could add
 `.tgd-review/rules/evil.md` to their own PR and have its contents executed
-as a trusted instruction by a subagent with real `bash`/`edit`/`write` tool
-access on the CI runner — no prompt-injection cleverness required, just
-adding a file. Sourcing rules from the base branch instead means:
+as a trusted instruction by a subagent with real tool access on the CI
+runner — no prompt-injection cleverness required, just adding a file.
+Sourcing rules from the base branch instead means:
 
 - **A PR cannot introduce or modify a rule that affects its own review.**
   Rule changes only take effect once merged into the base branch.
-- If the base branch has no `.tgd-review/rules/` directory at all, that's
-  just zero user rules (same "directory doesn't exist" handling
-  `loadRules()` already has) — not an error.
-- If you fork this workflow into your own repo, **keep this indirection**.
-  The inline comment above the fetch step in `tgd-review.yml` says so too:
-  don't "simplify" it back to the CLI's default `--rules-dir`, which would
-  resolve against the PR's own (attacker-controlled) checkout and reopen
-  this hole.
+- If the base branch has no `.tgd-review/rules/` directory at all,
+  `getRuleFilesFromBase` returns zero files (a 404 from the Contents API is
+  treated as "no rules," not an error) — same "directory doesn't exist"
+  handling `loadRules()` already has for the local-filesystem case.
+- Because this lives in the CLI (via the `VcsAdapter` abstraction), it works
+  identically for the shipped GitHub Actions workflow, a developer running
+  `tgd-review-agent review` from their own terminal against a real open PR,
+  or (once a `GitLabAdapter` exists) any other CI system `gh`/`glab` can
+  authenticate against — no bespoke `git worktree` step to remember, copy
+  correctly, or accidentally "simplify" away.
+- `--trust-local-rules` is the one deliberate escape hatch: it skips
+  `getRuleFilesFromBase` and reverts to reading `--rules-dir` directly off
+  the local filesystem (the pre-fix behavior). It exists for local
+  rule-authoring iteration (testing an uncommitted rule file) — **never**
+  pass it in a CI workflow that reviews untrusted PRs, since doing so
+  reopens exactly the hole described above.
 
 This closes the rule-file attack vector specifically. The PR *diff* itself
 is still untrusted input sent to the dispatched subagent — but as of the

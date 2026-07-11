@@ -10,10 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Checks out the PR's own merge ref. This is needed (and safe) for
-      # building the CLI and for `gh pr diff` to see the PR's actual diff —
-      # but see the "Fetch rule files from the BASE branch" step below for
-      # why the PR's own checkout must NEVER be used as the source of rule
-      # files (`.tgd-review/rules/`).
+      # building the CLI and for `gh pr diff` to see the PR's actual diff.
+      # Rule files (`.tgd-review/rules/`) are NOT read from this checkout —
+      # the `review` command below sources them from the PR's BASE branch
+      # itself, via the CLI's own `getRuleFilesFromBase` (GitHub Contents
+      # API through `gh api`), so no separate worktree/checkout step is
+      # needed here for that purpose (see ADR-002 and README.md's "Rule
+      # files are sourced from the base branch" section for the full
+      # threat model this closes).
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -73,40 +77,30 @@ jobs:
       # from the generic build step and from the later `node dist/cli.js`
       # invocation.
       - run: npm run test:smoke
-      # SECURITY (critical — do not remove or "simplify" this step): on a
-      # `pull_request` event, the `actions/checkout@v4` step above checks
-      # out the PR's merge ref with no `ref:` override, which reflects
-      # whatever the PR AUTHOR added or edited as part of the very PR being
-      # reviewed. If `tgd-review-agent review` were pointed at that
-      # checkout's own `.tgd-review/rules/` (the default `--rules-dir`),
-      # a malicious PR could simply ADD `.tgd-review/rules/evil.md` with
-      # attacker-authored instructions. `loadRules()` reads that directory
-      # unconditionally and `dispatchRules` sends each rule file's `body`
-      # verbatim as a TRUSTED agent-instruction prompt — with an
-      # attacker-chosen `provider`/`model` — to a subagent that has real
-      # `bash`/`edit`/`write` tool access on this runner. That is a
-      # code-execution attack vector requiring no prompt-injection
-      # cleverness whatsoever, just adding a file to your own PR.
+      # SECURITY (do not remove — see ADR-002 and README.md's "Rule files
+      # are sourced from the base branch" section for the full threat
+      # model): on a `pull_request` event, the `actions/checkout@v4` step
+      # above checks out the PR's merge ref with no `ref:` override, which
+      # reflects whatever the PR AUTHOR added or edited as part of the very
+      # PR being reviewed. If `tgd-review-agent review` read rule files
+      # straight off that checkout, a malicious PR could simply ADD
+      # `.tgd-review/rules/evil.md` with attacker-authored instructions,
+      # which `dispatchRules` would then send verbatim as a TRUSTED
+      # agent-instruction prompt — with an attacker-chosen `provider`/
+      # `model` — to a subagent with real tool access on this runner.
       #
-      # Fix: check out `.tgd-review/rules/` as it exists on the PR's BASE
-      # branch (the commit the PR is being merged into), in a separate
-      # worktree, and pass THAT path as `--rules-dir` below instead of the
-      # PR checkout's own `.tgd-review/rules/`. Rule files only take effect
-      # once merged into the base branch — a PR can never introduce or
-      # modify a rule that affects its own review. If the base branch has
-      # no `.tgd-review/rules/` directory at all, `git worktree add` still
-      # succeeds (it's a full checkout of the base commit) and
-      # `tgd-review-agent`'s `loadRules()` already treats a missing
-      # `--rules-dir` as "zero user rules" rather than an error — same
-      # behavior as today, just anchored to a trusted commit.
-      - name: Fetch rule files from the BASE branch (not the PR ref — see comment above)
-        run: |
-          set -euo pipefail
-          git fetch --depth 1 origin "${{ github.event.pull_request.base.sha }}"
-          git worktree add /tmp/base-rules-checkout "${{ github.event.pull_request.base.sha }}"
-      - run: >
-          node dist/cli.js review --pr "$PR_NUMBER"
-          --rules-dir /tmp/base-rules-checkout/.tgd-review/rules
+      # Fix (now CLI-native, not workflow-YAML-specific): `review`'s default
+      # behavior (no `--trust-local-rules`) fetches `.tgd-review/rules/*.md`
+      # from the PR's BASE branch via GitHub's Contents API
+      # (`getRuleFilesFromBase`, using the `baseSha` `gh pr view` already
+      # resolves) — never from this job's own local checkout. No separate
+      # `git fetch`/`git worktree add` step or `--rules-dir` override is
+      # needed here anymore; the CLI enforces the trust boundary itself,
+      # the same way it would for any other VCS/CI system `gh`/`glab` can
+      # authenticate against. Do not pass `--trust-local-rules` here — that
+      # flag reverts to reading `--rules-dir` off THIS job's own PR
+      # checkout, reopening exactly the hole described above.
+      - run: node dist/cli.js review --pr "$PR_NUMBER"
         env:
           # PR_NUMBER is a GitHub-controlled integer (not attacker-supplied
           # free text), but it's still passed via env + quoted arg rather

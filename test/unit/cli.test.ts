@@ -14,6 +14,7 @@ describe("parseArgs", () => {
       disableBuiltinRule: false,
       advisor: "on",
       dryRun: false,
+      trustLocalRules: false,
     });
   });
 
@@ -31,6 +32,7 @@ describe("parseArgs", () => {
       "--advisor",
       "off",
       "--dry-run",
+      "--trust-local-rules",
     ]);
 
     expect(result).toEqual({
@@ -40,6 +42,23 @@ describe("parseArgs", () => {
       disableBuiltinRule: true,
       advisor: "off",
       dryRun: true,
+      trustLocalRules: true,
+    });
+  });
+
+  // New flag: --trust-local-rules skips the base-branch-via-API fetch
+  // entirely and falls back to reading --rules-dir directly off the local
+  // filesystem (the OLD behavior) — a developer convenience for iterating
+  // on a not-yet-committed rule file, not a security bypass to use lightly.
+  describe("--trust-local-rules", () => {
+    it("defaults to false when not passed", () => {
+      const result = parseArgs(["review", "--pr", "1"]);
+      expect(result.trustLocalRules).toBe(false);
+    });
+
+    it("is true when --trust-local-rules is passed", () => {
+      const result = parseArgs(["review", "--pr", "1", "--trust-local-rules"]);
+      expect(result.trustLocalRules).toBe(true);
     });
   });
 

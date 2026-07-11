@@ -6,11 +6,13 @@
 // `gh` CLI, real network, or a real pi SDK/LLM session — same
 // dependency-injection spirit as Task 5's `dispatchRules` (which itself
 // takes an injectable `createSession`).
+import { existsSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import type { ResolvedConfig } from "../../src/config.js";
-import type { BotComment, PullRequestInfo, VcsAdapter } from "../../src/vcs/adapter.js";
+import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "../../src/vcs/adapter.js";
 import type { LoadResult } from "../../src/rules/loader.js";
 import type { RuleDefinition } from "../../src/rules/types.js";
 import type { DispatchResult } from "../../src/review/types.js";
@@ -24,6 +26,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     disableBuiltinRule: false,
     advisor: "on",
     dryRun: false,
+    trustLocalRules: false,
     ...overrides,
   };
 }
@@ -58,6 +61,7 @@ interface Harness {
     getDiff: ReturnType<typeof vi.fn>;
     findBotComment: ReturnType<typeof vi.fn>;
     upsertComment: ReturnType<typeof vi.fn>;
+    getRuleFilesFromBase: ReturnType<typeof vi.fn>;
   };
   resolveConfig: ReturnType<typeof vi.fn>;
   loadRules: ReturnType<typeof vi.fn>;
@@ -72,6 +76,7 @@ function makeHarness(options: {
   loadResult?: LoadResult;
   dispatchResult?: DispatchResult;
   orchestrationResult?: OrchestrationResult;
+  ruleFilesFromBase?: RuleFileContent[];
 } = {}): Harness {
   const args = options.args ?? makeArgs();
   const pr = options.pr ?? makePr();
@@ -88,12 +93,14 @@ function makeHarness(options: {
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
   };
+  const ruleFilesFromBase = options.ruleFilesFromBase ?? [];
 
   const vcsAdapter = {
     getPullRequest: vi.fn().mockResolvedValue(pr),
     getDiff: vi.fn().mockResolvedValue("diff --git a/x b/x"),
     findBotComment: vi.fn().mockResolvedValue(botComment),
     upsertComment: vi.fn().mockResolvedValue(undefined),
+    getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
   };
 
   const config: ResolvedConfig = { ...args, vcsAdapter: vcsAdapter as unknown as VcsAdapter };
@@ -142,6 +149,9 @@ describe("review", () => {
     // Dispatch/orchestrate machinery must not even run for a skipped review.
     expect(h.loadRules).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
+    // Nor should the base-branch rule fetch — no point fetching rules for a
+    // review that's about to be skipped entirely.
+    expect(h.vcsAdapter.getRuleFilesFromBase).not.toHaveBeenCalled();
 
     logSpy.mockRestore();
   });
@@ -397,6 +407,221 @@ describe("review", () => {
 
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
     expect(h.loadRules).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+});
+
+// ADR-002 / CLI-native fix: by default, review() sources rule files from the
+// PR's BASE branch via vcsAdapter.getRuleFilesFromBase (never the local
+// filesystem at config.rulesDir directly) — writing them into a fresh temp
+// directory before handing that directory to loadRules(). --trust-local-rules
+// reverts to the old local-filesystem behavior.
+describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => {
+  it("default (trustLocalRules: false): fetches rule files from the PR's base sha via getRuleFilesFromBase(baseSha, rulesDir)", async () => {
+    const pr = makePr({ baseSha: "based00d" });
+    const h = makeHarness({ pr, botComment: null });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.getRuleFilesFromBase).toHaveBeenCalledWith("based00d", ".tgd-review/rules");
+
+    vi.restoreAllMocks();
+  });
+
+  it("default (trustLocalRules: false): writes the fetched rule files into a fresh temp directory and calls loadRules with THAT directory, not config.rulesDir", async () => {
+    const pr = makePr({ baseSha: "based00d" });
+    const ruleFilesFromBase: RuleFileContent[] = [
+      { path: "security-review.md", content: "---\nname: security-review\nprovider: anthropic\nmodel: claude-opus-4-5\n---\nBody A" },
+      { path: "style-guide.md", content: "---\nname: style-guide\nprovider: anthropic\nmodel: claude-opus-4-5\n---\nBody B" },
+    ];
+    const h = makeHarness({ pr, botComment: null, ruleFilesFromBase });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    // Inspect the temp dir's contents INSIDE the loadRules mock, before
+    // review()'s `finally` block cleans it up.
+    let seenDir: string | undefined;
+    let seenIncludeBuiltin: boolean | undefined;
+    let seenFileA: string | undefined;
+    let seenFileB: string | undefined;
+    h.loadRules.mockImplementation(async (dir: string, includeBuiltin: boolean) => {
+      seenDir = dir;
+      seenIncludeBuiltin = includeBuiltin;
+      seenFileA = readFileSync(path.join(dir, "security-review.md"), "utf-8");
+      seenFileB = readFileSync(path.join(dir, "style-guide.md"), "utf-8");
+      return { rules: [makeRule()], errors: [] };
+    });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.loadRules).toHaveBeenCalledTimes(1);
+    expect(seenDir).not.toBe(".tgd-review/rules");
+    expect(path.isAbsolute(seenDir as string)).toBe(true);
+    expect(seenIncludeBuiltin).toBe(true);
+
+    // The temp dir actually contained the fetched files, written verbatim,
+    // at the time loadRules ran.
+    expect(seenFileA).toBe(ruleFilesFromBase[0].content);
+    expect(seenFileB).toBe(ruleFilesFromBase[1].content);
+
+    // ...and was removed afterward.
+    expect(existsSync(seenDir as string)).toBe(false);
+
+    vi.restoreAllMocks();
+  });
+
+  it("default (trustLocalRules: false): removes the temp rules directory after loadRules runs", async () => {
+    const h = makeHarness({ botComment: null, ruleFilesFromBase: [{ path: "a.md", content: "x" }] });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    let capturedDir: string | undefined;
+    h.loadRules.mockImplementation(async (dir: string) => {
+      capturedDir = dir;
+      return { rules: [makeRule()], errors: [] };
+    });
+
+    await review(h.args, depsFrom(h));
+
+    expect(capturedDir).toBeDefined();
+    expect(existsSync(capturedDir as string)).toBe(false);
+
+    vi.restoreAllMocks();
+  });
+
+  it("default (trustLocalRules: false): removes the temp rules directory even when loadRules rejects", async () => {
+    const h = makeHarness({ botComment: null, ruleFilesFromBase: [{ path: "a.md", content: "x" }] });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    let capturedDir: string | undefined;
+    h.loadRules.mockImplementation(async (dir: string) => {
+      capturedDir = dir;
+      throw new Error("boom");
+    });
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/boom/);
+
+    expect(capturedDir).toBeDefined();
+    expect(existsSync(capturedDir as string)).toBe(false);
+
+    vi.restoreAllMocks();
+  });
+
+  it("--trust-local-rules: skips getRuleFilesFromBase entirely and calls loadRules with config.rulesDir directly", async () => {
+    const args = makeArgs({ trustLocalRules: true, rulesDir: "local/rules" });
+    const h = makeHarness({ args, botComment: null });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.getRuleFilesFromBase).not.toHaveBeenCalled();
+    expect(h.loadRules).toHaveBeenCalledWith("local/rules", true);
+
+    vi.restoreAllMocks();
+  });
+
+  it("passes through --disable-builtin-rule as includeBuiltin: false when fetching from the base branch", async () => {
+    const args = makeArgs({ disableBuiltinRule: true });
+    const h = makeHarness({ args, botComment: null });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const [, includeBuiltin] = h.loadRules.mock.calls[0];
+    expect(includeBuiltin).toBe(false);
+
+    vi.restoreAllMocks();
+  });
+
+  it("getRuleFilesFromBase rejecting (e.g. auth failure) propagates out of review() rather than being swallowed", async () => {
+    const h = makeHarness({ botComment: null });
+    h.vcsAdapter.getRuleFilesFromBase.mockRejectedValue(new Error("gh: authentication required"));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/authentication required/);
+
+    expect(h.loadRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  it("an empty getRuleFilesFromBase result (no rule files on the base branch) still loads successfully (builtin rule only)", async () => {
+    const h = makeHarness({ botComment: null, ruleFilesFromBase: [] });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.loadRules).toHaveBeenCalledTimes(1);
+
+    vi.restoreAllMocks();
+  });
+
+  // Review fix (defense-in-depth, non-blocking hardening item): `file.path`
+  // in a fetched RuleFileContent comes from the GitHub Contents API response
+  // and is used directly to build a write path under the temp rules dir. Not
+  // currently exploitable — the base branch isn't attacker-controlled per
+  // ADR-002's own threat model — but a relative-traversal or absolute path
+  // must still be rejected/skipped (never written outside the temp dir),
+  // the same "one bad thing shouldn't kill the whole run" philosophy this
+  // codebase already applies to malformed rule files elsewhere.
+  it("path-traversal defense-in-depth: a fetched rule file whose path escapes the temp dir via '../' is skipped (never written outside it), other legit files still load", async () => {
+    const ruleFilesFromBase: RuleFileContent[] = [
+      { path: "../../etc/passwd", content: "malicious content" },
+      { path: "security-review.md", content: "legit content" },
+    ];
+    const h = makeHarness({ botComment: null, ruleFilesFromBase });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let seenDir: string | undefined;
+    h.loadRules.mockImplementation(async (dir: string) => {
+      seenDir = dir;
+      expect(readFileSync(path.join(dir, "security-review.md"), "utf-8")).toBe("legit content");
+      return { rules: [makeRule()], errors: [] };
+    });
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(seenDir).toBeDefined();
+
+    // The traversal target (two levels above the temp dir, then etc/passwd)
+    // must never have been written to.
+    const escapedPath = path.resolve(seenDir as string, "../../etc/passwd");
+    expect(existsSync(escapedPath)).toBe(false);
+
+    // A warning names the offending path — visible, not silently dropped.
+    const warnedText = warnSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(warnedText).toContain("../../etc/passwd");
+
+    vi.restoreAllMocks();
+  });
+
+  it("path-traversal defense-in-depth: a fetched rule file with an absolute path is skipped (never written to that absolute location)", async () => {
+    const ruleFilesFromBase: RuleFileContent[] = [
+      { path: "/etc/passwd", content: "malicious content" },
+      { path: "security-review.md", content: "legit content" },
+    ];
+    const h = makeHarness({ botComment: null, ruleFilesFromBase });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let seenDir: string | undefined;
+    h.loadRules.mockImplementation(async (dir: string) => {
+      seenDir = dir;
+      expect(readFileSync(path.join(dir, "security-review.md"), "utf-8")).toBe("legit content");
+      return { rules: [makeRule()], errors: [] };
+    });
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(seenDir).toBeDefined();
+
+    const warnedText = warnSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(warnedText).toContain("/etc/passwd");
 
     vi.restoreAllMocks();
   });

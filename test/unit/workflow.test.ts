@@ -143,22 +143,29 @@ describe("workflow dependency audit gate: npm audit runs as its own CI step", ()
   });
 });
 
-// Security review fix #2 (critical): rule files must be loaded from the PR's
-// BASE branch, never from the PR's own (attacker-controlled) checkout — see
-// the long comment in tgd-review.yml above the "Fetch rule files from the
-// BASE branch" step for the full attack scenario. These assertions are
-// provable purely from the YAML structure (no live GitHub Actions run
-// needed): the workflow's `review` command must NOT rely on the CLI's
-// default `--rules-dir` (which would resolve against the PR checkout's own
-// `.tgd-review/rules`), and a step must fetch/checkout the PR base sha
-// before that command runs.
-describe("workflow rule-file trust boundary: rules load from the base branch, not the PR ref", () => {
-  function getReviewStep(): { run?: unknown; name?: unknown } {
+// ADR-002 / CLI-native fix: rule files must be loaded from the PR's BASE
+// branch, never from the PR's own (attacker-controlled) checkout — but that
+// trust boundary is now enforced INSIDE the CLI itself (review()'s default
+// `getRuleFilesFromBase` flow, driven off `pr.baseSha` fetched via `gh api`
+// — see src/cli.ts's `loadRulesForReview` and src/vcs/github-adapter.ts's
+// `getRuleFilesFromBase`), not by bespoke workflow-YAML ceremony. The old
+// `git fetch`/`git worktree add` step and the `--rules-dir
+// /tmp/base-rules-checkout/...` override are gone: the CLI's own default
+// `--rules-dir` value (the repo-relative `.tgd-review/rules`) already means
+// "fetch from the base branch via the API" without any workflow-specific
+// wiring, and it works identically for a local `gh`-authenticated run, this
+// workflow, or any future CI system — not just GitHub Actions' `git
+// worktree` primitives.
+describe("workflow rule-file trust boundary: sourced from the base branch via the CLI, not workflow YAML", () => {
+  function getSteps(): { run?: unknown; name?: unknown; uses?: unknown }[] {
     const doc = loadYaml(workflowSource) as {
       jobs: { review: { steps: { run?: unknown; name?: unknown; uses?: unknown }[] } };
     };
-    const steps = doc.jobs.review.steps;
-    const reviewStep = steps.find(
+    return doc.jobs.review.steps;
+  }
+
+  function getReviewStep(): { run?: unknown; name?: unknown } {
+    const reviewStep = getSteps().find(
       (step) => typeof step.run === "string" && step.run.includes("review --pr"),
     );
     if (!reviewStep) {
@@ -167,54 +174,36 @@ describe("workflow rule-file trust boundary: rules load from the base branch, no
     return reviewStep;
   }
 
-  it("the `review --pr` step passes an explicit --rules-dir (not the bare default)", () => {
+  it("the `review --pr` step no longer passes an explicit --rules-dir override — the CLI's own default now sources from the base branch", () => {
     const reviewStep = getReviewStep();
     const run = reviewStep.run as string;
 
-    expect(run).toContain("--rules-dir");
-    // The default rules dir (relative `.tgd-review/rules`, resolved against
-    // the PR's own checkout) must never appear as the --rules-dir value —
-    // only an absolute path pointing at the separately-checked-out base
-    // branch worktree.
-    expect(run).not.toMatch(/--rules-dir\s+\.tgd-review\/rules\b/);
-    expect(run).toMatch(/--rules-dir\s+\/[^\s]+\.tgd-review\/rules\b/);
+    expect(run).not.toContain("--rules-dir");
+    expect(run).not.toContain("/tmp/base-rules-checkout");
   });
 
-  it("a step fetches/checks out the PR's base sha before the review step runs", () => {
-    const doc = loadYaml(workflowSource) as {
-      jobs: { review: { steps: { run?: unknown; name?: unknown }[] } };
-    };
-    const steps = doc.jobs.review.steps;
+  it("the workflow no longer contains a dedicated 'fetch rule files from the base branch' git worktree step", () => {
+    const steps = getSteps();
 
-    const baseShaStepIndex = steps.findIndex(
-      (step) =>
-        typeof step.run === "string" &&
-        step.run.includes("pull_request.base.sha") &&
-        (step.run.includes("git worktree add") || step.run.includes("git fetch")),
-    );
-    const reviewStepIndex = steps.findIndex(
-      (step) => typeof step.run === "string" && step.run.includes("review --pr"),
-    );
-
-    expect(baseShaStepIndex).toBeGreaterThanOrEqual(0);
-    expect(reviewStepIndex).toBeGreaterThan(baseShaStepIndex);
-  });
-
-  it("the --rules-dir value points into the base-sha worktree path used by the fetch step", () => {
-    const doc = loadYaml(workflowSource) as {
-      jobs: { review: { steps: { run?: unknown }[] } };
-    };
-    const steps = doc.jobs.review.steps;
-
-    const fetchStep = steps.find(
+    const worktreeStep = steps.find(
       (step) => typeof step.run === "string" && step.run.includes("git worktree add"),
     );
-    expect(fetchStep).toBeDefined();
-    const worktreeMatch = /git worktree add\s+(\S+)\s/.exec(fetchStep!.run as string);
-    expect(worktreeMatch).not.toBeNull();
-    const worktreePath = worktreeMatch![1];
+    expect(worktreeStep).toBeUndefined();
 
+    const fetchStep = steps.find(
+      (step) => typeof step.run === "string" && /\bgit fetch\b/.test(step.run),
+    );
+    expect(fetchStep).toBeUndefined();
+  });
+
+  it("the workflow no longer references github.event.pull_request.base.sha — that logic moved into the CLI", () => {
+    expect(workflowSource).not.toContain("pull_request.base.sha");
+  });
+
+  it("the review step still passes --pr (the CLI resolves baseSha itself via gh pr view)", () => {
     const reviewStep = getReviewStep();
-    expect(reviewStep.run as string).toContain(`--rules-dir ${worktreePath}/.tgd-review/rules`);
+    const run = reviewStep.run as string;
+
+    expect(run).toContain("review --pr");
   });
 });
