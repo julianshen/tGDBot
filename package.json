@@ -7,7 +7,7 @@
     "tgd-review-agent": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && mkdir -p dist/rules/builtin && cp src/rules/builtin/tgd-review.md dist/rules/builtin/tgd-review.md",
     "test": "vitest run",
     "lint": "eslint src test"
   },
