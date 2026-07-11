@@ -17,14 +17,15 @@
   "license": "UNLICENSED",
   "dependencies": {
     "@earendil-works/pi-coding-agent": "0.80.6",
-    "pi-subagents": "0.34.0",
     "@juicesharp/rpiv-advisor": "1.20.0",
-    "gray-matter": "4.0.3"
+    "gray-matter": "4.0.3",
+    "pi-subagents": "0.34.0"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
-    "vitest": "^3.0.0",
     "@types/node": "^22.10.0",
-    "eslint": "^9.17.0"
+    "eslint": "^9.17.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.63.0",
+    "vitest": "^3.0.0"
   }
 }
