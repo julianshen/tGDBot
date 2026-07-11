@@ -10,6 +10,10 @@
 // can stub the session entirely and never construct a real one or touch the
 // network (see test/fixtures/pi-session-stub.ts). The default factory,
 // used in production, is the only place that touches the real SDK.
+import { mkdir, mkdtemp, rm, copyFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   createAgentSession,
   DefaultResourceLoader,
@@ -30,10 +34,13 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
 If you find nothing, respond with [] exactly.
 `.trim();
 
-// TASKS.md Task 5 "Read-only enforcement caveat": pi-subagents' bundled
-// `reviewer` agent has bash/edit/write in its default tool list and the
-// `subagent` tool exposes no per-task tool allowlist override, so v1 relies
-// on this prompt instruction rather than a hard tool restriction.
+// DEBT.md "Dispatched review subagents retain bash/edit/write tool access"
+// (closed by ADR-003): this instruction is now defense-in-depth on top of a
+// genuine tool restriction (see createIsolatedSessionCwd below), not the
+// only enforcement mechanism. The dispatched "reviewer" agent's own
+// definition grants it only read/grep/find/ls — it has no bash/edit/write
+// tool to call at all, regardless of what this instruction says or what the
+// (untrusted) diff content tries to get it to do.
 const READ_ONLY_INSTRUCTION = "You are reviewing only — do not edit, write, or run mutating commands.";
 
 // TASKS.md Task 6: appended to the dispatch prompt only when the advisor
@@ -54,11 +61,14 @@ export interface DispatchSession {
 
 // TASKS.md Task 6: the factory now takes `useAdvisor` so the real
 // implementation can decide whether to load the rpiv-advisor extension
-// alongside pi-subagents. Stub factories used in tests (which don't care
-// about the extension list) may ignore the parameter.
-export type DispatchSessionFactory = (useAdvisor: boolean) => Promise<DispatchSession>;
+// alongside pi-subagents. It also now takes `cwd` — see
+// createIsolatedSessionCwd's doc comment below for why this is a fresh,
+// isolated temp directory rather than the process's own cwd. Stub factories
+// used in tests (which don't care about the extension list or cwd) may
+// ignore either parameter.
+export type DispatchSessionFactory = (useAdvisor: boolean, cwd: string) => Promise<DispatchSession>;
 
-async function createRealDispatchSession(useAdvisor: boolean): Promise<DispatchSession> {
+async function createRealDispatchSession(useAdvisor: boolean, cwd: string): Promise<DispatchSession> {
   // pi-subagents is ALWAYS loaded; rpiv-advisor is loaded only when the
   // advisor second-opinion pass is enabled (TASKS.md Task 6, AC-6.1/AC-6.2).
   const additionalExtensionPaths = [resolvePiSubagentsExtensionPath()];
@@ -66,8 +76,18 @@ async function createRealDispatchSession(useAdvisor: boolean): Promise<DispatchS
     additionalExtensionPaths.push(resolveRpivAdvisorExtensionPath());
   }
 
+  // `cwd` here is the isolated temp directory created/seeded by
+  // createIsolatedSessionCwd (never the target repo's own working
+  // directory) — passed to both the loader (its own project-local resource
+  // discovery: .pi/extensions, .pi/skills, .pi/prompts, AGENTS.md) and to
+  // createAgentSession itself (which sets the session's own `cwd`, used by
+  // dispatched tools — including pi-subagents' `subagent` tool — as their
+  // `ctx.cwd` for project-scoped agent discovery; confirmed by reading
+  // node_modules/@earendil-works/pi-coding-agent/docs/sdk.md's "Directories"
+  // section and pi-subagents' own discoverAgents()/findNearestProjectRoot()
+  // in node_modules/pi-subagents/src/agents/agents.ts).
   const loader = new DefaultResourceLoader({
-    cwd: process.cwd(),
+    cwd,
     agentDir: getAgentDir(),
     additionalExtensionPaths,
   });
@@ -75,11 +95,69 @@ async function createRealDispatchSession(useAdvisor: boolean): Promise<DispatchS
 
   const { session } = await createAgentSession({
     resourceLoader: loader,
+    cwd,
     tools: ["read", "subagent"],
     sessionManager: SessionManager.inMemory(),
   });
 
   return session;
+}
+
+// ADR-003: vendored, tool-restricted `reviewer` agent definition. Its
+// frontmatter matches the shape of pi-subagents' own bundled
+// agents/reviewer.md (name: reviewer, description, ...) but its `tools`
+// list is `read, grep, find, ls` only — no bash/edit/write/intercom.
+// Resolved relative to this module's own location (not process.cwd()) so it
+// works whether running from src/ in dev (vitest) or from dist/ after
+// `npm run build` — the build script copies this .md file alongside the
+// compiled dispatch.js at dist/review/builtin-agents/reviewer.md (same
+// pattern as src/rules/loader.ts's BUILTIN_RULE_PATH).
+const VENDORED_REVIEWER_AGENT_PATH = fileURLToPath(
+  new URL("./builtin-agents/reviewer.md", import.meta.url),
+);
+
+// ADR-003 "restrict dispatched subagent tools via project-scoped agent
+// override": pi-subagents' agent discovery priority is Builtin < Installed
+// package < User < Project, and — per pi-subagents' own README ("Agents and
+// chains") and its discoverAgents()/mergeAgentsForScope() source — "if both
+// .agents/ and the project config agents directory define the same parsed
+// runtime agent name, the project config directory wins." pi-subagents'
+// bundled `reviewer` agent (which has bash/edit/write) is loaded at
+// "builtin" priority (see BUILTIN_AGENTS_DIR in
+// node_modules/pi-subagents/src/agents/agents.ts) — the LOWEST priority.
+//
+// So: seed a fresh, empty temp directory with `<tempDir>/.pi/agents/
+// reviewer.md` (our restricted definition) and use that temp directory as
+// the orchestrating session's own `cwd`. pi-subagents' `findNearestProjectRoot`
+// walks up from `cwd` looking for a `.pi` (or legacy `.agents`) directory;
+// since we seed `<tempDir>/.pi/agents/`, `<tempDir>/.pi` exists, so the temp
+// dir itself is treated as the "project root" — making our restricted
+// `reviewer` definition win project-scope discovery and shadow the bundled
+// one, for every dispatched task that references `agent: "reviewer"`.
+//
+// Critically, this NEVER touches the actual repo being reviewed: the temp
+// directory is created fresh via `os.tmpdir()` + `fs.mkdtemp`, is empty
+// except for the one seeded agent file, and is removed in dispatchRules'
+// `finally` block after the session completes (success or failure).
+//
+// This also means the orchestrating session's OWN project-local resource
+// discovery (.pi/extensions, .pi/skills, .pi/prompts, AGENTS.md — see
+// node_modules/@earendil-works/pi-coding-agent/docs/sdk.md's "Directories"
+// section) is scoped to this empty temp dir rather than to
+// process.cwd()/the target repo, so nothing under the target repo can be
+// accidentally discovered as an extension/skill/prompt either — confirmed
+// by reading that doc directly rather than assuming.
+//
+// pi-subagents' and rpiv-advisor's own extension entry points
+// (additionalExtensionPaths, above) are UNAFFECTED by this: they are
+// resolved via `require.resolve` against THIS package's own node_modules in
+// extensions.ts, which returns absolute paths independent of `cwd`.
+async function createIsolatedSessionCwd(): Promise<string> {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-session-"));
+  const agentsDir = path.join(tempDir, ".pi", "agents");
+  await mkdir(agentsDir, { recursive: true });
+  await copyFile(VENDORED_REVIEWER_AGENT_PATH, path.join(agentsDir, "reviewer.md"));
+  return tempDir;
 }
 
 // Review finding (code-review fix): the diff IS embedded once per rule
@@ -261,29 +339,50 @@ function parseDispatchResult(text: string | undefined, rules: RuleDefinition[]):
 // is loaded (AC-6.1/AC-6.2) and whether the dispatch prompt instructs the
 // session to call its `advisor` tool for a second opinion before finalizing
 // (AC-6.3).
+//
+// ADR-003: every call creates a fresh, isolated temp directory (via
+// createIsolatedSessionCwd) seeded with our tool-restricted `reviewer`
+// agent override, passes it to the session factory as `cwd`, and always
+// removes it in a `finally` block — on the success path AND on every
+// error/fallback path below (a thrown session.prompt(), a malformed
+// response, ...) — so temp directories never leak, including across CI
+// runs where dispatchRules may be called repeatedly or fail partway.
 export async function dispatchRules(
   rules: RuleDefinition[],
   diff: string,
   useAdvisor: boolean,
   createSession: DispatchSessionFactory = createRealDispatchSession,
 ): Promise<DispatchResult> {
-  const session = await createSession(useAdvisor);
-  const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
+  const sessionCwd = await createIsolatedSessionCwd();
 
-  // dispatchRules is a safety boundary: a thrown exception from the real
-  // SDK (network error, tool failure, rate limit, ...) during prompt() or
-  // while reading the final message must not propagate — Task 8's CLI
-  // wiring calls this function directly without its own try/catch, relying
-  // on it to never throw (same contract as the malformed-JSON fallback
-  // path below).
-  let finalText: string | undefined;
   try {
-    await session.prompt(prompt);
-    finalText = session.getLastAssistantText();
-  } catch (err) {
-    console.warn(`dispatchRules: session.prompt() threw (${(err as Error).message})`);
-    return fallbackResult(rules);
-  }
+    const session = await createSession(useAdvisor, sessionCwd);
+    const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
 
-  return parseDispatchResult(finalText, rules);
+    // dispatchRules is a safety boundary: a thrown exception from the real
+    // SDK (network error, tool failure, rate limit, ...) during prompt() or
+    // while reading the final message must not propagate — Task 8's CLI
+    // wiring calls this function directly without its own try/catch, relying
+    // on it to never throw (same contract as the malformed-JSON fallback
+    // path below).
+    let finalText: string | undefined;
+    try {
+      await session.prompt(prompt);
+      finalText = session.getLastAssistantText();
+    } catch (err) {
+      console.warn(`dispatchRules: session.prompt() threw (${(err as Error).message})`);
+      return fallbackResult(rules);
+    }
+
+    return parseDispatchResult(finalText, rules);
+  } finally {
+    // Never let a cleanup failure mask the real result/error above, or
+    // itself throw out of dispatchRules — just warn, matching this module's
+    // existing "warn, don't throw" pattern.
+    await rm(sessionCwd, { recursive: true, force: true }).catch((err: unknown) => {
+      console.warn(
+        `dispatchRules: failed to remove temp session directory ${sessionCwd} (${(err as Error).message})`,
+      );
+    });
+  }
 }

@@ -12,16 +12,22 @@ See `tgd-review-agent/` docs in the sibling `tGDBot-tGD` planning directory
 **Read this before wiring `tgd-review-agent` into CI on any repository that
 accepts contributions you don't fully trust.**
 
-Every dispatched review subagent is a real pi SDK agent session with
-`bash`/`edit`/`write` tool access on the CI runner, and its task prompt
-includes the PR's diff **verbatim**. A malicious PR's diff content — file
-contents, filenames, even commit messages if a rule quotes them — could
-attempt to manipulate the reviewing LLM into calling those tools for real
-(a classic prompt-injection attack against an agent with real capabilities).
-**This risk is inherent to the current design and is not fully closed by
-this codebase alone.** See "Read-only enforcement caveat" below for the
-full technical explanation of why it can't be closed purely with a prompt
-instruction.
+Every dispatched review subagent's task prompt includes the PR's diff
+**verbatim**, and that diff is always attacker-controlled input by necessity
+(the whole point of the tool is to review it). **This is now substantially
+mitigated**: dispatched review subagents genuinely cannot call
+`bash`/`edit`/`write` — those tools are not available to them at all, not
+merely instructed against. See "Read-only enforcement" below for the full
+technical explanation of the mechanism (a project-scoped agent override,
+not just a prompt instruction).
+
+What remains, and is much lower severity: a sufficiently adversarial diff
+could still attempt to manipulate the reviewing LLM's *analysis or output* —
+e.g. try to get it to under-report a real issue, or fabricate/inflate a
+finding. The subagent can still reason and respond in natural language; it
+just can no longer *act* (no code execution, no file mutation, no external
+contact) — this closes the RCE-class risk while leaving a narrower,
+output-integrity-only residual risk, tracked in `DEBT.md`.
 
 One related attack vector **is** fully closed, at the workflow level: rule
 files (`.tgd-review/rules/*.md`) are loaded from the PR's **base** branch,
@@ -29,11 +35,11 @@ never from the PR's own checkout — see "Rule files are sourced from the
 base branch" below. Before that fix, a PR could simply add its own rule
 file and get attacker-authored instructions executed as a *trusted*
 subagent prompt with an attacker-chosen provider/model; that specific hole
-is now closed. The PR diff content itself remains untrusted input by
-necessity (the whole point of the tool is to review it), which is why the
-warning above still stands.
+is now closed.
 
-**Concrete mitigations if you run this in CI:**
+**Additional defense-in-depth if you run this in CI** (worthwhile even now
+that the tool-access risk is closed — the output-integrity residual risk
+above, and ordinary operational hygiene, still benefit from these):
 
 1. **Gate untrusted contributions before the workflow even triggers.** Do
    not run the shipped `pull_request` trigger unmodified on a repository
@@ -222,11 +228,14 @@ adding a file. Sourcing rules from the base branch instead means:
   resolve against the PR's own (attacker-controlled) checkout and reopen
   this hole.
 
-This closes the rule-file attack vector specifically. It does **not**
-close the separate, inherent risk that the PR *diff* itself is untrusted
-input sent to a tool-capable subagent — see "⚠️ Security Considerations"
-at the top of this document and "Read-only enforcement caveat" below for
-that (unclosed, must-mitigate-operationally) risk.
+This closes the rule-file attack vector specifically. The PR *diff* itself
+is still untrusted input sent to the dispatched subagent — but as of the
+fix described in "Read-only enforcement" below, that subagent has no
+`bash`/`edit`/`write` tool available to it at all, so untrusted diff content
+can no longer cause real destructive action, only (at most) attempt to
+mislead the subagent's own analysis/output. See "⚠️ Security
+Considerations" at the top of this document and "Read-only enforcement"
+below for the full picture.
 
 ### Provider API key secrets
 
@@ -255,31 +264,51 @@ or organization secret (`Settings -> Secrets and variables -> Actions`),
 then reference it as `${{ secrets.YOUR_KEY_NAME }}` in the workflow's `env:`
 block, exactly like `GH_TOKEN`/`ANTHROPIC_API_KEY` in the example workflow.
 
-### Read-only enforcement caveat (v1 limitation)
+### Read-only enforcement
 
 See also: "⚠️ Security Considerations" at the top of this document for the
-prominent version of this warning plus concrete CI mitigations. This
-section is the fuller technical explanation of *why* it can't be closed
-purely in this codebase.
+prominent version of this section, and
+`decisions/ADR-003-restrict-dispatched-subagent-tools-via-project-scoped-agent-override.md`
+in the sibling `tGDBot-tGD` planning directory for the full design record
+(context, decision, alternatives considered).
 
 Dispatched review subagents are instructed, via their prompt, not to edit
-files, write files, or run mutating commands — but this is **not** a hard
-sandboxed guarantee in v1. The bundled `pi-subagents` `reviewer` agent has
-`bash`/`edit`/`write` tools available in its default tool list, and
-`pi-subagents`' current `TaskItem`/`ParallelTaskSchema` expose no per-task
-tool-allowlist override to strip them. In other words: the review is
-*read-only by convention and prompt instruction*, not by sandbox
-enforcement.
+files, write files, or run mutating commands — and, as of this fix, that
+instruction is backed by a genuine tool restriction, not just prompt
+wording. Every dispatched task still references `agent: "reviewer"`, but
+`dispatch.ts` no longer lets that resolve to `pi-subagents`' *bundled*
+`reviewer` agent (which ships with `bash`/`edit`/`write`/`intercom`).
+Instead, each dispatch run:
 
-This is an inherent limitation of the current `pi-subagents` extension API,
-not something this codebase can fully close on its own. Rule files are no
-longer part of this risk as of the base-branch fix above (rule file
-*content* is now always trusted, since it's sourced from the base branch,
-not the PR) — but the PR **diff** itself is still attacker-controlled input
-embedded verbatim in every dispatched subagent's prompt, and that can't be
-avoided without the tool losing its purpose (reviewing the diff). Do not
-run this tool against diffs where a prompt-injection attempt getting a
-subagent to call `bash`/`edit`/`write` would be a real risk without the
-operational mitigations described in "⚠️ Security Considerations" above
-(contribution gating, ephemeral/isolated CI, minimally-scoped
-`permissions:`) — that risk is not mitigated by this codebase alone.
+1. Creates a fresh, isolated temp directory via `os.tmpdir()` +
+   `fs.mkdtemp` — **never** the target repo's own working directory, so the
+   repo being reviewed is never touched or mutated by this mechanism.
+2. Seeds it with `<tempDir>/.pi/agents/reviewer.md`: a vendored agent
+   definition (`src/review/builtin-agents/reviewer.md`) whose `tools` list
+   is `read, grep, find, ls` only.
+3. Passes that temp directory as the orchestrating session's `cwd`.
+
+`pi-subagents`' own documented agent discovery priority is Builtin <
+Installed package < User < Project, and "if both `.agents/` and the project
+config agents directory define the same parsed runtime agent name, the
+project config directory wins." Because the temp directory's `.pi/agents/`
+now defines a `reviewer` agent, it wins project-scope discovery over the
+bundled builtin `reviewer` for every dispatched task in that session — the
+dispatched subagent genuinely has no `bash`/`edit`/`write`/`intercom` tool
+it could call, regardless of what the diff content tries to instruct it to
+do. The temp directory is removed in a `finally` block after each dispatch
+run completes (success or failure), so nothing leaks across CI runs.
+
+Rule files are no longer part of this risk as of the base-branch fix above
+(rule file *content* is now always trusted, since it's sourced from the
+base branch, not the PR). The PR **diff** itself is still attacker-controlled
+input embedded verbatim in every dispatched subagent's prompt — that can't
+be avoided without the tool losing its purpose (reviewing the diff) — but
+the *consequence* of a prompt-injection attempt in that diff is now bounded:
+the subagent can at most try to skew its own analysis or output (e.g.
+under-report a real issue), since it has no tool available that could take
+a real destructive action. The operational mitigations in "⚠️ Security
+Considerations" above (contribution gating, ephemeral/isolated CI,
+minimally-scoped `permissions:`) remain worthwhile defense-in-depth, but are
+no longer the *only* thing standing between an adversarial diff and real
+tool execution.

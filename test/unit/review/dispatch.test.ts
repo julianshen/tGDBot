@@ -8,6 +8,9 @@
 // AgentSession. AC-5.2 through AC-5.4 instead inject a stub DispatchSession
 // via dispatchRules' third parameter (test/fixtures/pi-session-stub.ts),
 // which never touches the pi SDK at all.
+import { existsSync, readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
@@ -377,5 +380,134 @@ describe("dispatchRules advisor integration (Task 6)", () => {
     expect(promptWithAdvisor).toContain('call the "advisor" tool');
     expect(promptWithAdvisor).toMatch(/advisor/i);
     expect(promptWithoutAdvisor).not.toContain('call the "advisor" tool');
+  });
+});
+
+// Tests for ADR-003 "restrict dispatched subagent tools via project-scoped
+// agent override" — closes DEBT.md's High-priority "Dispatched review
+// subagents retain bash/edit/write tool access" item. See
+// decisions/ADR-003-restrict-dispatched-subagent-tools-via-project-scoped-agent-override.md
+// in the tgd-review-agent docs repo for the full mechanism writeup.
+describe("dispatchRules isolated session cwd (ADR-003)", () => {
+  // Given dispatchRules is called with an injected stub session factory,
+  // When the factory is invoked, Then it receives a `cwd` argument that is
+  // a fresh temp directory (not process.cwd(), not any target-repo
+  // directory) which — AT THE TIME the factory runs, i.e. before session
+  // creation and before dispatchRules' cleanup — already contains
+  // `.pi/agents/reviewer.md` seeded with our vendored restricted-tools
+  // agent definition (tools: read, grep, find, ls — no bash/edit/write).
+  it("passes the session factory a fresh temp cwd seeded with the restricted reviewer.md before session creation", async () => {
+    const stub = createPiSessionStub(JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }));
+    let capturedCwd: string | undefined;
+
+    const result = await dispatchRules(
+      [makeRule({ name: "rule-a" })],
+      "diff --git a/x b/x",
+      false,
+      async (_useAdvisor, cwd) => {
+        capturedCwd = cwd;
+
+        // Assert seeding happened BEFORE this factory (and therefore
+        // before any session/prompt work) runs, and before dispatchRules'
+        // finally-block cleanup has any chance to remove it.
+        expect(path.isAbsolute(cwd)).toBe(true);
+        expect(cwd).not.toBe(process.cwd());
+        expect(cwd.startsWith(os.tmpdir()) || cwd.includes(os.tmpdir())).toBe(true);
+
+        const agentFile = path.join(cwd, ".pi", "agents", "reviewer.md");
+        expect(existsSync(agentFile)).toBe(true);
+
+        const contents = readFileSync(agentFile, "utf-8");
+        expect(contents).toContain("name: reviewer");
+        // Must declare exactly the restricted read-only tool list...
+        expect(contents).toMatch(/^tools:\s*read,\s*grep,\s*find,\s*ls\s*$/m);
+        // ...and must NOT grant any mutating/comms tool.
+        expect(contents).not.toMatch(/^tools:.*\bbash\b/m);
+        expect(contents).not.toMatch(/^tools:.*\bedit\b/m);
+        expect(contents).not.toMatch(/^tools:.*\bwrite\b/m);
+        expect(contents).not.toMatch(/^tools:.*\bintercom\b/m);
+
+        return stub.session;
+      },
+    );
+
+    expect(result).toEqual({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] });
+    expect(capturedCwd).toBeDefined();
+  });
+
+  // Given dispatchRules completes successfully, Then the temp directory it
+  // created and seeded is removed afterward — it must not leak across CI
+  // runs.
+  it("removes the temp session directory after a successful dispatchRules run", async () => {
+    const stub = createPiSessionStub(JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }));
+    let capturedCwd: string | undefined;
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false, async (_useAdvisor, cwd) => {
+      capturedCwd = cwd;
+      return stub.session;
+    });
+
+    expect(capturedCwd).toBeDefined();
+    expect(existsSync(capturedCwd as string)).toBe(false);
+  });
+
+  // Given the session throws during dispatchRules' error/fallback path
+  // (session.prompt() rejects, handled by the existing AC-5.4 fallback
+  // contract), Then the temp directory is STILL removed — cleanup must
+  // happen on the error path too, not only the happy path.
+  it("removes the temp session directory even when session.prompt() throws (error/fallback path)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let capturedCwd: string | undefined;
+    const throwingSession = {
+      prompt: vi.fn().mockRejectedValue(new Error("ECONNRESET")),
+      getLastAssistantText: () => "should never be read",
+    };
+
+    const result = await dispatchRules(
+      [makeRule({ name: "rule-a" })],
+      "diff --git a/x b/x",
+      false,
+      async (_useAdvisor, cwd) => {
+        capturedCwd = cwd;
+        return throwingSession;
+      },
+    );
+
+    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(capturedCwd).toBeDefined();
+    expect(existsSync(capturedCwd as string)).toBe(false);
+    warnSpy.mockRestore();
+  });
+
+  // Given the real (default) session factory is used — i.e. the production
+  // code path, with the pi SDK module mocked so no real session is
+  // constructed — When dispatchRules runs, Then `createAgentSession` is
+  // called with a `cwd` option pointing at a temp directory, not
+  // `process.cwd()`, and the `DefaultResourceLoader` used for that session
+  // is likewise constructed with that same temp directory as `cwd`.
+  it("the real session factory calls createAgentSession with a temp-dir cwd, not process.cwd()", async () => {
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockClear();
+    hoisted.createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        getLastAssistantText: () => JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+      },
+    });
+
+    const rules = [makeRule({ name: "rule-a" })];
+    await dispatchRules(rules, "diff --git a/x b/x", false);
+
+    expect(hoisted.createAgentSessionMock).toHaveBeenCalledTimes(1);
+    const callArgs = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as { cwd: string };
+    expect(callArgs.cwd).toBeDefined();
+    expect(callArgs.cwd).not.toBe(process.cwd());
+    expect(path.isAbsolute(callArgs.cwd)).toBe(true);
+
+    expect(hoisted.resourceLoaderInstances).toHaveLength(1);
+    expect(hoisted.resourceLoaderInstances[0]?.options.cwd).toBe(callArgs.cwd);
+
+    // The real factory path also cleans up after itself.
+    expect(existsSync(callArgs.cwd)).toBe(false);
   });
 });
