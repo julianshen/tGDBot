@@ -82,6 +82,47 @@ async function createRealDispatchSession(useAdvisor: boolean): Promise<DispatchS
   return session;
 }
 
+// Review finding (code-review fix): the diff IS embedded once per rule
+// here, and that duplication is NECESSARY, not an oversight — verified
+// against node_modules/pi-subagents/src/extension/schemas.ts. Each rule
+// becomes its own entry in the "subagent" tool's top-level PARALLEL
+// `tasks` array (TaskItem: `{ agent, task, model, ... }`), which the
+// pi-subagents extension runs as an independent child agent session. Per
+// schemas.ts's `context` field ("'fresh' or 'fork' to branch from parent
+// session ... agents without defaultContext: 'fork' run fresh") and
+// node_modules/pi-subagents/agents/reviewer.md (no `defaultContext:
+// fork` frontmatter), the "reviewer" agent we dispatch defaults to a
+// FRESH child session with no visibility into the orchestrating
+// session's own conversation/context. Each task's `task` string is the
+// *only* input that child ever sees — so if the diff isn't embedded in
+// every rule's task text, N-1 of the N dispatched reviewers would have
+// no diff to review at all. Instructing tasks to "review the diff
+// already provided above in this conversation" would be incoherent
+// under this dispatch model.
+//
+// What IS a legitimate residual risk: this makes total prompt size
+// (across all N dispatched tasks combined) scale as O(rules * diff
+// size), which can be large for a big diff and many rules. There's no
+// safe way to truncate the diff without harming review quality (a
+// truncated diff produces false negatives), so instead of silently
+// eating that cost, `warnIfDiffCostRisk` below logs a visible warning
+// when the combined size crosses a threshold, so the risk is observable
+// rather than silent.
+const DIFF_COST_WARNING_THRESHOLD_CHARS = 500_000; // ~125k tokens at ~4 chars/token
+
+function warnIfDiffCostRisk(rules: RuleDefinition[], diff: string): void {
+  const totalChars = diff.length * rules.length;
+  if (rules.length > 1 && totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
+    console.warn(
+      `dispatchRules: dispatch prompt embeds the ${diff.length}-char diff once per rule ` +
+        `(${rules.length} rules, ~${totalChars} chars total) — this is required because each ` +
+        `dispatched "reviewer" subagent runs in a fresh, isolated child session with no access ` +
+        `to the orchestrator's own context, but it does mean cost/context-window usage scales ` +
+        `with rule count on large diffs or rule sets.`,
+    );
+  }
+}
+
 function buildTaskText(rule: RuleDefinition, diff: string): string {
   return [rule.body.trim(), READ_ONLY_INSTRUCTION, FINDING_JSON_CONTRACT, "---", "Diff:", diff].join(
     "\n\n",
@@ -89,12 +130,17 @@ function buildTaskText(rule: RuleDefinition, diff: string): string {
 }
 
 // Pure and SDK-independent, so it's directly testable (AC-5.2, AC-6.3)
-// without a session of any kind.
+// without a session of any kind. The only side effect is the cost-risk
+// warning above, which mirrors the existing console.warn use elsewhere
+// in this module (parseDispatchResult) and does not affect the return
+// value.
 export function buildDispatchPrompt(
   rules: RuleDefinition[],
   diff: string,
   useAdvisor: boolean,
 ): string {
+  warnIfDiffCostRisk(rules, diff);
+
   const ruleNames = rules.map((rule) => rule.name);
 
   const taskSpecs = rules

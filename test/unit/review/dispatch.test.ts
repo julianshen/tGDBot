@@ -110,6 +110,67 @@ describe("dispatchRules", () => {
     expect(stub.prompts[0]).toContain('agent: "reviewer"');
   });
 
+  // AC-5.1/AC-5.2 (review fix, multi-rule correctness): Given ≥2 rules with
+  // DISTINCT name/provider/model/body, When dispatchRules builds its
+  // dispatch prompt, Then the prompt sent to session.prompt() contains
+  // EVERY rule (none dropped) with its OWN provider/model string paired
+  // with its OWN body text — not swapped with another rule's, and not
+  // silently dropped in favor of only the last rule. Before this test,
+  // every existing test used either a single-rule array or never inspected
+  // the actual prompt text, so a "only the last rule gets dispatched" or
+  // "rule B's model used for rule A's task" regression would leave every
+  // other test green.
+  it("AC-5.1/5.2 (review fix): a multi-rule prompt includes every rule with its own correct provider/model pairing, not dropped or swapped", async () => {
+    const ruleA = makeRule({
+      name: "rule-a",
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+      body: "RULE-A-UNIQUE-INSTRUCTION: check for null derefs.",
+    });
+    const ruleB = makeRule({
+      name: "rule-b",
+      provider: "openai",
+      model: "gpt-5",
+      body: "RULE-B-UNIQUE-INSTRUCTION: check for SQL injection.",
+    });
+
+    const stub = createPiSessionStub(JSON.stringify({ findings: [], rulesRun: [], rulesFailed: [] }));
+    await dispatchRules([ruleA, ruleB], "diff --git a/x b/x", false, async () => stub.session);
+
+    expect(stub.prompts).toHaveLength(1);
+    const prompt = stub.prompts[0];
+
+    // Both rules' exact "provider/model" strings must appear somewhere —
+    // catches a rule being dropped entirely.
+    expect(prompt).toContain("anthropic/claude-opus-4-5");
+    expect(prompt).toContain("openai/gpt-5");
+
+    // Slice the prompt into each rule's own task block (from its "Task N"
+    // marker up to the next one) so pairing can be checked precisely
+    // rather than just "both strings appear somewhere in the prompt".
+    const taskAStart = prompt.indexOf('Task 1 — rule "rule-a":');
+    const taskBStart = prompt.indexOf('Task 2 — rule "rule-b":');
+    expect(taskAStart).toBeGreaterThanOrEqual(0);
+    expect(taskBStart).toBeGreaterThan(taskAStart);
+
+    const blockA = prompt.slice(taskAStart, taskBStart);
+    const blockB = prompt.slice(taskBStart);
+
+    // rule-a's block must pair rule-a's own model with rule-a's own body —
+    // and must NOT contain rule-b's model or body (catches a swap).
+    expect(blockA).toContain("anthropic/claude-opus-4-5");
+    expect(blockA).toContain("RULE-A-UNIQUE-INSTRUCTION");
+    expect(blockA).not.toContain("openai/gpt-5");
+    expect(blockA).not.toContain("RULE-B-UNIQUE-INSTRUCTION");
+
+    // rule-b's block must pair rule-b's own model with rule-b's own body —
+    // and must NOT contain rule-a's model or body.
+    expect(blockB).toContain("openai/gpt-5");
+    expect(blockB).toContain("RULE-B-UNIQUE-INSTRUCTION");
+    expect(blockB).not.toContain("anthropic/claude-opus-4-5");
+    expect(blockB).not.toContain("RULE-A-UNIQUE-INSTRUCTION");
+  });
+
   // AC-5.3: Given the stubbed session's final message is a well-formed
   // DispatchResult JSON object, When dispatchRules returns, Then the
   // returned value deep-equals that parsed object.
