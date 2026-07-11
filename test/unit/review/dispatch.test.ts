@@ -543,16 +543,32 @@ describe("dispatchRules isolated session cwd (ADR-003)", () => {
 // intercomBridge.mode: "off" DURING the session, then is restored and removed.
 describe("dispatchRules intercom-bridge disable (hermetic agent dir)", () => {
   it("does NOT mutate PI_CODING_AGENT_DIR when a stub session factory is injected", async () => {
-    const before = process.env.PI_CODING_AGENT_DIR;
+    // Set a distinctive value so a broken gate (which would overwrite it with
+    // a temp dir during the session) is detectable AT the moment the factory
+    // runs — checking only post-call state would miss it, since the restore
+    // logic makes the net effect zero even when the gate is broken.
+    const sentinel = "/tmp/tgd-test-sentinel-agent-dir";
     const hadBefore = "PI_CODING_AGENT_DIR" in process.env;
+    const realBefore = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = sentinel;
 
+    let envDuringFactory: string | undefined;
     const stub = createPiSessionStub(
       JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
     );
-    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false, async () => stub.session);
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false, async () => {
+      envDuringFactory = process.env.PI_CODING_AGENT_DIR;
+      return stub.session;
+    });
 
-    expect("PI_CODING_AGENT_DIR" in process.env).toBe(hadBefore);
-    expect(process.env.PI_CODING_AGENT_DIR).toBe(before);
+    // The stub path must never touch the env — the sentinel is intact both
+    // DURING the factory call and after.
+    expect(envDuringFactory).toBe(sentinel);
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(sentinel);
+
+    // Restore the test's own env change.
+    if (hadBefore) process.env.PI_CODING_AGENT_DIR = realBefore;
+    else delete process.env.PI_CODING_AGENT_DIR;
   });
 
   it("bug fix (real run, hmchangw/chat#490): the real factory points PI_CODING_AGENT_DIR at a hermetic agent dir seeded with intercomBridge.mode:off during the session, then restores and removes it", async () => {
@@ -595,5 +611,45 @@ describe("dispatchRules intercom-bridge disable (hermetic agent dir)", () => {
     // agent dir is removed.
     expect(process.env.PI_CODING_AGENT_DIR).toBe(before);
     expect(existsSync(agentDirDuringSession as string)).toBe(false);
+  });
+
+  // Companion to the above: exercises the OTHER restore branch — when
+  // PI_CODING_AGENT_DIR was ALREADY set to a specific value before
+  // dispatchRules, it must be restored to exactly that value (not deleted,
+  // not corrupted to the literal "undefined"). This is the corruption-prone
+  // branch the previous test doesn't cover (it runs with the env unset).
+  it("restores PI_CODING_AGENT_DIR to its prior VALUE (not unset) when it was already set", async () => {
+    const hadBefore = "PI_CODING_AGENT_DIR" in process.env;
+    const realBefore = process.env.PI_CODING_AGENT_DIR;
+    const preExisting = "/tmp/tgd-test-preexisting-agent-dir";
+    process.env.PI_CODING_AGENT_DIR = preExisting;
+
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockClear();
+
+    let agentDirDuringSession: string | undefined;
+    hoisted.createAgentSessionMock.mockImplementationOnce(async () => {
+      agentDirDuringSession = process.env.PI_CODING_AGENT_DIR;
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          getLastAssistantText: () =>
+            JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+        },
+      };
+    });
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false);
+
+    // During the session it was overridden to the temp dir...
+    expect(agentDirDuringSession).toBeDefined();
+    expect(agentDirDuringSession).not.toBe(preExisting);
+    // ...and afterward restored to the exact prior value, still present in env.
+    expect("PI_CODING_AGENT_DIR" in process.env).toBe(true);
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(preExisting);
+
+    // Restore the test's own env change.
+    if (hadBefore) process.env.PI_CODING_AGENT_DIR = realBefore;
+    else delete process.env.PI_CODING_AGENT_DIR;
   });
 });

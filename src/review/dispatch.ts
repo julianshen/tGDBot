@@ -428,34 +428,44 @@ export async function dispatchRules(
   useAdvisor: boolean,
   createSession: DispatchSessionFactory = createRealDispatchSession,
 ): Promise<DispatchResult> {
-  const sessionCwd = await createIsolatedSessionCwd();
-
   // Hermetic agent dir + PI_CODING_AGENT_DIR override (intercom-bridge fix,
   // see createIsolatedAgentDir) are set up ONLY for the real session factory.
   // When a test injects a stub factory, none of this runs — the stub never
   // touches the real SDK, so it needs no credentials, no agent-dir config,
   // and must not mutate process.env or symlink the real ~/.pi/agent.
   const usingRealFactory = createSession === createRealDispatchSession;
+
+  // Declared up front (not inside `try`) so the `finally` block can always
+  // see them: whatever was created before a mid-setup throw still gets
+  // restored/removed. All setup below happens INSIDE the try so that a
+  // failure in createIsolatedSessionCwd / createIsolatedAgentDir /
+  // createSession degrades to fallbackResult rather than propagating —
+  // dispatchRules is a never-throws safety boundary (Task 8's CLI wiring
+  // calls it directly without its own try/catch).
+  let sessionCwd: string | undefined;
   let tempAgentDir: string | undefined;
   let prevAgentDirEnv: string | undefined;
   let agentDirEnvWasSet = false;
-  if (usingRealFactory) {
-    tempAgentDir = await createIsolatedAgentDir(getAgentDir());
-    agentDirEnvWasSet = "PI_CODING_AGENT_DIR" in process.env;
-    prevAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
-    process.env.PI_CODING_AGENT_DIR = tempAgentDir;
-  }
+  let agentDirEnvOverridden = false;
 
   try {
+    sessionCwd = await createIsolatedSessionCwd();
+
+    if (usingRealFactory) {
+      tempAgentDir = await createIsolatedAgentDir(getAgentDir());
+      agentDirEnvWasSet = "PI_CODING_AGENT_DIR" in process.env;
+      prevAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+      agentDirEnvOverridden = true;
+    }
+
     const session = await createSession(useAdvisor, sessionCwd);
     const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
 
-    // dispatchRules is a safety boundary: a thrown exception from the real
-    // SDK (network error, tool failure, rate limit, ...) during prompt() or
-    // while reading the final message must not propagate — Task 8's CLI
-    // wiring calls this function directly without its own try/catch, relying
-    // on it to never throw (same contract as the malformed-JSON fallback
-    // path below).
+    // A thrown exception from the real SDK (network error, tool failure,
+    // rate limit, ...) during prompt() or while reading the final message
+    // must not propagate — same never-throws contract as the malformed-JSON
+    // fallback path below.
     let finalText: string | undefined;
     try {
       await session.prompt(prompt);
@@ -466,26 +476,41 @@ export async function dispatchRules(
     }
 
     return parseDispatchResult(finalText, rules);
+  } catch (err) {
+    // Setup/session-creation failure (createIsolatedSessionCwd,
+    // createIsolatedAgentDir, or createSession threw). Degrade to
+    // fallbackResult rather than propagating, upholding the never-throws
+    // safety-boundary contract.
+    console.warn(
+      `dispatchRules: setup or session creation failed (${(err as Error).message})`,
+    );
+    return fallbackResult(rules);
   } finally {
     // Restore PI_CODING_AGENT_DIR to exactly its prior state (unset vs. a
     // specific value) before anything else, so the override never leaks past
     // this call — the CLI runs one review per process, but leaving a mutated
-    // global env behind would still be a latent surprise.
-    if (usingRealFactory) {
+    // global env behind would still be a latent surprise. This is straight
+    // assignment/delete and cannot throw. NOTE: process.env is process-global,
+    // so dispatchRules must not be run concurrently within one process (the
+    // CLI runs exactly one review per process).
+    if (agentDirEnvOverridden) {
       if (agentDirEnvWasSet) {
         process.env.PI_CODING_AGENT_DIR = prevAgentDirEnv;
       } else {
         delete process.env.PI_CODING_AGENT_DIR;
       }
     }
-    // Never let a cleanup failure mask the real result/error above, or
-    // itself throw out of dispatchRules — just warn, matching this module's
-    // existing "warn, don't throw" pattern.
-    await rm(sessionCwd, { recursive: true, force: true }).catch((err: unknown) => {
-      console.warn(
-        `dispatchRules: failed to remove temp session directory ${sessionCwd} (${(err as Error).message})`,
-      );
-    });
+    // Never let a cleanup failure mask the real result/error above, or itself
+    // throw out of dispatchRules — just warn, matching this module's existing
+    // "warn, don't throw" pattern. Each rm is independently guarded so one
+    // failing doesn't skip the other.
+    if (sessionCwd) {
+      await rm(sessionCwd, { recursive: true, force: true }).catch((err: unknown) => {
+        console.warn(
+          `dispatchRules: failed to remove temp session directory ${sessionCwd} (${(err as Error).message})`,
+        );
+      });
+    }
     if (tempAgentDir) {
       await rm(tempAgentDir, { recursive: true, force: true }).catch((err: unknown) => {
         console.warn(
