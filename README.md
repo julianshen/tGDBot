@@ -67,6 +67,27 @@ gh auth login   # if not already authenticated
 node dist/cli.js review --pr 42 --dry-run
 ```
 
+### Zero-config smoke test (AC-9.2)
+
+Proves the "works with zero user configuration" claim: no `.tgd-review/rules/`
+directory, only the vendored built-in `tgd-review` rule.
+
+1. Clone the repo fresh and confirm there is no `.tgd-review/rules/`
+   directory (nothing to author, nothing to configure).
+2. `npm ci && npm run build`.
+3. Export the provider API key your builtin rule's `provider`/`model` needs
+   (the vendored rule uses `anthropic`/`claude-opus-4-5` — set
+   `ANTHROPIC_API_KEY`) and make sure `gh auth login` / `GH_TOKEN` is set up.
+4. Run `node dist/cli.js review --pr <a-real-open-PR-number> --dry-run`
+   against a real repo/PR you have `gh` access to.
+5. Confirm the printed comment body reflects the built-in `tgd-review`
+   rule's review output — no custom rule files were loaded, yet a full
+   review comment is produced end-to-end.
+6. Optionally, re-run without `--dry-run` to confirm it actually
+   posts/edits the PR comment (creates it the first time; a second run
+   against the same unchanged head SHA is skipped instead, per the dedup
+   behavior described above).
+
 ### Authoring a rule file
 
 Rule files live under `.tgd-review/rules/*.md` (configurable via
