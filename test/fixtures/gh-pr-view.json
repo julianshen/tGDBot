@@ -1,0 +1,6 @@
+{
+  "headRefOid": "abc1234567890abc1234567890abc1234567890",
+  "baseRefOid": "def4567890def4567890def4567890def4567890",
+  "title": "Add feature X",
+  "body": "This PR adds feature X.\n\nCloses #12"
+}
