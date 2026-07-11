@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { parseArgs as nodeParseArgs } from "node:util";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
@@ -10,6 +13,7 @@ import type { DispatchResult } from "./review/types.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import type { RuleDefinition } from "./rules/types.js";
+import type { PullRequestInfo } from "./vcs/adapter.js";
 
 /**
  * Parsed configuration for the `review` command, per SPEC.md's API Contract.
@@ -21,6 +25,7 @@ export interface CliArgs {
   disableBuiltinRule: boolean;
   advisor: "on" | "off";
   dryRun: boolean;
+  trustLocalRules: boolean;
 }
 
 const DEFAULTS = {
@@ -29,6 +34,7 @@ const DEFAULTS = {
   disableBuiltinRule: false,
   advisor: "on" as const,
   dryRun: false,
+  trustLocalRules: false,
 };
 
 /**
@@ -37,6 +43,29 @@ const DEFAULTS = {
  * AC-1.1: `review --pr 42` parses to the fully-defaulted CliArgs object.
  * AC-1.2: a missing `--pr` throws an Error naming `--pr` as required, which
  * `main()` translates into exit code 1 with a human-readable message.
+ *
+ * `--rules-dir <path>` (default `.tgd-review/rules`): a REPO-RELATIVE path,
+ * NOT a local filesystem path by default. `review()` passes it to
+ * `vcsAdapter.getRuleFilesFromBase(pr.baseSha, rulesDir)`, which fetches
+ * `<rulesDir>/*.md` as it exists on the PR's BASE branch via the VCS
+ * provider's API (`gh api` for GitHub) — never from whatever happens to be
+ * checked out locally. This is what closes the rule-file trust-boundary gap
+ * described in ADR-002: a PR cannot introduce or modify a rule that affects
+ * its own review, and this now holds true wherever the CLI runs (a
+ * developer's own terminal, any CI system with `gh` authenticated), not
+ * just inside a GitHub Actions workflow with a bespoke `git worktree`
+ * step. See `--trust-local-rules` below for the escape hatch back to the
+ * old local-filesystem behavior.
+ *
+ * `--trust-local-rules` (default false): skips the base-branch-via-API
+ * fetch entirely and reverts `--rules-dir` to its OLD meaning — a literal
+ * local filesystem path, resolved relative to the current working
+ * directory, read directly via `loadRules()`. This is primarily a
+ * developer convenience for iterating on a rule file you haven't committed
+ * yet (the base-branch fetch can only ever see committed content); it is
+ * NOT a security bypass to reach for casually; for the `review` command's
+ * actual PR-review flow — its whole purpose — leaving it off is what
+ * enforces the trust boundary in the first place.
  */
 export function parseArgs(argv: string[]): CliArgs {
   const { values } = nodeParseArgs({
@@ -50,6 +79,7 @@ export function parseArgs(argv: string[]): CliArgs {
       "disable-builtin-rule": { type: "boolean" },
       advisor: { type: "string" },
       "dry-run": { type: "boolean" },
+      "trust-local-rules": { type: "boolean" },
     },
   });
 
@@ -89,6 +119,7 @@ export function parseArgs(argv: string[]): CliArgs {
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
+    trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,
   };
 }
 
@@ -113,10 +144,10 @@ export interface ReviewDependencies {
 // Named exit codes (Task 8 review fix #3; refined by review fix #1) — see
 // SPEC.md's exit code contract: 0 = clean run, 1 = fatal (a PRE-WRITE
 // failure: zero rules loaded, or a VCS fetch — getPullRequest/
-// findBotComment/getDiff — rejects, before any comment write is
-// attempted), 2 = partial (a comment write WAS attempted/happened, but
-// something also failed — whether that's a rule failing to load, or every
-// loaded rule failing at dispatch time).
+// findBotComment/getDiff/getRuleFilesFromBase — rejects, before any comment
+// write is attempted), 2 = partial (a comment write WAS attempted/happened,
+// but something also failed — whether that's a rule failing to load, or
+// every loaded rule failing at dispatch time).
 const EXIT_OK = 0;
 const EXIT_FATAL = 1;
 const EXIT_PARTIAL = 2;
@@ -160,6 +191,64 @@ function renderLoadErrorsSection(loadErrors: LoadResult["errors"]): string {
 }
 
 /**
+ * ADR-002 / CLI-native fix: resolves this run's rule files, honoring
+ * `config.trustLocalRules`:
+ *
+ *  - Default (`trustLocalRules: false`): rules are sourced from the PR's
+ *    BASE branch via `vcsAdapter.getRuleFilesFromBase` — never the PR's
+ *    own, potentially attacker-controlled checkout, and never a literal
+ *    local filesystem path. The fetched files are written into a fresh,
+ *    isolated temp directory (same `mkdtemp`/`os.tmpdir()` convention
+ *    `dispatch.ts`'s `createIsolatedSessionCwd` already uses for its own
+ *    tool-restricted session cwd) so `loadRules()` — which only knows how
+ *    to read a real filesystem directory — can keep working unchanged. The
+ *    temp directory is always removed in a `finally` block, on both the
+ *    success and error path, mirroring `dispatch.ts`'s own cleanup
+ *    discipline.
+ *  - `--trust-local-rules` (`trustLocalRules: true`): reverts to the OLD
+ *    behavior — reads `config.rulesDir` directly off the local filesystem.
+ *    See `parseArgs`'s JSDoc for the full rationale (developer convenience,
+ *    not a security bypass to reach for lightly).
+ */
+async function loadRulesForReview(
+  config: ResolvedConfig,
+  pr: PullRequestInfo,
+  loadRulesFn: ReviewDependencies["loadRules"],
+): Promise<LoadResult> {
+  const includeBuiltin = !config.disableBuiltinRule;
+
+  if (config.trustLocalRules) {
+    return loadRulesFn(config.rulesDir, includeBuiltin);
+  }
+
+  const ruleFiles = await config.vcsAdapter.getRuleFilesFromBase(pr.baseSha, config.rulesDir);
+  const tempRulesDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-rules-"));
+  try {
+    // Written concurrently; v1's rule files are always a flat listing (see
+    // GitHubAdapter.getRuleFilesFromBase's own doc comment), but each
+    // destination's parent dir is still created defensively in case a
+    // future adapter's `path` ever contains a subdirectory component.
+    await Promise.all(
+      ruleFiles.map(async (file) => {
+        const dest = path.join(tempRulesDir, file.path);
+        await mkdir(path.dirname(dest), { recursive: true });
+        await writeFile(dest, file.content, "utf-8");
+      }),
+    );
+    return await loadRulesFn(tempRulesDir, includeBuiltin);
+  } finally {
+    // Never let a cleanup failure mask the real result/error above, or
+    // itself throw out of loadRulesForReview — just warn, matching
+    // dispatch.ts's existing "warn, don't throw" cleanup pattern.
+    await rm(tempRulesDir, { recursive: true, force: true }).catch((err: unknown) => {
+      console.warn(
+        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${(err as Error).message})`,
+      );
+    });
+  }
+}
+
+/**
  * The actual `review` command flow: resolve config, fetch the PR + existing
  * bot comment, decide dedup, load + dispatch rules, orchestrate the merged
  * findings, and upsert (or dry-run print) the final comment.
@@ -187,7 +276,7 @@ export async function review(
   }
 
   const diff = await config.vcsAdapter.getDiff(config.pr);
-  const { rules, errors: loadErrors } = await loadRulesFn(config.rulesDir, !config.disableBuiltinRule);
+  const { rules, errors: loadErrors } = await loadRulesForReview(config, pr, loadRulesFn);
 
   // Task 8 review fix #1: surface load errors via console.error whenever
   // ANY rule file failed to load — not just when every rule failed. A

@@ -406,4 +406,150 @@ describe("GitHubAdapter", () => {
       );
     });
   });
+
+  // --- getRuleFilesFromBase (ADR-002 CLI-native fix) ---
+  //
+  // Uses GitHub's Contents API via `gh api repos/{owner}/{repo}/contents/{path}?ref={sha}`,
+  // routed through the same injectable `execGh` seam as every other method —
+  // no real `gh` calls in these unit tests.
+  describe("getRuleFilesFromBase", () => {
+    const b64 = (s: string): string => Buffer.from(s, "utf-8").toString("base64");
+
+    it("lists the rules directory at the given base sha, fetches each .md file's content, and decodes it from base64", async () => {
+      const dirListing = JSON.stringify([
+        { name: "security-review.md", path: ".tgd-review/rules/security-review.md", type: "file", sha: "sha1" },
+        { name: "style-guide.md", path: ".tgd-review/rules/style-guide.md", type: "file", sha: "sha2" },
+      ]);
+      const execGh = vi.fn(async (args: string[]) => {
+        const target = args[1];
+        if (target === "repos/{owner}/{repo}/contents/.tgd-review/rules?ref=deadbeef") {
+          return dirListing;
+        }
+        if (target === "repos/{owner}/{repo}/contents/.tgd-review/rules/security-review.md?ref=deadbeef") {
+          return JSON.stringify({ content: b64("---\nname: security-review\n---\nBody A"), encoding: "base64" });
+        }
+        if (target === "repos/{owner}/{repo}/contents/.tgd-review/rules/style-guide.md?ref=deadbeef") {
+          return JSON.stringify({ content: b64("---\nname: style-guide\n---\nBody B"), encoding: "base64" });
+        }
+        throw new Error(`unexpected execGh call: ${JSON.stringify(args)}`);
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+
+      expect(files).toEqual(
+        expect.arrayContaining([
+          { path: "security-review.md", content: "---\nname: security-review\n---\nBody A" },
+          { path: "style-guide.md", content: "---\nname: style-guide\n---\nBody B" },
+        ]),
+      );
+      expect(files).toHaveLength(2);
+    });
+
+    it("returns [] (not an error) when the rules directory doesn't exist on the base branch (404)", async () => {
+      const execGh = vi.fn(async () => {
+        throw new Error(
+          "Command failed: gh api repos/{owner}/{repo}/contents/.tgd-review/rules?ref=deadbeef\n" +
+            "gh: Not Found (HTTP 404)",
+        );
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+
+      expect(files).toEqual([]);
+    });
+
+    it("returns [] when the rules directory exists but is empty", async () => {
+      const execGh = vi.fn().mockResolvedValue("[]");
+      const adapter = new GitHubAdapter(execGh);
+
+      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+
+      expect(files).toEqual([]);
+    });
+
+    it("filters out non-.md files and subdirectories, and never fetches their content", async () => {
+      const dirListing = JSON.stringify([
+        { name: "README.txt", path: ".tgd-review/rules/README.txt", type: "file", sha: "sha1" },
+        { name: "security-review.md", path: ".tgd-review/rules/security-review.md", type: "file", sha: "sha2" },
+        { name: "nested", path: ".tgd-review/rules/nested", type: "dir", sha: "sha3" },
+      ]);
+      const execGh = vi.fn(async (args: string[]) => {
+        const target = args[1];
+        if (target === "repos/{owner}/{repo}/contents/.tgd-review/rules?ref=deadbeef") {
+          return dirListing;
+        }
+        if (target === "repos/{owner}/{repo}/contents/.tgd-review/rules/security-review.md?ref=deadbeef") {
+          return JSON.stringify({ content: b64("Body"), encoding: "base64" });
+        }
+        throw new Error(`unexpected execGh call for a filtered-out entry: ${JSON.stringify(args)}`);
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+
+      expect(files).toEqual([{ path: "security-review.md", content: "Body" }]);
+    });
+
+    it("issues the directory listing via `gh api repos/{owner}/{repo}/contents/{rulesDir}?ref={baseSha}`", async () => {
+      const execGh = vi.fn().mockResolvedValue("[]");
+      const adapter = new GitHubAdapter(execGh);
+
+      await adapter.getRuleFilesFromBase("abc123", ".tgd-review/rules");
+
+      expect(execGh).toHaveBeenCalledWith(["api", "repos/{owner}/{repo}/contents/.tgd-review/rules?ref=abc123"]);
+    });
+
+    it("propagates a genuine error (e.g. auth failure) rather than swallowing it as 'not found'", async () => {
+      const execGh = vi.fn().mockRejectedValue(new Error("gh: authentication required (HTTP 401)"));
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules")).rejects.toThrow(
+        /HTTP 401/,
+      );
+    });
+
+    it("propagates a rejection when the directory listing response is malformed/non-JSON", async () => {
+      const execGh = vi.fn().mockResolvedValue("not valid json{{{");
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules")).rejects.toThrow(
+        SyntaxError,
+      );
+    });
+
+    it("propagates a genuine error raised while fetching an individual file's content", async () => {
+      const dirListing = JSON.stringify([
+        { name: "security-review.md", path: ".tgd-review/rules/security-review.md", type: "file", sha: "sha1" },
+      ]);
+      const execGh = vi.fn(async (args: string[]) => {
+        const target = args[1];
+        if (target === "repos/{owner}/{repo}/contents/.tgd-review/rules?ref=deadbeef") {
+          return dirListing;
+        }
+        throw new Error("gh: network error (ECONNRESET)");
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules")).rejects.toThrow(
+        /ECONNRESET/,
+      );
+    });
+
+    it("treats a single-file (non-array) contents response as 'no rules directory' rather than throwing", async () => {
+      // The Contents API returns a single object (not an array) when the
+      // given path is itself a file rather than a directory — e.g. if
+      // rulesDir was misconfigured to point at a file. Treated the same as
+      // "directory doesn't exist": zero user rules, not an error.
+      const execGh = vi.fn().mockResolvedValue(
+        JSON.stringify({ name: "rules", path: ".tgd-review/rules", type: "file", sha: "sha1", content: "x" }),
+      );
+      const adapter = new GitHubAdapter(execGh);
+
+      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+
+      expect(files).toEqual([]);
+    });
+  });
 });

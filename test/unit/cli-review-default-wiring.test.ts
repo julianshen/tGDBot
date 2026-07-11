@@ -19,6 +19,7 @@ const hoisted = vi.hoisted(() => ({
   getDiff: vi.fn(),
   findBotComment: vi.fn(),
   upsertComment: vi.fn(),
+  getRuleFilesFromBase: vi.fn(),
 }));
 
 vi.mock("../../src/vcs/github-adapter.js", () => ({
@@ -27,6 +28,7 @@ vi.mock("../../src/vcs/github-adapter.js", () => ({
     getDiff = hoisted.getDiff;
     findBotComment = hoisted.findBotComment;
     upsertComment = hoisted.upsertComment;
+    getRuleFilesFromBase = hoisted.getRuleFilesFromBase;
   },
   realExecGh: vi.fn(),
 }));
@@ -57,6 +59,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     disableBuiltinRule: false,
     advisor: "on",
     dryRun: false,
+    trustLocalRules: false,
     ...overrides,
   };
 }
@@ -73,6 +76,7 @@ describe("review — default dependency wiring", () => {
     hoisted.getDiff.mockResolvedValue("diff --git a/x b/x");
     hoisted.findBotComment.mockResolvedValue(null);
     hoisted.upsertComment.mockResolvedValue(undefined);
+    hoisted.getRuleFilesFromBase.mockResolvedValue([]);
 
     vi.mocked(loadRules).mockResolvedValue({
       rules: [
@@ -118,9 +122,19 @@ describe("review — default dependency wiring", () => {
     expect(existing).toBeNull();
     expect(body).toContain("<!-- tgd-review-agent:sha=wired1234 -->");
 
+    // ADR-002 CLI-native fix: rules are now sourced from the PR's base
+    // branch via getRuleFilesFromBase, not the literal --rules-dir path.
+    expect(hoisted.getRuleFilesFromBase).toHaveBeenCalledWith("base0000", ".tgd-review/rules");
+
     // The real loadRulesReal/dispatchRulesReal/orchestrateReal references
-    // were actually invoked (not silently skipped by a typo'd default).
-    expect(loadRules).toHaveBeenCalledWith(".tgd-review/rules", true);
+    // were actually invoked (not silently skipped by a typo'd default) —
+    // loadRules is called with a fresh temp directory (not the literal
+    // --rules-dir path, which by default is now only a repo-relative
+    // lookup key for the base-branch fetch above).
+    expect(loadRules).toHaveBeenCalledTimes(1);
+    const [loadedDir, includeBuiltin] = vi.mocked(loadRules).mock.calls[0];
+    expect(loadedDir).not.toBe(".tgd-review/rules");
+    expect(includeBuiltin).toBe(true);
     expect(dispatchRules).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ name: "rule-a" })]),
       "diff --git a/x b/x",

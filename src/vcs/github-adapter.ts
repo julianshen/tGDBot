@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import type { BotComment, PullRequestInfo, VcsAdapter } from "./adapter.js";
+import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "./adapter.js";
 
 /**
  * Seam for shelling out to the `gh` CLI. GitHubAdapter accepts an ExecGh
@@ -67,6 +67,40 @@ interface GhIssueComment {
 
 interface GhUser {
   login: string;
+}
+
+// One entry of a GitHub Contents API directory listing
+// (`gh api repos/{owner}/{repo}/contents/{path}?ref={sha}` when `path` is a
+// directory returns an array of these; when `path` is a file it returns a
+// single object of roughly this same shape plus `content`/`encoding` — see
+// GhContentsFileResponse below).
+interface GhContentsEntry {
+  name: string;
+  path: string;
+  type: string; // "file" | "dir" | "symlink" | "submodule"
+  sha: string;
+}
+
+// The Contents API's single-file response shape (used both for the
+// "path is a file, not a directory" case above and for the per-file content
+// fetch below). `content` is base64-encoded (GitHub inserts a newline every
+// 60 chars — Node's Buffer.from(..., "base64") ignores embedded whitespace,
+// confirmed against a real `gh api .../contents/<file>` response).
+interface GhContentsFileResponse {
+  content: string;
+  encoding: string;
+}
+
+// `gh api`'s non-zero-exit rejection carries the HTTP status in its
+// stderr-derived error message (e.g. `gh: Not Found (HTTP 404)`), appended
+// by Node's execFile to the rejected Error's `.message` — confirmed
+// empirically against a real `gh api` 404 response (there is no structured
+// "status code" field on the rejection itself). Used by
+// getRuleFilesFromBase to distinguish "rulesDir doesn't exist on the base
+// branch" (return [], per ADR-002's existing "no rules dir = zero user
+// rules" semantics) from a genuine error, which must still propagate.
+function isNotFoundError(err: unknown): boolean {
+  return err instanceof Error && /HTTP 404/.test(err.message);
 }
 
 /**
@@ -199,5 +233,58 @@ export class GitHubAdapter implements VcsAdapter {
         JSON.stringify({ body }),
       );
     }
+  }
+
+  /**
+   * ADR-002 / CLI-native fix: fetches every `*.md` rule file under
+   * `rulesDir` AS IT EXISTS ON THE BASE BRANCH (`baseSha`), via GitHub's
+   * Contents API (`gh api repos/{owner}/{repo}/contents/{path}?ref={sha}`)
+   * rather than any local git checkout/worktree — this is what lets the CLI
+   * enforce the "rules come from the base branch, not the PR's own
+   * checkout" trust boundary anywhere `gh` is authenticated (a developer's
+   * own terminal, any CI system), not just inside a GitHub Actions workflow
+   * with local git worktree support.
+   *
+   * Lists `rulesDir` as a directory first; a 404 (directory doesn't exist
+   * on the base branch) resolves to `[]` — the same "no rules dir = zero
+   * user rules" semantics `loadRules()` already has for the local-
+   * filesystem case — rather than throwing. Any other failure (auth error,
+   * network error, malformed JSON) propagates.
+   *
+   * v1 limitation: only fetches files directly inside `rulesDir` (a flat
+   * listing) — entries with `type !== "file"` (subdirectories, submodules,
+   * symlinks) are skipped rather than recursed into. Recursing would need
+   * either the `?recursive=1` git-trees API (a different endpoint/shape) or
+   * one extra `gh api` round trip per nested directory; neither is
+   * necessary for v1's flat `.tgd-review/rules/*.md` layout.
+   */
+  async getRuleFilesFromBase(baseSha: string, rulesDir: string): Promise<RuleFileContent[]> {
+    let entries: GhContentsEntry[];
+    try {
+      const out = await this.execGh(["api", `repos/{owner}/{repo}/contents/${rulesDir}?ref=${baseSha}`]);
+      const parsed = JSON.parse(out) as unknown;
+      // The Contents API returns a single object (not an array) when the
+      // given path resolves to a FILE rather than a directory. rulesDir is
+      // expected to be a directory; treat that shape the same as "doesn't
+      // exist" (zero user rules) rather than throwing.
+      entries = Array.isArray(parsed) ? (parsed as GhContentsEntry[]) : [];
+    } catch (err) {
+      if (isNotFoundError(err)) return [];
+      throw err;
+    }
+
+    const mdFileEntries = entries.filter((entry) => entry.type === "file" && entry.name.endsWith(".md"));
+
+    // Fetched concurrently, mirroring loader.ts's own concurrent-read
+    // pattern for local rule files — one bad/slow file's fetch doesn't need
+    // to block the others, and Promise.all still surfaces (propagates) the
+    // first genuine rejection, per this method's error-handling contract.
+    return Promise.all(
+      mdFileEntries.map(async (entry) => {
+        const out = await this.execGh(["api", `repos/{owner}/{repo}/contents/${entry.path}?ref=${baseSha}`]);
+        const parsed = JSON.parse(out) as GhContentsFileResponse;
+        return { path: entry.name, content: Buffer.from(parsed.content, "base64").toString("utf-8") };
+      }),
+    );
   }
 }
