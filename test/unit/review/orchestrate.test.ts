@@ -198,6 +198,48 @@ describe("orchestrate", () => {
     expect(result.commentBody.trim()).not.toBe("");
   });
 
+  // A file-level finding with no specific line (e.g. "this file is
+  // missing a license header") has no exercised test coverage: every
+  // existing makeFinding() call sets a concrete `line`. renderFinding's
+  // `line === undefined` branch renders "general" instead of "L<n>", and
+  // dedupeKey's `finding.line ?? null` must handle it without crashing
+  // JSON.stringify (it doesn't — `undefined` is a perfectly valid input to
+  // the nullish-coalescing operator — but this pins that explicitly).
+  it("renders the 'general' placeholder (not a line number) for a finding with no line, and does not crash", () => {
+    const generalFinding = makeFinding({
+      file: "src/foo.ts",
+      line: undefined,
+      message: "Missing license header",
+      severity: "warning",
+    });
+
+    const result = orchestrate(makeDispatchResult({ findings: [generalFinding] }));
+
+    expect(result.findingsCount).toBe(1);
+    expect(result.commentBody).toContain("**[general]**");
+    expect(result.commentBody).not.toMatch(/\[L(undefined|null)\]/);
+    expect(result.commentBody).toContain("Missing license header");
+  });
+
+  // Same, but with `line` explicitly set to `null` (as opposed to simply
+  // omitted) — the two are handled by the same `!== undefined && !== null`
+  // check in renderFinding, and dedupeKey's `?? null` should treat both
+  // identically for dedup purposes.
+  it("renders the 'general' placeholder for a finding with line explicitly set to null", () => {
+    const generalFinding = makeFinding({
+      file: "src/bar.ts",
+      line: null as unknown as number,
+      message: "File-level issue",
+      severity: "suggestion",
+    });
+
+    const result = orchestrate(makeDispatchResult({ findings: [generalFinding] }));
+
+    expect(result.findingsCount).toBe(1);
+    expect(result.commentBody).toContain("**[general]**");
+    expect(result.commentBody).toContain("File-level issue");
+  });
+
   it("passes rulesRun and rulesFailed through unchanged from the input dispatchResult", () => {
     const result = orchestrate(
       makeDispatchResult({ rulesRun: ["a", "b"], rulesFailed: ["c"] }),

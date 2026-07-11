@@ -310,4 +310,94 @@ describe("review", () => {
 
     vi.restoreAllMocks();
   });
+
+  // Review fix #1: rules LOADED fine (loadErrors is empty, rules.length >
+  // 0), but every rule failed at DISPATCH time (e.g. a total LLM/provider
+  // outage sends dispatchRules down its fallback path, which returns
+  // `rulesRun: []` / `rulesFailed: [...all rule names]`). This is
+  // distinct from AC-8.5 (every rule fails to LOAD, which aborts BEFORE
+  // any VCS write with exit 1). Here a comment IS posted — so exit code
+  // must be EXIT_PARTIAL (2), not EXIT_FATAL (1): a CI consumer treating
+  // exit 1 as "nothing happened, no VCS write" would be wrong, since a
+  // comment WAS posted naming the total dispatch failure.
+  it("all rules failing at DISPATCH time (not load) still posts the comment and exits 2, not 1", async () => {
+    const loadResult: LoadResult = {
+      rules: [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })],
+      errors: [],
+    };
+    const dispatchResult: DispatchResult = {
+      findings: [],
+      rulesRun: [],
+      rulesFailed: ["rule-a", "rule-b"],
+    };
+    const orchestrationResult: OrchestrationResult = {
+      commentBody: "## Code Review\n\n### ⚠️ Rules that failed\n\nThe following rules failed to run and were skipped:\n\n- rule-a\n- rule-b",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: ["rule-a", "rule-b"],
+    };
+    const h = makeHarness({ botComment: null, loadResult, dispatchResult, orchestrationResult });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(2);
+    // The comment WAS posted — never fail silently, even on total wipeout.
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    const [, body] = h.vcsAdapter.upsertComment.mock.calls[0];
+    expect(body).toContain("rule-a");
+    expect(body).toContain("rule-b");
+
+    vi.restoreAllMocks();
+  });
+
+  // Review fix #2: SPEC.md's exit code contract lists "missing gh/glab
+  // auth" and "no such PR" as fatal (exit 1) cases. Until now that
+  // behavior was only ever exercised via main()'s outer catch-all — never
+  // pinned against review() itself. Reading review()'s actual source
+  // (src/cli.ts) confirms it has NO try/catch of its own around
+  // `config.vcsAdapter.getPullRequest`/`findBotComment`/`getDiff`: a
+  // rejection there propagates straight out of `review()` as a rejected
+  // promise, and it is `main()` (not `review()`) that catches it and maps
+  // it to exit 1. These tests pin that actual, current behavior so a
+  // future refactor that adds an inner try/catch with different
+  // swallow-and-continue fallback behavior fails loudly here instead of
+  // silently changing the exit-code contract.
+  it("review fix #2: getPullRequest rejecting (e.g. `gh: not found` / auth error) propagates out of review() rather than being swallowed", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getPullRequest.mockRejectedValue(
+      new Error("gh: command not found (is the GitHub CLI installed and authenticated?)"),
+    );
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/gh: command not found/);
+
+    // Nothing downstream of the failed fetch should have run.
+    expect(h.vcsAdapter.findBotComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.loadRules).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+  });
+
+  it("review fix #2: findBotComment rejecting (e.g. no such PR) propagates out of review()", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.findBotComment.mockRejectedValue(new Error("no such PR: #42"));
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/no such PR/);
+
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.loadRules).not.toHaveBeenCalled();
+  });
+
+  it("review fix #2: getDiff rejecting propagates out of review()", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockRejectedValue(new Error("gh: failed to fetch diff"));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/failed to fetch diff/);
+
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.loadRules).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
 });

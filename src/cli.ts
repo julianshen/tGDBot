@@ -97,9 +97,13 @@ export interface ReviewDependencies {
   orchestrate: (dispatchResult: DispatchResult) => OrchestrationResult;
 }
 
-// Named exit codes (Task 8 review fix #3) — see SPEC.md's exit code
-// contract: 0 = clean run, 1 = fatal (zero rules ran at all), 2 = partial
-// (at least one rule ran, but something also failed).
+// Named exit codes (Task 8 review fix #3; refined by review fix #1) — see
+// SPEC.md's exit code contract: 0 = clean run, 1 = fatal (a PRE-WRITE
+// failure: zero rules loaded, or a VCS fetch — getPullRequest/
+// findBotComment/getDiff — rejects, before any comment write is
+// attempted), 2 = partial (a comment write WAS attempted/happened, but
+// something also failed — whether that's a rule failing to load, or every
+// loaded rule failing at dispatch time).
 const EXIT_OK = 0;
 const EXIT_FATAL = 1;
 const EXIT_PARTIAL = 2;
@@ -215,10 +219,18 @@ export async function review(
     loadErrors: loadErrors.length > 0 ? loadErrors.map((e) => `${e.sourcePath}: ${e.message}`) : undefined,
   });
 
-  // AC-8.6: some rules ran but at least one failed (dispatch OR load) ->
-  // exit 2 (partial). Zero rules ran at all -> exit 1 (fatal), even though
-  // a comment was still posted (SPEC.md "Never fail silently" boundary).
-  if (orchestration.rulesRun.length === 0) return EXIT_FATAL;
+  // AC-8.6 / Task 8 review fix #1: EXIT_FATAL is reserved strictly for
+  // pre-write cases — zero rules loaded (handled above, before any VCS
+  // write is attempted) or a getPullRequest/findBotComment/getDiff
+  // rejection (propagates past this function entirely; see review()'s
+  // lack of a try/catch and main()'s outer catch-all). By this point a
+  // comment has already been posted (or, for --dry-run, printed) above,
+  // so exit code must reflect "was a write attempted", not "did every
+  // rule produce a result": even a total dispatch-time wipeout (e.g. every
+  // rule failing due to a provider outage, `dispatchRules`'s fallback
+  // returning `rulesRun: []`) is a partial failure (exit 2), not fatal
+  // (exit 1) — a CI consumer must not read exit 1 here as "nothing was
+  // written to the VCS", since a comment WAS posted.
   return hasFailure ? EXIT_PARTIAL : EXIT_OK;
 }
 
