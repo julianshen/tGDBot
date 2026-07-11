@@ -39,8 +39,17 @@ export const realExecGh: ExecGh = (args, stdin) =>
     }
   });
 
+// Detects the *presence* of our marker prefix, regardless of whether the SHA
+// that follows is well-formed. Used to distinguish "the bot posted a marker
+// comment (possibly with a malformed SHA)" from "this isn't our comment at
+// all" — see findBotComment.
+const BOT_MARKER_PREFIX_RE = /<!-- tgd-review-agent:sha=/;
+
 // Matches the bot's own HTML marker comment, e.g.
 // `<!-- tgd-review-agent:sha=abc1234 -->`. Capture group 1 is lastReviewedSha.
+// A comment can match BOT_MARKER_PREFIX_RE without matching this (malformed
+// SHA) — that's still treated as "the bot's marker comment", just with an
+// empty lastReviewedSha (see findBotComment).
 const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40}) -->/;
 
 interface GhPrViewJson {
@@ -53,6 +62,11 @@ interface GhPrViewJson {
 interface GhIssueComment {
   id: number | string;
   body: string;
+  user: { login: string };
+}
+
+interface GhUser {
+  login: string;
 }
 
 /**
@@ -66,6 +80,29 @@ interface GhIssueComment {
  */
 export class GitHubAdapter implements VcsAdapter {
   constructor(private readonly execGh: ExecGh = realExecGh) {}
+
+  // Caches the resolved bot login (the currently-authenticated `gh` identity)
+  // across calls within an adapter instance, so `gh api user` is only ever
+  // invoked once per process — not once per comment-list fetch. Caching the
+  // in-flight Promise (not just the resolved value) also collapses
+  // concurrent callers onto a single `gh api user` invocation.
+  private botLoginPromise: Promise<string> | null = null;
+
+  /**
+   * Resolves the identity `gh` is currently authenticated as, via
+   * `gh api user`. This works whether auth is via `GITHUB_TOKEN` in Actions
+   * (resolves to `github-actions[bot]`) or a PAT (resolves to a real user
+   * login) — see security fix for findBotComment below.
+   */
+  private getBotLogin(): Promise<string> {
+    if (!this.botLoginPromise) {
+      this.botLoginPromise = this.execGh(["api", "user"]).then((out) => {
+        const parsed = JSON.parse(out) as GhUser;
+        return parsed.login;
+      });
+    }
+    return this.botLoginPromise;
+  }
 
   /**
    * AC-2.1: parses `gh pr view <id> --json headRefOid,baseRefOid,title,body`
@@ -95,22 +132,50 @@ export class GitHubAdapter implements VcsAdapter {
 
   /**
    * AC-2.2 / AC-2.3: lists PR comments via `gh api
-   * repos/{owner}/{repo}/issues/{id}/comments` and returns the first comment
-   * whose body matches the bot marker regex (with lastReviewedSha extracted
-   * from the capture group), or `null` if no comment matches.
+   * repos/{owner}/{repo}/issues/{id}/comments` (paginated — `--paginate -f
+   * per_page=100` — since the default 30/page could put the bot's own prior
+   * comment on page 2+, causing upsertComment to CREATE a duplicate instead
+   * of editing it) and returns the first comment that is BOTH authored by
+   * the bot's own verified identity (via getBotLogin(), never trusted from
+   * the comment body itself — see security fix below) AND contains our
+   * marker prefix, or `null` if no such comment exists.
+   *
+   * Security fix: a comment is only ever treated as "the bot's" if
+   * `comment.user.login` matches the tool's own authenticated identity.
+   * Without this check, anyone can post a fake
+   * `<!-- tgd-review-agent:sha=<currentHeadSha> -->` comment on a public PR
+   * to trick decideDedup() into permanently skipping review of their own PR.
+   *
+   * Correctness fix: marker *detection* (BOT_MARKER_PREFIX_RE — does this
+   * comment look like our marker at all) is separated from SHA
+   * *extraction/validation* (BOT_MARKER_RE — is the SHA after the prefix
+   * well-formed). If the bot's own comment has the marker prefix but a
+   * malformed SHA, it is still returned as a BotComment with
+   * `lastReviewedSha: ""` rather than being skipped entirely — an empty
+   * lastReviewedSha already flows safely through dedup.ts's decideDedup
+   * (treated as "no prior review", never as "skip"), whereas returning
+   * `null` here would cause upsertComment to CREATE a second comment
+   * instead of editing the existing (malformed) one.
    */
   async findBotComment(id: string): Promise<BotComment | null> {
-    const out = await this.execGh(["api", `repos/{owner}/{repo}/issues/${id}/comments`]);
+    const botLogin = await this.getBotLogin();
+    const out = await this.execGh([
+      "api",
+      "--paginate",
+      "-f",
+      "per_page=100",
+      `repos/{owner}/{repo}/issues/${id}/comments`,
+    ]);
     const comments = JSON.parse(out) as GhIssueComment[];
     for (const comment of comments) {
+      if (comment.user?.login !== botLogin) continue;
+      if (!BOT_MARKER_PREFIX_RE.test(comment.body)) continue;
       const match = BOT_MARKER_RE.exec(comment.body);
-      if (match) {
-        return {
-          id: String(comment.id),
-          body: comment.body,
-          lastReviewedSha: match[1] ?? "",
-        };
-      }
+      return {
+        id: String(comment.id),
+        body: comment.body,
+        lastReviewedSha: match?.[1] ?? "",
+      };
     }
     return null;
   }
