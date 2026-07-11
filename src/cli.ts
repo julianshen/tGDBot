@@ -97,15 +97,49 @@ export interface ReviewDependencies {
   orchestrate: (dispatchResult: DispatchResult) => OrchestrationResult;
 }
 
+// Named exit codes (Task 8 review fix #3) — see SPEC.md's exit code
+// contract: 0 = clean run, 1 = fatal (zero rules ran at all), 2 = partial
+// (at least one rule ran, but something also failed).
+const EXIT_OK = 0;
+const EXIT_FATAL = 1;
+const EXIT_PARTIAL = 2;
+
 interface StatusLog {
   status: "skipped" | "posted" | "partial";
   findingsCount: number;
   rulesRun: string[];
   rulesFailed: string[];
+  // Task 8 review fix #1: only present (and non-empty) when one or more
+  // rule files failed to LOAD (bad/missing frontmatter etc.) — distinct
+  // from `rulesFailed`, which is dispatch-time-only. Omitted entirely
+  // (via JSON.stringify dropping `undefined` values) when there were no
+  // load errors, so the "skipped"/all-succeeded log shape is unchanged.
+  loadErrors?: string[];
 }
 
+// Task 8 review fix #2: the final structured status line is always the
+// LAST line this process writes to stdout, prefixed with a greppable
+// marker. This matters specifically for `--dry-run`, where a multi-line
+// Markdown comment preview is ALSO printed to stdout earlier in the same
+// invocation — without a marker, a CI log scraper has no reliable way to
+// tell the human-readable preview apart from the one line it actually
+// wants to parse. Simpler than routing dry-run output to stderr (which
+// would make local `--dry-run` previews awkward to read/pipe), and it
+// keeps the JSON status line's own shape untouched for anyone already
+// parsing it directly off the end of stdout.
+const STATUS_LOG_PREFIX = "TGD_REVIEW_RESULT: ";
+
 function logStatus(log: StatusLog): void {
-  console.log(JSON.stringify(log));
+  console.log(`${STATUS_LOG_PREFIX}${JSON.stringify(log)}`);
+}
+
+// Task 8 review fix #1: renders a visible section naming every rule file
+// that failed to LOAD (as opposed to `orchestrate.ts`'s own "Rules that
+// failed" section, which only covers dispatch-time failures) — mirrors
+// orchestrate.ts's renderFailedRulesSection formatting for consistency.
+function renderLoadErrorsSection(loadErrors: LoadResult["errors"]): string {
+  const items = loadErrors.map((e) => `- \`${e.sourcePath}\`: ${e.message}`).join("\n");
+  return `### ⚠️ Rule files that failed to load\n\nThe following rule files were skipped because they failed to load:\n\n${items}`;
 }
 
 /**
@@ -132,26 +166,38 @@ export async function review(
   // AC-8.1: sha match -> skip, exit 0, upsertComment is never called.
   if (decideDedup(pr, botComment) === "skip-no-new-commits") {
     logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
-    return 0;
+    return EXIT_OK;
   }
 
   const diff = await config.vcsAdapter.getDiff(config.pr);
   const { rules, errors: loadErrors } = await loadRulesFn(config.rulesDir, !config.disableBuiltinRule);
 
-  // AC-8.5: every rule failed to load -> exit 1 before any VCS write.
-  if (rules.length === 0) {
-    console.error(
-      `tgd-review-agent: no rules could be loaded (${loadErrors.length} load error(s)); aborting before posting a comment`,
-    );
+  // Task 8 review fix #1: surface load errors via console.error whenever
+  // ANY rule file failed to load — not just when every rule failed. A
+  // partial load failure must still be visible (SPEC.md: "every non-zero
+  // exit must include a human-readable reason").
+  if (loadErrors.length > 0) {
+    console.error(`tgd-review-agent: ${loadErrors.length} rule file(s) failed to load:`);
     for (const loadError of loadErrors) {
       console.error(`  ${loadError.sourcePath}: ${loadError.message}`);
     }
-    return 1;
+  }
+
+  // AC-8.5: every rule failed to load -> exit 1 before any VCS write.
+  if (rules.length === 0) {
+    console.error("tgd-review-agent: no rules could be loaded; aborting before posting a comment");
+    return EXIT_FATAL;
   }
 
   const dispatchResult = await dispatchRulesFn(rules, diff, config.advisor === "on");
   const orchestration = orchestrateFn(dispatchResult);
-  const body = `${orchestration.commentBody}\n\n${formatMarker(pr.headSha)}`;
+
+  const bodyParts = [orchestration.commentBody];
+  if (loadErrors.length > 0) {
+    bodyParts.push(renderLoadErrorsSection(loadErrors));
+  }
+  bodyParts.push(formatMarker(pr.headSha));
+  const body = bodyParts.join("\n\n");
 
   // AC-8.4: --dry-run prints the body instead of writing to the VCS.
   if (config.dryRun) {
@@ -166,13 +212,14 @@ export async function review(
     findingsCount: orchestration.findingsCount,
     rulesRun: orchestration.rulesRun,
     rulesFailed: orchestration.rulesFailed,
+    loadErrors: loadErrors.length > 0 ? loadErrors.map((e) => `${e.sourcePath}: ${e.message}`) : undefined,
   });
 
-  // AC-8.6: some rules ran but at least one failed -> exit 2 (partial).
-  // Zero rules ran at all -> exit 1 (fatal), even though a comment was
-  // still posted (SPEC.md "Never fail silently" boundary).
-  if (orchestration.rulesRun.length === 0) return 1;
-  return hasFailure ? 2 : 0;
+  // AC-8.6: some rules ran but at least one failed (dispatch OR load) ->
+  // exit 2 (partial). Zero rules ran at all -> exit 1 (fatal), even though
+  // a comment was still posted (SPEC.md "Never fail silently" boundary).
+  if (orchestration.rulesRun.length === 0) return EXIT_FATAL;
+  return hasFailure ? EXIT_PARTIAL : EXIT_OK;
 }
 
 /**
@@ -188,7 +235,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<void
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`tgd-review-agent: ${message}`);
-    process.exit(1);
+    process.exit(EXIT_FATAL);
   }
 }
 

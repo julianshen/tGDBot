@@ -137,7 +137,7 @@ describe("review", () => {
     expect(exitCode).toBe(0);
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
     expect(logSpy).toHaveBeenCalledWith(
-      JSON.stringify({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] }),
+      `TGD_REVIEW_RESULT: ${JSON.stringify({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] })}`,
     );
     // Dispatch/orchestrate machinery must not even run for a skipped review.
     expect(h.loadRules).not.toHaveBeenCalled();
@@ -259,6 +259,54 @@ describe("review", () => {
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
     const [, body] = h.vcsAdapter.upsertComment.mock.calls[0];
     expect(body).toContain("rule-b");
+
+    vi.restoreAllMocks();
+  });
+
+  // AC-8.6 (same "partial failure must be visible" intent, applied to a
+  // rule that failed to LOAD rather than a rule that failed at dispatch
+  // time — Task 8 review fix #1): a partial load failure must surface in
+  // console.error, the posted comment body, and the JSON status line's
+  // `loadErrors` field, not just when every rule fails to load.
+  it("AC-8.6: partial rule LOAD failure is surfaced in console.error, the comment body, and the status line's loadErrors — exits 2", async () => {
+    const loadResult: LoadResult = {
+      rules: [makeRule({ name: "rule-a" })],
+      errors: [{ sourcePath: "/rules/bad.md", message: 'missing required frontmatter field "model"' }],
+    };
+    const dispatchResult: DispatchResult = { findings: [], rulesRun: ["rule-a"], rulesFailed: [] };
+    const orchestrationResult: OrchestrationResult = {
+      commentBody: "## Code Review\n\nNo issues found.",
+      findingsCount: 0,
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    };
+    const h = makeHarness({ botComment: null, loadResult, dispatchResult, orchestrationResult });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(2);
+
+    // The comment is still posted (not swallowed).
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    const [, body] = h.vcsAdapter.upsertComment.mock.calls[0];
+    expect(body).toContain("/rules/bad.md");
+    expect(body).toContain('missing required frontmatter field "model"');
+
+    // console.error names the load failure, not just in the all-rules-failed branch.
+    const errorText = errorSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(errorText).toContain("/rules/bad.md");
+
+    // The final JSON status line carries the load errors so CI log
+    // scrapers/dashboards see them even without reading the comment body.
+    const statusCall = logSpy.mock.calls.find(
+      (call) => typeof call[0] === "string" && call[0].startsWith("TGD_REVIEW_RESULT: "),
+    );
+    expect(statusCall).toBeDefined();
+    const statusJson = JSON.parse((statusCall![0] as string).slice("TGD_REVIEW_RESULT: ".length));
+    expect(statusJson.loadErrors).toEqual(['/rules/bad.md: missing required frontmatter field "model"']);
+    expect(statusJson.status).toBe("partial");
 
     vi.restoreAllMocks();
   });
