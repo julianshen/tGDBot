@@ -7,6 +7,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  extractPiExtensionEntry,
   resolvePiSubagentsExtensionPath,
   resolveRpivAdvisorExtensionPath,
 } from "../../../src/review/extensions.js";
@@ -33,5 +34,34 @@ describe("resolveRpivAdvisorExtensionPath", () => {
     expect(path.isAbsolute(resolved)).toBe(true);
     expect(resolved.endsWith(path.join("@juicesharp", "rpiv-advisor", "index.ts"))).toBe(true);
     expect(existsSync(resolved)).toBe(true);
+  });
+});
+
+// Test coverage fix (DEBT.md): the malformed-manifest throw path was
+// previously only reachable via a real installed package's package.json,
+// making it untestable in practice. extractPiExtensionEntry is the pure,
+// exported extraction step (no file I/O) so a fake parsed manifest can
+// exercise the throw directly.
+describe("extractPiExtensionEntry", () => {
+  it("throws a clear error when the parsed package.json has no `pi` field at all", () => {
+    expect(() => extractPiExtensionEntry("fake-package", "/fake/path/package.json", {})).toThrow(
+      'fake-package package.json (/fake/path/package.json) is missing a "pi.extensions[0]" entry',
+    );
+  });
+
+  it("throws when `pi.extensions` is present but empty", () => {
+    expect(() =>
+      extractPiExtensionEntry("fake-package", "/fake/path/package.json", {
+        pi: { extensions: [] },
+      }),
+    ).toThrow('fake-package package.json (/fake/path/package.json) is missing a "pi.extensions[0]" entry');
+  });
+
+  it("returns the first entry when `pi.extensions[0]` is present", () => {
+    const entry = extractPiExtensionEntry("fake-package", "/fake/path/package.json", {
+      pi: { extensions: ["./index.ts", "./other.ts"] },
+    });
+
+    expect(entry).toBe("./index.ts");
   });
 });

@@ -233,6 +233,75 @@ describe("GitHubAdapter", () => {
     });
   });
 
+  // --- Test coverage fix (DEBT.md): "first match wins" semantics ---
+
+  it("test coverage fix: findBotComment returns the FIRST bot-authored, marker-matching comment when multiple are present", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      return JSON.stringify([
+        {
+          id: 111,
+          body: "## tGD Review\n\n<!-- tgd-review-agent:sha=aaa1111 -->",
+          user: { login: "tgd-review-agent[bot]" },
+        },
+        {
+          id: 222,
+          body: "## tGD Review\n\n<!-- tgd-review-agent:sha=bbb2222 -->",
+          user: { login: "tgd-review-agent[bot]" },
+        },
+      ]);
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    const botComment = await adapter.findBotComment("42");
+
+    // Both comments are authored by the bot and both match the marker
+    // pattern; findBotComment iterates the list in order and returns on
+    // the first match, so the second (later, presumably newer) comment
+    // must never win here.
+    expect(botComment).toEqual({
+      id: "111",
+      body: "## tGD Review\n\n<!-- tgd-review-agent:sha=aaa1111 -->",
+      lastReviewedSha: "aaa1111",
+    });
+  });
+
+  // --- Test coverage fix (DEBT.md): malformed/non-JSON gh output ---
+  //
+  // Pinning tests only (no code change): JSON.parse throws synchronously
+  // inside these async methods, so the returned promise rejects and the
+  // rejection propagates out of findBotComment uncaught. That is the
+  // correct behavior here, not an oversight — review()'s call site
+  // (cli.ts) never wraps getPullRequest/findBotComment/getDiff in a
+  // try/catch; per SPEC.md's exit-code contract (exit 1: "missing gh/glab
+  // auth, no such PR, all rules failed to load") and cli.ts's own
+  // EXIT_FATAL comment, any pre-write VCS fetch failure — including
+  // unparseable `gh` output — is a fatal, pre-write condition that must
+  // abort before any comment is posted, not be swallowed into a
+  // partial/degraded result. main()'s outer catch-all turns this rejection
+  // into a human-readable `tgd-review-agent: <message>` stderr line and
+  // exit code 1, which is the desired behavior. So: pin it, don't change it.
+
+  it("test coverage fix (pinning): findBotComment rejects when the paginated comments call returns malformed/non-JSON output", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      return "not valid json{{{";
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.findBotComment("42")).rejects.toThrow(SyntaxError);
+  });
+
+  it("test coverage fix (pinning): findBotComment rejects when the `gh api user` call returns malformed/non-JSON output", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return "not valid json{{{";
+      return readFixture("gh-comments.json");
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.findBotComment("42")).rejects.toThrow(SyntaxError);
+  });
+
   // --- Review fix #4 (test gap): realExecGh coverage ---
 
   describe("realExecGh (test gap fix: real child_process.execFile-backed implementation)", () => {

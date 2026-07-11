@@ -60,4 +60,33 @@ describe("parseArgs", () => {
     expect(caught).toBeInstanceOf(Error);
     expect((caught as Error).message).toMatch(/--pr/);
   });
+
+  // Security hardening (DEBT.md): a non-numeric --pr value throws, the same
+  // way the missing---pr case does, rather than being silently accepted and
+  // later interpolated into a `gh api` path unchecked.
+  it("security hardening: throws naming --pr as invalid when --pr is not a plain positive integer", () => {
+    expect(() => parseArgs(["review", "--pr", "abc"])).toThrow(/--pr/);
+  });
+
+  it("security hardening: throws an Error instance for a non-numeric --pr value", () => {
+    let caught: unknown;
+    try {
+      parseArgs(["review", "--pr", "42; rm -rf /"]);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/--pr/);
+  });
+
+  it("security hardening: rejects a --pr value with a leading sign, decimal, or leading zero-padded non-integer form like '+1' or '1.5'", () => {
+    expect(() => parseArgs(["review", "--pr", "+1"])).toThrow(/--pr/);
+    expect(() => parseArgs(["review", "--pr", "1.5"])).toThrow(/--pr/);
+    expect(() => parseArgs(["review", "--pr", "-1"])).toThrow(/--pr/);
+  });
+
+  it("security hardening: still accepts a plain positive integer --pr value", () => {
+    expect(() => parseArgs(["review", "--pr", "007"])).not.toThrow();
+    expect(parseArgs(["review", "--pr", "0"]).pr).toBe("0");
+  });
 });

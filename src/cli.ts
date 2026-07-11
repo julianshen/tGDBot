@@ -59,6 +59,19 @@ export function parseArgs(argv: string[]): CliArgs {
     );
   }
 
+  // Defense-in-depth (DEBT.md security item, Low): --pr is interpolated
+  // into `gh api repos/{owner}/{repo}/issues/${id}/comments`-style paths in
+  // github-adapter.ts. Not currently exploitable — execFile is invoked with
+  // array args (no shell), and the shipped workflow only ever passes
+  // `github.event.pull_request.number`, a genuine integer — but a plain
+  // positive-integer check costs nothing and closes off any future
+  // path/query-string interpolation from accepting non-numeric input.
+  if (!/^\d+$/.test(values.pr as string)) {
+    throw new Error(
+      `Invalid --pr value: "${values.pr as string}" (expected a positive integer, e.g. --pr 42)`,
+    );
+  }
+
   const vcs = (values.vcs as string | undefined) ?? DEFAULTS.vcs;
   if (vcs !== "github" && vcs !== "gitlab") {
     throw new Error(`Invalid --vcs value: "${vcs}" (expected "github" or "gitlab")`);
