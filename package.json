@@ -8,7 +8,9 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/rules/builtin && cp src/rules/builtin/tgd-review.md dist/rules/builtin/tgd-review.md && mkdir -p dist/review/builtin-agents && cp src/review/builtin-agents/reviewer.md dist/review/builtin-agents/reviewer.md",
-    "test": "vitest run",
+    "test": "vitest run test/unit",
+    "test:smoke": "vitest run test/smoke",
+    "test:all": "vitest run",
     "lint": "eslint src test"
   },
   "engines": {

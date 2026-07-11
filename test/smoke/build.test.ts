@@ -10,9 +10,20 @@ import { describe, expect, it } from "vitest";
 // This is a genuine build smoke test — it shells out to the real `npm run
 // build` script (tsc + the dist/rules/builtin copy step) rather than
 // mocking the compiler, so it is legitimately slower than the rest of the
-// unit suite. Running `npm run build` is idempotent/safe: it only
-// (re)writes files under `dist/`, which is gitignored and not otherwise
-// depended on by any other test in this suite.
+// unit suite (~800-1000ms vs low-single-digit ms for the rest). Running
+// `npm run build` is idempotent/safe: it only (re)writes files under
+// `dist/`, which is gitignored and not otherwise depended on by any other
+// test in this suite.
+//
+// Lives under test/smoke/ (not test/unit/) and is deliberately excluded
+// from the default `npm test` path (see package.json's "test" script,
+// scoped to `test/unit`) so the fast unit suite doesn't shell out to a
+// real build and write to `dist/` on every run. Run it explicitly via
+// `npm run test:smoke` (or `npm run test:all` to run everything). The
+// AC-1.3 requirement-coverage gate (ac-trace.py) only looks for the
+// "AC-1.3" id string inside any file matching a test-file naming
+// convention anywhere in the repo — it does not care which directory the
+// test lives in — so this move does not break AC-1.3 traceability.
 describe("AC-1.3: npm run build", () => {
   const repoRoot = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),

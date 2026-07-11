@@ -82,6 +82,67 @@ describe("AC-9.1: .github/workflows/tgd-review.yml syntax", () => {
   );
 });
 
+// DEBT.md (Security, Medium): "No npm audit/provenance gate in CI" — the
+// runtime dependency chain (pi-subagents / rpiv-advisor / pi-coding-agent)
+// is pinned to exact versions but otherwise unaudited, despite being able
+// to execute code and influence agent behavior. Assert the CI job actually
+// runs `npm audit` as its own step (not folded into the build step), gated
+// on high/critical severity, and that it runs after `npm ci` and before the
+// build/review steps.
+describe("workflow dependency audit gate: npm audit runs as its own CI step", () => {
+  function getSteps(): { run?: unknown; name?: unknown; uses?: unknown }[] {
+    const doc = loadYaml(workflowSource) as {
+      jobs: { review: { steps: { run?: unknown; name?: unknown; uses?: unknown }[] } };
+    };
+    return doc.jobs.review.steps;
+  }
+
+  it("a step's `run:` contains `npm audit` with a high/critical threshold", () => {
+    const steps = getSteps();
+    const auditStep = steps.find(
+      (step) => typeof step.run === "string" && step.run.includes("npm audit"),
+    );
+
+    expect(auditStep).toBeDefined();
+    const run = auditStep!.run as string;
+    expect(run).toContain("npm audit");
+    expect(run).toMatch(/--audit-level[= ]high/);
+  });
+
+  it("the audit step is separate from `npm ci` and `npm run build` (not folded into either)", () => {
+    const steps = getSteps();
+    const auditStep = steps.find(
+      (step) => typeof step.run === "string" && step.run.includes("npm audit"),
+    );
+
+    expect(auditStep).toBeDefined();
+    const run = auditStep!.run as string;
+    // The audit step's own run: must not also perform `npm ci` or
+    // `npm run build` — those must be distinct steps, so an audit failure
+    // is attributable in the Actions UI to "dependency audit failed" and
+    // not conflated with an install or build failure.
+    expect(run).not.toContain("npm ci");
+    expect(run).not.toContain("npm run build");
+  });
+
+  it("npm ci runs before the audit step, which runs before npm run build", () => {
+    const steps = getSteps();
+    const ciIndex = steps.findIndex(
+      (step) => typeof step.run === "string" && step.run.trim() === "npm ci",
+    );
+    const auditIndex = steps.findIndex(
+      (step) => typeof step.run === "string" && step.run.includes("npm audit"),
+    );
+    const buildIndex = steps.findIndex(
+      (step) => typeof step.run === "string" && step.run.trim() === "npm run build",
+    );
+
+    expect(ciIndex).toBeGreaterThanOrEqual(0);
+    expect(auditIndex).toBeGreaterThan(ciIndex);
+    expect(buildIndex).toBeGreaterThan(auditIndex);
+  });
+});
+
 // Security review fix #2 (critical): rule files must be loaded from the PR's
 // BASE branch, never from the PR's own (attacker-controlled) checkout — see
 // the long comment in tgd-review.yml above the "Fetch rule files from the
