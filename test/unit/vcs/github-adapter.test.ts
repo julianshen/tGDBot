@@ -9,7 +9,12 @@ const fixturePath = (name: string): string =>
 
 const readFixture = (name: string): string => readFileSync(fixturePath(name), "utf-8");
 
-const PAGINATED_COMMENTS_ARGS_PREFIX = ["api", "--paginate", "-f", "per_page=100"];
+// `-X GET` is REQUIRED here (not the implicit default) because `-f
+// per_page=100` is present — see the bug-fix doc comment on findBotComment
+// in src/vcs/github-adapter.ts for why `gh api` silently defaults to POST
+// once any `-f`/`-F` param is passed, and the real end-to-end 422 this
+// caused against `hmchangw/chat` PR #491.
+const PAGINATED_COMMENTS_ARGS_PREFIX = ["api", "-X", "GET", "--paginate", "-f", "per_page=100"];
 
 /**
  * Builds an execGh mock that dispatches based on the `gh` subcommand:
@@ -205,11 +210,43 @@ describe("GitHubAdapter", () => {
 
     expect(execGh).toHaveBeenCalledWith([
       "api",
+      "-X",
+      "GET",
       "--paginate",
       "-f",
       "per_page=100",
       "repos/{owner}/{repo}/issues/42/comments",
     ]);
+  });
+
+  // --- Bug fix (real end-to-end run): `gh api` silently defaults to POST
+  // once `-f`/`-F` params are present, even for a GET-shaped endpoint ---
+  //
+  // Found via a live end-to-end run against `hmchangw/chat` PR #491:
+  // `findBotComment` — called on EVERY `review` invocation, before
+  // dedup/rule-loading/dispatch ever run — failed 100% of the time with an
+  // HTTP 422 ("body" wasn't supplied), because `gh api --paginate -f
+  // per_page=100 <endpoint>` (no explicit `-X`/`--method`) issues a POST,
+  // not a GET, whenever any `-f`/`-F` parameter is present — regardless of
+  // the target endpoint. No unit test caught this before the fix because
+  // every test here mocks `execGh` entirely: a wrong HTTP-method flag never
+  // produces a wrong *result* in a mocked test, since the mock just returns
+  // whatever fixture it's told to, independent of the args actually passed.
+  // This test exists specifically to pin the exact args shape (including
+  // `-X GET`) so this real-world regression can never silently return.
+  it("bug fix (real end-to-end run, hmchangw/chat PR #491): findBotComment issues an explicit -X GET, since gh api silently defaults to POST once -f per_page=100 is present", async () => {
+    const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments.json");
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.findBotComment("42");
+
+    const paginatedCall = execGh.mock.calls.find(
+      ([args]) => args[0] === "api" && args.includes("--paginate"),
+    );
+    expect(paginatedCall).toBeDefined();
+    const [args] = paginatedCall as [string[]];
+    expect(args).toContain("-X");
+    expect(args[args.indexOf("-X") + 1]).toBe("GET");
   });
 
   // --- Review fix #3 (correctness): malformed marker on the bot's own comment ---

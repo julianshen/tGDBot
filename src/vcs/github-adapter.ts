@@ -174,6 +174,24 @@ export class GitHubAdapter implements VcsAdapter {
    * the comment body itself — see security fix below) AND contains our
    * marker prefix, or `null` if no such comment exists.
    *
+   * Bug fix (found via a real end-to-end run against `hmchangw/chat` PR
+   * #491 — see git history): `-X GET` is REQUIRED here, explicitly. `gh
+   * api`'s documented default method is GET for a path like this one, but
+   * that default silently flips to POST the moment ANY `-f`/`-F` parameter
+   * is present on the invocation — regardless of the target endpoint. Since
+   * this call passes `-f per_page=100` for pagination, omitting `-X GET`
+   * makes `gh` issue a POST to the issue-comments endpoint, which GitHub
+   * interprets as "create a comment" and rejects with HTTP 422 (`"body"
+   * wasn't supplied`) — confirmed empirically:
+   *   `gh api --paginate -f per_page=100 repos/{owner}/{repo}/issues/{id}/comments`
+   *     → 422 "body" wasn't supplied
+   *   `gh api --method GET --paginate -f per_page=100 repos/{owner}/{repo}/issues/{id}/comments`
+   *     → correct paginated comments array
+   * Without the explicit method flag, findBotComment fails on EVERY
+   * `review` invocation (it runs before dedup/rule-loading/dispatch), so
+   * this is a load-bearing flag, not decoration — do not remove it as
+   * "redundant with the GET default".
+   *
    * Security fix: a comment is only ever treated as "the bot's" if
    * `comment.user.login` matches the tool's own authenticated identity.
    * Without this check, anyone can post a fake
@@ -195,6 +213,8 @@ export class GitHubAdapter implements VcsAdapter {
     const botLogin = await this.getBotLogin();
     const out = await this.execGh([
       "api",
+      "-X",
+      "GET",
       "--paginate",
       "-f",
       "per_page=100",
