@@ -9,6 +9,11 @@ jobs:
   review:
     runs-on: ubuntu-latest
     steps:
+      # Checks out the PR's own merge ref. This is needed (and safe) for
+      # building the CLI and for `gh pr diff` to see the PR's actual diff —
+      # but see the "Fetch rule files from the BASE branch" step below for
+      # why the PR's own checkout must NEVER be used as the source of rule
+      # files (`.tgd-review/rules/`).
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -17,7 +22,40 @@ jobs:
           # itself requires >=22.19.0.
           node-version: "22.19.0"
       - run: npm ci && npm run build
-      - run: node dist/cli.js review --pr "$PR_NUMBER"
+      # SECURITY (critical — do not remove or "simplify" this step): on a
+      # `pull_request` event, the `actions/checkout@v4` step above checks
+      # out the PR's merge ref with no `ref:` override, which reflects
+      # whatever the PR AUTHOR added or edited as part of the very PR being
+      # reviewed. If `tgd-review-agent review` were pointed at that
+      # checkout's own `.tgd-review/rules/` (the default `--rules-dir`),
+      # a malicious PR could simply ADD `.tgd-review/rules/evil.md` with
+      # attacker-authored instructions. `loadRules()` reads that directory
+      # unconditionally and `dispatchRules` sends each rule file's `body`
+      # verbatim as a TRUSTED agent-instruction prompt — with an
+      # attacker-chosen `provider`/`model` — to a subagent that has real
+      # `bash`/`edit`/`write` tool access on this runner. That is a
+      # code-execution attack vector requiring no prompt-injection
+      # cleverness whatsoever, just adding a file to your own PR.
+      #
+      # Fix: check out `.tgd-review/rules/` as it exists on the PR's BASE
+      # branch (the commit the PR is being merged into), in a separate
+      # worktree, and pass THAT path as `--rules-dir` below instead of the
+      # PR checkout's own `.tgd-review/rules/`. Rule files only take effect
+      # once merged into the base branch — a PR can never introduce or
+      # modify a rule that affects its own review. If the base branch has
+      # no `.tgd-review/rules/` directory at all, `git worktree add` still
+      # succeeds (it's a full checkout of the base commit) and
+      # `tgd-review-agent`'s `loadRules()` already treats a missing
+      # `--rules-dir` as "zero user rules" rather than an error — same
+      # behavior as today, just anchored to a trusted commit.
+      - name: Fetch rule files from the BASE branch (not the PR ref — see comment above)
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "${{ github.event.pull_request.base.sha }}"
+          git worktree add /tmp/base-rules-checkout "${{ github.event.pull_request.base.sha }}"
+      - run: >
+          node dist/cli.js review --pr "$PR_NUMBER"
+          --rules-dir /tmp/base-rules-checkout/.tgd-review/rules
         env:
           # PR_NUMBER is a GitHub-controlled integer (not attacker-supplied
           # free text), but it's still passed via env + quoted arg rather

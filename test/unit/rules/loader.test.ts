@@ -10,6 +10,25 @@ import { loadRules } from "../../../src/rules/loader.js";
 const fixturesDir = fileURLToPath(new URL("../../fixtures/rules", import.meta.url));
 const nonexistentDir = path.join(fixturesDir, "this-directory-does-not-exist");
 
+// `malformed-yaml-dir/` is a dedicated fixture directory (separate from
+// `fixturesDir` above), holding just `malformed-yaml.md` (genuinely broken
+// YAML frontmatter) and `sibling-valid-rule.md` (valid). Kept separate from
+// `fixturesDir` deliberately: gray-matter caches parse results keyed by the
+// exact raw file content it's given (`matter.cache[file.content]` in
+// `node_modules/gray-matter/index.js`), and that cache entry is written
+// *before* the YAML engine parses/throws — so a second `matter()` call on
+// byte-identical content that previously threw returns the stale pre-parse
+// cache entry instead of re-throwing. If `malformed-yaml.md` lived in the
+// shared `fixturesDir`, the AC-4.1/4.2/4.3 tests below (which also call
+// `loadRules(fixturesDir, ...)` and therefore also parse every file in it,
+// including this one) would consume that one real throw first, and the
+// malformed-YAML test itself would then see the poisoned cache entry
+// instead of a fresh YAMLException. Isolating it here guarantees this is
+// the only place in the whole suite that ever parses that exact content.
+const malformedYamlDir = fileURLToPath(
+  new URL("../../fixtures/rules/malformed-yaml-dir", import.meta.url),
+);
+
 describe("loadRules", () => {
   // AC-4.1: Given a valid rule file with name/provider/model set, When
   // loadRules runs, Then the returned rules array contains a matching
@@ -93,5 +112,37 @@ describe("loadRules", () => {
 
     expect(result.rules).toEqual([]);
     expect(result.errors).toEqual([]);
+  });
+
+  // Task 4 review fix #1 (critical test gap): malformed YAML frontmatter
+  // (e.g. an unclosed `[` flow sequence) makes gray-matter's underlying
+  // YAML parser throw a `YAMLException`. Before this fix, nothing caught
+  // that exception, so it propagated straight out of `loadRules()` and
+  // aborted the ENTIRE run — directly violating SPEC.md's "skip and warn
+  // on a single bad rule rather than failing the whole run" boundary
+  // (already correctly applied to missing-field errors, just not to
+  // YAML-syntax errors). `test/fixtures/rules/malformed-yaml.md` has
+  // genuinely malformed frontmatter, so this proves loadRules converts the
+  // thrown YAMLException into a `loadError` entry instead of letting it
+  // propagate — and, critically, that `valid-rule.md` in the SAME
+  // directory still loads successfully alongside it (one bad rule file
+  // does not kill the run).
+  it("a rule file with malformed YAML frontmatter is recorded as a load error, not thrown, and other valid rule files in the same directory still load", async () => {
+    const result = await loadRules(malformedYamlDir, false);
+
+    // loadRules must not have thrown to get here at all — the assertions
+    // below double-check the shape of what it returned instead.
+    const err = result.errors.find(
+      (e) => e.sourcePath === path.join(malformedYamlDir, "malformed-yaml.md"),
+    );
+    expect(err).toBeDefined();
+    expect(err?.message.toLowerCase()).toContain("yaml");
+    expect(result.rules.some((r) => r.name === "malformed-yaml")).toBe(false);
+
+    // Proves one bad rule file doesn't kill the run: the valid rule file
+    // living in the very same directory still loads successfully.
+    const sibling = result.rules.find((r) => r.name === "sibling-valid-rule");
+    expect(sibling).toBeDefined();
+    expect(sibling?.provider).toBe("anthropic");
   });
 });

@@ -7,6 +7,59 @@ review workflows.
 See `tgd-review-agent/` docs in the sibling `tGDBot-tGD` planning directory
 (PRD.md, SPEC.md, TASKS.md) for the full spec and task breakdown.
 
+## ⚠️ Security Considerations
+
+**Read this before wiring `tgd-review-agent` into CI on any repository that
+accepts contributions you don't fully trust.**
+
+Every dispatched review subagent is a real pi SDK agent session with
+`bash`/`edit`/`write` tool access on the CI runner, and its task prompt
+includes the PR's diff **verbatim**. A malicious PR's diff content — file
+contents, filenames, even commit messages if a rule quotes them — could
+attempt to manipulate the reviewing LLM into calling those tools for real
+(a classic prompt-injection attack against an agent with real capabilities).
+**This risk is inherent to the current design and is not fully closed by
+this codebase alone.** See "Read-only enforcement caveat" below for the
+full technical explanation of why it can't be closed purely with a prompt
+instruction.
+
+One related attack vector **is** fully closed, at the workflow level: rule
+files (`.tgd-review/rules/*.md`) are loaded from the PR's **base** branch,
+never from the PR's own checkout — see "Rule files are sourced from the
+base branch" below. Before that fix, a PR could simply add its own rule
+file and get attacker-authored instructions executed as a *trusted*
+subagent prompt with an attacker-chosen provider/model; that specific hole
+is now closed. The PR diff content itself remains untrusted input by
+necessity (the whole point of the tool is to review it), which is why the
+warning above still stands.
+
+**Concrete mitigations if you run this in CI:**
+
+1. **Gate untrusted contributions before the workflow even triggers.** Do
+   not run the shipped `pull_request` trigger unmodified on a repository
+   that accepts first-time/fork/untrusted contributors without additional
+   gating — e.g. require a maintainer-applied label (such as
+   `safe-to-review`) as an additional `on.pull_request.types` condition or
+   a manual approval step before the review job runs. GitHub also documents
+   `pull_request_target` for exactly this class of risk (it runs with the
+   base branch's workflow file and secrets, decoupled from the PR's own
+   workflow changes) — but do **not** reach for it casually: `pull_request_target`
+   is itself dangerous if misconfigured (e.g. if you then check out and
+   execute the PR's own code with it, you reintroduce the same class of
+   risk it was meant to prevent). If you use it, it needs the same level of
+   care as the rule-file fix below: never check out and run PR-controlled
+   code/config with `pull_request_target`'s elevated permissions.
+2. **Run in an isolated, ephemeral CI environment with no persistent
+   secrets beyond the PR-scoped token.** GitHub-hosted runners are
+   ephemeral by default (a fresh VM per job) — keep it that way; don't add
+   self-hosted runners with persistent state/credentials to this workflow
+   without separately re-assessing this risk.
+3. **Keep the `permissions:` block minimally scoped.** The shipped workflow
+   already sets `pull-requests: write, contents: read` and nothing else —
+   this is intentional, not an oversight, and should not be widened (e.g.
+   no `contents: write`, no `actions: write`, no org-level secrets beyond
+   the specific provider API keys the rules you actually use need).
+
 ## Setting up `tgd-review-agent` in CI
 
 ### Requirements
@@ -37,6 +90,12 @@ the reviewer on every PR `opened`/`synchronize`/`reopened` event. Copy it into
 a consuming repo's `.github/workflows/` directory (adjusting the checkout
 target if `tgd-review-agent` isn't vendored into that repo directly) and add
 the provider secrets described below.
+
+Note the workflow's `git worktree add`/`--rules-dir` steps before the
+`review` command — those exist to source rule files from the PR's base
+branch rather than the PR's own checkout, and are load-bearing for the
+security fix described in "Rule files are sourced from the base branch"
+below. Preserve them if you adapt the workflow.
 
 ### CLI flags
 
@@ -130,6 +189,45 @@ confident about.
 API key secrets" below for the full list, e.g. `anthropic`, `openai`,
 `google`); `model` is that provider's model id.
 
+### Rule files are sourced from the base branch, not the PR (security design decision)
+
+`loadRules()` itself just reads whatever `--rules-dir` it's given — it has
+no opinion about which commit that directory belongs to. The **workflow**
+is what enforces the trust boundary: in
+[`.github/workflows/tgd-review.yml`](.github/workflows/tgd-review.yml), a
+dedicated step checks out `.tgd-review/rules/` from
+`github.event.pull_request.base.sha` (the PR's *base* branch) into a
+separate `git worktree`, and `--rules-dir` is pointed at that checkout —
+**not** at the PR's own `.tgd-review/rules/`, even though `actions/checkout@v4`
+in the same job also checks out the PR's merge ref (needed for building the
+CLI and reading the diff).
+
+This is deliberate, not an oversight. `dispatchRules` sends every rule
+file's `body` verbatim as a **trusted** agent-instruction prompt, with an
+attacker-chosen `provider`/`model` if the rule file itself is
+attacker-controlled. Without this indirection, a PR author could add
+`.tgd-review/rules/evil.md` to their own PR and have its contents executed
+as a trusted instruction by a subagent with real `bash`/`edit`/`write` tool
+access on the CI runner — no prompt-injection cleverness required, just
+adding a file. Sourcing rules from the base branch instead means:
+
+- **A PR cannot introduce or modify a rule that affects its own review.**
+  Rule changes only take effect once merged into the base branch.
+- If the base branch has no `.tgd-review/rules/` directory at all, that's
+  just zero user rules (same "directory doesn't exist" handling
+  `loadRules()` already has) — not an error.
+- If you fork this workflow into your own repo, **keep this indirection**.
+  The inline comment above the fetch step in `tgd-review.yml` says so too:
+  don't "simplify" it back to the CLI's default `--rules-dir`, which would
+  resolve against the PR's own (attacker-controlled) checkout and reopen
+  this hole.
+
+This closes the rule-file attack vector specifically. It does **not**
+close the separate, inherent risk that the PR *diff* itself is untrusted
+input sent to a tool-capable subagent — see "⚠️ Security Considerations"
+at the top of this document and "Read-only enforcement caveat" below for
+that (unclosed, must-mitigate-operationally) risk.
+
 ### Provider API key secrets
 
 Each dispatched rule runs as a pi SDK agent session; API keys are resolved
@@ -159,6 +257,11 @@ block, exactly like `GH_TOKEN`/`ANTHROPIC_API_KEY` in the example workflow.
 
 ### Read-only enforcement caveat (v1 limitation)
 
+See also: "⚠️ Security Considerations" at the top of this document for the
+prominent version of this warning plus concrete CI mitigations. This
+section is the fuller technical explanation of *why* it can't be closed
+purely in this codebase.
+
 Dispatched review subagents are instructed, via their prompt, not to edit
 files, write files, or run mutating commands — but this is **not** a hard
 sandboxed guarantee in v1. The bundled `pi-subagents` `reviewer` agent has
@@ -166,6 +269,17 @@ sandboxed guarantee in v1. The bundled `pi-subagents` `reviewer` agent has
 `pi-subagents`' current `TaskItem`/`ParallelTaskSchema` expose no per-task
 tool-allowlist override to strip them. In other words: the review is
 *read-only by convention and prompt instruction*, not by sandbox
-enforcement. Do not run this tool against untrusted rule files or diffs
-where a prompt-injection attempt getting a subagent to call `bash`/`edit`/
-`write` would be a real risk — that risk is not mitigated in this version.
+enforcement.
+
+This is an inherent limitation of the current `pi-subagents` extension API,
+not something this codebase can fully close on its own. Rule files are no
+longer part of this risk as of the base-branch fix above (rule file
+*content* is now always trusted, since it's sourced from the base branch,
+not the PR) — but the PR **diff** itself is still attacker-controlled input
+embedded verbatim in every dispatched subagent's prompt, and that can't be
+avoided without the tool losing its purpose (reviewing the diff). Do not
+run this tool against diffs where a prompt-injection attempt getting a
+subagent to call `bash`/`edit`/`write` would be a real risk without the
+operational mitigations described in "⚠️ Security Considerations" above
+(contribution gating, ephemeral/isolated CI, minimally-scoped
+`permissions:`) — that risk is not mitigated by this codebase alone.

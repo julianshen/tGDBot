@@ -34,8 +34,21 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+// Wraps `matter(raw)` in try/catch: malformed YAML frontmatter (bad
+// indentation, unclosed brackets, etc.) makes gray-matter throw a
+// `YAMLException` rather than returning a parse-error value. Left
+// uncaught, that exception would propagate out of `loadRules()` and abort
+// the entire run — the same "one bad rule file must not fail the whole
+// run" boundary that already applies to missing-field errors below, just
+// not yet applied to YAML-syntax errors. See Task 4 review fix #1.
 function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
-  const parsed = matter(raw);
+  let parsed: matter.GrayMatterFile<string>;
+  try {
+    parsed = matter(raw);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { error: `rule file has malformed YAML frontmatter: ${message}` };
+  }
   const data = parsed.data as Record<string, unknown>;
 
   const missingField = REQUIRED_STRING_FIELDS.find((field) => !isNonEmptyString(data[field]));
@@ -57,7 +70,18 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
 async function loadOneRuleFile(
   sourcePath: string,
 ): Promise<{ rule?: RuleDefinition; loadError?: { sourcePath: string; message: string } }> {
-  const raw = await readFile(sourcePath, "utf-8");
+  // The `readFile` call is included in this try/catch (not just
+  // `parseRuleFile`'s YAML parsing) in case of OS-level read errors (e.g. a
+  // permissions error, or a race where the file is removed between
+  // `readdir` and `readFile`) — those must also become a per-file
+  // `loadError` rather than propagating and aborting the whole run.
+  let raw: string;
+  try {
+    raw = await readFile(sourcePath, "utf-8");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { loadError: { sourcePath, message: `could not read rule file: ${message}` } };
+  }
   const { rule, error } = parseRuleFile(sourcePath, raw);
   if (error) {
     return { loadError: { sourcePath, message: error } };
