@@ -193,7 +193,11 @@ confident about.
 
 `provider` should be one of the pi SDK's known provider ids (see "Provider
 API key secrets" below for the full list, e.g. `anthropic`, `openai`,
-`google`); `model` is that provider's model id.
+`google`); `model` is that provider's model id. `provider`/`model` are
+plain pass-through strings — nothing in `tgd-review-agent` validates them
+against a fixed list, so any provider the underlying pi SDK can resolve
+works, including custom/self-hosted providers you register yourself (see
+"Custom model providers (e.g. NousResearch Hermes)" below).
 
 ### Rule files are sourced from the base branch, not the PR (security design decision)
 
@@ -263,6 +267,113 @@ an example — add more `env:` entries for any other providers you use):
 or organization secret (`Settings -> Secrets and variables -> Actions`),
 then reference it as `${{ secrets.YOUR_KEY_NAME }}` in the workflow's `env:`
 block, exactly like `GH_TOKEN`/`ANTHROPIC_API_KEY` in the example workflow.
+
+### Custom model providers (e.g. NousResearch Hermes)
+
+Open-weight model families like [NousResearch's Hermes](https://nousresearch.com/)
+aren't one of the pi SDK's built-in providers (there's no `provider: hermes`
+out of the box) — but nothing in `tgd-review-agent` restricts `provider`
+values to a fixed list, either. As long as the pi SDK can resolve the
+provider, a rule file can use it. Registering a new provider is a **user-side
+pi SDK configuration step** (a `models.json` file), not a `tgd-review-agent`
+code change — the same mechanism works for any custom or self-hosted model,
+not just Hermes.
+
+**1. Add the provider to `~/.pi/agent/models.json`** (created if it doesn't
+exist; reloaded automatically, no restart needed). Hermes models are most
+commonly reached through an OpenAI-compatible endpoint — pick whichever you
+actually have access to:
+
+Via [OpenRouter](https://openrouter.ai) (simplest if you already have an
+OpenRouter key — it hosts several current Hermes releases):
+```json
+{
+  "providers": {
+    "hermes": {
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "api": "openai-completions",
+      "apiKey": "$OPENROUTER_API_KEY",
+      "models": [
+        {
+          "id": "nousresearch/hermes-4-405b",
+          "name": "Hermes 4 405B",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 131072,
+          "maxTokens": 8192
+        }
+      ]
+    }
+  }
+}
+```
+
+Via a self-hosted server (vLLM, Ollama, LM Studio running a Hermes GGUF/weights
+export) — only `id` is required per model for local servers:
+```json
+{
+  "providers": {
+    "hermes": {
+      "baseUrl": "http://localhost:11434/v1",
+      "api": "openai-completions",
+      "apiKey": "ollama",
+      "compat": { "supportsDeveloperRole": false },
+      "models": [
+        { "id": "hermes4:70b" }
+      ]
+    }
+  }
+}
+```
+
+(See `node_modules/@earendil-works/pi-coding-agent/docs/models.md` for the
+full schema — `compat` flags, `thinkingLevelMap`, cost tiers, etc. Any
+provider name works, not just `hermes`; pick something that matches the
+`provider` field you'll write in your rule files.)
+
+**2. Reference it in a rule file** exactly like a built-in provider:
+```markdown
+---
+name: hermes-review
+provider: hermes
+model: nousresearch/hermes-4-405b
+---
+
+Review this diff for ...
+```
+
+**3. In CI**, `~/.pi/agent/models.json` needs to exist on the runner *before*
+`tgd-review-agent review` runs (GitHub Actions runners start with a clean
+`$HOME` every job — nothing persists from a manual local setup). Add a step
+before the review step that writes the file, sourcing the API key from a
+secret rather than committing it:
+```yaml
+- name: Configure custom model providers
+  run: |
+    mkdir -p ~/.pi/agent
+    cat > ~/.pi/agent/models.json <<'EOF'
+    {
+      "providers": {
+        "hermes": {
+          "baseUrl": "https://openrouter.ai/api/v1",
+          "api": "openai-completions",
+          "apiKey": "$OPENROUTER_API_KEY",
+          "models": [
+            { "id": "nousresearch/hermes-4-405b", "reasoning": true, "contextWindow": 131072, "maxTokens": 8192 }
+          ]
+        }
+      }
+    }
+    EOF
+  env:
+    OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+```
+The `apiKey` value in the JSON is the literal string `$OPENROUTER_API_KEY`
+(pi's own env-var interpolation syntax, resolved when pi reads the file) —
+it does not need the `env:` block's value substituted into the JSON itself;
+pi reads the environment variable at request time. Add
+`OPENROUTER_API_KEY` (or whichever provider you're using) as a repository
+secret the same way as `ANTHROPIC_API_KEY` above.
 
 ### Read-only enforcement
 
