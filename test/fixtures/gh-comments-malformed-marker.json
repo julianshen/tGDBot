@@ -1,0 +1,12 @@
+[
+  {
+    "id": 111,
+    "body": "Thanks for the PR, looks good overall!",
+    "user": { "login": "someone-else" }
+  },
+  {
+    "id": 555,
+    "body": "## tGD Review\n\nNo blocking issues found.\n\n<!-- tgd-review-agent:sha=CORRUPTED!! -->",
+    "user": { "login": "tgd-review-agent[bot]" }
+  }
+]

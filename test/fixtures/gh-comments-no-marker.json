@@ -1,0 +1,12 @@
+[
+  {
+    "id": 111,
+    "body": "Thanks for the PR, looks good overall!",
+    "user": { "login": "someone-else" }
+  },
+  {
+    "id": 333,
+    "body": "LGTM, merging soon.",
+    "user": { "login": "tgd-review-agent[bot]" }
+  }
+]

@@ -1,0 +1,121 @@
+name: tGD Review Agent
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      # Checks out the PR's own merge ref. This is needed (and safe) for
+      # building the CLI and for `gh pr diff` to see the PR's actual diff —
+      # but see the "Fetch rule files from the BASE branch" step below for
+      # why the PR's own checkout must NEVER be used as the source of rule
+      # files (`.tgd-review/rules/`).
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Must match package.json's "engines.node" (>=22.19.0) — the
+          # actually-installed @earendil-works/pi-coding-agent dependency
+          # itself requires >=22.19.0.
+          node-version: "22.19.0"
+      - run: npm ci
+      # SECURITY (DEBT.md: "No npm audit/provenance gate in CI"): pi-subagents,
+      # @juicesharp/rpiv-advisor, and @earendil-works/pi-coding-agent are all
+      # pinned to exact versions in package.json but are otherwise unaudited
+      # third-party code that can, per their own package descriptions,
+      # "execute code and influence agent behavior" — a supply-chain
+      # compromise in any of them (or their transitive deps) runs on this
+      # runner with this job's GITHUB_TOKEN/ANTHROPIC_API_KEY in scope. This
+      # is a separate step (not folded into `npm ci`/`npm run build`) so a
+      # failure here shows up in the Actions UI unambiguously as "dependency
+      # audit failed" rather than looking like a build breakage.
+      #
+      # Threshold: --audit-level=high fails the job only on high/critical
+      # findings. Moderate/low-severity advisories in transitive deps are
+      # extremely common in a fast-moving ecosystem (and frequently apply to
+      # dev-only tooling or have no fix available yet); gating on every one
+      # of those would create constant noise that trains reviewers to ignore
+      # or bypass the check entirely. High/critical findings are rarer and
+      # far more likely to represent a real, actionable, exploitable risk —
+      # the right bar for a hard CI gate. Moderate/low findings still print
+      # in this step's own log output; they just don't block the PR.
+      #
+      # Scope: --omit=dev limits the audit to production dependencies —
+      # exactly the pi-subagents / rpiv-advisor / pi-coding-agent supply
+      # chain this gate exists for, i.e. code that actually runs as part of
+      # the reviewing agent's own execution against untrusted PR content.
+      # devDependencies (vitest, eslint, typescript, ...) never run in that
+      # capacity. This isn't just theoretical scoping: at the time this gate
+      # was added, auditing without --omit=dev turned up a real high-severity
+      # advisory (GHSA-5j98-mcp5-4vw2, command injection in glob's CLI via
+      # -c/--cmd) reached only via @vitest/coverage-v8's devDependency chain
+      # (test-exclude -> glob), which uses glob purely as a library (never
+      # the CLI's -c/--cmd flag) and is therefore not exploitable here — the
+      # kind of noisy, non-actionable finding the --audit-level=high
+      # threshold above is meant to avoid, just one level up the dep tree.
+      # Re-evaluate --omit=dev if this project ever executes devDependency
+      # code against untrusted input (it does not today: build/test/lint are
+      # run against trusted, repo-authored source only).
+      - name: Dependency audit (npm audit, production deps, fails only on high/critical)
+        run: npm audit --audit-level=high --omit=dev
+      - run: npm run build
+      # Runs the build smoke test (AC-1.3: `npm run build` exits 0 and
+      # produces dist/cli.js) explicitly in CI. This is deliberately excluded
+      # from the default `npm test` path (see package.json) so the fast unit
+      # suite doesn't shell out to a real build on every local run — but CI's
+      # own pipeline already does a real `npm run build` above, so this step
+      # is largely redundant with that (a broken build would already fail
+      # the line above). Kept anyway because it's cheap (~1s) and gives an
+      # explicitly-named, unambiguous "build smoke test" signal distinct
+      # from the generic build step and from the later `node dist/cli.js`
+      # invocation.
+      - run: npm run test:smoke
+      # SECURITY (critical — do not remove or "simplify" this step): on a
+      # `pull_request` event, the `actions/checkout@v4` step above checks
+      # out the PR's merge ref with no `ref:` override, which reflects
+      # whatever the PR AUTHOR added or edited as part of the very PR being
+      # reviewed. If `tgd-review-agent review` were pointed at that
+      # checkout's own `.tgd-review/rules/` (the default `--rules-dir`),
+      # a malicious PR could simply ADD `.tgd-review/rules/evil.md` with
+      # attacker-authored instructions. `loadRules()` reads that directory
+      # unconditionally and `dispatchRules` sends each rule file's `body`
+      # verbatim as a TRUSTED agent-instruction prompt — with an
+      # attacker-chosen `provider`/`model` — to a subagent that has real
+      # `bash`/`edit`/`write` tool access on this runner. That is a
+      # code-execution attack vector requiring no prompt-injection
+      # cleverness whatsoever, just adding a file to your own PR.
+      #
+      # Fix: check out `.tgd-review/rules/` as it exists on the PR's BASE
+      # branch (the commit the PR is being merged into), in a separate
+      # worktree, and pass THAT path as `--rules-dir` below instead of the
+      # PR checkout's own `.tgd-review/rules/`. Rule files only take effect
+      # once merged into the base branch — a PR can never introduce or
+      # modify a rule that affects its own review. If the base branch has
+      # no `.tgd-review/rules/` directory at all, `git worktree add` still
+      # succeeds (it's a full checkout of the base commit) and
+      # `tgd-review-agent`'s `loadRules()` already treats a missing
+      # `--rules-dir` as "zero user rules" rather than an error — same
+      # behavior as today, just anchored to a trusted commit.
+      - name: Fetch rule files from the BASE branch (not the PR ref — see comment above)
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin "${{ github.event.pull_request.base.sha }}"
+          git worktree add /tmp/base-rules-checkout "${{ github.event.pull_request.base.sha }}"
+      - run: >
+          node dist/cli.js review --pr "$PR_NUMBER"
+          --rules-dir /tmp/base-rules-checkout/.tgd-review/rules
+        env:
+          # PR_NUMBER is a GitHub-controlled integer (not attacker-supplied
+          # free text), but it's still passed via env + quoted arg rather
+          # than interpolated straight into the run: script, per GitHub's
+          # Actions script-injection guidance.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Provider API keys are resolved by the pi SDK's AuthStorage from
+          # environment variables (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY) —
+          # see README.md's "Provider API key secrets" section for the full
+          # list and how to wire them as repo/organization secrets.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
