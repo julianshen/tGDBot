@@ -10,7 +10,7 @@
 // can stub the session entirely and never construct a real one or touch the
 // network (see test/fixtures/pi-session-stub.ts). The default factory,
 // used in production, is the only place that touches the real SDK.
-import { mkdir, mkdtemp, rm, copyFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, copyFile, symlink, writeFile, access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -160,6 +160,70 @@ async function createIsolatedSessionCwd(): Promise<string> {
   return tempDir;
 }
 
+// Bug fix (found via a real multi-model run against hmchangw/chat#490):
+// pi-subagents' "intercom bridge" defaults to mode "always" — it injects
+// `intercom`/`contact_supervisor` tools plus a coordination instruction into
+// EVERY dispatched agent (even our tool-restricted reviewer) and lets a
+// PARALLEL run "detach for intercom coordination", handing control back to
+// the orchestrator to reply to a supervisor request over multiple turns.
+// Our orchestrator is single-shot (one prompt() call, read the final
+// message), so when N>1 rules dispatch in parallel and the run detaches, the
+// orchestrator can't do that multi-turn coordination and every task fails at
+// once. A single-rule run (N=1) happened to avoid the detach, which is why
+// one model worked but two didn't.
+//
+// The fix: disable the intercom bridge for our dispatched runs by setting
+// pi-subagents' `intercomBridge.mode: "off"` in its config. pi-subagents
+// reads that config from `<agentDir>/extensions/subagent/config.json`, where
+// `agentDir` comes from `process.env.PI_CODING_AGENT_DIR` (or ~/.pi/agent) —
+// a GLOBAL location we must not mutate as a side effect of running the CLI.
+// So instead we build a hermetic, throwaway agent dir per dispatch:
+//   - symlink the real agentDir's `auth.json`/`models.json`/`settings.json`
+//     into it (so credentials and model config still resolve — a symlink,
+//     not a copy, so no secret is ever duplicated to a second location)
+//   - write our own `extensions/subagent/config.json` with the bridge off
+// dispatchRules points `PI_CODING_AGENT_DIR` at this temp dir for the
+// duration of the session (restoring the previous value afterward) and
+// removes it in its `finally` block. This never touches the user's real
+// ~/.pi/agent. Validated end-to-end: with the bridge off, a 2-model parallel
+// fan-out against hmchangw/chat#490 completes with rulesRun for both models.
+const HERMETIC_AGENT_LINK_FILES = ["auth.json", "models.json", "settings.json"];
+const SUBAGENT_CONFIG_INTERCOM_OFF = JSON.stringify({ intercomBridge: { mode: "off" } });
+
+async function createIsolatedAgentDir(realAgentDir: string): Promise<string> {
+  const tempAgentDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-agentdir-"));
+
+  // Symlink credential/model/settings files from the real agent dir so the
+  // orchestrating session and dispatched subagents still resolve API keys and
+  // custom-provider config. Only link files that actually exist (a fresh CI
+  // env may have none — that's fine, the review just runs with whatever
+  // provider auth is present via env vars, same as before).
+  await Promise.all(
+    HERMETIC_AGENT_LINK_FILES.map(async (name) => {
+      const source = path.join(realAgentDir, name);
+      try {
+        await access(source);
+      } catch {
+        return; // source absent — nothing to link
+      }
+      await symlink(source, path.join(tempAgentDir, name)).catch((err: unknown) => {
+        // A failed symlink (e.g. sandbox without symlink support) shouldn't
+        // abort the review — warn and continue; worst case is that provider
+        // auth resolves from env vars instead of auth.json.
+        console.warn(
+          `dispatchRules: could not symlink ${name} into the isolated agent dir (${(err as Error).message})`,
+        );
+      });
+    }),
+  );
+
+  const subagentConfigDir = path.join(tempAgentDir, "extensions", "subagent");
+  await mkdir(subagentConfigDir, { recursive: true });
+  await writeFile(path.join(subagentConfigDir, "config.json"), SUBAGENT_CONFIG_INTERCOM_OFF, "utf-8");
+
+  return tempAgentDir;
+}
+
 // Review finding (code-review fix): the diff IS embedded once per rule
 // here, and that duplication is NECESSARY, not an oversight — verified
 // against node_modules/pi-subagents/src/extension/schemas.ts. Each rule
@@ -238,6 +302,17 @@ export function buildDispatchPrompt(
   const parts = [
     `You are orchestrating a code review. Call the "subagent" tool exactly ONCE, in its PARALLEL form (a top-level "tasks" array), with one task entry per rule below.`,
     `Each task entry's "agent" field must be the literal string "reviewer", its "task" field must be that rule's task text below (verbatim, including the diff), and its "model" field must be that rule's exact "<provider>/<model>" string below.`,
+    // Bug fix (found via a real multi-model run against hmchangw/chat#490): the
+    // orchestrating LLM otherwise sometimes picks `context: "fork"`, which
+    // requires a persisted parent session — but this review session is
+    // deliberately in-memory/ephemeral (SessionManager.inMemory), so fork
+    // hard-fails with "Forked subagent context requires a persisted parent
+    // session" and takes down every dispatched task at once. Fresh context is
+    // also what we actually want: each rule's review is independent and needs
+    // no visibility into the parent conversation. Per pi-subagents' schema, an
+    // explicit top-level `context` overrides every child in the invocation, so
+    // stating it here deterministically forces fresh for all tasks.
+    `Set the subagent tool call's top-level "context" field to the literal string "fresh". Do NOT use "fork" — this review session is not persisted, so a forked context would fail every task at once.`,
     taskSpecs,
     `After the subagent tool call returns, merge every task's own JSON findings array into one combined result, tagging each finding's "ruleName" field with the name of the rule whose task produced it (one of: ${ruleNames
       .map((name) => `"${name}"`)
@@ -355,6 +430,22 @@ export async function dispatchRules(
 ): Promise<DispatchResult> {
   const sessionCwd = await createIsolatedSessionCwd();
 
+  // Hermetic agent dir + PI_CODING_AGENT_DIR override (intercom-bridge fix,
+  // see createIsolatedAgentDir) are set up ONLY for the real session factory.
+  // When a test injects a stub factory, none of this runs — the stub never
+  // touches the real SDK, so it needs no credentials, no agent-dir config,
+  // and must not mutate process.env or symlink the real ~/.pi/agent.
+  const usingRealFactory = createSession === createRealDispatchSession;
+  let tempAgentDir: string | undefined;
+  let prevAgentDirEnv: string | undefined;
+  let agentDirEnvWasSet = false;
+  if (usingRealFactory) {
+    tempAgentDir = await createIsolatedAgentDir(getAgentDir());
+    agentDirEnvWasSet = "PI_CODING_AGENT_DIR" in process.env;
+    prevAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = tempAgentDir;
+  }
+
   try {
     const session = await createSession(useAdvisor, sessionCwd);
     const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
@@ -376,6 +467,17 @@ export async function dispatchRules(
 
     return parseDispatchResult(finalText, rules);
   } finally {
+    // Restore PI_CODING_AGENT_DIR to exactly its prior state (unset vs. a
+    // specific value) before anything else, so the override never leaks past
+    // this call — the CLI runs one review per process, but leaving a mutated
+    // global env behind would still be a latent surprise.
+    if (usingRealFactory) {
+      if (agentDirEnvWasSet) {
+        process.env.PI_CODING_AGENT_DIR = prevAgentDirEnv;
+      } else {
+        delete process.env.PI_CODING_AGENT_DIR;
+      }
+    }
     // Never let a cleanup failure mask the real result/error above, or
     // itself throw out of dispatchRules — just warn, matching this module's
     // existing "warn, don't throw" pattern.
@@ -384,5 +486,12 @@ export async function dispatchRules(
         `dispatchRules: failed to remove temp session directory ${sessionCwd} (${(err as Error).message})`,
       );
     });
+    if (tempAgentDir) {
+      await rm(tempAgentDir, { recursive: true, force: true }).catch((err: unknown) => {
+        console.warn(
+          `dispatchRules: failed to remove temp agent directory ${tempAgentDir} (${(err as Error).message})`,
+        );
+      });
+    }
   }
 }

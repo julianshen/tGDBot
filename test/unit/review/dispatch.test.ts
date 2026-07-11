@@ -381,6 +381,26 @@ describe("dispatchRules advisor integration (Task 6)", () => {
     expect(promptWithAdvisor).toMatch(/advisor/i);
     expect(promptWithoutAdvisor).not.toContain('call the "advisor" tool');
   });
+
+  // Bug fix (found via a real multi-model run against hmchangw/chat#490): the
+  // orchestrating LLM sometimes chose `context: "fork"` for its subagent
+  // call. Fork requires a PERSISTED parent session, but dispatchRules uses
+  // SessionManager.inMemory() (deliberately ephemeral, no persistence), so
+  // fork hard-fails with "Forked subagent context requires a persisted
+  // parent session" — taking down ALL dispatched tasks at once. Fresh
+  // context is what we actually want anyway (each rule's review is
+  // independent), so the prompt now explicitly instructs `context: "fresh"`.
+  // Per pi-subagents' schema, an explicit top-level `context` overrides every
+  // child in the invocation, so this deterministically forces fresh.
+  it("bug fix (real run, hmchangw/chat#490): the dispatch prompt instructs context: fresh and forbids fork (fork needs a persisted session, which we don't use)", () => {
+    const rules = [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })];
+
+    const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", false);
+
+    expect(prompt).toContain('"fresh"');
+    expect(prompt).toMatch(/context/i);
+    expect(prompt).toMatch(/fork/i);
+  });
 });
 
 // Tests for ADR-003 "restrict dispatched subagent tools via project-scoped
@@ -509,5 +529,71 @@ describe("dispatchRules isolated session cwd (ADR-003)", () => {
 
     // The real factory path also cleans up after itself.
     expect(existsSync(callArgs.cwd)).toBe(false);
+  });
+});
+
+// Bug fix (found via a real multi-model run against hmchangw/chat#490):
+// pi-subagents' intercom bridge defaults to mode "always", which makes a
+// PARALLEL run "detach for intercom coordination" — multi-turn work our
+// single-shot orchestrator can't do, failing every task at once. The fix
+// disables the bridge via a hermetic PI_CODING_AGENT_DIR (see
+// createIsolatedAgentDir). These tests pin: (a) the setup is real-factory-only
+// (a stub factory never mutates the env or symlinks the real ~/.pi/agent), and
+// (b) on the real path the env points at a temp agent dir seeded with
+// intercomBridge.mode: "off" DURING the session, then is restored and removed.
+describe("dispatchRules intercom-bridge disable (hermetic agent dir)", () => {
+  it("does NOT mutate PI_CODING_AGENT_DIR when a stub session factory is injected", async () => {
+    const before = process.env.PI_CODING_AGENT_DIR;
+    const hadBefore = "PI_CODING_AGENT_DIR" in process.env;
+
+    const stub = createPiSessionStub(
+      JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+    );
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false, async () => stub.session);
+
+    expect("PI_CODING_AGENT_DIR" in process.env).toBe(hadBefore);
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(before);
+  });
+
+  it("bug fix (real run, hmchangw/chat#490): the real factory points PI_CODING_AGENT_DIR at a hermetic agent dir seeded with intercomBridge.mode:off during the session, then restores and removes it", async () => {
+    const before = process.env.PI_CODING_AGENT_DIR;
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockClear();
+
+    let agentDirDuringSession: string | undefined;
+    let configDuringSession: string | undefined;
+    hoisted.createAgentSessionMock.mockImplementationOnce(async () => {
+      // Captured at session-creation time, i.e. while dispatchRules is inside
+      // its try block with the override active.
+      agentDirDuringSession = process.env.PI_CODING_AGENT_DIR;
+      if (agentDirDuringSession) {
+        configDuringSession = readFileSync(
+          path.join(agentDirDuringSession, "extensions", "subagent", "config.json"),
+          "utf-8",
+        );
+      }
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          getLastAssistantText: () =>
+            JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+        },
+      };
+    });
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false);
+
+    // During the session the env pointed at a hermetic temp agent dir, NOT the
+    // real one, seeded with the intercom bridge turned off.
+    expect(agentDirDuringSession).toBeDefined();
+    expect(agentDirDuringSession).not.toBe(before);
+    expect(agentDirDuringSession?.startsWith(os.tmpdir()) || agentDirDuringSession?.includes(os.tmpdir())).toBe(true);
+    expect(configDuringSession).toBeDefined();
+    expect(JSON.parse(configDuringSession as string)).toEqual({ intercomBridge: { mode: "off" } });
+
+    // Afterward the env is restored to exactly its prior state and the temp
+    // agent dir is removed.
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(before);
+    expect(existsSync(agentDirDuringSession as string)).toBe(false);
   });
 });
