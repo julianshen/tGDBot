@@ -1,11 +1,13 @@
-// Resolves the on-disk path to the installed `pi-subagents` pi extension's
-// entry point, for use in DefaultResourceLoader's `additionalExtensionPaths`.
-// See SPEC.md's "Architecture correction" note and TASKS.md Task 5.
+// Resolves the on-disk path to an installed pi extension's entry point, for
+// use in DefaultResourceLoader's `additionalExtensionPaths`. See SPEC.md's
+// "Architecture correction" note and TASKS.md Tasks 5 and 6.
 //
-// The entry path is read from pi-subagents' own package.json ("pi":
-// { "extensions": [...] }) rather than hardcoded, because the field is
-// authoritative and the exact file layout can change between versions
-// (confirmed against the installed pi-subagents@0.34.0: "./src/extension/index.ts").
+// Each extension's entry path is read from that package's own package.json
+// ("pi": { "extensions": [...] }) rather than hardcoded, because the field
+// is authoritative and the exact file layout can change between versions
+// (confirmed against the installed pi-subagents@0.34.0:
+// "./src/extension/index.ts" and @juicesharp/rpiv-advisor@1.20.0:
+// "./index.ts").
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -26,17 +28,33 @@ interface PiPackageJson {
 // vitest's SSR runner support, and gives identical resolution semantics.
 const require = createRequire(import.meta.url);
 
-export function resolvePiSubagentsExtensionPath(): string {
-  const packageJsonPath = require.resolve("pi-subagents/package.json");
+// Shared resolution logic: both pi-subagents and rpiv-advisor are ordinary
+// node_modules packages that declare their pi extension entry point in
+// their own package.json, so the same require.resolve + "pi.extensions[0]"
+// read applies to either.
+function resolvePiExtensionEntryPath(packageName: string): string {
+  const packageJsonPath = require.resolve(`${packageName}/package.json`);
   const packageRoot = path.dirname(packageJsonPath);
 
   const pkg = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as PiPackageJson;
   const entry = pkg.pi?.extensions?.[0];
   if (!entry) {
     throw new Error(
-      `pi-subagents package.json (${packageJsonPath}) is missing a "pi.extensions[0]" entry`,
+      `${packageName} package.json (${packageJsonPath}) is missing a "pi.extensions[0]" entry`,
     );
   }
 
   return path.resolve(packageRoot, entry);
+}
+
+export function resolvePiSubagentsExtensionPath(): string {
+  return resolvePiExtensionEntryPath("pi-subagents");
+}
+
+// TASKS.md Task 6: same resolution pattern as
+// resolvePiSubagentsExtensionPath — read from the real installed
+// @juicesharp/rpiv-advisor package's own manifest rather than hardcoding
+// (confirmed entry: "./index.ts").
+export function resolveRpivAdvisorExtensionPath(): string {
+  return resolvePiExtensionEntryPath("@juicesharp/rpiv-advisor");
 }

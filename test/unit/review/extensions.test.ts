@@ -6,7 +6,10 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { resolvePiSubagentsExtensionPath } from "../../../src/review/extensions.js";
+import {
+  resolvePiSubagentsExtensionPath,
+  resolveRpivAdvisorExtensionPath,
+} from "../../../src/review/extensions.js";
 
 describe("resolvePiSubagentsExtensionPath", () => {
   it("resolves to pi-subagents' real extension entry point on disk", () => {
@@ -14,6 +17,21 @@ describe("resolvePiSubagentsExtensionPath", () => {
 
     expect(path.isAbsolute(resolved)).toBe(true);
     expect(resolved.endsWith(path.join("pi-subagents", "src", "extension", "index.ts"))).toBe(true);
+    expect(existsSync(resolved)).toBe(true);
+  });
+});
+
+// Sanity check for resolveRpivAdvisorExtensionPath — not one of Task 6's
+// numbered ACs (AC-6.1 through AC-6.3 all live in dispatch.test.ts, per
+// TASKS.md Task 6's "Files Likely Touched"), but this function underpins
+// AC-6.1 and is cheap to verify directly against the real installed
+// @juicesharp/rpiv-advisor package.
+describe("resolveRpivAdvisorExtensionPath", () => {
+  it("resolves to rpiv-advisor's real extension entry point on disk", () => {
+    const resolved = resolveRpivAdvisorExtensionPath();
+
+    expect(path.isAbsolute(resolved)).toBe(true);
+    expect(resolved.endsWith(path.join("@juicesharp", "rpiv-advisor", "index.ts"))).toBe(true);
     expect(existsSync(resolved)).toBe(true);
   });
 });

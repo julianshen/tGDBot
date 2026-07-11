@@ -17,7 +17,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { RuleDefinition } from "../rules/types.js";
-import { resolvePiSubagentsExtensionPath } from "./extensions.js";
+import { resolvePiSubagentsExtensionPath, resolveRpivAdvisorExtensionPath } from "./extensions.js";
 import type { DispatchResult, Finding } from "./types.js";
 
 export type { DispatchResult, Finding } from "./types.js";
@@ -36,6 +36,14 @@ If you find nothing, respond with [] exactly.
 // on this prompt instruction rather than a hard tool restriction.
 const READ_ONLY_INSTRUCTION = "You are reviewing only — do not edit, write, or run mutating commands.";
 
+// TASKS.md Task 6: appended to the dispatch prompt only when the advisor
+// second-opinion pass is enabled (`--advisor on`, the default). Instructs
+// the orchestrating session to call rpiv-advisor's `advisor` tool on its
+// merged findings before emitting the final JSON, and to drop anything the
+// advisor flags as a false positive.
+const ADVISOR_INSTRUCTION =
+  'Before responding with the final JSON, call the "advisor" tool for a second opinion on your merged findings; if the advisor flags a finding as a false positive, remove it before responding.';
+
 // The minimal slice of the real pi SDK's `AgentSession` this module needs.
 // The real `AgentSession` (from @earendil-works/pi-coding-agent) satisfies
 // this shape directly.
@@ -44,13 +52,24 @@ export interface DispatchSession {
   getLastAssistantText(): string | undefined;
 }
 
-export type DispatchSessionFactory = () => Promise<DispatchSession>;
+// TASKS.md Task 6: the factory now takes `useAdvisor` so the real
+// implementation can decide whether to load the rpiv-advisor extension
+// alongside pi-subagents. Stub factories used in tests (which don't care
+// about the extension list) may ignore the parameter.
+export type DispatchSessionFactory = (useAdvisor: boolean) => Promise<DispatchSession>;
 
-async function createRealDispatchSession(): Promise<DispatchSession> {
+async function createRealDispatchSession(useAdvisor: boolean): Promise<DispatchSession> {
+  // pi-subagents is ALWAYS loaded; rpiv-advisor is loaded only when the
+  // advisor second-opinion pass is enabled (TASKS.md Task 6, AC-6.1/AC-6.2).
+  const additionalExtensionPaths = [resolvePiSubagentsExtensionPath()];
+  if (useAdvisor) {
+    additionalExtensionPaths.push(resolveRpivAdvisorExtensionPath());
+  }
+
   const loader = new DefaultResourceLoader({
     cwd: process.cwd(),
     agentDir: getAgentDir(),
-    additionalExtensionPaths: [resolvePiSubagentsExtensionPath()],
+    additionalExtensionPaths,
   });
   await loader.reload();
 
@@ -69,9 +88,13 @@ function buildTaskText(rule: RuleDefinition, diff: string): string {
   );
 }
 
-// Pure and SDK-independent, so it's directly testable (AC-5.2) without a
-// session of any kind.
-export function buildDispatchPrompt(rules: RuleDefinition[], diff: string): string {
+// Pure and SDK-independent, so it's directly testable (AC-5.2, AC-6.3)
+// without a session of any kind.
+export function buildDispatchPrompt(
+  rules: RuleDefinition[],
+  diff: string,
+  useAdvisor: boolean,
+): string {
   const ruleNames = rules.map((rule) => rule.name);
 
   const taskSpecs = rules
@@ -88,17 +111,28 @@ export function buildDispatchPrompt(rules: RuleDefinition[], diff: string): stri
     })
     .join("\n\n");
 
-  return [
+  const parts = [
     `You are orchestrating a code review. Call the "subagent" tool exactly ONCE, in its PARALLEL form (a top-level "tasks" array), with one task entry per rule below.`,
     `Each task entry's "agent" field must be the literal string "reviewer", its "task" field must be that rule's task text below (verbatim, including the diff), and its "model" field must be that rule's exact "<provider>/<model>" string below.`,
     taskSpecs,
     `After the subagent tool call returns, merge every task's own JSON findings array into one combined result, tagging each finding's "ruleName" field with the name of the rule whose task produced it (one of: ${ruleNames
       .map((name) => `"${name}"`)
       .join(", ")}).`,
+  ];
+
+  // TASKS.md Task 6, AC-6.3: only present when the advisor second-opinion
+  // pass is enabled — must NOT appear when useAdvisor is false.
+  if (useAdvisor) {
+    parts.push(ADVISOR_INSTRUCTION);
+  }
+
+  parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
     `{ "findings": [{ "file": string, "line": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "message": string, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
     `"rulesRun" lists the names of rules whose subagent task completed and produced usable output; "rulesFailed" lists any rule names whose task errored or produced no usable output.`,
-  ].join("\n\n");
+  );
+
+  return parts.join("\n\n");
 }
 
 function stripCodeFences(text: string): string {
@@ -177,19 +211,18 @@ function parseDispatchResult(text: string | undefined, rules: RuleDefinition[]):
   return parsed;
 }
 
-// TODO(Task 6): this function will grow a `useAdvisor: boolean` parameter
-// that also loads the `rpiv-advisor` extension (a second
-// `additionalExtensionPaths` entry) and instructs the dispatch prompt to
-// call its `advisor` tool for a second opinion before the final JSON
-// response — see TASKS.md Task 6. Not implemented here; out of Task 5's
-// scope.
+// TASKS.md Task 6: `useAdvisor` controls whether the rpiv-advisor extension
+// is loaded (AC-6.1/AC-6.2) and whether the dispatch prompt instructs the
+// session to call its `advisor` tool for a second opinion before finalizing
+// (AC-6.3).
 export async function dispatchRules(
   rules: RuleDefinition[],
   diff: string,
+  useAdvisor: boolean,
   createSession: DispatchSessionFactory = createRealDispatchSession,
 ): Promise<DispatchResult> {
-  const session = await createSession();
-  const prompt = buildDispatchPrompt(rules, diff);
+  const session = await createSession(useAdvisor);
+  const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
 
   // dispatchRules is a safety boundary: a thrown exception from the real
   // SDK (network error, tool failure, rate limit, ...) during prompt() or

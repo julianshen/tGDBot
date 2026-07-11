@@ -46,8 +46,11 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir: () => "/fake/agent/dir",
 }));
 
-import { dispatchRules } from "../../../src/review/dispatch.js";
-import { resolvePiSubagentsExtensionPath } from "../../../src/review/extensions.js";
+import { buildDispatchPrompt, dispatchRules } from "../../../src/review/dispatch.js";
+import {
+  resolvePiSubagentsExtensionPath,
+  resolveRpivAdvisorExtensionPath,
+} from "../../../src/review/extensions.js";
 
 function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
   return {
@@ -75,7 +78,7 @@ describe("dispatchRules", () => {
     });
 
     const rules = [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })];
-    await dispatchRules(rules, "diff --git a/x b/x");
+    await dispatchRules(rules, "diff --git a/x b/x", false);
 
     expect(hoisted.resourceLoaderInstances).toHaveLength(1);
     expect(hoisted.resourceLoaderInstances[0]?.options.additionalExtensionPaths).toEqual([
@@ -100,7 +103,7 @@ describe("dispatchRules", () => {
     const stub = createPiSessionStub(JSON.stringify({ findings: [], rulesRun: [], rulesFailed: [] }));
     const rule = makeRule({ provider: "anthropic", model: "claude-opus-4-5" });
 
-    await dispatchRules([rule], "diff --git a/x b/x", async () => stub.session);
+    await dispatchRules([rule], "diff --git a/x b/x", false, async () => stub.session);
 
     expect(stub.prompts).toHaveLength(1);
     expect(stub.prompts[0]).toContain("anthropic/claude-opus-4-5");
@@ -127,7 +130,7 @@ describe("dispatchRules", () => {
     };
     const stub = createPiSessionStub(JSON.stringify(wellFormed));
 
-    const result = await dispatchRules([makeRule()], "diff --git a/x b/x", async () => stub.session);
+    const result = await dispatchRules([makeRule()], "diff --git a/x b/x", false, async () => stub.session);
 
     expect(result).toEqual(wellFormed);
   });
@@ -138,7 +141,7 @@ describe("dispatchRules", () => {
     const wellFormed = { findings: [], rulesRun: ["rule-a"], rulesFailed: [] };
     const stub = createPiSessionStub("```json\n" + JSON.stringify(wellFormed) + "\n```");
 
-    const result = await dispatchRules([makeRule()], "diff --git a/x b/x", async () => stub.session);
+    const result = await dispatchRules([makeRule()], "diff --git a/x b/x", false, async () => stub.session);
 
     expect(result).toEqual(wellFormed);
   });
@@ -152,7 +155,7 @@ describe("dispatchRules", () => {
     const stub = createPiSessionStub("Sorry, I could not complete this task.");
     const rules = [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })];
 
-    const result = await dispatchRules(rules, "diff --git a/x b/x", async () => stub.session);
+    const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
     expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a", "rule-b"] });
     expect(warnSpy).toHaveBeenCalled();
@@ -166,7 +169,7 @@ describe("dispatchRules", () => {
     const stub = createPiSessionStub(JSON.stringify({ findings: [] })); // missing rulesRun/rulesFailed
     const rules = [makeRule({ name: "rule-a" })];
 
-    const result = await dispatchRules(rules, "diff --git a/x b/x", async () => stub.session);
+    const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
     expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
     expect(warnSpy).toHaveBeenCalled();
@@ -181,7 +184,7 @@ describe("dispatchRules", () => {
     const rules = [makeRule({ name: "rule-a" })];
 
     await expect(
-      dispatchRules(rules, "diff --git a/x b/x", async () => stub.session),
+      dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session),
     ).resolves.toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
@@ -203,7 +206,7 @@ describe("dispatchRules", () => {
     const stub = createPiSessionStub(JSON.stringify(malformed));
     const rules = [makeRule({ name: "rule-a" })];
 
-    const result = await dispatchRules(rules, "diff --git a/x b/x", async () => stub.session);
+    const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
     expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
     expect(warnSpy).toHaveBeenCalled();
@@ -232,7 +235,7 @@ describe("dispatchRules", () => {
     const stub = createPiSessionStub(JSON.stringify(malformed));
     const rules = [makeRule({ name: "rule-a" })];
 
-    const result = await dispatchRules(rules, "diff --git a/x b/x", async () => stub.session);
+    const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
     expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
     expect(warnSpy).toHaveBeenCalled();
@@ -254,9 +257,64 @@ describe("dispatchRules", () => {
     };
 
     await expect(
-      dispatchRules(rules, "diff --git a/x b/x", async () => throwingSession),
+      dispatchRules(rules, "diff --git a/x b/x", false, async () => throwingSession),
     ).resolves.toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a", "rule-b"] });
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+});
+
+// Tests for the Task 6 advisor second-opinion integration — see TASKS.md
+// Task 6 "Acceptance Criteria (BDD)" AC-6.1 through AC-6.3. These exercise
+// dispatchRules' real (default) session factory (same approach as AC-5.1),
+// mocking "@earendil-works/pi-coding-agent" so no real SDK/network call is
+// made, in order to inspect the resourceLoader's additionalExtensionPaths.
+describe("dispatchRules advisor integration (Task 6)", () => {
+  it("AC-6.1: useAdvisor: true includes both the pi-subagents and rpiv-advisor extension paths", async () => {
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        getLastAssistantText: () => JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+      },
+    });
+
+    const rules = [makeRule({ name: "rule-a" })];
+    await dispatchRules(rules, "diff --git a/x b/x", true);
+
+    expect(hoisted.resourceLoaderInstances).toHaveLength(1);
+    expect(hoisted.resourceLoaderInstances[0]?.options.additionalExtensionPaths).toEqual([
+      resolvePiSubagentsExtensionPath(),
+      resolveRpivAdvisorExtensionPath(),
+    ]);
+  });
+
+  it("AC-6.2: useAdvisor: false includes only the pi-subagents extension path — rpiv-advisor is never loaded", async () => {
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        getLastAssistantText: () => JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+      },
+    });
+
+    const rules = [makeRule({ name: "rule-a" })];
+    await dispatchRules(rules, "diff --git a/x b/x", false);
+
+    expect(hoisted.resourceLoaderInstances).toHaveLength(1);
+    const paths = hoisted.resourceLoaderInstances[0]?.options.additionalExtensionPaths as string[];
+    expect(paths).toEqual([resolvePiSubagentsExtensionPath()]);
+    expect(paths).not.toContain(resolveRpivAdvisorExtensionPath());
+  });
+
+  it("AC-6.3: useAdvisor: true includes an explicit instruction to call the advisor tool before finalizing", () => {
+    const rules = [makeRule({ name: "rule-a" })];
+
+    const promptWithAdvisor = buildDispatchPrompt(rules, "diff --git a/x b/x", true);
+    const promptWithoutAdvisor = buildDispatchPrompt(rules, "diff --git a/x b/x", false);
+
+    expect(promptWithAdvisor).toContain('call the "advisor" tool');
+    expect(promptWithAdvisor).toMatch(/advisor/i);
+    expect(promptWithoutAdvisor).not.toContain('call the "advisor" tool');
   });
 });
