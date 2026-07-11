@@ -1,0 +1,32 @@
+name: tGD Review Agent
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Must match package.json's "engines.node" (>=22.19.0) — the
+          # actually-installed @earendil-works/pi-coding-agent dependency
+          # itself requires >=22.19.0.
+          node-version: "22.19.0"
+      - run: npm ci && npm run build
+      - run: node dist/cli.js review --pr "$PR_NUMBER"
+        env:
+          # PR_NUMBER is a GitHub-controlled integer (not attacker-supplied
+          # free text), but it's still passed via env + quoted arg rather
+          # than interpolated straight into the run: script, per GitHub's
+          # Actions script-injection guidance.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Provider API keys are resolved by the pi SDK's AuthStorage from
+          # environment variables (e.g. ANTHROPIC_API_KEY, OPENAI_API_KEY) —
+          # see README.md's "Provider API key secrets" section for the full
+          # list and how to wire them as repo/organization secrets.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
