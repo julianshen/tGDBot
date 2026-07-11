@@ -102,23 +102,71 @@ async function listMarkdownFiles(rulesDir: string): Promise<string[]> {
   return entries.filter((entry) => entry.endsWith(".md")).sort();
 }
 
-export async function loadRules(rulesDir: string, includeBuiltin: boolean): Promise<LoadResult> {
+// De-duplicates rules by `name`, in the order they appear in `candidates`.
+// The FIRST rule to claim a given name is kept in the returned array; every
+// later rule with the same name is dropped and turned into a `loadError`
+// naming its own `sourcePath` and the conflicting `name` (the same "skip and
+// record, never throw" pattern used for missing-field validation above).
+//
+// Load order (and therefore "first wins") is: user rule files in the
+// `rulesDir`, in the alphabetical-by-filename order `listMarkdownFiles`
+// already sorts them into, followed by the vendored builtin (appended last,
+// only when `includeBuiltin` is true). This is deterministic and, as a
+// side effect, lets a user rule file shadow the builtin's `name: tgd-review`
+// by defining its own rule under that same name — consistent with the
+// "project config wins on a name collision" precedent already used for
+// dispatch's `.pi/agents` override (see ADR-003) — rather than the builtin
+// silently winning and the user's same-named file being dropped instead.
+function dedupeByName(
+  candidates: RuleDefinition[],
+): { rules: RuleDefinition[]; errors: { sourcePath: string; message: string }[] } {
   const rules: RuleDefinition[] = [];
+  const errors: { sourcePath: string; message: string }[] = [];
+  const firstSourceByName = new Map<string, string>();
+
+  for (const candidate of candidates) {
+    const firstSourcePath = firstSourceByName.get(candidate.name);
+    if (firstSourcePath === undefined) {
+      firstSourceByName.set(candidate.name, candidate.sourcePath);
+      rules.push(candidate);
+    } else {
+      errors.push({
+        sourcePath: candidate.sourcePath,
+        message: `duplicate rule name "${candidate.name}": already defined by ${firstSourcePath}; this file's rule was skipped`,
+      });
+    }
+  }
+
+  return { rules, errors };
+}
+
+export async function loadRules(rulesDir: string, includeBuiltin: boolean): Promise<LoadResult> {
+  const candidates: RuleDefinition[] = [];
   const errors: { sourcePath: string; message: string }[] = [];
 
   const mdFiles = await listMarkdownFiles(rulesDir);
-  for (const file of mdFiles) {
-    const sourcePath = path.join(rulesDir, file);
-    const { rule, loadError } = await loadOneRuleFile(sourcePath);
-    if (rule) rules.push(rule);
+  // Read + parse every user rule file concurrently rather than one at a
+  // time. `loadOneRuleFile` never rejects (it wraps both the `readFile` and
+  // the YAML/field parsing in try/catch and resolves to a `loadError`
+  // marker instead) so `Promise.all` here still isolates each file's
+  // failure to that file alone — one bad file cannot abort the others or
+  // reject the whole batch. Order is preserved (`Promise.all` resolves in
+  // input order), so the alphabetical "first wins" ordering `dedupeByName`
+  // relies on is unaffected by this becoming concurrent.
+  const results = await Promise.all(
+    mdFiles.map((file) => loadOneRuleFile(path.join(rulesDir, file))),
+  );
+  for (const { rule, loadError } of results) {
+    if (rule) candidates.push(rule);
     if (loadError) errors.push(loadError);
   }
 
   if (includeBuiltin) {
     const { rule, loadError } = await loadOneRuleFile(BUILTIN_RULE_PATH);
-    if (rule) rules.push(rule);
+    if (rule) candidates.push(rule);
     if (loadError) errors.push(loadError);
   }
 
-  return { rules, errors };
+  const deduped = dedupeByName(candidates);
+  return { rules: deduped.rules, errors: [...errors, ...deduped.errors] };
 }

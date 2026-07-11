@@ -29,6 +29,21 @@ const malformedYamlDir = fileURLToPath(
   new URL("../../fixtures/rules/malformed-yaml-dir", import.meta.url),
 );
 
+// `duplicate-name-dir/` holds two valid rule files (`rule-a.md`, `rule-b.md`)
+// that both set `name: duplicate-rule` — dedicated to the duplicate-name
+// tests below, kept separate from `fixturesDir` so those tests' assertions
+// don't have to account for the rest of `fixturesDir`'s fixture files.
+const duplicateNameDir = fileURLToPath(
+  new URL("../../fixtures/rules/duplicate-name-dir", import.meta.url),
+);
+
+// `duplicate-builtin-dir/` holds one valid user rule file that deliberately
+// reuses the vendored builtin's `name: tgd-review`, for testing the
+// user-rule-vs-builtin collision case specifically.
+const duplicateBuiltinDir = fileURLToPath(
+  new URL("../../fixtures/rules/duplicate-builtin-dir", import.meta.url),
+);
+
 describe("loadRules", () => {
   // AC-4.1: Given a valid rule file with name/provider/model set, When
   // loadRules runs, Then the returned rules array contains a matching
@@ -73,6 +88,23 @@ describe("loadRules", () => {
     );
     expect(err).toBeDefined();
     expect(err?.message.toLowerCase()).toContain("model");
+  });
+
+  // Same required-field validation path as AC-4.2/AC-4.3, exercised for the
+  // untested `name` branch (Test Coverage debt item: `provider`/`model` each
+  // had their own fixture + test, `name` did not, despite being the same
+  // code path in `parseRuleFile`'s `REQUIRED_STRING_FIELDS` check).
+  it("a rule file missing name is excluded from rules and recorded in errors, without throwing", async () => {
+    const result = await loadRules(fixturesDir, false);
+
+    expect(result.rules.some((r) => r.sourcePath === path.join(fixturesDir, "missing-name.md"))).toBe(
+      false,
+    );
+    const err = result.errors.find(
+      (e) => e.sourcePath === path.join(fixturesDir, "missing-name.md"),
+    );
+    expect(err).toBeDefined();
+    expect(err?.message.toLowerCase()).toContain("name");
   });
 
   // AC-4.4: Given includeBuiltin: true and an empty rulesDir (here: a
@@ -144,5 +176,52 @@ describe("loadRules", () => {
     const sibling = result.rules.find((r) => r.name === "sibling-valid-rule");
     expect(sibling).toBeDefined();
     expect(sibling?.provider).toBe("anthropic");
+  });
+
+  // Code Quality debt item: two rule files defining the same `name` must
+  // not both end up in `rules` — that would make attribution in the
+  // dispatch prompt and in `Finding.ruleName`/`rulesRun`/`rulesFailed`
+  // ambiguous (which file is "rule X" if two claim that name?). loadRules
+  // resolves this the same "skip and record, never throw" way as
+  // missing-field validation: the FIRST-loaded rule with a given name wins
+  // and is kept in `rules`; every later rule sharing that name is dropped
+  // and recorded as a `loadError` instead. "First" here means discovery
+  // order: user rule files in `duplicate-name-dir/` are read in the
+  // alphabetical-by-filename order `listMarkdownFiles` sorts them into, so
+  // `rule-a.md` (alphabetically first) is the one that wins.
+  it("two user rule files sharing the same name: the alphabetically-first file's rule loads, the second becomes a loadError naming both the duplicate name and its own sourcePath", async () => {
+    const result = await loadRules(duplicateNameDir, false);
+
+    const loaded = result.rules.filter((r) => r.name === "duplicate-rule");
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.sourcePath).toBe(path.join(duplicateNameDir, "rule-a.md"));
+    expect(loaded[0]?.provider).toBe("anthropic");
+
+    const err = result.errors.find(
+      (e) => e.sourcePath === path.join(duplicateNameDir, "rule-b.md"),
+    );
+    expect(err).toBeDefined();
+    expect(err?.message).toContain("duplicate-rule");
+    expect(err?.message.toLowerCase()).toContain("duplicate");
+  });
+
+  // Same duplicate-name handling, specifically for a user rule file that
+  // reuses the vendored builtin's `name: tgd-review`. Because user rule
+  // files are loaded (and therefore win ties) before the builtin is
+  // appended, the USER rule loads into `rules` and the builtin is skipped
+  // and recorded as a loadError instead — asserting the actual "first
+  // wins" choice documented on `dedupeByName` in loader.ts.
+  it("a user rule file reusing the builtin's name (tgd-review): the user rule wins, the builtin becomes a loadError", async () => {
+    const result = await loadRules(duplicateBuiltinDir, true);
+
+    const loaded = result.rules.filter((r) => r.name === "tgd-review");
+    expect(loaded).toHaveLength(1);
+    expect(loaded[0]?.sourcePath).toBe(path.join(duplicateBuiltinDir, "user-rule.md"));
+    expect(loaded[0]?.provider).toBe("openai");
+
+    const err = result.errors.find((e) => e.sourcePath.endsWith(path.join("builtin", "tgd-review.md")));
+    expect(err).toBeDefined();
+    expect(err?.message).toContain("tgd-review");
+    expect(err?.message.toLowerCase()).toContain("duplicate");
   });
 });
