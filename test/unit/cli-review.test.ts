@@ -557,4 +557,72 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
 
     vi.restoreAllMocks();
   });
+
+  // Review fix (defense-in-depth, non-blocking hardening item): `file.path`
+  // in a fetched RuleFileContent comes from the GitHub Contents API response
+  // and is used directly to build a write path under the temp rules dir. Not
+  // currently exploitable — the base branch isn't attacker-controlled per
+  // ADR-002's own threat model — but a relative-traversal or absolute path
+  // must still be rejected/skipped (never written outside the temp dir),
+  // the same "one bad thing shouldn't kill the whole run" philosophy this
+  // codebase already applies to malformed rule files elsewhere.
+  it("path-traversal defense-in-depth: a fetched rule file whose path escapes the temp dir via '../' is skipped (never written outside it), other legit files still load", async () => {
+    const ruleFilesFromBase: RuleFileContent[] = [
+      { path: "../../etc/passwd", content: "malicious content" },
+      { path: "security-review.md", content: "legit content" },
+    ];
+    const h = makeHarness({ botComment: null, ruleFilesFromBase });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let seenDir: string | undefined;
+    h.loadRules.mockImplementation(async (dir: string) => {
+      seenDir = dir;
+      expect(readFileSync(path.join(dir, "security-review.md"), "utf-8")).toBe("legit content");
+      return { rules: [makeRule()], errors: [] };
+    });
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(seenDir).toBeDefined();
+
+    // The traversal target (two levels above the temp dir, then etc/passwd)
+    // must never have been written to.
+    const escapedPath = path.resolve(seenDir as string, "../../etc/passwd");
+    expect(existsSync(escapedPath)).toBe(false);
+
+    // A warning names the offending path — visible, not silently dropped.
+    const warnedText = warnSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(warnedText).toContain("../../etc/passwd");
+
+    vi.restoreAllMocks();
+  });
+
+  it("path-traversal defense-in-depth: a fetched rule file with an absolute path is skipped (never written to that absolute location)", async () => {
+    const ruleFilesFromBase: RuleFileContent[] = [
+      { path: "/etc/passwd", content: "malicious content" },
+      { path: "security-review.md", content: "legit content" },
+    ];
+    const h = makeHarness({ botComment: null, ruleFilesFromBase });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let seenDir: string | undefined;
+    h.loadRules.mockImplementation(async (dir: string) => {
+      seenDir = dir;
+      expect(readFileSync(path.join(dir, "security-review.md"), "utf-8")).toBe("legit content");
+      return { rules: [makeRule()], errors: [] };
+    });
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(seenDir).toBeDefined();
+
+    const warnedText = warnSpy.mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(warnedText).toContain("/etc/passwd");
+
+    vi.restoreAllMocks();
+  });
 });

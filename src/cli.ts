@@ -190,6 +190,28 @@ function renderLoadErrorsSection(loadErrors: LoadResult["errors"]): string {
   return `### ⚠️ Rule files that failed to load\n\nThe following rule files were skipped because they failed to load:\n\n${items}`;
 }
 
+// Review fix (defense-in-depth, non-blocking hardening item): `file.path`
+// comes from the VCS provider's API response (GitHub's Contents API `name`
+// field for GitHubAdapter) and is used to build a filesystem write path
+// under the temp rules dir. Not currently exploitable — per ADR-002's own
+// threat model the base branch is not attacker-controlled, and
+// GitHubAdapter's directory-listing `name` field can't itself contain a
+// path separator — but this is cheap, good practice, and consistent with
+// this project's existing defense-in-depth posture (e.g. --pr's format
+// validation in parseArgs, added despite not being currently exploitable
+// either). Guards against a "zip slip"-style escape: resolves `file.path`
+// against `tempDir` and rejects anything whose resolved location isn't
+// actually inside `tempDir` (relative traversal via `../`, or an absolute
+// path that ignores `tempDir` entirely).
+function resolveSafeRuleFilePath(tempDir: string, filePath: string): string | null {
+  const dest = path.resolve(tempDir, filePath);
+  const relative = path.relative(tempDir, dest);
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return null;
+  }
+  return dest;
+}
+
 /**
  * ADR-002 / CLI-native fix: resolves this run's rule files, honoring
  * `config.trustLocalRules`:
@@ -230,7 +252,16 @@ async function loadRulesForReview(
     // future adapter's `path` ever contains a subdirectory component.
     await Promise.all(
       ruleFiles.map(async (file) => {
-        const dest = path.join(tempRulesDir, file.path);
+        const dest = resolveSafeRuleFilePath(tempRulesDir, file.path);
+        if (dest === null) {
+          // Defense-in-depth: skip and warn, don't throw — one bad entry
+          // must not abort the whole run, same "warn, don't throw"
+          // philosophy used elsewhere in this file and in dispatch.ts.
+          console.warn(
+            `tgd-review-agent: skipping rule file with unsafe path "${file.path}" (resolves outside the rules directory)`,
+          );
+          return;
+        }
         await mkdir(path.dirname(dest), { recursive: true });
         await writeFile(dest, file.content, "utf-8");
       }),
