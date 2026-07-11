@@ -186,4 +186,77 @@ describe("dispatchRules", () => {
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
+
+  // AC-5.4 (malformed Finding element variant, review fix): a
+  // structurally-valid DispatchResult whose findings array contains an
+  // element missing required Finding fields (file/severity/category/
+  // message/ruleName) must not be returned as-is — that would silently
+  // hand Task 7's orchestration garbage Finding objects. The whole
+  // response falls back, same as the non-JSON case.
+  it("AC-5.4: a findings element missing required Finding fields falls back, without throwing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const malformed = {
+      findings: [{ foo: "bar" }],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    };
+    const stub = createPiSessionStub(JSON.stringify(malformed));
+    const rules = [makeRule({ name: "rule-a" })];
+
+    const result = await dispatchRules(rules, "diff --git a/x b/x", async () => stub.session);
+
+    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  // AC-5.4 (invalid Finding severity variant, review fix): a findings
+  // element with all fields present but an out-of-enum "severity" value
+  // is equally untrustworthy and must also fall back.
+  it("AC-5.4: a findings element with an invalid severity value falls back, without throwing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const malformed = {
+      findings: [
+        {
+          file: "src/foo.ts",
+          line: 1,
+          severity: "critical", // not one of blocking/warning/suggestion
+          category: "security",
+          message: "bad",
+          ruleName: "rule-a",
+        },
+      ],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    };
+    const stub = createPiSessionStub(JSON.stringify(malformed));
+    const rules = [makeRule({ name: "rule-a" })];
+
+    const result = await dispatchRules(rules, "diff --git a/x b/x", async () => stub.session);
+
+    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  // AC-5.4 (session.prompt() throws variant, review fix): dispatchRules is
+  // a safety boundary that later tasks (Task 8's CLI wiring) call directly
+  // without their own try/catch — a real SDK exception during
+  // session.prompt() (network error, tool failure, rate limit, ...) must
+  // be caught here and turned into the same fallback shape, not
+  // propagated.
+  it("AC-5.4: session.prompt() throwing falls back, without throwing", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rules = [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })];
+    const throwingSession = {
+      prompt: vi.fn().mockRejectedValue(new Error("ECONNRESET")),
+      getLastAssistantText: () => "should never be read",
+    };
+
+    await expect(
+      dispatchRules(rules, "diff --git a/x b/x", async () => throwingSession),
+    ).resolves.toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a", "rule-b"] });
+    expect(warnSpy).toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
 });

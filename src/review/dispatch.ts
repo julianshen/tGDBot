@@ -18,7 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { RuleDefinition } from "../rules/types.js";
 import { resolvePiSubagentsExtensionPath } from "./extensions.js";
-import type { DispatchResult } from "./types.js";
+import type { DispatchResult, Finding } from "./types.js";
 
 export type { DispatchResult, Finding } from "./types.js";
 
@@ -111,11 +111,39 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string");
 }
 
+const VALID_SEVERITIES = new Set(["blocking", "warning", "suggestion"]);
+
+// Validates a single Finding's required fields/types. `line` is optional/
+// nullable (per the JSON contract, `number | null`) so it's checked only
+// when present. If any element of `findings` fails this check, the whole
+// response is treated as malformed (see dispatch.ts's caller) rather than
+// silently keeping the well-formed findings and dropping the bad ones —
+// a response that gets the shape wrong for one finding is not trustworthy
+// for the others either.
+function isValidFinding(value: unknown): value is Finding {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  if (typeof candidate.file !== "string") return false;
+  if (!VALID_SEVERITIES.has(candidate.severity as string)) return false;
+  if (typeof candidate.category !== "string") return false;
+  if (typeof candidate.message !== "string") return false;
+  if (typeof candidate.ruleName !== "string") return false;
+  if (
+    candidate.line !== undefined &&
+    candidate.line !== null &&
+    typeof candidate.line !== "number"
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function looksLikeDispatchResult(value: unknown): value is DispatchResult {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
   return (
     Array.isArray(candidate.findings) &&
+    candidate.findings.every(isValidFinding) &&
     isStringArray(candidate.rulesRun) &&
     isStringArray(candidate.rulesFailed)
   );
@@ -162,6 +190,21 @@ export async function dispatchRules(
 ): Promise<DispatchResult> {
   const session = await createSession();
   const prompt = buildDispatchPrompt(rules, diff);
-  await session.prompt(prompt);
-  return parseDispatchResult(session.getLastAssistantText(), rules);
+
+  // dispatchRules is a safety boundary: a thrown exception from the real
+  // SDK (network error, tool failure, rate limit, ...) during prompt() or
+  // while reading the final message must not propagate — Task 8's CLI
+  // wiring calls this function directly without its own try/catch, relying
+  // on it to never throw (same contract as the malformed-JSON fallback
+  // path below).
+  let finalText: string | undefined;
+  try {
+    await session.prompt(prompt);
+    finalText = session.getLastAssistantText();
+  } catch (err) {
+    console.warn(`dispatchRules: session.prompt() threw (${(err as Error).message})`);
+    return fallbackResult(rules);
+  }
+
+  return parseDispatchResult(finalText, rules);
 }
