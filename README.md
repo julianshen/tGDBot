@@ -331,16 +331,50 @@ full schema — `compat` flags, `thinkingLevelMap`, cost tiers, etc. Any
 provider name works, not just `hermes`; pick something that matches the
 `provider` field you'll write in your rule files.)
 
-**2. Reference it in a rule file** exactly like a built-in provider:
+**2. Create a custom rule file that uses it.** Rule files live at
+`.tgd-review/rules/*.md` in your repo (the default `--rules-dir`; see
+"Authoring a rule file" above for the full frontmatter reference). Create
+one — the filename doesn't matter, only the `name` in the frontmatter does —
+referencing your new provider exactly like a built-in one:
+
+`.tgd-review/rules/hermes-readability-review.md`:
 ```markdown
 ---
-name: hermes-review
+name: hermes-readability-review
 provider: hermes
 model: nousresearch/hermes-4-405b
 ---
 
-Review this diff for ...
+Review this diff for readability and maintainability only — do not repeat
+findings that a security or correctness rule would already cover.
+
+Focus on:
+- Names that don't convey intent (vague `data`/`temp`/`result` without
+  context, misleading names, inconsistent casing/conventions).
+- Control flow that's harder to follow than it needs to be (deep nesting,
+  long functions doing multiple unrelated things, clever one-liners that
+  trade clarity for brevity).
+- Duplicated logic that should be extracted, or premature abstraction that
+  adds indirection without earning it.
+- Comments that restate the code instead of explaining non-obvious *why*,
+  or comments that are now stale/incorrect relative to the code they
+  describe.
+
+Report only findings you're genuinely confident improve readability — skip
+purely stylistic nitpicks (formatting, quote style) that a linter would
+already catch.
 ```
+
+Commit the file to your repo (on the **base branch** — see "Rule files are
+sourced from the base branch" below for why a PR can't add or edit this file
+to affect its own review) and it takes effect on the next PR review
+automatically. It runs *alongside* the built-in `tgd-review` rule and any
+other rule files in the directory — `--disable-builtin-rule` only affects
+the vendored default, not your own rules, and there's no limit on how many
+rule files you add (each becomes its own dispatched subagent task; see
+"Custom model providers" above for wiring the provider, and "Provider API
+key secrets" for the general secrets pattern this rule's `hermes` provider
+also follows via `OPENROUTER_API_KEY`).
 
 **3. In CI**, `~/.pi/agent/models.json` needs to exist on the runner *before*
 `tgd-review-agent review` runs (GitHub Actions runners start with a clean
