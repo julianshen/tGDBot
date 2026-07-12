@@ -401,6 +401,36 @@ describe("dispatchRules advisor integration (Task 6)", () => {
     expect(prompt).toMatch(/context/i);
     expect(prompt).toMatch(/fork/i);
   });
+
+  // Bug fix (found via a real multi-model run against hmchangw/chat#490): with
+  // the fork/intercom bugs fixed, BOTH parallel tasks reliably ran ("2/2
+  // succeeded"), but the orchestrator's FINAL accounting sometimes marked one
+  // model (whose task ran but found little/nothing, or only findings that
+  // overlapped the other model's) as "failed" and dropped it — so a 2-model
+  // fan-out silently degraded to 1-model coverage reported as partial. Two
+  // prompt fixes make attribution reliable: (1) an explicit order→rule map so
+  // the orchestrator attributes each "=== Task K ===" block by position, not
+  // by guessing from content; (2) a sharp rulesRun/rulesFailed definition —
+  // a task that RAN and returned a parseable findings array (INCLUDING an
+  // empty []) is a SUCCESS (rulesRun), and rulesFailed is ONLY for tasks that
+  // errored or returned no parseable array at all.
+  it("bug fix (real run, hmchangw/chat#490): the prompt maps tasks to rules by order and defines rulesRun to include a rule that ran but found nothing", () => {
+    const rules = [makeRule({ name: "grok-review" }), makeRule({ name: "terra-review" })];
+
+    const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", false);
+
+    // Explicit order→rule attribution, anchored on the tool's own output shape.
+    expect(prompt).toMatch(/order/i);
+    expect(prompt).toContain('"grok-review"');
+    expect(prompt).toContain('"terra-review"');
+    // The "N/N succeeded" anchor the orchestrator keys attribution on.
+    expect(prompt).toMatch(/succeeded/i);
+    // The sharp rulesRun/rulesFailed distinction: empty findings is still a run.
+    expect(prompt).toMatch(/empty/i);
+    expect(prompt).toMatch(/\[\]/);
+    // And an explicit anti-drop instruction.
+    expect(prompt).toMatch(/never (drop|omit)/i);
+  });
 });
 
 // Tests for ADR-003 "restrict dispatched subagent tools via project-scoped

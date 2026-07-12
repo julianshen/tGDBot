@@ -314,9 +314,19 @@ export function buildDispatchPrompt(
     // stating it here deterministically forces fresh for all tasks.
     `Set the subagent tool call's top-level "context" field to the literal string "fresh". Do NOT use "fork" — this review session is not persisted, so a forked context would fail every task at once.`,
     taskSpecs,
-    `After the subagent tool call returns, merge every task's own JSON findings array into one combined result, tagging each finding's "ruleName" field with the name of the rule whose task produced it (one of: ${ruleNames
-      .map((name) => `"${name}"`)
-      .join(", ")}).`,
+    // Attribution fix (found via a real multi-model run against
+    // hmchangw/chat#490): with fork/intercom fixed, BOTH parallel tasks
+    // reliably ran, but the orchestrator sometimes mis-attributed or dropped
+    // one. The subagent tool aggregates results as a "N/N succeeded" summary
+    // line followed by one "=== Task K: reviewer ===" block per task, in the
+    // SAME ORDER they were dispatched — but every block is headed "reviewer"
+    // (the agent name), so the ONLY reliable signal for which block belongs to
+    // which rule is position. Spell that mapping out explicitly rather than
+    // letting the orchestrator guess from a block's content.
+    `The subagent tool returns its result as a "K/N succeeded" summary line followed by one "=== Task <i>: reviewer ===" block per task, in the EXACT ORDER you dispatched them. Attribute strictly by that order: ${ruleNames
+      .map((name, index) => `Task ${index + 1}'s block is rule "${name}"`)
+      .join("; ")}. Never infer a block's rule from its content — only from its task position.`,
+    `Merge every task block's JSON findings array into one combined "findings" array, stamping each finding's "ruleName" with its task's rule name from the order mapping above.`,
   ];
 
   // TASKS.md Task 6, AC-6.3: only present when the advisor second-opinion
@@ -328,7 +338,14 @@ export function buildDispatchPrompt(
   parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
     `{ "findings": [{ "file": string, "line": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "message": string, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
-    `"rulesRun" lists the names of rules whose subagent task completed and produced usable output; "rulesFailed" lists any rule names whose task errored or produced no usable output.`,
+    // Attribution fix (see order-mapping note above): the old wording defined
+    // rulesFailed as tasks that "produced no usable output", which the
+    // orchestrator wrongly applied to a task that RAN and returned an empty or
+    // all-duplicate findings array — silently degrading a 2-model fan-out to
+    // 1-model coverage. A rule that ran and found nothing is a SUCCESS.
+    `A rule's task SUCCEEDED — put it in "rulesRun" — if its "=== Task <i> ===" block contains a parseable JSON findings array, INCLUDING an empty array []. A rule that ran and simply found no issues (or only issues another rule also found) is a SUCCESS, not a failure. Put a rule in "rulesFailed" ONLY if its task errored/crashed or its block has no parseable findings array at all. Every task counted in the "K/N succeeded" summary MUST appear in "rulesRun" by its rule name — never drop or omit a rule that ran. The rules are: ${ruleNames
+      .map((name) => `"${name}"`)
+      .join(", ")}.`,
   );
 
   return parts.join("\n\n");
