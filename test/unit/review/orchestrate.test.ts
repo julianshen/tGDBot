@@ -249,3 +249,44 @@ describe("orchestrate", () => {
     expect(result.rulesFailed).toEqual(["c"]);
   });
 });
+
+// Smoke-test finding (fresh clone, zero-config run against a live PR): the
+// built-in rule failed and the comment said only "rules failed to run and were
+// skipped" — with NO reason, anywhere. The actual cause (no anthropic API key on
+// that machine) was captured in the subagent's result and then thrown away. That
+// is the same diagnosability hole as issue #1, one layer down.
+describe("failed rules carry a reason (smoke-test finding)", () => {
+  it("renders the reason next to each failed rule when one is available", () => {
+    const result = orchestrate({
+      findings: [],
+      rulesRun: [],
+      rulesFailed: ["tgd-review"],
+      ruleFailureReasons: { "tgd-review": "no working credentials for provider `anthropic`" },
+    });
+
+    expect(result.commentBody).toContain("### ⚠️ Rules that failed");
+    expect(result.commentBody).toContain("tgd-review");
+    // The whole point: a maintainer reading the comment learns something actionable.
+    expect(result.commentBody).toMatch(/no working credentials for provider `anthropic`/);
+  });
+
+  it("still renders cleanly when a reason is missing (never prints 'undefined')", () => {
+    const result = orchestrate({
+      findings: [],
+      rulesRun: [],
+      rulesFailed: ["rule-a", "rule-b"],
+      ruleFailureReasons: { "rule-a": "timed out" },
+    });
+
+    expect(result.commentBody).toMatch(/rule-a.*timed out/);
+    expect(result.commentBody).toContain("rule-b");
+    expect(result.commentBody).not.toMatch(/undefined/);
+  });
+
+  it("is backward compatible: no ruleFailureReasons at all still renders the old bare list", () => {
+    const result = orchestrate({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+
+    expect(result.commentBody).toContain("- rule-a");
+    expect(result.commentBody).not.toMatch(/undefined/);
+  });
+});

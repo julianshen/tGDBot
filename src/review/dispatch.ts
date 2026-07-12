@@ -712,8 +712,18 @@ function looksLikeDispatchResult(value: unknown): value is DispatchResult {
   );
 }
 
-function fallbackResult(rules: RuleDefinition[]): DispatchResult {
-  return { findings: [], rulesRun: [], rulesFailed: rules.map((rule) => rule.name) };
+function fallbackResult(
+  rules: RuleDefinition[],
+  reason = "the review orchestrator did not complete — see the CI logs for the cause",
+): DispatchResult {
+  // Review finding: without a reason here, every ORCHESTRATOR-level failure
+  // (prompt() threw, malformed final JSON, setup failed, unreconcilable results)
+  // still rendered the bare "- rule-name" list this change exists to kill. Stamp
+  // a generic-but-honest reason so the whole class is covered, not just the
+  // per-task branch the smoke test happened to hit.
+  const ruleFailureReasons: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const rule of rules) ruleFailureReasons[rule.name] = reason;
+  return { findings: [], rulesRun: [], rulesFailed: rules.map((rule) => rule.name), ruleFailureReasons };
 }
 
 // Never throws — a single bad/malformed LLM response must not crash the
@@ -805,6 +815,52 @@ function taskSucceeded(c: CapturedTaskResult): boolean {
   return c.exitCode === 0 && !c.error && !c.timedOut && !c.detached;
 }
 
+// Errors that mean "this rule's provider isn't usable on this machine" — by far
+// the most common real cause (the zero-config smoke test hit exactly this: the
+// builtin rule is pinned to anthropic and the box had no ANTHROPIC_API_KEY).
+//
+// The numeric status codes are DELIBERATELY anchored. A bare /401|403/ matches
+// those digits anywhere — "retry after 4030ms", "40312 tokens exceeds limit",
+// "req_011CS401xyz" — and this string is published in the PR comment. Telling a
+// maintainer "no working credentials" when the real cause was a rate limit sends
+// them to rotate a healthy key while the truth hides in the logs: confidently
+// wrong, which is worse than the silence this whole change exists to fix.
+//
+// Distinct from PI_AUTH_ERROR_RE above, which annotates the ORCHESTRATOR's own
+// prompt() throw. This one classifies a dispatched RULE's task error. They
+// overlap but are not interchangeable — update both if auth detection changes.
+const PROVIDER_AUTH_ERROR_RE =
+  /No API key found|Authentication failed|no configured credentials|unauthoriz|forbidden|invalid api key|\b(?:status|code|http)\W{0,4}(?:401|403)\b/i;
+
+// rule.provider is rule-file-sourced and gets interpolated into a world-readable
+// PR comment inside a code span. Strip what could break out of it (backticks,
+// newlines, table pipes) and cap the length, so a crafted value can't inject
+// markdown into the bot's own comment.
+function sanitizeForComment(value: string): string {
+  return value.replace(/[`\r\n|]/g, "").trim().slice(0, 60);
+}
+
+/**
+ * WHY a rule's task failed, as a short phrase SAFE TO PUBLISH.
+ *
+ * This is rendered into a PR comment, which is world-readable on a public repo.
+ * Raw provider errors can echo request/response details, so they are deliberately
+ * NOT included here — they go to stderr (private CI logs) instead. What a
+ * maintainer needs from the comment is the actionable class of failure plus which
+ * provider it was, and that is exactly what this returns.
+ */
+function classifyTaskFailure(c: CapturedTaskResult, rule: RuleDefinition): string {
+  if (c.timedOut) return "timed out";
+  if (c.detached) return "detached before finishing";
+  const error = c.error ?? "";
+  if (PROVIDER_AUTH_ERROR_RE.test(error)) {
+    return `no working credentials for provider \`${sanitizeForComment(rule.provider)}\` on the machine running the review`;
+  }
+  if (error) return `errored (see the CI logs for the full message)`;
+  if (typeof c.exitCode === "number" && c.exitCode !== 0) return `exited with code ${c.exitCode}`;
+  return "failed to run";
+}
+
 // Deterministic reconciliation of the orchestrating LLM's self-reported
 // DispatchResult against the structured per-task results captured from the
 // subagent tool (details.results). See DispatchSession.subscribe's doc comment
@@ -856,11 +912,25 @@ function reconcileWithCapturedResults(
 
   const rulesRun: string[] = [];
   const rulesFailed: string[] = [];
+  // Null-prototype: a rule literally named "__proto__" would otherwise not set an
+  // own property, and the later lookup would return Object.prototype (truthy) and
+  // render "[object Object]" as the reason.
+  const ruleFailureReasons: Record<string, string> = Object.create(null) as Record<string, string>;
   const recovered: Finding[] = [];
   captured.forEach((c, i) => {
     const rule = rules[i];
     if (!taskSucceeded(c)) {
       rulesFailed.push(rule.name);
+      ruleFailureReasons[rule.name] = classifyTaskFailure(c, rule);
+      // Smoke-test finding: this was previously silent — a rule failed and NOTHING,
+      // not even stderr, said why. The RAW error goes to the CI logs; only the
+      // classified reason above reaches the PR comment. (On a public repo the logs
+      // are readable too — but GitHub masks registered secrets there, and a comment
+      // is pushed into every reviewer's face while a log line is not.)
+      const raw = c.error ?? classifyTaskFailure(c, rule);
+      console.warn(
+        `dispatchRules: rule "${rule.name}" (${rule.provider}/${rule.model}) failed: ${raw}`,
+      );
       return;
     }
     rulesRun.push(rule.name);
@@ -873,7 +943,7 @@ function reconcileWithCapturedResults(
 
   const runSet = new Set(rulesRun);
   const kept = orchestrator.findings.filter((f) => runSet.has(f.ruleName));
-  return { findings: [...kept, ...recovered], rulesRun, rulesFailed };
+  return { findings: [...kept, ...recovered], rulesRun, rulesFailed, ruleFailureReasons };
 }
 
 // TASKS.md Task 6: `useAdvisor` controls whether the rpiv-advisor extension

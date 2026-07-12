@@ -305,7 +305,10 @@ describe("dispatchRules", () => {
 
     const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
-    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a", "rule-b"] });
+    expect(result).toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a", "rule-b"] });
+    // Review fix: fallbacks now also explain THEMSELVES, so the comment never
+    // renders a bare, reasonless "- rule-a" list.
+    expect(result.ruleFailureReasons?.["rule-a"]).toMatch(/orchestrator did not complete/i);
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
@@ -319,7 +322,8 @@ describe("dispatchRules", () => {
 
     const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
-    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result).toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result.ruleFailureReasons?.["rule-a"]).toMatch(/orchestrator did not complete/i);
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
@@ -333,7 +337,7 @@ describe("dispatchRules", () => {
 
     await expect(
       dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session),
-    ).resolves.toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    ).resolves.toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
@@ -356,7 +360,8 @@ describe("dispatchRules", () => {
 
     const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
-    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result).toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result.ruleFailureReasons?.["rule-a"]).toMatch(/orchestrator did not complete/i);
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
@@ -385,7 +390,8 @@ describe("dispatchRules", () => {
 
     const result = await dispatchRules(rules, "diff --git a/x b/x", false, async () => stub.session);
 
-    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result).toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result.ruleFailureReasons?.["rule-a"]).toMatch(/orchestrator did not complete/i);
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
@@ -406,7 +412,7 @@ describe("dispatchRules", () => {
 
     await expect(
       dispatchRules(rules, "diff --git a/x b/x", false, async () => throwingSession),
-    ).resolves.toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a", "rule-b"] });
+    ).resolves.toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a", "rule-b"] });
     expect(warnSpy).toHaveBeenCalled();
     warnSpy.mockRestore();
   });
@@ -609,7 +615,8 @@ describe("dispatchRules isolated session cwd (ADR-003)", () => {
       },
     );
 
-    expect(result).toEqual({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result).toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    expect(result.ruleFailureReasons?.["rule-a"]).toMatch(/orchestrator did not complete/i);
     expect(capturedCwd).toBeDefined();
     expect(existsSync(capturedCwd as string)).toBe(false);
     warnSpy.mockRestore();
@@ -1449,6 +1456,215 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
     );
 
     expect(warnings(warn)).toBe("");
+    warn.mockRestore();
+  });
+});
+
+// Smoke-test finding: a rule's subagent can fail (e.g. no API key for its
+// pinned provider) and NOTHING anywhere said why — not stderr, not the PR
+// comment. The cause was already captured in the subagent tool's
+// details.results[i].error and then dropped on the floor.
+//
+// Two audiences, two levels of detail, deliberately:
+//   - stderr (private CI logs): the RAW provider error, for the operator.
+//   - PR comment (PUBLIC): a CLASSIFIED reason only. Raw provider errors can
+//     echo request details, and the comment is world-readable on a public repo.
+describe("failed rules report WHY (smoke-test finding)", () => {
+  it("classifies a missing-credentials failure and exposes it as a rule failure reason", async () => {
+    const rules = [makeRule({ name: "tgd-review", provider: "anthropic", model: "claude-opus-4-5" })];
+    const details = [
+      {
+        model: "anthropic/claude-opus-4-5:high",
+        exitCode: 1,
+        error: "No API key found for anthropic. Use /login to log into a provider",
+      },
+    ];
+    const final = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["tgd-review"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () =>
+      makeSubscribableSession(details, final),
+    );
+
+    expect(result.rulesFailed).toEqual(["tgd-review"]);
+    // PUBLIC comment reason: classified + names the provider, no raw error text.
+    expect(result.ruleFailureReasons?.["tgd-review"]).toMatch(/no working credentials/i);
+    expect(result.ruleFailureReasons?.["tgd-review"]).toContain("anthropic");
+    // stderr: the RAW error, for whoever is reading CI logs.
+    const messages = warn.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(messages).toMatch(/tgd-review/);
+    expect(messages).toMatch(/No API key found for anthropic/);
+    warn.mockRestore();
+  });
+
+  it("does NOT leak the raw provider error into the public comment reason (generic branch)", async () => {
+    const rules = [makeRule({ name: "rule-a", provider: "anthropic", model: "claude-opus-4-5" })];
+    // Deliberately a NON-auth error, so this exercises the generic
+    // "errored (see the CI logs...)" branch — the one someone would be tempted to
+    // "improve" by appending the raw message. Routing through the auth branch
+    // would make this test near-tautological (that branch interpolates nothing).
+    const secretish = "boom: upstream rejected token sk-abc123SECRET while streaming";
+    const details = [{ model: "anthropic/claude-opus-4-5:high", exitCode: 1, error: secretish }];
+    const final = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () =>
+      makeSubscribableSession(details, final),
+    );
+
+    const publicReason = result.ruleFailureReasons?.["rule-a"] ?? "";
+    // The comment is world-readable — raw provider text must never reach it.
+    expect(publicReason).not.toContain("sk-abc123SECRET");
+    expect(publicReason).not.toContain(secretish);
+    expect(publicReason.length).toBeGreaterThan(0); // but it still says SOMETHING
+    warn.mockRestore();
+  });
+
+  it("classifies a timeout distinctly from a generic failure", async () => {
+    const rules = [
+      makeRule({ name: "slow-rule", provider: "xai", model: "grok-4.5" }),
+      makeRule({ name: "odd-rule", provider: "xai", model: "grok-4.5" }),
+    ];
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 1, timedOut: true },
+      { model: "xai/grok-4.5:high", exitCode: 7 },
+    ];
+    const final = JSON.stringify({
+      findings: [],
+      rulesRun: [],
+      rulesFailed: ["slow-rule", "odd-rule"],
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () =>
+      makeSubscribableSession(details, final),
+    );
+
+    expect(result.ruleFailureReasons?.["slow-rule"]).toMatch(/timed out/i);
+    expect(result.ruleFailureReasons?.["odd-rule"]).toMatch(/exit(ed)? .*7/i);
+    warn.mockRestore();
+  });
+
+  it("reports no reasons for rules that SUCCEEDED (no spurious noise)", async () => {
+    const rules = [makeRule({ name: "ok-rule", provider: "xai", model: "grok-4.5" })];
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" }];
+    const final = JSON.stringify({ findings: [], rulesRun: ["ok-rule"], rulesFailed: [] });
+
+    const result = await dispatchRules(rules, "diff", false, async () =>
+      makeSubscribableSession(details, final),
+    );
+
+    expect(result.rulesFailed).toEqual([]);
+    expect(result.ruleFailureReasons ?? {}).toEqual({});
+  });
+});
+
+// Review findings on the first draft of this fix.
+describe("failed-rule reasons: review fixes", () => {
+  // BOTH reviewers caught this. A bare /401|403/ matches those digits ANYWHERE —
+  // "retry after 4030ms", "40312 tokens", "req_011CS401xyz" — and the result is
+  // PUBLISHED in the PR comment. Telling a maintainer "no working credentials"
+  // when the truth was a rate limit sends them to rotate a healthy key. Being
+  // confidently wrong is worse than the silence this change exists to fix.
+  it("does NOT misclassify rate-limit / timeout / token-count errors as auth failures", async () => {
+    const nonAuthErrors = [
+      "429 rate_limit_error: retry after 4030ms",
+      "context length 40312 tokens exceeds limit",
+      "500 Internal Server Error (request_id: req_011CS401xyz)",
+      "Error: connection reset after 4013 ms",
+    ];
+    for (const error of nonAuthErrors) {
+      const rules = [makeRule({ name: "r", provider: "anthropic", model: "claude-opus-4-5" })];
+      const details = [{ model: "anthropic/claude-opus-4-5:high", exitCode: 1, error }];
+      const final = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["r"] });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const result = await dispatchRules(rules, "diff", false, async () =>
+        makeSubscribableSession(details, final),
+      );
+
+      expect(result.ruleFailureReasons?.["r"], `misclassified: ${error}`).not.toMatch(
+        /no working credentials/i,
+      );
+      warn.mockRestore();
+    }
+  });
+
+  it("still classifies genuine auth failures (incl. an anchored 401)", async () => {
+    for (const error of [
+      "No API key found for anthropic",
+      "401 Unauthorized",
+      "HTTP 403 forbidden",
+    ]) {
+      const rules = [makeRule({ name: "r", provider: "anthropic", model: "claude-opus-4-5" })];
+      const details = [{ model: "anthropic/claude-opus-4-5:high", exitCode: 1, error }];
+      const final = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["r"] });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const result = await dispatchRules(rules, "diff", false, async () =>
+        makeSubscribableSession(details, final),
+      );
+
+      expect(result.ruleFailureReasons?.["r"], `missed: ${error}`).toMatch(/no working credentials/i);
+      warn.mockRestore();
+    }
+  });
+
+  // Review finding: without this, every ORCHESTRATOR-level failure still rendered
+  // the bare "- rule-name" list — the symptom survived in the fallback paths.
+  it("stamps a reason even when the ORCHESTRATOR itself fails (fallbackResult path)", async () => {
+    const rules = [makeRule({ name: "rule-a" })];
+    const throwing: DispatchSession = {
+      prompt: vi.fn().mockRejectedValue(new Error("session exploded")),
+      getLastAssistantText: () => undefined,
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () => throwing);
+
+    expect(result.rulesFailed).toEqual(["rule-a"]);
+    expect(result.ruleFailureReasons?.["rule-a"]).toMatch(/orchestrator did not complete/i);
+    warn.mockRestore();
+  });
+
+  // A rule literally named "__proto__" must not render "[object Object]".
+  it("survives a rule named __proto__ (null-prototype reason map)", async () => {
+    const rules = [makeRule({ name: "__proto__", provider: "xai", model: "grok-4.5" })];
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 1, error: "boom" }];
+    const final = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["__proto__"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () =>
+      makeSubscribableSession(details, final),
+    );
+
+    const reason = result.ruleFailureReasons?.["__proto__"];
+    expect(typeof reason).toBe("string");
+    expect(reason).not.toMatch(/\[object Object\]/);
+    warn.mockRestore();
+  });
+
+  // rule.provider is rule-file-sourced and lands inside a code span in a
+  // world-readable comment; a crafted value must not break out and inject markdown.
+  it("sanitizes rule.provider so it cannot break out of the comment code span", async () => {
+    const evil = "x`\n\n### ✅ All rules passed\n\n`y";
+    const rules = [makeRule({ name: "r", provider: evil, model: "m" })];
+    const details = [{ exitCode: 1, error: "No API key found" }]; // no model => order trusted
+    const final = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["r"] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () =>
+      makeSubscribableSession(details, final),
+    );
+
+    const reason = result.ruleFailureReasons?.["r"] ?? "";
+    // The security property is BREAKOUT, not the payload's mere presence: with
+    // backticks and newlines stripped, the value stays inert INSIDE the code span
+    // (rendered as literal code), so it cannot open a heading or close the span.
+    const provider = /`([^`]*)`/.exec(reason)?.[1] ?? "";
+    expect(reason.match(/`/g)).toHaveLength(2); // exactly the span's own two backticks
+    expect(provider).not.toMatch(/[`\r\n|]/);
+    expect(provider.length).toBeLessThanOrEqual(60); // capped
     warn.mockRestore();
   });
 });

@@ -111,8 +111,21 @@ function renderFindingsSection(findings: Finding[]): string {
   return sections.join("\n\n");
 }
 
-function renderFailedRulesSection(rulesFailed: string[]): string {
-  const items = rulesFailed.map((ruleName) => `- ${ruleName}`).join("\n");
+// Smoke-test finding: this section used to name the failed rules and say
+// nothing about WHY, leaving a maintainer with no next step. Append the reason
+// when dispatch could classify one (see DispatchResult.ruleFailureReasons);
+// stay exactly as before when it couldn't, so a missing reason never renders as
+// "undefined".
+function renderFailedRulesSection(
+  rulesFailed: string[],
+  reasons: Record<string, string> | undefined,
+): string {
+  const items = rulesFailed
+    .map((ruleName) => {
+      const reason = reasons?.[ruleName];
+      return reason ? `- ${ruleName} — ${reason}` : `- ${ruleName}`;
+    })
+    .join("\n");
   return `### ⚠️ Rules that failed\n\nThe following rules failed to run and were skipped:\n\n${items}`;
 }
 
@@ -131,7 +144,9 @@ export function orchestrate(dispatchResult: DispatchResult): OrchestrationResult
   }
 
   if (hasFailedRules) {
-    bodyParts.push(renderFailedRulesSection(dispatchResult.rulesFailed));
+    bodyParts.push(
+      renderFailedRulesSection(dispatchResult.rulesFailed, dispatchResult.ruleFailureReasons),
+    );
   }
 
   return {
