@@ -32,6 +32,9 @@ const hoisted = vi.hoisted(() => {
 
   const createAgentSessionMock = vi.fn();
   const sessionManagerInMemory = vi.fn(() => "fake-session-manager");
+  // createRealDispatchSession now uses SessionManager.create(cwd) (persisted,
+  // for fork-safety) instead of .inMemory(); the mock must expose it.
+  const sessionManagerCreate = vi.fn(() => "fake-persisted-session-manager");
 
   return {
     resourceLoaderInstances,
@@ -39,13 +42,14 @@ const hoisted = vi.hoisted(() => {
     FakeResourceLoader,
     createAgentSessionMock,
     sessionManagerInMemory,
+    sessionManagerCreate,
   };
 });
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   DefaultResourceLoader: hoisted.FakeResourceLoader,
   createAgentSession: hoisted.createAgentSessionMock,
-  SessionManager: { inMemory: hoisted.sessionManagerInMemory },
+  SessionManager: { inMemory: hoisted.sessionManagerInMemory, create: hoisted.sessionManagerCreate },
   getAgentDir: () => "/fake/agent/dir",
 }));
 
@@ -392,14 +396,13 @@ describe("dispatchRules advisor integration (Task 6)", () => {
   // independent), so the prompt now explicitly instructs `context: "fresh"`.
   // Per pi-subagents' schema, an explicit top-level `context` overrides every
   // child in the invocation, so this deterministically forces fresh.
-  it("bug fix (real run, hmchangw/chat#490): the dispatch prompt instructs context: fresh and forbids fork (fork needs a persisted session, which we don't use)", () => {
+  it("bug fix (real run, hmchangw/chat#490): the dispatch prompt instructs context: fresh (fork-safety itself is now guaranteed by the persisted session, tested separately)", () => {
     const rules = [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })];
 
     const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", false);
 
     expect(prompt).toContain('"fresh"');
     expect(prompt).toMatch(/context/i);
-    expect(prompt).toMatch(/fork/i);
   });
 
   // Bug fix (found via a real multi-model run against hmchangw/chat#490): with
@@ -684,5 +687,195 @@ describe("dispatchRules intercom-bridge disable (hermetic agent dir)", () => {
     // Restore the test's own env change.
     if (hadBefore) process.env.PI_CODING_AGENT_DIR = realBefore;
     else delete process.env.PI_CODING_AGENT_DIR;
+  });
+});
+
+// Deterministic reconciliation of the orchestrator's self-reported result
+// against the subagent tool's structured details.results — the "fix all"
+// hardening (found via hmchangw/chat#490). See dispatchRules /
+// reconcileWithCapturedResults. A session that supports subscribe() emits one
+// subagent tool_execution_end event carrying details.results; dispatchRules
+// uses those to correct rulesRun/rulesFailed and recover dropped findings.
+describe("dispatchRules deterministic reconciliation (details.results)", () => {
+  const twoRules = () => [
+    makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" }),
+    makeRule({ name: "terra-review", provider: "openai-codex", model: "gpt-5.6-terra" }),
+  ];
+
+  // A stub session that, on prompt(), synchronously emits one subagent
+  // tool_execution_end event with the given details.results to its subscriber,
+  // then resolves; getLastAssistantText returns the orchestrator's final JSON.
+  function makeSubscribableSession(detailsResults: unknown[], finalMessage: string): DispatchSession {
+    let listener: ((event: unknown) => void) | undefined;
+    return {
+      subscribe(l: (event: unknown) => void) {
+        listener = l;
+        return () => {
+          listener = undefined;
+        };
+      },
+      async prompt() {
+        listener?.({
+          type: "tool_execution_end",
+          toolName: "subagent",
+          result: { details: { results: detailsResults } },
+        });
+      },
+      getLastAssistantText() {
+        return finalMessage;
+      },
+    };
+  }
+
+  it("corrects a task the orchestrator wrongly marked failed but which actually ran (exit 0)", async () => {
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
+      { model: "openai-codex/gpt-5.6-terra:high", exitCode: 0, finalOutput: "[]" },
+    ];
+    const buggyFinal = JSON.stringify({ findings: [], rulesRun: ["grok-review"], rulesFailed: ["terra-review"] });
+    const session = makeSubscribableSession(details, buggyFinal);
+
+    const result = await dispatchRules(twoRules(), "diff", false, async () => session);
+
+    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.rulesFailed).toEqual([]);
+  });
+
+  it("recovers a whole rule's findings from finalOutput when the orchestrator dropped them", async () => {
+    const terraFinding = { file: "a.go", line: 1, severity: "warning", category: "correctness", message: "bug" };
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
+      { model: "openai-codex/gpt-5.6-terra:high", exitCode: 0, finalOutput: JSON.stringify([terraFinding]) },
+    ];
+    const buggyFinal = JSON.stringify({ findings: [], rulesRun: ["grok-review"], rulesFailed: ["terra-review"] });
+    const session = makeSubscribableSession(details, buggyFinal);
+
+    const result = await dispatchRules(twoRules(), "diff", false, async () => session);
+
+    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review" });
+  });
+
+  it("with advisor ON, does NOT recover a dropped rule's raw findings (recovering would undo the advisor's false-positive filtering) — but still corrects accounting", async () => {
+    const terraFinding = { file: "a.go", line: 1, severity: "warning", category: "correctness", message: "maybe-false-positive" };
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
+      { model: "openai-codex/gpt-5.6-terra:high", exitCode: 0, finalOutput: JSON.stringify([terraFinding]) },
+    ];
+    // Orchestrator ran the advisor pass and it removed ALL of terra's findings
+    // (legitimately, as false positives) → zero findings for terra, but terra
+    // DID run. With advisor on we must NOT re-add terra's raw finalOutput.
+    const finalWithAdvisor = JSON.stringify({ findings: [], rulesRun: ["grok-review", "terra-review"], rulesFailed: [] });
+    const session = makeSubscribableSession(details, finalWithAdvisor);
+
+    // useAdvisor = true (4th arg)
+    const result = await dispatchRules(twoRules(), "diff", true, async () => session);
+
+    // Accounting still deterministically correct: both ran.
+    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.rulesFailed).toEqual([]);
+    // But the advisor-removed finding is NOT resurrected.
+    expect(result.findings).toEqual([]);
+  });
+
+  it("keeps the orchestrator's (advisor-filtered) findings and does NOT re-add raw ones when the rule was not dropped", async () => {
+    const rules = [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })];
+    const rawFinding = { file: "a.go", line: 1, severity: "warning", category: "x", message: "raw" };
+    const advisorKept = {
+      file: "a.go",
+      line: 1,
+      severity: "warning",
+      category: "x",
+      message: "advisor-kept",
+      ruleName: "grok-review",
+    };
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: JSON.stringify([rawFinding]) }];
+    const final = JSON.stringify({ findings: [advisorKept], rulesRun: ["grok-review"], rulesFailed: [] });
+    const session = makeSubscribableSession(details, final);
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
+    expect(result.findings).toEqual([advisorKept]);
+  });
+
+  it("marks a genuinely failed task (exit != 0) as rulesFailed and drops any findings the orchestrator attributed to it", async () => {
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
+      { model: "openai-codex/gpt-5.6-terra:high", exitCode: 1, error: "No API key found for openai-codex" },
+    ];
+    const final = JSON.stringify({
+      findings: [{ file: "x", line: null, severity: "warning", category: "c", message: "m", ruleName: "terra-review" }],
+      rulesRun: ["grok-review", "terra-review"],
+      rulesFailed: [],
+    });
+    const session = makeSubscribableSession(details, final);
+
+    const result = await dispatchRules(twoRules(), "diff", false, async () => session);
+
+    expect(result.rulesRun).toEqual(["grok-review"]);
+    expect(result.rulesFailed).toEqual(["terra-review"]);
+    expect(result.findings).toEqual([]);
+  });
+
+  it("falls back to the orchestrator's result when captured count != rules count (no safe order mapping)", async () => {
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" }];
+    const orch = JSON.stringify({ findings: [], rulesRun: ["grok-review"], rulesFailed: ["terra-review"] });
+    const session = makeSubscribableSession(details, orch);
+
+    const result = await dispatchRules(twoRules(), "diff", false, async () => session);
+
+    expect(result.rulesRun).toEqual(["grok-review"]);
+    expect(result.rulesFailed).toEqual(["terra-review"]);
+  });
+
+  it("falls back when a captured model doesn't match its positional rule (order not verifiable)", async () => {
+    // Results delivered in the WRONG order (terra first) — each model no longer
+    // prefix-matches its positional rule, so reconciliation must not trust it.
+    const details = [
+      { model: "openai-codex/gpt-5.6-terra:high", exitCode: 0, finalOutput: "[]" },
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
+    ];
+    const orch = JSON.stringify({ findings: [], rulesRun: ["grok-review"], rulesFailed: ["terra-review"] });
+    const session = makeSubscribableSession(details, orch);
+
+    const result = await dispatchRules(twoRules(), "diff", false, async () => session);
+
+    expect(result.rulesRun).toEqual(["grok-review"]);
+    expect(result.rulesFailed).toEqual(["terra-review"]);
+  });
+
+  it("a session without subscribe() skips reconciliation entirely (uses the orchestrator's result as-is)", async () => {
+    const stub = createPiSessionStub(
+      JSON.stringify({ findings: [], rulesRun: ["grok-review"], rulesFailed: ["terra-review"] }),
+    );
+    const result = await dispatchRules(twoRules(), "diff", false, async () => stub.session);
+
+    expect(result.rulesRun).toEqual(["grok-review"]);
+    expect(result.rulesFailed).toEqual(["terra-review"]);
+  });
+});
+
+// Fork-safety fix (hmchangw/chat#490): the orchestrating session is now
+// PERSISTED so a `context: "fork"` subagent call can never crash regardless of
+// the LLM's choice. See createRealDispatchSession's SessionManager.create.
+describe("dispatchRules persisted session (fork-safety)", () => {
+  it("createRealDispatchSession uses SessionManager.create (persisted), never .inMemory()", async () => {
+    hoisted.createAgentSessionMock.mockClear();
+    hoisted.sessionManagerCreate.mockClear();
+    hoisted.sessionManagerInMemory.mockClear();
+    hoisted.createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        getLastAssistantText: () =>
+          JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+      },
+    });
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false);
+
+    expect(hoisted.sessionManagerCreate).toHaveBeenCalledTimes(1);
+    expect(hoisted.sessionManagerInMemory).not.toHaveBeenCalled();
+    const opts = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as { sessionManager: unknown };
+    expect(opts.sessionManager).toBe("fake-persisted-session-manager");
   });
 });

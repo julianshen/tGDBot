@@ -57,6 +57,54 @@ const ADVISOR_INSTRUCTION =
 export interface DispatchSession {
   prompt(text: string): Promise<void>;
   getLastAssistantText(): string | undefined;
+  // Optional. The real pi AgentSession exposes subscribe(); dispatchRules uses
+  // it (when present) to capture the `subagent` tool's structured
+  // `result.details.results` — one entry per dispatched task, in dispatch
+  // order, each carrying the task's model/exitCode/finalOutput. That structured
+  // data lets dispatchRules deterministically FIX the rulesRun/rulesFailed
+  // accounting and RECOVER any whole rule's findings the orchestrating LLM
+  // dropped, instead of trusting the LLM's self-reported final JSON (which was
+  // observed to occasionally mark a task that ran — exit 0 — as "failed" and
+  // drop its findings). Stub sessions that omit subscribe simply skip
+  // reconciliation and fall back to the orchestrator's JSON (existing behavior).
+  //
+  // The listener's event is typed `any` because the real pi AgentSession's
+  // event is a large SDK-internal union; forcing our narrower
+  // DispatchSessionEvent here creates a listener-parameter variance conflict
+  // that prevents the real session from satisfying this interface. We narrow to
+  // the fields we actually read (DispatchSessionEvent) inside the listener.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  subscribe?(listener: (event: any) => void): () => void;
+}
+
+// The narrow slice of pi AgentSession events dispatchRules inspects: a
+// tool_execution_end for the "subagent" tool, whose result.details.results
+// carries the per-task structured outcomes (see pi-subagents'
+// SingleResult in node_modules/pi-subagents/src/shared/types.ts — fields
+// beyond these exist but are not needed here).
+export interface DispatchSessionEvent {
+  type: string;
+  toolName?: string;
+  result?: {
+    details?: {
+      results?: CapturedTaskResult[];
+    };
+  };
+}
+
+// One dispatched task's structured outcome, read from the subagent tool's
+// details.results[i] (order = dispatch order = rule order). `model` is
+// "<provider>/<model>[:thinkingLevel]" (e.g. "xai/grok-4.5:high"), used to
+// cross-check the positional rule mapping. `finalOutput` is the task's raw
+// findings-JSON text (the FINDING_JSON_CONTRACT array), used to recover a
+// rule's findings if the orchestrator dropped them.
+export interface CapturedTaskResult {
+  model?: string;
+  exitCode?: number | null;
+  error?: string;
+  timedOut?: boolean;
+  detached?: boolean;
+  finalOutput?: string;
 }
 
 // TASKS.md Task 6: the factory now takes `useAdvisor` so the real
@@ -97,7 +145,20 @@ async function createRealDispatchSession(useAdvisor: boolean, cwd: string): Prom
     resourceLoader: loader,
     cwd,
     tools: ["read", "subagent"],
-    sessionManager: SessionManager.inMemory(),
+    // Fork-safety fix (found via a real multi-model run against
+    // hmchangw/chat#490): the orchestrating LLM sometimes chooses
+    // `context: "fork"` for its subagent call, which requires a PERSISTED
+    // parent session. Previously this session was in-memory, so fork hard-failed
+    // ("Forked subagent context requires a persisted parent session") and took
+    // down every task at once — we relied on a prompt instruction (still present
+    // as the preferred path) to steer the LLM to "fresh". A PERSISTED session
+    // makes fork a no-op-safe choice regardless of what the LLM picks, turning
+    // that from a prompt-guarded risk into a hard guarantee. Session files land
+    // under `getAgentDir()/sessions/` — which, because dispatchRules points
+    // PI_CODING_AGENT_DIR at the hermetic throwaway agent dir (intercom fix),
+    // means they live inside that temp dir and are removed with it in the
+    // `finally` block. Nothing persists into the user's real ~/.pi/agent.
+    sessionManager: SessionManager.create(cwd),
   });
 
   return session;
@@ -302,17 +363,15 @@ export function buildDispatchPrompt(
   const parts = [
     `You are orchestrating a code review. Call the "subagent" tool exactly ONCE, in its PARALLEL form (a top-level "tasks" array), with one task entry per rule below.`,
     `Each task entry's "agent" field must be the literal string "reviewer", its "task" field must be that rule's task text below (verbatim, including the diff), and its "model" field must be that rule's exact "<provider>/<model>" string below.`,
-    // Bug fix (found via a real multi-model run against hmchangw/chat#490): the
-    // orchestrating LLM otherwise sometimes picks `context: "fork"`, which
-    // requires a persisted parent session — but this review session is
-    // deliberately in-memory/ephemeral (SessionManager.inMemory), so fork
-    // hard-fails with "Forked subagent context requires a persisted parent
-    // session" and takes down every dispatched task at once. Fresh context is
-    // also what we actually want: each rule's review is independent and needs
-    // no visibility into the parent conversation. Per pi-subagents' schema, an
-    // explicit top-level `context` overrides every child in the invocation, so
-    // stating it here deterministically forces fresh for all tasks.
-    `Set the subagent tool call's top-level "context" field to the literal string "fresh". Do NOT use "fork" — this review session is not persisted, so a forked context would fail every task at once.`,
+    // The orchestrating session is now PERSISTED (createRealDispatchSession),
+    // so `context: "fork"` no longer crashes — but "fresh" is still what we
+    // actually want: each rule's review is independent and needs no visibility
+    // into the parent conversation, and fresh is cheaper (no parent context
+    // carried into each child). This instruction keeps "fresh" as the preferred
+    // path; the persisted session is the hard-guarantee backstop if the LLM
+    // ignores it. Per pi-subagents' schema, an explicit top-level `context`
+    // overrides every child in the invocation.
+    `Set the subagent tool call's top-level "context" field to the literal string "fresh" — each rule's review is independent and needs no shared context.`,
     taskSpecs,
     // Attribution fix (found via a real multi-model run against
     // hmchangw/chat#490): with fork/intercom fixed, BOTH parallel tasks
@@ -427,6 +486,122 @@ function parseDispatchResult(text: string | undefined, rules: RuleDefinition[]):
   return parsed;
 }
 
+// Like isValidFinding but WITHOUT requiring ruleName — a dispatched task's raw
+// finalOutput follows FINDING_JSON_CONTRACT (`[{file,line,severity,category,
+// message}]`), which has no ruleName (the orchestrator adds it during merge;
+// when we recover a dropped task's findings we stamp it ourselves).
+function isValidRawFinding(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const c = value as Record<string, unknown>;
+  if (typeof c.file !== "string") return false;
+  if (!VALID_SEVERITIES.has(c.severity as string)) return false;
+  if (typeof c.category !== "string") return false;
+  if (typeof c.message !== "string") return false;
+  if (c.line !== undefined && c.line !== null && typeof c.line !== "number") return false;
+  return true;
+}
+
+// Parses one task's raw finalOutput into Finding[] stamped with ruleName.
+// Best-effort — returns [] on any parse/shape problem, never throws.
+function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stripCodeFences(text));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed) || !parsed.every(isValidRawFinding)) return [];
+  return parsed.map((f) => {
+    const c = f as Record<string, unknown>;
+    return {
+      file: c.file as string,
+      // The contract allows `number | null`; Finding.line is `number?`, so a
+      // null (or absent) line becomes undefined rather than being kept as null.
+      line: typeof c.line === "number" ? c.line : undefined,
+      severity: c.severity as Finding["severity"],
+      category: c.category as string,
+      message: c.message as string,
+      ruleName,
+    };
+  });
+}
+
+// A task ran successfully iff it exited 0 with no error/timeout/detach.
+function taskSucceeded(c: CapturedTaskResult): boolean {
+  return c.exitCode === 0 && !c.error && !c.timedOut && !c.detached;
+}
+
+// Deterministic reconciliation of the orchestrating LLM's self-reported
+// DispatchResult against the structured per-task results captured from the
+// subagent tool (details.results). See DispatchSession.subscribe's doc comment
+// for why: the LLM was observed to occasionally mark a task that RAN (exit 0)
+// as "failed" and drop its whole findings set.
+//
+// - rulesRun/rulesFailed come purely from each task's exitCode (order-mapped to
+//   rules), so a task that ran can never be mis-reported as failed.
+// - Findings are always kept from the orchestrator for rules that ran (and
+//   dropped for rules that did NOT run — a failed task's output isn't
+//   trustworthy; this also drops hallucinated rule names).
+// - When `recoverFindings` is true, a rule that ran but has ZERO orchestrator
+//   findings ALSO has its findings recovered from its raw finalOutput (the
+//   orchestrator dropped the whole rule). `recoverFindings` is `!useAdvisor`:
+//   with the advisor pass OFF, "zero findings for a rule that ran" can only
+//   mean a buggy drop, so recovery is safe. With the advisor ON, zero findings
+//   is AMBIGUOUS — it could be a buggy drop OR the advisor legitimately
+//   removing all of that rule's findings as false positives — and recovering
+//   from raw finalOutput would UNDO the advisor and reintroduce false
+//   positives. So with advisor on we do NOT recover: accounting is still fixed
+//   deterministically (the rule correctly shows as run), but its findings are
+//   left as the advisor-filtered orchestrator produced them.
+//
+// Falls back to the orchestrator's own result (NO reconciliation) whenever the
+// captured results can't be safely 1:1 order-mapped to rules — counts differ,
+// or a captured model doesn't match its positional rule's "<provider>/<model>"
+// prefix (the real details.model carries a ":thinkingLevel" suffix, so a prefix
+// match is used). This guarantees reconciliation never makes results WORSE on
+// an unexpected shape; it only ever corrects a mapping we can fully verify.
+//
+// KNOWN LIMITATION (documented, unobserved): this repairs whole-rule drops (the
+// observed failure) and fixes accounting; it does not detect a PARTIAL drop
+// within a rule the orchestrator kept, nor a mis-attribution where the
+// orchestrator tagged one rule's findings with another rule's name. And with
+// advisor on, a genuine whole-rule drop leaves that rule's findings lost (only
+// its accounting is corrected) — accepted to never undo advisor filtering.
+function reconcileWithCapturedResults(
+  orchestrator: DispatchResult,
+  captured: CapturedTaskResult[],
+  rules: RuleDefinition[],
+  recoverFindings: boolean,
+): DispatchResult {
+  if (captured.length !== rules.length) return orchestrator;
+  const orderTrustworthy = captured.every((c, i) => {
+    if (!c.model) return true; // nothing to cross-check — rely on dispatch order
+    return c.model.startsWith(`${rules[i].provider}/${rules[i].model}`);
+  });
+  if (!orderTrustworthy) return orchestrator;
+
+  const rulesRun: string[] = [];
+  const rulesFailed: string[] = [];
+  const recovered: Finding[] = [];
+  captured.forEach((c, i) => {
+    const rule = rules[i];
+    if (!taskSucceeded(c)) {
+      rulesFailed.push(rule.name);
+      return;
+    }
+    rulesRun.push(rule.name);
+    if (!recoverFindings) return;
+    const orchestratorHasFindings = orchestrator.findings.some((f) => f.ruleName === rule.name);
+    if (!orchestratorHasFindings && c.finalOutput) {
+      recovered.push(...parseFindingsFromFinalOutput(c.finalOutput, rule.name));
+    }
+  });
+
+  const runSet = new Set(rulesRun);
+  const kept = orchestrator.findings.filter((f) => runSet.has(f.ruleName));
+  return { findings: [...kept, ...recovered], rulesRun, rulesFailed };
+}
+
 // TASKS.md Task 6: `useAdvisor` controls whether the rpiv-advisor extension
 // is loaded (AC-6.1/AC-6.2) and whether the dispatch prompt instructs the
 // session to call its `advisor` tool for a second opinion before finalizing
@@ -479,6 +654,25 @@ export async function dispatchRules(
     const session = await createSession(useAdvisor, sessionCwd);
     const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
 
+    // Capture the subagent tool's structured per-task results (details.results)
+    // so we can deterministically reconcile the orchestrator's self-reported
+    // accounting/findings afterward (see reconcileWithCapturedResults). Only
+    // the LAST subagent call's results are kept (the orchestrator is instructed
+    // to call it exactly once; if it retries, the final call is authoritative).
+    // Sessions without subscribe (test stubs) skip capture → no reconciliation.
+    let capturedTaskResults: CapturedTaskResult[] = [];
+    let unsubscribe: (() => void) | undefined;
+    if (typeof session.subscribe === "function") {
+      unsubscribe = session.subscribe((event: DispatchSessionEvent) => {
+        if (event.type === "tool_execution_end" && event.toolName === "subagent") {
+          const results = event.result?.details?.results;
+          if (Array.isArray(results)) {
+            capturedTaskResults = results;
+          }
+        }
+      });
+    }
+
     // A thrown exception from the real SDK (network error, tool failure,
     // rate limit, ...) during prompt() or while reading the final message
     // must not propagate — same never-throws contract as the malformed-JSON
@@ -490,9 +684,15 @@ export async function dispatchRules(
     } catch (err) {
       console.warn(`dispatchRules: session.prompt() threw (${(err as Error).message})`);
       return fallbackResult(rules);
+    } finally {
+      unsubscribe?.();
     }
 
-    return parseDispatchResult(finalText, rules);
+    const orchestratorResult = parseDispatchResult(finalText, rules);
+    // Recover dropped findings only when advisor is OFF — see
+    // reconcileWithCapturedResults' doc comment for why recovering while the
+    // advisor pass is active would undo its false-positive filtering.
+    return reconcileWithCapturedResults(orchestratorResult, capturedTaskResults, rules, !useAdvisor);
   } catch (err) {
     // Setup/session-creation failure (createIsolatedSessionCwd,
     // createIsolatedAgentDir, or createSession threw). Degrade to
