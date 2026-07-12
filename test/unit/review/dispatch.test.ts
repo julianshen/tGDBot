@@ -419,10 +419,13 @@ describe("dispatchRules advisor integration (Task 6)", () => {
 
     const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", false);
 
-    // Explicit order→rule attribution, anchored on the tool's own output shape.
+    // Explicit order→rule attribution: assert the EXACT pairing, not just that
+    // both names appear somewhere — a reversed or off-by-one mapping (Task 1 →
+    // terra) is exactly the bug this must catch, and loose keyword matching
+    // would miss it.
+    expect(prompt).toContain('Task 1\'s block is rule "grok-review"');
+    expect(prompt).toContain('Task 2\'s block is rule "terra-review"');
     expect(prompt).toMatch(/order/i);
-    expect(prompt).toContain('"grok-review"');
-    expect(prompt).toContain('"terra-review"');
     // The "N/N succeeded" anchor the orchestrator keys attribution on.
     expect(prompt).toMatch(/succeeded/i);
     // The sharp rulesRun/rulesFailed distinction: empty findings is still a run.
