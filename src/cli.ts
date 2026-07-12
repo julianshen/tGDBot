@@ -21,6 +21,13 @@ import type { PullRequestInfo } from "./vcs/adapter.js";
 export interface CliArgs {
   pr: string;
   vcs: "github" | "gitlab";
+  /**
+   * Issue #1 (round 2): "<provider>/<model>" for the ORCHESTRATING session.
+   * Optional. Resolution order is --model -> pi's settings default -> each
+   * rule's own model -> pi's auth-aware default, and EVERY candidate must have
+   * configured credentials on this machine (see resolveOrchestratorModel).
+   */
+  model?: string;
   rulesDir: string;
   disableBuiltinRule: boolean;
   advisor: "on" | "off";
@@ -78,6 +85,7 @@ export function parseArgs(argv: string[]): CliArgs {
       "rules-dir": { type: "string" },
       "disable-builtin-rule": { type: "boolean" },
       advisor: { type: "string" },
+      model: { type: "string" },
       "dry-run": { type: "boolean" },
       "trust-local-rules": { type: "boolean" },
     },
@@ -112,9 +120,25 @@ export function parseArgs(argv: string[]): CliArgs {
     throw new Error(`Invalid --advisor value: "${advisor}" (expected "on" or "off")`);
   }
 
+  // Issue #1 (round 2), review fix: validate --model HERE, like --vcs/--advisor.
+  // `??` is nullish-only, so an EMPTY string would otherwise sail past the
+  // rule-derived default and land back on pi's ambient default — silently
+  // restoring the exact coupling this flag exists to remove (realistic trigger:
+  // a workflow passing `--model "${{ inputs.model }}"` with the input unset).
+  const model = values.model as string | undefined;
+  if (model !== undefined) {
+    const slash = model.indexOf("/");
+    if (slash <= 0 || slash === model.length - 1) {
+      throw new Error(
+        `Invalid --model value: "${model}" (expected "<provider>/<model>", e.g. "openai-codex/gpt-5.6-terra")`,
+      );
+    }
+  }
+
   return {
     pr: values.pr as string,
     vcs,
+    model,
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
@@ -137,6 +161,7 @@ export interface ReviewDependencies {
     rules: RuleDefinition[],
     diff: string,
     useAdvisor: boolean,
+    orchestratorModel?: string,
   ) => Promise<DispatchResult>;
   orchestrate: (dispatchResult: DispatchResult) => OrchestrationResult;
 }
@@ -293,7 +318,17 @@ export async function review(
 ): Promise<number> {
   const resolveConfigFn = deps.resolveConfig ?? resolveConfigReal;
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
-  const dispatchRulesFn = deps.dispatchRules ?? dispatchRulesReal;
+  // The adapter exists because `dispatchRulesReal` (whose 4th positional param
+  // is its injectable session FACTORY, with `orchestratorModel` only 5th) is not
+  // assignable to ReviewDependencies["dispatchRules"], whose 4th param IS the
+  // model. tsc rejects both the direct assignment and the slot-swapped call, so
+  // this is a plain shape mismatch, not a silent landmine — but the awkwardness
+  // is real, and is why the tests below pin the exact argument positions.
+  // Passing `undefined` for the factory keeps dispatchRules' real default.
+  const dispatchRulesFn =
+    deps.dispatchRules ??
+    ((rules: RuleDefinition[], diff: string, useAdvisor: boolean, orchestratorModel?: string) =>
+      dispatchRulesReal(rules, diff, useAdvisor, undefined, orchestratorModel));
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
 
   const config = resolveConfigFn(args);
@@ -326,7 +361,7 @@ export async function review(
     return EXIT_FATAL;
   }
 
-  const dispatchResult = await dispatchRulesFn(rules, diff, config.advisor === "on");
+  const dispatchResult = await dispatchRulesFn(rules, diff, config.advisor === "on", config.model);
   const orchestration = orchestrateFn(dispatchResult);
 
   const bodyParts = [orchestration.commentBody];

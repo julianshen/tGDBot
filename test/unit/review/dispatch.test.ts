@@ -45,9 +45,31 @@ const hoisted = vi.hoisted(() => {
   // "auth.json exists but can't be linked" case, e.g. EPERM in a locked-down
   // container). Null by default, so every other test gets the real symlink.
   const failSymlinkFor: { name: string | null } = { name: null };
+  // Orchestrator-model decoupling: the real factory resolves an explicit Model
+  // via ModelRegistry.find(provider, modelId) instead of inheriting pi's
+  // ambient default. `findModelMock` lets a test say "this model resolves" (a
+  // Model object) or "it doesn't" (undefined).
+  const findModelMock = vi.fn((provider: string, modelId: string) => ({
+    id: modelId,
+    provider,
+    name: `${provider}/${modelId}`,
+  }));
+  const authStorageCreate = vi.fn(() => "fake-auth-storage");
+  // hasConfiguredAuth is THE credential gate (review: find() is a pure name
+  // lookup with no auth check). Default true; tests flip it to prove an
+  // un-credentialed model is never handed to the session.
+  const hasConfiguredAuthMock = vi.fn(() => true);
+  const modelRegistryCreate = vi.fn(() => ({
+    find: findModelMock,
+    hasConfiguredAuth: hasConfiguredAuthMock,
+  }));
 
   return {
     failSymlinkFor,
+    findModelMock,
+    hasConfiguredAuthMock,
+    authStorageCreate,
+    modelRegistryCreate,
     resourceLoaderInstances,
     reload,
     FakeResourceLoader,
@@ -63,6 +85,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession: hoisted.createAgentSessionMock,
   SessionManager: { inMemory: hoisted.sessionManagerInMemory, create: hoisted.sessionManagerCreate },
   getAgentDir: hoisted.getAgentDirMock,
+  AuthStorage: { create: hoisted.authStorageCreate },
+  ModelRegistry: { create: hoisted.modelRegistryCreate },
 }));
 
 // dispatch.ts imports `symlink` as an ESM named binding, so it can't be spied
@@ -1200,5 +1224,231 @@ describe("issue #1: describeAuthContext distinguishes the two auth failure cause
     // would waste their time and hide the real cause.
     expect(msg).not.toMatch(/no auth\.json was found/i);
     expect(msg).not.toMatch(/not pointing where you think/i);
+  });
+});
+
+// Issue #1, round 2 — the ACTUAL design flaw. The orchestrating session was
+// created WITHOUT a `model` option, so pi fell back to "from settings, else
+// first available" — the machine's ambient default. tGDBot's core function was
+// BOUND to a global it cannot verify: on the cron box that default would not
+// resolve and the whole review died, even though every rule declared a good
+// model of its own.
+//
+// Resolution order is now: --model → pi's settings default → each rule's model
+// → pi's own auth-aware default. EVERY candidate is gated on hasConfiguredAuth,
+// because ModelRegistry.find() is a pure NAME lookup with no credential check
+// and setting `options.model` SHORT-CIRCUITS the SDK's auth-aware selection —
+// so passing an un-credentialed model is strictly WORSE than passing none
+// (guaranteed `No API key found` → fallbackResult → every rule marked failed).
+describe("issue #1 (round 2): orchestrator model — explicit → settings → rules, all credential-gated", () => {
+  const AGENT_DIR_WITH_DEFAULT = (spec?: string): string => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "tgd-test-orch-"));
+    agentDirs.push(dir);
+    if (spec) {
+      const [provider, ...rest] = spec.split("/");
+      writeFileSync(
+        path.join(dir, "settings.json"),
+        JSON.stringify({ defaultProvider: provider, defaultModel: rest.join("/") }),
+        "utf-8",
+      );
+    }
+    hoisted.getAgentDirMock.mockReturnValue(dir);
+    return dir;
+  };
+  const agentDirs: string[] = [];
+
+  afterEach(() => {
+    hoisted.getAgentDirMock.mockReturnValue("/fake/agent/dir");
+    hoisted.createAgentSessionMock.mockReset();
+    hoisted.findModelMock.mockClear();
+    hoisted.findModelMock.mockImplementation((provider: string, modelId: string) => ({
+      id: modelId,
+      provider,
+      name: `${provider}/${modelId}`,
+    }));
+    hoisted.hasConfiguredAuthMock.mockClear();
+    hoisted.hasConfiguredAuthMock.mockReturnValue(true);
+    for (const d of agentDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function okSession() {
+    hoisted.createAgentSessionMock.mockImplementationOnce(async () => ({
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        getLastAssistantText: () =>
+          JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+      },
+    }));
+  }
+
+  function chosen(): { provider: string; id: string } | undefined {
+    const args = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as {
+      model?: { provider: string; id: string };
+    };
+    return args?.model;
+  }
+  const warnings = (spy: ReturnType<typeof vi.spyOn>): string =>
+    spy.mock.calls.map((c) => String(c[0])).join("\n");
+
+  // Healthy machines must keep the model they already had. Rule models are
+  // chosen for their RULE's job (someone may pin a cheap model to a style rule);
+  // silently demoting the orchestrator onto one would be an unannounced quality
+  // regression. Gating it on credentials is what stops it being a hard binding.
+  it("prefers pi's settings default when it HAS credentials (no silent downgrade for healthy users)", async () => {
+    AGENT_DIR_WITH_DEFAULT("openai-codex/gpt-5.6-terra");
+    okSession();
+    const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
+
+    await dispatchRules(rules, "diff", false);
+
+    expect(chosen()).toMatchObject({ provider: "openai-codex", id: "gpt-5.6-terra" });
+  });
+
+  // THE issue #1 SCENARIO: the settings default can't be used → fall through to
+  // the rules instead of dying.
+  it("falls through to the RULES when pi's settings default has no credentials (the cron-box bug)", async () => {
+    AGENT_DIR_WITH_DEFAULT("openai-codex/gpt-5.6-luna"); // the cron box's broken default
+    okSession();
+    hoisted.hasConfiguredAuthMock.mockImplementation((m: { provider: string }) => m.provider === "xai");
+    const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
+
+    const result = await dispatchRules(rules, "diff", false);
+
+    expect(chosen()).toMatchObject({ provider: "xai", id: "grok-4.5" });
+    expect(result.rulesRun).toEqual(["rule-a"]); // review survives
+  });
+
+  // THE CRITICAL ONE (round-1 review). Mirrors the shipped CI workflow: only
+  // ANTHROPIC_API_KEY is set, but rules[0] is pinned to openai-codex. Passing an
+  // un-credentialed model would fail EVERY rule.
+  it("skips candidates with NO credentials and picks the first that has them (no total wipeout)", async () => {
+    AGENT_DIR_WITH_DEFAULT(undefined); // no settings default
+    okSession();
+    hoisted.hasConfiguredAuthMock.mockImplementation(
+      (m: { provider: string }) => m.provider === "anthropic",
+    );
+    const rules = [
+      makeRule({ name: "rule-a", provider: "openai-codex", model: "gpt-5.6-terra" }), // no key here
+      makeRule({ name: "rule-b", provider: "anthropic", model: "claude-opus-4-5" }), // key present
+    ];
+
+    const result = await dispatchRules(rules, "diff", false);
+
+    expect(chosen()).toMatchObject({ provider: "anthropic", id: "claude-opus-4-5" });
+    expect(result.rulesRun).toEqual(["rule-a"]);
+  });
+
+  it("never hands the session an UN-CREDENTIALED model — falls back to pi's own auth-aware default", async () => {
+    AGENT_DIR_WITH_DEFAULT(undefined);
+    okSession();
+    hoisted.hasConfiguredAuthMock.mockReturnValue(false); // nothing is authed
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules([makeRule({ name: "rule-a" })], "diff", false);
+
+    expect(chosen()).toBeUndefined(); // → pi picks an *available* model itself
+    expect(warnings(warn)).toMatch(/no orchestrator model with configured credentials/i);
+    expect(result.rulesRun).toEqual(["rule-a"]); // still never hard-fails
+    warn.mockRestore();
+  });
+
+  it("an explicit --model outranks both the settings default and the rules", async () => {
+    AGENT_DIR_WITH_DEFAULT("openai-codex/gpt-5.6-terra");
+    okSession();
+    const rules = [makeRule({ provider: "xai", model: "grok-4.5" })];
+
+    await dispatchRules(rules, "diff", false, undefined, "anthropic/claude-opus-4-5");
+
+    expect(chosen()).toMatchObject({ provider: "anthropic", id: "claude-opus-4-5" });
+  });
+
+  // Review finding: previously an unusable --model fell straight back to pi's
+  // AMBIENT default — the very thing broken on the cron box — making --model
+  // STRICTLY WORSE than omitting it. It must fall through the remaining
+  // candidates instead.
+  it("an unusable --model warns and falls through to the other candidates (never straight to the ambient default)", async () => {
+    AGENT_DIR_WITH_DEFAULT(undefined);
+    okSession();
+    hoisted.hasConfiguredAuthMock.mockImplementation((m: { provider: string }) => m.provider === "xai");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
+
+    await dispatchRules(rules, "diff", false, undefined, "anthropic/claude-opus-4-5"); // no creds
+
+    // Fell through to the rule's model — NOT undefined (which would mean the
+    // ambient default), and NOT the un-credentialed explicit one.
+    expect(chosen()).toMatchObject({ provider: "xai", id: "grok-4.5" });
+    expect(warnings(warn)).toMatch(/--model "anthropic\/claude-opus-4-5" has no configured credentials/i);
+    warn.mockRestore();
+  });
+
+  // Review finding: pi-subagents resolves a rule's model fuzzily (it strips a
+  // thinking suffix), but ModelRegistry.find() is EXACT. Without stripping, a
+  // rule written `model: claude-opus-4-5:high` would run fine as a subagent yet
+  // be silently skipped as an orchestrator candidate.
+  it("strips a thinking-level suffix so `model: x:high` still resolves (find() is exact; pi-subagents is fuzzy)", async () => {
+    AGENT_DIR_WITH_DEFAULT(undefined);
+    okSession();
+
+    await dispatchRules([makeRule()], "diff", false, undefined, "anthropic/claude-opus-4-5:high");
+
+    expect(hoisted.findModelMock).toHaveBeenCalledWith("anthropic", "claude-opus-4-5");
+  });
+
+  it("splits provider/model on the FIRST slash, so model ids containing slashes survive", async () => {
+    AGENT_DIR_WITH_DEFAULT(undefined);
+    okSession();
+
+    await dispatchRules([makeRule()], "diff", false, undefined, "openrouter/vendor/model-x");
+
+    expect(hoisted.findModelMock).toHaveBeenCalledWith("openrouter", "vendor/model-x");
+  });
+
+  // Duplicate specs are legitimate (--model may equal the settings default; two
+  // rules may share a model). Without dedup we'd re-query the registry and warn
+  // about the same rejected model twice — observed live.
+  it("dedupes candidates, so a rejected model is reported once, not once per duplicate", async () => {
+    AGENT_DIR_WITH_DEFAULT("anthropic/claude-opus-4-5"); // settings default == --model below
+    okSession();
+    hoisted.hasConfiguredAuthMock.mockImplementation((m: { provider: string }) => m.provider === "xai");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await dispatchRules(
+      [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })],
+      "diff",
+      false,
+      undefined,
+      "anthropic/claude-opus-4-5",
+    );
+
+    const hits = warn.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes("has no configured credentials"));
+    expect(hits).toHaveLength(1); // exactly once, despite the duplicate
+    expect(chosen()).toMatchObject({ provider: "xai", id: "grok-4.5" }); // still falls through
+    warn.mockRestore();
+  });
+
+  // Rule/settings candidates are routine automatic selection — narrating their
+  // rejection would print on every healthy CI run (the round-1 lesson).
+  it("stays QUIET when skipping an unauthenticated RULE candidate (no CI warning noise)", async () => {
+    AGENT_DIR_WITH_DEFAULT(undefined);
+    okSession();
+    hoisted.hasConfiguredAuthMock.mockImplementation(
+      (m: { provider: string }) => m.provider === "anthropic",
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await dispatchRules(
+      [
+        makeRule({ name: "rule-a", provider: "openai-codex", model: "gpt-5.6-terra" }),
+        makeRule({ name: "rule-b", provider: "anthropic", model: "claude-opus-4-5" }),
+      ],
+      "diff",
+      false,
+    );
+
+    expect(warnings(warn)).toBe("");
+    warn.mockRestore();
   });
 });

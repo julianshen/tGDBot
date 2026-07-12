@@ -9,7 +9,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { review } from "../../src/cli.js";
+import { parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "../../src/vcs/adapter.js";
@@ -624,5 +624,50 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
     expect(warnedText).toContain("/etc/passwd");
 
     vi.restoreAllMocks();
+  });
+});
+
+// Issue #1 (round 2): the `--model` flag must reach dispatchRules as the
+// ORCHESTRATOR MODEL, not as its injectable session factory. dispatchRules'
+// 4th positional param is `createSession`; `orchestratorModel` is only the 5th,
+// so wiring dispatchRulesReal straight in would silently pass the model string
+// into the factory slot — a bug TypeScript would happily accept at the call
+// site. Pin the contract at the boundary.
+describe("issue #1 (round 2): --model reaches dispatchRules as the orchestrator model", () => {
+  it("parses --model and forwards it as the orchestratorModel argument", async () => {
+    const args = parseArgs(["review", "--pr", "42", "--model", "openai-codex/gpt-5.6-terra", "--dry-run"]);
+    expect(args.model).toBe("openai-codex/gpt-5.6-terra");
+
+    const h = makeHarness({ args });
+    await review(args, depsFrom(h));
+
+    // 4th positional arg of ReviewDependencies["dispatchRules"] = orchestratorModel.
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    expect(h.dispatchRules.mock.calls[0]?.[3]).toBe("openai-codex/gpt-5.6-terra");
+  });
+
+  // Review fix: `??` is nullish-only, so `--model ""` would otherwise slip past
+  // the rule-derived default and land back on pi's AMBIENT default — silently
+  // restoring the exact coupling this flag exists to remove. Realistic trigger:
+  // a workflow passing `--model "${{ inputs.model }}"` with the input unset.
+  // Fail fast at parse time, like --vcs/--advisor already do.
+  it("rejects a malformed or EMPTY --model instead of silently falling back to pi's ambient default", () => {
+    for (const bad of ["", "just-a-name", "/leading", "trailing/"]) {
+      expect(() => parseArgs(["review", "--pr", "42", "--model", bad])).toThrow(/Invalid --model/);
+    }
+    // A model id may itself contain slashes — that must still be accepted.
+    expect(parseArgs(["review", "--pr", "42", "--model", "openrouter/vendor/model-x"]).model).toBe(
+      "openrouter/vendor/model-x",
+    );
+  });
+
+  it("forwards undefined when --model is omitted (dispatchRules then defaults to the first rule's pinned model)", async () => {
+    const args = parseArgs(["review", "--pr", "42", "--dry-run"]);
+    expect(args.model).toBeUndefined();
+
+    const h = makeHarness({ args });
+    await review(args, depsFrom(h));
+
+    expect(h.dispatchRules.mock.calls[0]?.[3]).toBeUndefined();
   });
 });

@@ -119,6 +119,13 @@ tgd-review-agent review \
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
+  --model <provider>/<model>     # optional: the model that ORCHESTRATES the review (merges each
+                                  # rule's findings). Each rule still runs on its OWN pinned model.
+                                  # Default: the first rule whose model has working credentials on
+                                  # this machine — NOT pi's ambient defaultModel, which this tool
+                                  # has no relationship to and cannot verify. If nothing here has
+                                  # credentials, pi picks its own available model. See "Which model
+                                  # orchestrates?" below.
   --dry-run                      # print the synthesized comment body to stdout instead of posting it
   --trust-local-rules            # optional: read --rules-dir directly off the local filesystem
                                   # instead of fetching from the base branch — a developer
@@ -131,6 +138,45 @@ Exit codes: `0` success (posted, or skipped because the head SHA was already
 reviewed), `1` fatal (e.g. every rule failed to load), `2` partial (at least
 one rule ran, but something also failed — the comment is still posted and
 the failure is noted in it).
+
+### Which model orchestrates?
+
+Every rule file is pinned to its own `provider`/`model` — that is the point of
+the tool, and it is unchanged. But the **orchestrating** session (the one that
+dispatches the rules as parallel subagents and merges their findings) needs a
+model too.
+
+It used to have none, so pi silently fell back to the machine's ambient
+`defaultProvider`/`defaultModel` from `~/.pi/agent/settings.json`. That coupled
+the tool to a global it has no relationship to and cannot verify: on a box whose
+pi default could not resolve, the **entire review died** — even though every rule
+declared a perfectly good model of its own
+([#1](https://github.com/julianshen/tGDBot/issues/1)).
+
+Now the orchestrator model is resolved explicitly. Candidates are tried in this
+order, and **every one of them must have working credentials on the machine
+running the review**:
+
+1. `--model <provider>/<model>`, if you pass it.
+2. pi's own `defaultProvider`/`defaultModel` from `settings.json` — so on a
+   healthy machine the orchestrator keeps running on exactly the model it always
+   did. Requiring credentials is what turns this from a hard binding into a
+   preference.
+3. each rule's own model, in rule order.
+4. failing all that, pi's own auth-aware default.
+
+The credential check is the load-bearing part. `ModelRegistry.find()` is a pure
+name lookup with no auth check, and setting an explicit model *short-circuits*
+pi's own auth-aware selection — so handing it an un-credentialed model is
+strictly worse than handing it none: it guarantees a `No API key found` and
+fails **every** rule. A rule pinned to `openai-codex` proves the rule *author's*
+machine had that key, not that *this* one does. In CI, where typically only
+`ANTHROPIC_API_KEY` is set, such a rule is simply skipped as an orchestrator
+candidate (its own subagent still reports its own failure separately) and an
+authenticated candidate is used instead — rather than failing the whole review.
+
+A model id may carry a thinking suffix (`claude-opus-4-5:high`); it is stripped
+before lookup, so it resolves the same way it does for the rule's own subagent.
 
 Use `--dry-run` to test locally before wiring up CI — it runs the full
 pipeline (fetch PR + diff via `gh`, load rules, dispatch, orchestrate) but

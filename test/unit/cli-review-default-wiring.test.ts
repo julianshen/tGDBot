@@ -135,10 +135,17 @@ describe("review — default dependency wiring", () => {
     const [loadedDir, includeBuiltin] = vi.mocked(loadRules).mock.calls[0];
     expect(loadedDir).not.toBe(".tgd-review/rules");
     expect(includeBuiltin).toBe(true);
+    // Issue #1 (round 2): review() now wires dispatchRules through an adapter so
+    // the --model string lands in the 5th (orchestratorModel) slot, NOT the 4th
+    // (createSession factory). The 4th must stay `undefined` so dispatchRules
+    // keeps its real default factory — asserting it here is what would catch a
+    // regression that silently passes the model string as the session factory.
     expect(dispatchRules).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ name: "rule-a" })]),
       "diff --git a/x b/x",
       true,
+      undefined, // createSession → real default (NOT the model string)
+      undefined, // orchestratorModel → none given; dispatchRules derives it from the rules
     );
     expect(orchestrate).toHaveBeenCalledTimes(1);
 
@@ -149,5 +156,31 @@ describe("review — default dependency wiring", () => {
     await expect(review(makeArgs({ vcs: "gitlab" }))).rejects.toThrow(
       /GitLab support not yet implemented \(Phase 2\)/,
     );
+  });
+
+  // Slot-pinning with a REAL model: with --model absent, slots 4 and 5 are both
+  // `undefined`, so the assertion above cannot tell them apart. Setting a model
+  // makes it behavioral — a slot swap (the model string landing in the
+  // session-factory slot) fails loudly here.
+  it("passes --model into the orchestratorModel slot (5th), never the session-factory slot (4th)", async () => {
+    const { dispatchRules } = await import("../../src/review/dispatch.js");
+    vi.mocked(dispatchRules).mockClear();
+    vi.mocked(dispatchRules).mockResolvedValue({
+      findings: [],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(makeArgs({ model: "x/y" }));
+
+    expect(dispatchRules).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      true,
+      undefined, // createSession → real default
+      "x/y", // orchestratorModel
+    );
+    logSpy.mockRestore();
   });
 });

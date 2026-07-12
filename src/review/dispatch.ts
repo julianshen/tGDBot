@@ -10,16 +10,20 @@
 // can stub the session entirely and never construct a real one or touch the
 // network (see test/fixtures/pi-session-stub.ts). The default factory,
 // used in production, is the only place that touches the real SDK.
+import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, rm, copyFile, symlink, writeFile, access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
+  ModelRegistry,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import type { RuleDefinition } from "../rules/types.js";
 import { resolvePiSubagentsExtensionPath, resolveRpivAdvisorExtensionPath } from "./extensions.js";
 import type { DispatchResult, Finding } from "./types.js";
@@ -107,16 +111,180 @@ export interface CapturedTaskResult {
   finalOutput?: string;
 }
 
-// TASKS.md Task 6: the factory now takes `useAdvisor` so the real
-// implementation can decide whether to load the rpiv-advisor extension
-// alongside pi-subagents. It also now takes `cwd` — see
-// createIsolatedSessionCwd's doc comment below for why this is a fresh,
-// isolated temp directory rather than the process's own cwd. Stub factories
-// used in tests (which don't care about the extension list or cwd) may
-// ignore either parameter.
-export type DispatchSessionFactory = (useAdvisor: boolean, cwd: string) => Promise<DispatchSession>;
+// The session factory takes: `useAdvisor` (whether to also load the
+// rpiv-advisor extension alongside pi-subagents), `cwd` (the fresh isolated
+// temp dir — see createIsolatedSessionCwd), and `orchestratorModel` (issue #1
+// round 2 — which model the ORCHESTRATING session runs on). Stub factories used
+// in tests may ignore any of them.
+// Files symlinked into the hermetic agent dir (see createIsolatedAgentDir).
+const AUTH_FILE = "auth.json";
+const MODELS_FILE = "models.json";
+const SETTINGS_FILE = "settings.json";
+const HERMETIC_AGENT_LINK_FILES = [AUTH_FILE, MODELS_FILE, SETTINGS_FILE];
 
-async function createRealDispatchSession(useAdvisor: boolean, cwd: string): Promise<DispatchSession> {
+/**
+ * What model the ORCHESTRATING session should use, in priority order.
+ *
+ * `explicit` distinguishes "the user demanded this exact model via --model"
+ * (worth warning loudly when it can't be used) from "we derived candidates from
+ * the rules" (routine automatic selection — must stay quiet on the happy path,
+ * because a warning that fires on every healthy CI run is a warning nobody
+ * reads).
+ */
+export interface OrchestratorModelRequest {
+  /** From `--model`. Highest priority; failures are narrated (the user asked). */
+  explicit?: string;
+  /** Each rule's own "<provider>/<model>", in rule order. */
+  ruleCandidates: string[];
+}
+
+export type DispatchSessionFactory = (
+  useAdvisor: boolean,
+  cwd: string,
+  orchestratorModel?: OrchestratorModelRequest,
+) => Promise<DispatchSession>;
+
+// Known pi thinking-level suffixes. A rule may legitimately write
+// `model: claude-opus-4-5:high` — pi-subagents resolves that fuzzily for the
+// rule's OWN subagent (it strips the suffix), but ModelRegistry.find() is an
+// EXACT match and would miss it. Strip it here so the two agree; otherwise a
+// perfectly good rule model would be silently skipped as an orchestrator
+// candidate and we'd fall back to the ambient default — the bug we're fixing.
+const THINKING_SUFFIX_RE = /:(?:none|off|minimal|low|medium|high|max)$/i;
+
+function parseModelRef(spec: string): { provider: string; modelId: string } | undefined {
+  const trimmed = spec.trim();
+  // Split on the FIRST slash only: model ids can contain slashes
+  // (e.g. "openrouter/vendor/model-x").
+  const slash = trimmed.indexOf("/");
+  if (slash <= 0 || slash === trimmed.length - 1) return undefined;
+  const provider = trimmed.slice(0, slash).trim();
+  const modelId = trimmed.slice(slash + 1).trim().replace(THINKING_SUFFIX_RE, "");
+  if (!provider || !modelId) return undefined;
+  return { provider, modelId };
+}
+
+// pi's own configured default ("<provider>/<model>" from settings.json), or
+// undefined. Read straight off the agent dir — best-effort, never throws: a
+// missing or corrupt settings.json just means "no default candidate".
+function readSettingsDefaultSpec(agentDir: string): string | undefined {
+  try {
+    const raw = readFileSync(path.join(agentDir, SETTINGS_FILE), "utf-8");
+    const parsed = JSON.parse(raw) as { defaultProvider?: unknown; defaultModel?: unknown };
+    const { defaultProvider: p, defaultModel: m } = parsed;
+    if (typeof p === "string" && typeof m === "string" && p && m) return `${p}/${m}`;
+  } catch {
+    // absent / unreadable / malformed — simply no candidate
+  }
+  return undefined;
+}
+
+/**
+ * Issue #1 (round 2): resolve an EXPLICIT, CREDENTIALED model for the
+ * orchestrating session.
+ *
+ * Previously `createAgentSession` got no `model`, so pi fell back to "from
+ * settings, else first available" — the machine's ambient default. That BOUND
+ * the tool to a global it cannot verify: on a cron box whose pi default would
+ * not resolve, the whole review died even though every rule declared a good
+ * model of its own.
+ *
+ * Candidates, highest priority first:
+ *   1. `--model` (explicit user request)
+ *   2. pi's OWN settings default — but only if it actually has credentials.
+ *      Keeping this ahead of the rules is deliberate: on every healthy machine
+ *      it preserves exactly the model the orchestrator used before this change.
+ *      Rule models are chosen for their RULE's job (a cheap model may be pinned
+ *      to a narrow style rule); silently demoting the orchestrator onto one
+ *      would be an unannounced quality regression. Gating it on credentials is
+ *      what stops it from being a hard binding.
+ *   3. each rule's own model, in order.
+ *   4. nothing usable → return undefined, i.e. let pi apply its own auth-aware
+ *      default (`getAvailable()`), exactly the pre-existing behavior.
+ *
+ * CRITICAL (caught in review): `ModelRegistry.find()` is a pure NAME lookup with
+ * NO credential check, and setting `options.model` SHORT-CIRCUITS the SDK's own
+ * auth-aware selection (`findInitialModel` gates the settings default on
+ * `hasConfiguredAuth` and otherwise falls back to the auth-filtered
+ * `getAvailable()`). Handing it an un-credentialed model is therefore strictly
+ * WORSE than handing it none: a guaranteed `No API key found` at prompt() →
+ * fallbackResult → EVERY rule marked failed. A rule's pinned model proves the
+ * rule AUTHOR's box had that key, not that this one does (the shipped CI
+ * workflow sets only ANTHROPIC_API_KEY). So every candidate is gated on
+ * `hasConfiguredAuth`, which counts env-var keys — keeping env-var-only CI
+ * working.
+ *
+ * Never throws: model selection must not be able to kill a review.
+ */
+function resolveOrchestratorModel(
+  request: OrchestratorModelRequest | undefined,
+): CreateAgentSessionOptions["model"] | undefined {
+  if (!request) return undefined;
+
+  // Read the registry through the SAME agent dir the session will use: by now
+  // PI_CODING_AGENT_DIR already points at the hermetic dir (see dispatchRules),
+  // whose auth.json/models.json/settings.json are symlinks to the real ones — so
+  // this credential view matches the session's exactly.
+  const agentDir = getAgentDir();
+  const authStorage = AuthStorage.create(path.join(agentDir, AUTH_FILE));
+  const registry = ModelRegistry.create(authStorage, path.join(agentDir, MODELS_FILE));
+
+  const settingsDefault = readSettingsDefaultSpec(agentDir);
+  // Deduped, order-preserving: the same spec can legitimately appear more than
+  // once (e.g. --model happens to equal the settings default, or two rules share
+  // a model). Without this we'd re-query the registry for it and — since
+  // `narrate` matches by value — warn about the same rejected model twice.
+  const candidates = [
+    ...(request.explicit ? [request.explicit] : []),
+    ...(settingsDefault ? [settingsDefault] : []),
+    ...request.ruleCandidates,
+  ].filter((spec, i, all) => all.indexOf(spec) === i);
+  if (candidates.length === 0) return undefined;
+
+  for (const spec of candidates) {
+    // Only an EXPLICIT --model narrates its rejection: the user asked for that
+    // model by name and deserves to know it wasn't used. Skipping a settings or
+    // rule candidate is routine automatic selection (e.g. a rule pinned to a
+    // provider this box has no key for), and warning about it would fire on
+    // every healthy CI run — a warning nobody reads.
+    const narrate = spec === request.explicit;
+    const explain = (why: string): void => {
+      if (narrate) console.warn(`dispatchRules: --model "${spec}" ${why}; trying the next candidate`);
+    };
+
+    const ref = parseModelRef(spec);
+    if (!ref) {
+      explain('is malformed — expected "<provider>/<model>"');
+      continue;
+    }
+    const model = registry.find(ref.provider, ref.modelId);
+    if (!model) {
+      explain(`is not in the pi model registry (agent dir: ${agentDir})`);
+      continue;
+    }
+    // THE gate. Without it we hand the session a credential-less model and
+    // guarantee a total review wipeout.
+    if (!registry.hasConfiguredAuth(model)) {
+      explain("has no configured credentials on this machine");
+      continue;
+    }
+    return model as CreateAgentSessionOptions["model"];
+  }
+
+  // Nothing usable anywhere. Fall back to pi's own auth-aware default rather
+  // than failing — never hard-fail on model selection.
+  console.warn(
+    `dispatchRules: no orchestrator model with configured credentials among ` +
+      `[${candidates.join(", ")}]; falling back to pi's default model`,
+  );
+  return undefined;
+}
+
+async function createRealDispatchSession(
+  useAdvisor: boolean,
+  cwd: string,
+  orchestratorModel?: OrchestratorModelRequest,
+): Promise<DispatchSession> {
   // pi-subagents is ALWAYS loaded; rpiv-advisor is loaded only when the
   // advisor second-opinion pass is enabled (TASKS.md Task 6, AC-6.1/AC-6.2).
   const additionalExtensionPaths = [resolvePiSubagentsExtensionPath()];
@@ -141,10 +309,16 @@ async function createRealDispatchSession(useAdvisor: boolean, cwd: string): Prom
   });
   await loader.reload();
 
+  // Explicit model — NOT pi's ambient default. See resolveOrchestratorModel.
+  // When it resolves to undefined (absent/malformed/unknown spec), omitting the
+  // key leaves pi to pick its own default, i.e. the previous behavior.
+  const model = resolveOrchestratorModel(orchestratorModel);
+
   const { session, modelFallbackMessage } = await createAgentSession({
     resourceLoader: loader,
     cwd,
     tools: ["read", "subagent"],
+    ...(model ? { model } : {}),
     // Fork-safety fix (found via a real multi-model run against
     // hmchangw/chat#490): the orchestrating LLM sometimes chooses
     // `context: "fork"` for its subagent call, which requires a PERSISTED
@@ -266,8 +440,6 @@ async function createIsolatedSessionCwd(): Promise<string> {
 // removes it in its `finally` block. This never touches the user's real
 // ~/.pi/agent. Validated end-to-end: with the bridge off, a 2-model parallel
 // fan-out against hmchangw/chat#490 completes with rulesRun for both models.
-const AUTH_FILE = "auth.json";
-const HERMETIC_AGENT_LINK_FILES = [AUTH_FILE, "models.json", "settings.json"];
 const SUBAGENT_CONFIG_INTERCOM_OFF = JSON.stringify({ intercomBridge: { mode: "off" } });
 
 // Issue #1: the pi SDK's auth failures ("No API key found for <provider>",
@@ -721,6 +893,14 @@ export async function dispatchRules(
   diff: string,
   useAdvisor: boolean,
   createSession: DispatchSessionFactory = createRealDispatchSession,
+  /**
+   * Issue #1 (round 2): "<provider>/<model>" for the ORCHESTRATING session
+   * (the `--model` flag). Highest-priority candidate; see
+   * resolveOrchestratorModel for the full order (--model -> pi's settings
+   * default -> each rule's own model -> pi's auth-aware default) and for why
+   * EVERY candidate must have configured credentials on this machine.
+   */
+  orchestratorModel?: string,
 ): Promise<DispatchResult> {
   // Hermetic agent dir + PI_CODING_AGENT_DIR override (intercom-bridge fix,
   // see createIsolatedAgentDir) are set up ONLY for the real session factory.
@@ -763,7 +943,20 @@ export async function dispatchRules(
       agentDirEnvOverridden = true;
     }
 
-    const session = await createSession(useAdvisor, sessionCwd);
+    // Candidates for the orchestrating session's model, highest priority first.
+    // An explicit --model is a single, user-demanded candidate (failures are
+    // narrated). Otherwise every rule's own pinned model is a candidate, tried
+    // in order — the first one with working credentials on THIS box wins, so a
+    // rule pinned to a provider this box isn't authenticated for (e.g. the CI
+    // workflow only sets ANTHROPIC_API_KEY) is skipped rather than fatal.
+    // resolveOrchestratorModel returns undefined if none are usable, which lets
+    // pi apply its own auth-aware default — the pre-existing behavior.
+    const modelRequest: OrchestratorModelRequest = {
+      explicit: orchestratorModel,
+      ruleCandidates: rules.map((r) => `${r.provider}/${r.model}`),
+    };
+
+    const session = await createSession(useAdvisor, sessionCwd, modelRequest);
     const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
 
     // Capture the subagent tool's structured per-task results (details.results)
