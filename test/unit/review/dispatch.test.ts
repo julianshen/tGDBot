@@ -381,6 +381,26 @@ describe("dispatchRules advisor integration (Task 6)", () => {
     expect(promptWithAdvisor).toMatch(/advisor/i);
     expect(promptWithoutAdvisor).not.toContain('call the "advisor" tool');
   });
+
+  // Bug fix (found via a real multi-model run against hmchangw/chat#490): the
+  // orchestrating LLM sometimes chose `context: "fork"` for its subagent
+  // call. Fork requires a PERSISTED parent session, but dispatchRules uses
+  // SessionManager.inMemory() (deliberately ephemeral, no persistence), so
+  // fork hard-fails with "Forked subagent context requires a persisted
+  // parent session" — taking down ALL dispatched tasks at once. Fresh
+  // context is what we actually want anyway (each rule's review is
+  // independent), so the prompt now explicitly instructs `context: "fresh"`.
+  // Per pi-subagents' schema, an explicit top-level `context` overrides every
+  // child in the invocation, so this deterministically forces fresh.
+  it("bug fix (real run, hmchangw/chat#490): the dispatch prompt instructs context: fresh and forbids fork (fork needs a persisted session, which we don't use)", () => {
+    const rules = [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })];
+
+    const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", false);
+
+    expect(prompt).toContain('"fresh"');
+    expect(prompt).toMatch(/context/i);
+    expect(prompt).toMatch(/fork/i);
+  });
 });
 
 // Tests for ADR-003 "restrict dispatched subagent tools via project-scoped
@@ -509,5 +529,127 @@ describe("dispatchRules isolated session cwd (ADR-003)", () => {
 
     // The real factory path also cleans up after itself.
     expect(existsSync(callArgs.cwd)).toBe(false);
+  });
+});
+
+// Bug fix (found via a real multi-model run against hmchangw/chat#490):
+// pi-subagents' intercom bridge defaults to mode "always", which makes a
+// PARALLEL run "detach for intercom coordination" — multi-turn work our
+// single-shot orchestrator can't do, failing every task at once. The fix
+// disables the bridge via a hermetic PI_CODING_AGENT_DIR (see
+// createIsolatedAgentDir). These tests pin: (a) the setup is real-factory-only
+// (a stub factory never mutates the env or symlinks the real ~/.pi/agent), and
+// (b) on the real path the env points at a temp agent dir seeded with
+// intercomBridge.mode: "off" DURING the session, then is restored and removed.
+describe("dispatchRules intercom-bridge disable (hermetic agent dir)", () => {
+  it("does NOT mutate PI_CODING_AGENT_DIR when a stub session factory is injected", async () => {
+    // Set a distinctive value so a broken gate (which would overwrite it with
+    // a temp dir during the session) is detectable AT the moment the factory
+    // runs — checking only post-call state would miss it, since the restore
+    // logic makes the net effect zero even when the gate is broken.
+    const sentinel = "/tmp/tgd-test-sentinel-agent-dir";
+    const hadBefore = "PI_CODING_AGENT_DIR" in process.env;
+    const realBefore = process.env.PI_CODING_AGENT_DIR;
+    process.env.PI_CODING_AGENT_DIR = sentinel;
+
+    let envDuringFactory: string | undefined;
+    const stub = createPiSessionStub(
+      JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+    );
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false, async () => {
+      envDuringFactory = process.env.PI_CODING_AGENT_DIR;
+      return stub.session;
+    });
+
+    // The stub path must never touch the env — the sentinel is intact both
+    // DURING the factory call and after.
+    expect(envDuringFactory).toBe(sentinel);
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(sentinel);
+
+    // Restore the test's own env change.
+    if (hadBefore) process.env.PI_CODING_AGENT_DIR = realBefore;
+    else delete process.env.PI_CODING_AGENT_DIR;
+  });
+
+  it("bug fix (real run, hmchangw/chat#490): the real factory points PI_CODING_AGENT_DIR at a hermetic agent dir seeded with intercomBridge.mode:off during the session, then restores and removes it", async () => {
+    const before = process.env.PI_CODING_AGENT_DIR;
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockClear();
+
+    let agentDirDuringSession: string | undefined;
+    let configDuringSession: string | undefined;
+    hoisted.createAgentSessionMock.mockImplementationOnce(async () => {
+      // Captured at session-creation time, i.e. while dispatchRules is inside
+      // its try block with the override active.
+      agentDirDuringSession = process.env.PI_CODING_AGENT_DIR;
+      if (agentDirDuringSession) {
+        configDuringSession = readFileSync(
+          path.join(agentDirDuringSession, "extensions", "subagent", "config.json"),
+          "utf-8",
+        );
+      }
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          getLastAssistantText: () =>
+            JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+        },
+      };
+    });
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false);
+
+    // During the session the env pointed at a hermetic temp agent dir, NOT the
+    // real one, seeded with the intercom bridge turned off.
+    expect(agentDirDuringSession).toBeDefined();
+    expect(agentDirDuringSession).not.toBe(before);
+    expect(agentDirDuringSession?.startsWith(os.tmpdir()) || agentDirDuringSession?.includes(os.tmpdir())).toBe(true);
+    expect(configDuringSession).toBeDefined();
+    expect(JSON.parse(configDuringSession as string)).toEqual({ intercomBridge: { mode: "off" } });
+
+    // Afterward the env is restored to exactly its prior state and the temp
+    // agent dir is removed.
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(before);
+    expect(existsSync(agentDirDuringSession as string)).toBe(false);
+  });
+
+  // Companion to the above: exercises the OTHER restore branch — when
+  // PI_CODING_AGENT_DIR was ALREADY set to a specific value before
+  // dispatchRules, it must be restored to exactly that value (not deleted,
+  // not corrupted to the literal "undefined"). This is the corruption-prone
+  // branch the previous test doesn't cover (it runs with the env unset).
+  it("restores PI_CODING_AGENT_DIR to its prior VALUE (not unset) when it was already set", async () => {
+    const hadBefore = "PI_CODING_AGENT_DIR" in process.env;
+    const realBefore = process.env.PI_CODING_AGENT_DIR;
+    const preExisting = "/tmp/tgd-test-preexisting-agent-dir";
+    process.env.PI_CODING_AGENT_DIR = preExisting;
+
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockClear();
+
+    let agentDirDuringSession: string | undefined;
+    hoisted.createAgentSessionMock.mockImplementationOnce(async () => {
+      agentDirDuringSession = process.env.PI_CODING_AGENT_DIR;
+      return {
+        session: {
+          prompt: vi.fn().mockResolvedValue(undefined),
+          getLastAssistantText: () =>
+            JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+        },
+      };
+    });
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff --git a/x b/x", false);
+
+    // During the session it was overridden to the temp dir...
+    expect(agentDirDuringSession).toBeDefined();
+    expect(agentDirDuringSession).not.toBe(preExisting);
+    // ...and afterward restored to the exact prior value, still present in env.
+    expect("PI_CODING_AGENT_DIR" in process.env).toBe(true);
+    expect(process.env.PI_CODING_AGENT_DIR).toBe(preExisting);
+
+    // Restore the test's own env change.
+    if (hadBefore) process.env.PI_CODING_AGENT_DIR = realBefore;
+    else delete process.env.PI_CODING_AGENT_DIR;
   });
 });
