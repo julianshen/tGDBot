@@ -515,7 +515,9 @@ function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[]
     const c = f as Record<string, unknown>;
     return {
       file: c.file as string,
-      line: c.line as number | undefined,
+      // The contract allows `number | null`; Finding.line is `number?`, so a
+      // null (or absent) line becomes undefined rather than being kept as null.
+      line: typeof c.line === "number" ? c.line : undefined,
       severity: c.severity as Finding["severity"],
       category: c.category as string,
       message: c.message as string,
@@ -537,12 +539,20 @@ function taskSucceeded(c: CapturedTaskResult): boolean {
 //
 // - rulesRun/rulesFailed come purely from each task's exitCode (order-mapped to
 //   rules), so a task that ran can never be mis-reported as failed.
-// - Findings are kept from the orchestrator (preserving the advisor
-//   second-opinion pass's filtering) for rules that ran, PLUS recovered from a
-//   rule's raw finalOutput when the orchestrator dropped that whole rule's
-//   findings (zero findings tagged with its name). Findings the orchestrator
-//   attributed to a rule that did NOT run are dropped (a failed task's output
-//   isn't trustworthy; also drops hallucinated rule names).
+// - Findings are always kept from the orchestrator for rules that ran (and
+//   dropped for rules that did NOT run — a failed task's output isn't
+//   trustworthy; this also drops hallucinated rule names).
+// - When `recoverFindings` is true, a rule that ran but has ZERO orchestrator
+//   findings ALSO has its findings recovered from its raw finalOutput (the
+//   orchestrator dropped the whole rule). `recoverFindings` is `!useAdvisor`:
+//   with the advisor pass OFF, "zero findings for a rule that ran" can only
+//   mean a buggy drop, so recovery is safe. With the advisor ON, zero findings
+//   is AMBIGUOUS — it could be a buggy drop OR the advisor legitimately
+//   removing all of that rule's findings as false positives — and recovering
+//   from raw finalOutput would UNDO the advisor and reintroduce false
+//   positives. So with advisor on we do NOT recover: accounting is still fixed
+//   deterministically (the rule correctly shows as run), but its findings are
+//   left as the advisor-filtered orchestrator produced them.
 //
 // Falls back to the orchestrator's own result (NO reconciliation) whenever the
 // captured results can't be safely 1:1 order-mapped to rules — counts differ,
@@ -554,11 +564,14 @@ function taskSucceeded(c: CapturedTaskResult): boolean {
 // KNOWN LIMITATION (documented, unobserved): this repairs whole-rule drops (the
 // observed failure) and fixes accounting; it does not detect a PARTIAL drop
 // within a rule the orchestrator kept, nor a mis-attribution where the
-// orchestrator tagged one rule's findings with another rule's name.
+// orchestrator tagged one rule's findings with another rule's name. And with
+// advisor on, a genuine whole-rule drop leaves that rule's findings lost (only
+// its accounting is corrected) — accepted to never undo advisor filtering.
 function reconcileWithCapturedResults(
   orchestrator: DispatchResult,
   captured: CapturedTaskResult[],
   rules: RuleDefinition[],
+  recoverFindings: boolean,
 ): DispatchResult {
   if (captured.length !== rules.length) return orchestrator;
   const orderTrustworthy = captured.every((c, i) => {
@@ -577,6 +590,7 @@ function reconcileWithCapturedResults(
       return;
     }
     rulesRun.push(rule.name);
+    if (!recoverFindings) return;
     const orchestratorHasFindings = orchestrator.findings.some((f) => f.ruleName === rule.name);
     if (!orchestratorHasFindings && c.finalOutput) {
       recovered.push(...parseFindingsFromFinalOutput(c.finalOutput, rule.name));
@@ -675,7 +689,10 @@ export async function dispatchRules(
     }
 
     const orchestratorResult = parseDispatchResult(finalText, rules);
-    return reconcileWithCapturedResults(orchestratorResult, capturedTaskResults, rules);
+    // Recover dropped findings only when advisor is OFF — see
+    // reconcileWithCapturedResults' doc comment for why recovering while the
+    // advisor pass is active would undo its false-positive filtering.
+    return reconcileWithCapturedResults(orchestratorResult, capturedTaskResults, rules, !useAdvisor);
   } catch (err) {
     // Setup/session-creation failure (createIsolatedSessionCwd,
     // createIsolatedAgentDir, or createSession threw). Degrade to

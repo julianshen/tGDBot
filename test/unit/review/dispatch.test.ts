@@ -756,6 +756,28 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
     expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review" });
   });
 
+  it("with advisor ON, does NOT recover a dropped rule's raw findings (recovering would undo the advisor's false-positive filtering) — but still corrects accounting", async () => {
+    const terraFinding = { file: "a.go", line: 1, severity: "warning", category: "correctness", message: "maybe-false-positive" };
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
+      { model: "openai-codex/gpt-5.6-terra:high", exitCode: 0, finalOutput: JSON.stringify([terraFinding]) },
+    ];
+    // Orchestrator ran the advisor pass and it removed ALL of terra's findings
+    // (legitimately, as false positives) → zero findings for terra, but terra
+    // DID run. With advisor on we must NOT re-add terra's raw finalOutput.
+    const finalWithAdvisor = JSON.stringify({ findings: [], rulesRun: ["grok-review", "terra-review"], rulesFailed: [] });
+    const session = makeSubscribableSession(details, finalWithAdvisor);
+
+    // useAdvisor = true (4th arg)
+    const result = await dispatchRules(twoRules(), "diff", true, async () => session);
+
+    // Accounting still deterministically correct: both ran.
+    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.rulesFailed).toEqual([]);
+    // But the advisor-removed finding is NOT resurrected.
+    expect(result.findings).toEqual([]);
+  });
+
   it("keeps the orchestrator's (advisor-filtered) findings and does NOT re-add raw ones when the rule was not dropped", async () => {
     const rules = [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })];
     const rawFinding = { file: "a.go", line: 1, severity: "warning", category: "x", message: "raw" };
