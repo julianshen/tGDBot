@@ -501,16 +501,36 @@ function isValidRawFinding(value: unknown): boolean {
   return true;
 }
 
+// Extracts a findings JSON array from a task's finalOutput, tolerating a model
+// that wraps the array in preamble/trailing prose despite the STRICT contract
+// (e.g. "Here is my review:\n[ ... ]"). Tries, in order: (1) strict parse of
+// the fence-stripped text; (2) parse of the first `[` … last `]` slice. Returns
+// undefined if neither yields a valid findings array. The reviewer's own system
+// prompt is the primary defense (it's instructed to emit ONLY the array); this
+// leniency is a safety net so a stray preamble doesn't silently lose findings.
+function extractFindingsArray(text: string): unknown[] | undefined {
+  const stripped = stripCodeFences(text);
+  const tryParse = (s: string): unknown[] | undefined => {
+    try {
+      const p = JSON.parse(s);
+      return Array.isArray(p) && p.every(isValidRawFinding) ? p : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const strict = tryParse(stripped);
+  if (strict) return strict;
+  const first = stripped.indexOf("[");
+  const last = stripped.lastIndexOf("]");
+  if (first >= 0 && last > first) return tryParse(stripped.slice(first, last + 1));
+  return undefined;
+}
+
 // Parses one task's raw finalOutput into Finding[] stamped with ruleName.
 // Best-effort — returns [] on any parse/shape problem, never throws.
 function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stripCodeFences(text));
-  } catch {
-    return [];
-  }
-  if (!Array.isArray(parsed) || !parsed.every(isValidRawFinding)) return [];
+  const parsed = extractFindingsArray(text);
+  if (!parsed) return [];
   return parsed.map((f) => {
     const c = f as Record<string, unknown>;
     return {

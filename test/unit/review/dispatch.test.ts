@@ -11,6 +11,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
@@ -54,6 +55,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 }));
 
 import { buildDispatchPrompt, dispatchRules } from "../../../src/review/dispatch.js";
+import type { DispatchSession } from "../../../src/review/dispatch.js";
 import {
   resolvePiSubagentsExtensionPath,
   resolveRpivAdvisorExtensionPath,
@@ -67,6 +69,32 @@ function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
     body: "Check for bugs.",
     sourcePath: "/rules/rule-a.md",
     ...overrides,
+  };
+}
+
+// A stub session that, on prompt(), synchronously emits one subagent
+// tool_execution_end event with the given details.results to its subscriber,
+// then resolves; getLastAssistantText returns the orchestrator's final JSON.
+// Shared by the reconciliation and prose-recovery describe blocks below.
+function makeSubscribableSession(detailsResults: unknown[], finalMessage: string): DispatchSession {
+  let listener: ((event: unknown) => void) | undefined;
+  return {
+    subscribe(l: (event: unknown) => void) {
+      listener = l;
+      return () => {
+        listener = undefined;
+      };
+    },
+    async prompt() {
+      listener?.({
+        type: "tool_execution_end",
+        toolName: "subagent",
+        result: { details: { results: detailsResults } },
+      });
+    },
+    getLastAssistantText() {
+      return finalMessage;
+    },
   };
 }
 
@@ -702,31 +730,6 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
     makeRule({ name: "terra-review", provider: "openai-codex", model: "gpt-5.6-terra" }),
   ];
 
-  // A stub session that, on prompt(), synchronously emits one subagent
-  // tool_execution_end event with the given details.results to its subscriber,
-  // then resolves; getLastAssistantText returns the orchestrator's final JSON.
-  function makeSubscribableSession(detailsResults: unknown[], finalMessage: string): DispatchSession {
-    let listener: ((event: unknown) => void) | undefined;
-    return {
-      subscribe(l: (event: unknown) => void) {
-        listener = l;
-        return () => {
-          listener = undefined;
-        };
-      },
-      async prompt() {
-        listener?.({
-          type: "tool_execution_end",
-          toolName: "subagent",
-          result: { details: { results: detailsResults } },
-        });
-      },
-      getLastAssistantText() {
-        return finalMessage;
-      },
-    };
-  }
-
   it("corrects a task the orchestrator wrongly marked failed but which actually ran (exit 0)", async () => {
     const details = [
       { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
@@ -877,5 +880,81 @@ describe("dispatchRules persisted session (fork-safety)", () => {
     expect(hoisted.sessionManagerInMemory).not.toHaveBeenCalled();
     const opts = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as { sessionManager: unknown };
     expect(opts.sessionManager).toBe("fake-persisted-session-manager");
+  });
+});
+
+// Follow-up fix (found via hmchangw/chat#490 runs): a dispatched reviewer
+// occasionally returned prose instead of the JSON findings contract, so its
+// findings weren't extractable. Root cause: the vendored reviewer agent's
+// system prompt (systemPromptMode: replace) had a "## Review output format"
+// section instructing PROSE markdown, directly contradicting the task-level
+// JSON contract. These tests pin the vendored agent's output contract so that
+// conflict can't silently return.
+describe("vendored reviewer agent output contract", () => {
+  const reviewerMd = readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../src/review/builtin-agents/reviewer.md",
+    ),
+    "utf-8",
+  );
+
+  it("instructs JSON-array-only output and does NOT carry the old prose '## Review' format", () => {
+    // JSON-array-only contract present.
+    expect(reviewerMd).toMatch(/ONLY the JSON array/i);
+    expect(reviewerMd).toMatch(/first character of your response must be `\[`/i);
+    // The old prose format (which conflicted with the JSON contract) is gone.
+    expect(reviewerMd).not.toMatch(/^- Correct:/m);
+    expect(reviewerMd).not.toMatch(/^- Blocker:/m);
+  });
+
+  it("does not set defaultReads (self-contained review tasks; avoids spurious plan.md/progress.md findings)", () => {
+    // Frontmatter is the block between the first two `---` lines.
+    const frontmatter = reviewerMd.split("---")[1] ?? "";
+    expect(frontmatter).not.toMatch(/defaultReads/);
+  });
+
+  it("still declares exactly the restricted read-only tool set (regression guard alongside the output-format change)", () => {
+    expect(reviewerMd).toMatch(/^tools:\s*read,\s*grep,\s*find,\s*ls\s*$/m);
+    expect(reviewerMd).not.toMatch(/^tools:.*\b(bash|edit|write|intercom)\b/m);
+  });
+});
+
+// Leniency safety net (same follow-up): even with the reviewer instructed to
+// emit ONLY the array, if a model wraps it in preamble/trailing prose the
+// recovery path must still extract the findings rather than silently losing
+// them. Exercised through the public API (dispatchRules recovery path, advisor
+// off) since the parser itself is internal.
+describe("dispatchRules recovery tolerates preamble/trailing prose around the findings array", () => {
+  it("recovers a dropped rule's findings even when its finalOutput has prose around the JSON array", async () => {
+    const rules = [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })];
+    const finding = { file: "a.go", line: 7, severity: "warning", category: "correctness", message: "off-by-one" };
+    // finalOutput wraps the array in preamble + trailing prose (contract violation).
+    const messyOutput = `Here is my review of the diff:\n\n[${JSON.stringify(finding)}]\n\nThat's all I found.`;
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: messyOutput }];
+    // Orchestrator dropped the rule (prose confused it); advisor OFF so recovery runs.
+    const buggyFinal = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["grok-review"] });
+    const session = makeSubscribableSession(details, buggyFinal);
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
+    expect(result.rulesRun).toEqual(["grok-review"]);
+    expect(result.rulesFailed).toEqual([]);
+    expect(result.findings).toContainEqual({ ...finding, ruleName: "grok-review" });
+  });
+
+  it("returns no recovered findings when finalOutput is pure prose with no JSON array at all", async () => {
+    const rules = [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })];
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "I reviewed the code and everything looks fine to me." },
+    ];
+    const buggyFinal = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["grok-review"] });
+    const session = makeSubscribableSession(details, buggyFinal);
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
+    // Accounting still corrected (it ran, exit 0), but nothing recoverable.
+    expect(result.rulesRun).toEqual(["grok-review"]);
+    expect(result.findings).toEqual([]);
   });
 });
