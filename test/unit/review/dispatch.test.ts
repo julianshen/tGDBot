@@ -8,11 +8,11 @@
 // AgentSession. AC-5.2 through AC-5.4 instead inject a stub DispatchSession
 // via dispatchRules' third parameter (test/fixtures/pi-session-stub.ts),
 // which never touches the pi SDK at all.
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 
@@ -36,14 +36,25 @@ const hoisted = vi.hoisted(() => {
   // createRealDispatchSession now uses SessionManager.create(cwd) (persisted,
   // for fork-safety) instead of .inMemory(); the mock must expose it.
   const sessionManagerCreate = vi.fn(() => "fake-persisted-session-manager");
+  // getAgentDir is a configurable mock (not a fixed string) so the auth.json
+  // diagnostics tests (issue #1) can point it at a real temp dir with/without
+  // an auth.json. Defaults to the original nonexistent path, which is what
+  // every pre-existing real-factory test expects.
+  const getAgentDirMock = vi.fn(() => "/fake/agent/dir");
+  // Lets ONE test force symlink() to fail for a specific filename (issue #1's
+  // "auth.json exists but can't be linked" case, e.g. EPERM in a locked-down
+  // container). Null by default, so every other test gets the real symlink.
+  const failSymlinkFor: { name: string | null } = { name: null };
 
   return {
+    failSymlinkFor,
     resourceLoaderInstances,
     reload,
     FakeResourceLoader,
     createAgentSessionMock,
     sessionManagerInMemory,
     sessionManagerCreate,
+    getAgentDirMock,
   };
 });
 
@@ -51,10 +62,27 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   DefaultResourceLoader: hoisted.FakeResourceLoader,
   createAgentSession: hoisted.createAgentSessionMock,
   SessionManager: { inMemory: hoisted.sessionManagerInMemory, create: hoisted.sessionManagerCreate },
-  getAgentDir: () => "/fake/agent/dir",
+  getAgentDir: hoisted.getAgentDirMock,
 }));
 
-import { buildDispatchPrompt, dispatchRules } from "../../../src/review/dispatch.js";
+// dispatch.ts imports `symlink` as an ESM named binding, so it can't be spied
+// after the fact — the mock has to be hoisted ahead of the import. Everything
+// is delegated to the real fs/promises EXCEPT symlink, and even that only fails
+// when a test explicitly opts in via hoisted.failSymlinkFor (default: null).
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    symlink: async (target: Parameters<typeof actual.symlink>[0], linkPath: Parameters<typeof actual.symlink>[1]) => {
+      if (hoisted.failSymlinkFor.name && path.basename(String(linkPath)) === hoisted.failSymlinkFor.name) {
+        throw new Error("EPERM: operation not permitted, symlink");
+      }
+      return actual.symlink(target, linkPath);
+    },
+  };
+});
+
+import { buildDispatchPrompt, describeAuthContext, dispatchRules } from "../../../src/review/dispatch.js";
 import type { DispatchSession } from "../../../src/review/dispatch.js";
 import {
   resolvePiSubagentsExtensionPath,
@@ -956,5 +984,221 @@ describe("dispatchRules recovery tolerates preamble/trailing prose around the fi
     // Accounting still corrected (it ran, exit 0), but nothing recoverable.
     expect(result.rulesRun).toEqual(["grok-review"]);
     expect(result.findings).toEqual([]);
+  });
+});
+
+// Issue #1 (github.com/julianshen/tGDBot/issues/1): a cron/headless run died
+// with the cryptic `No API key found for undefined`. Root cause: dispatchRules
+// replaces PI_CODING_AGENT_DIR with a HERMETIC temp agent dir holding only
+// symlinks to auth.json/models.json/settings.json — and when the source
+// auth.json didn't exist, it was silently skipped, yielding a credential-free
+// agent dir. pi's model registry then had zero providers, so the resolved model
+// had no `provider` field, and ~30s later prompt() blew up with an error naming
+// neither auth.json nor the directory.
+//
+// The fix is DIAGNOSABILITY, not fail-fast — a missing auth.json is legitimate
+// (the shipped GitHub Actions workflow authenticates purely via env vars, with
+// no auth.json anywhere), so it must stay non-fatal AND stay quiet on that
+// healthy path. Two complementary signals instead:
+//   (a) createAgentSession's `modelFallbackMessage` — the SDK's own structured
+//       "No models available" signal, previously destructured away. It is set
+//       exactly when zero providers resolved, and is absent when env-var auth
+//       works, so it is silent on healthy runs.
+//   (b) an auth-context note appended to the pi auth error, naming the resolved
+//       agent dir and distinguishing "absent" from "exists but couldn't link".
+describe("issue #1: credential-free agent dir is diagnosable", () => {
+  const AUTH_ERROR = "No API key found for undefined.\n\nUse /login to log into a provider";
+  const tempDirs: string[] = [];
+
+  // Both reviewers flagged this: getAgentDirMock is shared and mockReturnValue
+  // persists, and the temp dirs leaked. Restore + clean after every test so
+  // this block can't poison the pre-existing real-factory tests (which expect
+  // "/fake/agent/dir") regardless of file order or vitest sequence.shuffle.
+  afterEach(() => {
+    hoisted.getAgentDirMock.mockReturnValue("/fake/agent/dir");
+    hoisted.failSymlinkFor.name = null;
+    // Nit from review: an un-consumed mockImplementationOnce would leak into the
+    // next test if one of these ever threw before dispatchRules ran.
+    hoisted.createAgentSessionMock.mockReset();
+    for (const d of tempDirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  function realSessionThatThrows(message: string, modelFallbackMessage?: string) {
+    hoisted.createAgentSessionMock.mockImplementationOnce(async () => ({
+      modelFallbackMessage,
+      session: {
+        prompt: vi.fn().mockRejectedValue(new Error(message)),
+        getLastAssistantText: () => undefined,
+      },
+    }));
+  }
+
+  function realSessionOk(modelFallbackMessage?: string) {
+    hoisted.createAgentSessionMock.mockImplementationOnce(async () => ({
+      modelFallbackMessage,
+      session: {
+        prompt: vi.fn().mockResolvedValue(undefined),
+        getLastAssistantText: () =>
+          JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+      },
+    }));
+  }
+
+  function agentDir({ withAuth }: { withAuth: boolean }): string {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "tgd-test-agentdir-"));
+    tempDirs.push(dir);
+    if (withAuth) {
+      writeFileSync(path.join(dir, "auth.json"), JSON.stringify({ "openai-codex": {} }), "utf-8");
+    }
+    hoisted.getAgentDirMock.mockReturnValue(dir);
+    return dir;
+  }
+
+  function warnings(spy: ReturnType<typeof vi.spyOn>): string {
+    return spy.mock.calls.map((c) => String(c[0])).join("\n");
+  }
+
+  // The pi auth error is itself MULTI-LINE, so the appended hint lands after a
+  // newline — inspect each console.warn call whole rather than splitting.
+  function promptWarn(spy: ReturnType<typeof vi.spyOn>): string | undefined {
+    return spy.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes("session.prompt() threw"));
+  }
+
+  // (a) The SDK signal we used to throw away. This is the EARLY diagnosis —
+  // it fires at session creation, before the 30-second detonation in prompt().
+  it("surfaces pi's modelFallbackMessage (\"No models available\") instead of discarding it", async () => {
+    agentDir({ withAuth: false });
+    realSessionOk("No models available. Use /login to log into a provider via OAuth or API key.");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff", false);
+
+    expect(warnings(warn)).toMatch(/could not resolve a model/i);
+    expect(warnings(warn)).toMatch(/No models available/);
+    warn.mockRestore();
+  });
+
+  // The whole reason the fix is diagnostics-only: this healthy path (env-var
+  // auth, exactly what .github/workflows/tgd-review.yml does) must stay SILENT.
+  // A warning that fires on every good CI run is a warning nobody reads.
+  it("stays silent AND non-fatal when auth.json is absent but credentials resolve (env-var auth — the shipped CI workflow)", async () => {
+    agentDir({ withAuth: false });
+    realSessionOk(undefined); // pi resolved a model from env vars → no fallback message
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules([makeRule({ name: "rule-a" })], "diff", false);
+
+    expect(result.rulesRun).toEqual(["rule-a"]);
+    expect(result.rulesFailed).toEqual([]);
+    // No auth noise at all on the healthy env-var path.
+    expect(warnings(warn)).not.toMatch(/auth\.json/);
+    expect(warnings(warn)).not.toMatch(/could not resolve a model/i);
+    warn.mockRestore();
+  });
+
+  // (b) The exact issue #1 failure: the opaque SDK error now names its cause.
+  it("annotates the pi auth error with the resolved agent dir when auth.json was ABSENT", async () => {
+    const dir = agentDir({ withAuth: false });
+    realSessionThatThrows(AUTH_ERROR);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules([makeRule({ name: "rule-a" })], "diff", false);
+
+    const promptWarnMsg = promptWarn(warn);
+    expect(promptWarnMsg).toContain("No API key found"); // original SDK message kept
+    expect(promptWarnMsg).toMatch(/no auth\.json was found/i); // ...now with the cause
+    expect(promptWarnMsg).toContain(dir); // ...and the RESOLVED dir
+    expect(promptWarnMsg).toMatch(/PI_CODING_AGENT_DIR/); // ...and where to look
+    expect(result.rulesFailed).toEqual(["rule-a"]);
+    warn.mockRestore();
+  });
+
+  // Mutation-testing gap found in verification review: deleting the
+  // `authStatus = "link-failed"` assignment in createIsolatedAgentDir left the
+  // whole suite green, because only the PURE describeAuthContext was tested. If
+  // that wiring regresses, a container that simply cannot symlink (EPERM) would
+  // once again be told "no auth.json was found — PI_CODING_AGENT_DIR is likely
+  // not pointing where you think" while the file sits right there. Pin the
+  // END-TO-END path: real createIsolatedAgentDir -> real authStatus -> message.
+  it("wires link-failed end-to-end: a real symlink failure yields the EXISTS message, not the absent one", async () => {
+    const dir = agentDir({ withAuth: true }); // auth.json really is there
+    hoisted.failSymlinkFor.name = "auth.json"; // ...but it cannot be linked
+    realSessionThatThrows(AUTH_ERROR);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff", false);
+
+    const msg = promptWarn(warn);
+    expect(msg).toMatch(/EXISTS/);
+    expect(msg).toContain(dir);
+    // The confident lie must NOT come back.
+    expect(msg).not.toMatch(/no auth\.json was found/i);
+    expect(msg).not.toMatch(/not pointing where you think/i);
+    warn.mockRestore();
+  });
+
+  it("adds NO auth context when auth.json linked fine (no misleading noise)", async () => {
+    const dir = agentDir({ withAuth: true });
+    realSessionThatThrows(AUTH_ERROR);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff", false);
+
+    const promptWarnMsg = promptWarn(warn);
+    // Structural assertion (not prose-coupled): a linked auth.json means the
+    // agent-dir path must never be appended to the error at all.
+    expect(promptWarnMsg).not.toContain(dir);
+    warn.mockRestore();
+  });
+
+  it("adds NO auth context to a NON-auth error, even when auth.json is absent", async () => {
+    const dir = agentDir({ withAuth: false });
+    realSessionThatThrows("ECONNRESET: socket hang up");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await dispatchRules([makeRule({ name: "rule-a" })], "diff", false);
+
+    const promptWarnMsg = promptWarn(warn);
+    expect(promptWarnMsg).toContain("ECONNRESET");
+    // A network error has nothing to do with auth.json — don't misdirect.
+    expect(promptWarnMsg).not.toContain(dir);
+    expect(promptWarnMsg).not.toMatch(/auth\.json/);
+    warn.mockRestore();
+  });
+});
+
+// Reviewer catch: conflating "auth.json is absent" with "auth.json exists but
+// couldn't be symlinked" makes the tool confidently LIE — it would tell someone
+// to go check PI_CODING_AGENT_DIR when the file is exactly where they put it,
+// while the real cause (a filesystem that can't symlink, e.g. EPERM in a locked
+// -down container) goes unmentioned. describeAuthContext is the single source of
+// this wording, so pin all three states here — a pure function, no mocking, and
+// it can't drift from what dispatchRules actually appends.
+describe("issue #1: describeAuthContext distinguishes the two auth failure causes", () => {
+  const DIR = "/home/julianshen/.pi/agent";
+
+  it("says nothing when auth.json linked fine", () => {
+    expect(describeAuthContext("linked", DIR)).toBeUndefined();
+  });
+
+  it("ABSENT: names the dir, explains env-var fallback, and points at PI_CODING_AGENT_DIR", () => {
+    const msg = describeAuthContext("absent", DIR) as string;
+    expect(msg).toContain(DIR);
+    expect(msg).toMatch(/no auth\.json was found/i);
+    expect(msg).toMatch(/environment variables/i);
+    expect(msg).toMatch(/PI_CODING_AGENT_DIR/);
+  });
+
+  it("LINK-FAILED: says the file EXISTS — and does NOT misdirect to PI_CODING_AGENT_DIR", () => {
+    const msg = describeAuthContext("link-failed", DIR) as string;
+    expect(msg).toContain(DIR);
+    expect(msg).toMatch(/EXISTS/);
+    expect(msg).toMatch(/could not be linked/i);
+    // The path is correct in this case — sending the reader to re-check it
+    // would waste their time and hide the real cause.
+    expect(msg).not.toMatch(/no auth\.json was found/i);
+    expect(msg).not.toMatch(/not pointing where you think/i);
   });
 });

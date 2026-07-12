@@ -141,7 +141,7 @@ async function createRealDispatchSession(useAdvisor: boolean, cwd: string): Prom
   });
   await loader.reload();
 
-  const { session } = await createAgentSession({
+  const { session, modelFallbackMessage } = await createAgentSession({
     resourceLoader: loader,
     cwd,
     tools: ["read", "subagent"],
@@ -160,6 +160,24 @@ async function createRealDispatchSession(useAdvisor: boolean, cwd: string): Prom
     // `finally` block. Nothing persists into the user's real ~/.pi/agent.
     sessionManager: SessionManager.create(cwd),
   });
+
+  // Issue #1: createAgentSession does NOT throw when it can't resolve any
+  // model — it hands the caller `modelFallbackMessage` and carries on, and we
+  // used to destructure only `session` and drop it on the floor. That message
+  // ("No models available. Use /login to ...") is set precisely when the model
+  // registry came up with zero providers — the exact credential-free state
+  // that later detonates inside prompt() as the opaque `No API key found for
+  // undefined`. Surfacing it here moves the diagnosis ~30 seconds earlier, to
+  // the moment the problem actually exists.
+  //
+  // It is also self-silencing on the happy path: when provider credentials DO
+  // resolve (from auth.json or from env vars, as the shipped CI workflow does),
+  // no fallback message is produced and this stays quiet. That matters — a
+  // warning that fires on every healthy run is a warning everyone learns to
+  // ignore.
+  if (modelFallbackMessage) {
+    console.warn(`dispatchRules: pi could not resolve a model — ${modelFallbackMessage}`);
+  }
 
   return session;
 }
@@ -248,10 +266,68 @@ async function createIsolatedSessionCwd(): Promise<string> {
 // removes it in its `finally` block. This never touches the user's real
 // ~/.pi/agent. Validated end-to-end: with the bridge off, a 2-model parallel
 // fan-out against hmchangw/chat#490 completes with rulesRun for both models.
-const HERMETIC_AGENT_LINK_FILES = ["auth.json", "models.json", "settings.json"];
+const AUTH_FILE = "auth.json";
+const HERMETIC_AGENT_LINK_FILES = [AUTH_FILE, "models.json", "settings.json"];
 const SUBAGENT_CONFIG_INTERCOM_OFF = JSON.stringify({ intercomBridge: { mode: "off" } });
 
-async function createIsolatedAgentDir(realAgentDir: string): Promise<string> {
+// Issue #1: the pi SDK's auth failures ("No API key found for <provider>",
+// "Authentication failed for ...", "No model selected") are thrown from deep
+// inside session.prompt() and name neither auth.json nor the agent dir. When
+// the hermetic agent dir was built WITHOUT credentials, that produced the
+// utterly opaque `No API key found for undefined` — the registry had no
+// providers at all, so the resolved model carried no provider name. These are
+// the error shapes worth annotating with the auth context below.
+//
+// Deliberately NOT including "No models available": that string is only ever
+// produced as createAgentSession's non-throwing `modelFallbackMessage` (see
+// createRealDispatchSession), never thrown from prompt(), so matching it here
+// would be dead code.
+const PI_AUTH_ERROR_RE = /No API key found|Authentication failed|No model selected/i;
+
+// Why auth.json is (or isn't) present in the hermetic agent dir. The two
+// failure causes are kept DISTINCT on purpose: telling someone "no auth.json
+// found — check PI_CODING_AGENT_DIR" when the file is right there but couldn't
+// be symlinked sends them to verify a path that will check out fine, while the
+// real cause (a filesystem that can't symlink) goes unmentioned.
+export type AuthLinkStatus = "linked" | "absent" | "link-failed";
+
+interface IsolatedAgentDir {
+  dir: string;
+  /**
+   * Anything other than "linked" means the hermetic dir has NO credentials
+   * file, so provider auth must come from environment variables. That is NOT
+   * an error on its own — the shipped GitHub Actions workflow authenticates
+   * purely via env vars (ANTHROPIC_API_KEY etc.) with no auth.json anywhere,
+   * and that must keep working silently. It IS the most useful fact to attach
+   * to a downstream auth failure — see describeAuthContext.
+   */
+  authStatus: AuthLinkStatus;
+}
+
+// Single source of the auth explanation, so the wording can't drift between
+// the places that surface it. Returns undefined when auth.json linked fine
+// (nothing to explain).
+export function describeAuthContext(
+  authStatus: AuthLinkStatus,
+  realAgentDir: string,
+): string | undefined {
+  if (authStatus === "linked") return undefined;
+  if (authStatus === "absent") {
+    return (
+      `no ${AUTH_FILE} was found in the pi agent dir (${realAgentDir}), so provider ` +
+      `credentials had to come from environment variables (e.g. ANTHROPIC_API_KEY) — ` +
+      `if none were set, that is this error. If you expected file-based auth (e.g. OAuth ` +
+      `set up via pi's /login), then PI_CODING_AGENT_DIR is likely not pointing where you think`
+    );
+  }
+  return (
+    `${AUTH_FILE} EXISTS in the pi agent dir (${realAgentDir}) but could not be linked into ` +
+    `the isolated agent dir (see the symlink warning above), so provider credentials fell back ` +
+    `to environment variables`
+  );
+}
+
+async function createIsolatedAgentDir(realAgentDir: string): Promise<IsolatedAgentDir> {
   const tempAgentDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-agentdir-"));
 
   // Symlink credential/model/settings files from the real agent dir so the
@@ -259,6 +335,8 @@ async function createIsolatedAgentDir(realAgentDir: string): Promise<string> {
   // custom-provider config. Only link files that actually exist (a fresh CI
   // env may have none — that's fine, the review just runs with whatever
   // provider auth is present via env vars, same as before).
+  let authStatus: AuthLinkStatus = "absent";
+
   await Promise.all(
     HERMETIC_AGENT_LINK_FILES.map(async (name) => {
       const source = path.join(realAgentDir, name);
@@ -267,14 +345,18 @@ async function createIsolatedAgentDir(realAgentDir: string): Promise<string> {
       } catch {
         return; // source absent — nothing to link
       }
-      await symlink(source, path.join(tempAgentDir, name)).catch((err: unknown) => {
+      try {
+        await symlink(source, path.join(tempAgentDir, name));
+        if (name === AUTH_FILE) authStatus = "linked";
+      } catch (err) {
         // A failed symlink (e.g. sandbox without symlink support) shouldn't
         // abort the review — warn and continue; worst case is that provider
         // auth resolves from env vars instead of auth.json.
+        if (name === AUTH_FILE) authStatus = "link-failed";
         console.warn(
           `dispatchRules: could not symlink ${name} into the isolated agent dir (${(err as Error).message})`,
         );
-      });
+      }
     }),
   );
 
@@ -282,7 +364,7 @@ async function createIsolatedAgentDir(realAgentDir: string): Promise<string> {
   await mkdir(subagentConfigDir, { recursive: true });
   await writeFile(path.join(subagentConfigDir, "config.json"), SUBAGENT_CONFIG_INTERCOM_OFF, "utf-8");
 
-  return tempAgentDir;
+  return { dir: tempAgentDir, authStatus };
 }
 
 // Review finding (code-review fix): the diff IS embedded once per rule
@@ -659,12 +741,22 @@ export async function dispatchRules(
   let prevAgentDirEnv: string | undefined;
   let agentDirEnvWasSet = false;
   let agentDirEnvOverridden = false;
+  // Issue #1: set only when the hermetic agent dir ended up WITHOUT auth.json.
+  // Appended to a downstream pi auth error so the failure names its own cause.
+  let missingAuthDiagnostic: string | undefined;
 
   try {
     sessionCwd = await createIsolatedSessionCwd();
 
     if (usingRealFactory) {
-      tempAgentDir = await createIsolatedAgentDir(getAgentDir());
+      const realAgentDir = getAgentDir();
+      const isolated = await createIsolatedAgentDir(realAgentDir);
+      tempAgentDir = isolated.dir;
+      // Issue #1: remember WHY a later auth failure might be happening, so the
+      // cryptic pi-SDK message can be annotated with the actionable context.
+      // Nothing is printed here — a missing auth.json is normal (env-var auth)
+      // and warning about it unconditionally would fire on every healthy CI run.
+      missingAuthDiagnostic = describeAuthContext(isolated.authStatus, realAgentDir);
       agentDirEnvWasSet = "PI_CODING_AGENT_DIR" in process.env;
       prevAgentDirEnv = process.env.PI_CODING_AGENT_DIR;
       process.env.PI_CODING_AGENT_DIR = tempAgentDir;
@@ -702,7 +794,18 @@ export async function dispatchRules(
       await session.prompt(prompt);
       finalText = session.getLastAssistantText();
     } catch (err) {
-      console.warn(`dispatchRules: session.prompt() threw (${(err as Error).message})`);
+      const message = (err as Error).message;
+      // Issue #1: the pi SDK's auth errors name neither auth.json nor the agent
+      // dir (worst case: "No API key found for undefined", when the registry
+      // had no providers at all). If we already know the hermetic agent dir was
+      // built without credentials, attach that — it turns a dead-end error into
+      // an actionable one. Only for auth-shaped errors: appending it to, say, a
+      // network timeout would just misdirect.
+      const authHint =
+        missingAuthDiagnostic && PI_AUTH_ERROR_RE.test(message)
+          ? ` — ${missingAuthDiagnostic}`
+          : "";
+      console.warn(`dispatchRules: session.prompt() threw (${message})${authHint}`);
       return fallbackResult(rules);
     } finally {
       unsubscribe?.();
