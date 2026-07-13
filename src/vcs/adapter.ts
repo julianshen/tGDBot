@@ -9,6 +9,23 @@ export interface VcsAdapter {
   findBotComment(id: string): Promise<BotComment | null>;
   upsertComment(id: string, body: string, existing: BotComment | null): Promise<void>;
   /**
+   * Posts findings as INLINE review comments anchored to lines of the diff
+   * (GitHub: `POST /pulls/{n}/reviews` with `event: COMMENT`).
+   *
+   * `comments` MUST already be filtered to lines that are part of the diff — see
+   * review/diff-anchors. GitHub rejects the WHOLE request with 422 if even one
+   * anchor is invalid, which would lose every finding in the review.
+   *
+   * Callers must treat a rejection as recoverable, not fatal: the review()
+   * flow falls back to putting every finding in the summary comment, so a
+   * finding is only ever relocated, never lost.
+   */
+  createInlineReview(
+    id: string,
+    headSha: string,
+    comments: InlineReviewComment[],
+  ): Promise<void>;
+  /**
    * ADR-002: fetches every `*.md` rule file under `rulesDir` AS IT EXISTS ON
    * THE PR's BASE BRANCH (`baseSha`), via the VCS provider's own API (e.g.
    * GitHub's Contents API through `gh api`, or a future GitLabAdapter's
@@ -29,6 +46,14 @@ export interface VcsAdapter {
    * API response) should still propagate/reject.
    */
   getRuleFilesFromBase(baseSha: string, rulesDir: string): Promise<RuleFileContent[]>;
+}
+
+export interface InlineReviewComment {
+  /** Repo-relative path on the NEW side of the diff. */
+  path: string;
+  /** NEW-file line number; must lie inside a diff hunk. */
+  line: number;
+  body: string;
 }
 
 export interface RuleFileContent {

@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "./adapter.js";
+import type { BotComment, InlineReviewComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "./adapter.js";
 
 /**
  * Seam for shelling out to the `gh` CLI. GitHubAdapter accepts an ExecGh
@@ -253,6 +253,48 @@ export class GitHubAdapter implements VcsAdapter {
         JSON.stringify({ body }),
       );
     }
+  }
+
+  /**
+   * Posts the findings as inline review comments in ONE review
+   * (`POST /pulls/{n}/reviews`, `event: COMMENT`).
+   *
+   * Why one request and not one comment each: a single review groups the
+   * comments into a coherent unit in the GitHub UI and generates one
+   * notification instead of N. The cost is all-or-nothing — GitHub 422s the
+   * entire request if any single anchor is off the diff — which is exactly why
+   * `comments` must come from the diff-anchors filter, and why review() treats a
+   * rejection as "fall back to the summary comment", never as a lost finding.
+   *
+   * `side: RIGHT` pins each comment to the NEW file, which is the side our
+   * anchors are computed against; `commit_id` pins the review to the head SHA we
+   * actually reviewed, so the comments don't drift onto a newer commit.
+   *
+   * The payload goes over stdin (`--input -`), never argv: bodies are multi-line
+   * markdown, and there is no shell involved (execFile with an array).
+   */
+  async createInlineReview(
+    id: string,
+    headSha: string,
+    comments: InlineReviewComment[],
+  ): Promise<void> {
+    if (comments.length === 0) return;
+
+    const payload = {
+      commit_id: headSha,
+      event: "COMMENT",
+      comments: comments.map((c) => ({
+        path: c.path,
+        line: c.line,
+        side: "RIGHT",
+        body: c.body,
+      })),
+    };
+
+    await this.execGh(
+      ["api", `repos/{owner}/{repo}/pulls/${id}/reviews`, "-X", "POST", "--input", "-"],
+      JSON.stringify(payload),
+    );
   }
 
   /**

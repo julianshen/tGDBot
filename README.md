@@ -139,6 +139,49 @@ reviewed), `1` fatal (e.g. every rule failed to load), `2` partial (at least
 one rule ran, but something also failed — the comment is still posted and
 the failure is noted in it).
 
+### What the review looks like
+
+Findings are posted as **inline review comments, anchored to the line of the diff
+they are about** — the model CodeRabbit and Cursor Bugbot use, because a finding
+is most useful sitting next to the code, not in a list you have to cross-reference
+by hand.
+
+Each inline comment carries a metadata line, a scannable bold headline, the
+reasoning, and a collapsed **🤖 Prompt for AI Agents** block — a self-contained,
+copy-pasteable instruction that already names the file and line, so a coding agent
+(or you) can act on it without re-deriving the context:
+
+```
+_🎯 correctness_ | _🔴 Blocking_ | _`terra-review`_
+
+**The reaction toggle remains a check-then-act operation…**
+
+Concurrent callers can observe the same state and take the same branch, so this
+is not an atomic CAS and can lose a toggle...
+
+<details><summary>🤖 Prompt for AI Agents</summary> ... </details>
+```
+
+A single **summary comment** is upserted alongside them with the counts, the
+files reviewed, the rules that ran, and any rule that failed (and why). It also
+carries the `<!-- tgd-review-agent:sha=... -->` marker, which is what makes the
+bot idempotent per commit.
+
+On a new commit the review runs again and posts fresh inline comments; the
+previous commit's comments **remain** on the PR as history (the same behaviour
+CodeRabbit has — there is no upsert for review comments, only for the summary).
+If the head SHA hasn't changed, the run is skipped entirely, so the same comments
+are never posted twice.
+
+**Nothing is ever lost.** GitHub rejects an inline comment on a line that isn't
+part of the diff — and rejects the *entire* review if even one is invalid. So a
+finding is only anchored when the diff itself proves the line is addressable
+(`src/review/diff-anchors.ts`). Anything else — a finding with no line number, a
+line outside the changed hunks, a file this PR doesn't touch — is rendered in full
+in the summary under **💬 Additional comments**. And if the inline post is
+rejected outright, the run falls back to a summary containing *every* finding. A
+finding is only ever relocated, never dropped.
+
 ### Which model orchestrates?
 
 Every rule file is pinned to its own `provider`/`model` — that is the point of

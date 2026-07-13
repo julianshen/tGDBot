@@ -62,6 +62,7 @@ interface Harness {
     findBotComment: ReturnType<typeof vi.fn>;
     upsertComment: ReturnType<typeof vi.fn>;
     getRuleFilesFromBase: ReturnType<typeof vi.fn>;
+    createInlineReview: ReturnType<typeof vi.fn>;
   };
   resolveConfig: ReturnType<typeof vi.fn>;
   loadRules: ReturnType<typeof vi.fn>;
@@ -88,7 +89,8 @@ function makeHarness(options: {
     rulesFailed: [],
   };
   const orchestrationResult: OrchestrationResult = options.orchestrationResult ?? {
-    commentBody: "## Code Review\n\nNo issues found.",
+    commentBody: "**No actionable comments.** ✅",
+    inlineComments: [],
     findingsCount: 0,
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
@@ -101,6 +103,7 @@ function makeHarness(options: {
     findBotComment: vi.fn().mockResolvedValue(botComment),
     upsertComment: vi.fn().mockResolvedValue(undefined),
     getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
+    createInlineReview: vi.fn().mockResolvedValue(undefined),
   };
 
   const config: ResolvedConfig = { ...args, vcsAdapter: vcsAdapter as unknown as VcsAdapter };
@@ -255,6 +258,7 @@ describe("review", () => {
       rulesFailed: ["rule-b"],
     };
     const orchestrationResult: OrchestrationResult = {
+      inlineComments: [],
       commentBody: "## Code Review\n\n### ⚠️ Rules that failed\n\n- rule-b",
       findingsCount: 0,
       rulesRun: ["rule-a"],
@@ -285,6 +289,7 @@ describe("review", () => {
     };
     const dispatchResult: DispatchResult = { findings: [], rulesRun: ["rule-a"], rulesFailed: [] };
     const orchestrationResult: OrchestrationResult = {
+      inlineComments: [],
       commentBody: "## Code Review\n\nNo issues found.",
       findingsCount: 0,
       rulesRun: ["rule-a"],
@@ -341,6 +346,7 @@ describe("review", () => {
       rulesFailed: ["rule-a", "rule-b"],
     };
     const orchestrationResult: OrchestrationResult = {
+      inlineComments: [],
       commentBody: "## Code Review\n\n### ⚠️ Rules that failed\n\nThe following rules failed to run and were skipped:\n\n- rule-a\n- rule-b",
       findingsCount: 0,
       rulesRun: [],
@@ -669,5 +675,105 @@ describe("issue #1 (round 2): --model reaches dispatchRules as the orchestrator 
     await review(args, depsFrom(h));
 
     expect(h.dispatchRules.mock.calls[0]?.[3]).toBeUndefined();
+  });
+});
+
+// Inline review comments: findings are posted as review comments anchored to the
+// diff (createInlineReview), with the summary comment upserted as before (so the
+// SHA-marker dedup — "never re-comment without new commits" — still holds).
+describe("inline review comments", () => {
+  const DIFF = "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,2 @@\n ctx\n+added\n";
+
+  // NOTE: resolveConfig is mocked to return config built from the HARNESS's args,
+  // so dryRun must be set here — passing it to review() would have no effect.
+  function inlineHarness(orchestrationResult: OrchestrationResult, dryRun = false) {
+    const h = makeHarness({ args: makeArgs({ dryRun }), botComment: null, orchestrationResult });
+    h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
+    return h;
+  }
+
+  const withInline: OrchestrationResult = {
+    commentBody: "**Actionable comments posted: 1**",
+    inlineComments: [{ path: "x.ts", line: 2, body: "_🔴 Blocking_\n\n**Boom.**" }],
+    findingsCount: 1,
+    rulesRun: ["rule-a"],
+    rulesFailed: [],
+  };
+
+  it("posts the inline comments via createInlineReview, pinned to the head SHA", async () => {
+    const h = inlineHarness(withInline);
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
+    const [prId, headSha, comments] = h.vcsAdapter.createInlineReview.mock.calls[0];
+    expect(prId).toBe("42");
+    expect(headSha).toBe("cafef00d"); // makePr()'s head sha
+    expect(comments).toEqual(withInline.inlineComments);
+    // The summary is STILL upserted — that's what carries the dedup marker.
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+  });
+
+  // GitHub 422s the ENTIRE review if any anchor is off-diff. Losing every
+  // finding to a formatting technicality is unacceptable — fall back to a
+  // summary comment that contains them all.
+  it("falls back to a full summary comment when the inline review is rejected — never loses findings", async () => {
+    const h = inlineHarness(withInline);
+    h.vcsAdapter.createInlineReview.mockRejectedValue(new Error("HTTP 422 line not part of the diff"));
+    // The fallback re-renders with inline: false.
+    h.orchestrate.mockReturnValueOnce(withInline).mockReturnValueOnce({
+      ...withInline,
+      commentBody: "**Actionable comments posted: 1**\n\n### 💬 Findings (1)\n\nBoom.",
+      inlineComments: [],
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    // Re-orchestrated with inline disabled...
+    expect(h.orchestrate).toHaveBeenCalledTimes(2);
+    expect(h.orchestrate.mock.calls[1]?.[2]).toEqual({ inline: false });
+    // ...and the summary is REWRITTEN (upserted again) to carry the finding. The
+    // marker-bearing summary is posted FIRST by design, so the fallback edits it.
+    const calls = h.vcsAdapter.upsertComment.mock.calls;
+    expect(calls.length).toBe(2);
+    expect(String(calls[calls.length - 1]?.[1])).toContain("Boom.");
+    expect(exitCode).toBe(0); // a rejected inline post is NOT a failed review
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("--dry-run posts nothing: no inline review, no comment", async () => {
+    const h = inlineHarness(withInline, true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    // ...but it PREVIEWS the inline comments, so a dry run shows the whole review.
+    const printed = log.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(printed).toContain("x.ts:2");
+    expect(printed).toContain("Boom.");
+    log.mockRestore();
+  });
+
+  it("skips createInlineReview entirely when there are no anchored findings", async () => {
+    const h = inlineHarness({ ...withInline, inlineComments: [], findingsCount: 0 });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes the DIFF to orchestrate (that's what makes anchoring possible)", async () => {
+    const h = inlineHarness(withInline, true);
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.orchestrate.mock.calls[0]?.[1]).toBe(DIFF);
+    expect(h.orchestrate.mock.calls[0]?.[2]).toEqual({ inline: true });
   });
 });

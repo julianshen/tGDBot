@@ -5,19 +5,29 @@
 // This is a PURE, SYNCHRONOUS function — no LLM calls, no I/O. Any advisor
 // second-opinion pass already happened inside dispatchRules (Task 6); this
 // module is a plain formatting/safety-net layer on top of its output.
+import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
+import type { InlineComment } from "./comment-format.js";
+import { changedFiles, commentableLines, isCommentable } from "./diff-anchors.js";
 import type { DispatchResult, Finding } from "./types.js";
 
+export type { InlineComment } from "./comment-format.js";
+
 export interface OrchestrationResult {
+  /** The SUMMARY comment (upserted, carries the dedup SHA marker). */
   commentBody: string;
+  /**
+   * Findings anchored to a line of the diff, to be posted as INLINE review
+   * comments. Empty when there are none, or when the caller opted out.
+   *
+   * Every finding is in exactly ONE place: either here, or rendered in full in
+   * `commentBody`. A finding is never dropped and never duplicated.
+   */
+  inlineComments: InlineComment[];
   findingsCount: number;
   rulesRun: string[];
   rulesFailed: string[];
 }
 
-// Order matters here: it doubles as both the dedup severity-preference
-// ranking and the section-rendering order (TASKS.md Task 7 step 2:
-// "blocking, then warning, then suggestion").
-const SEVERITY_ORDER: Finding["severity"][] = ["blocking", "warning", "suggestion"];
 
 const SEVERITY_RANK: Record<Finding["severity"], number> = {
   blocking: 0,
@@ -25,11 +35,6 @@ const SEVERITY_RANK: Record<Finding["severity"], number> = {
   suggestion: 2,
 };
 
-const SEVERITY_LABEL: Record<Finding["severity"], string> = {
-  blocking: "Blocking",
-  warning: "Warning",
-  suggestion: "Suggestion",
-};
 
 // Trimmed, case-insensitive, whitespace-collapsed — so cosmetic differences
 // between two rules' phrasing of the same underlying issue (extra spaces,
@@ -65,92 +70,74 @@ function dedupeFindings(findings: Finding[]): Finding[] {
   return [...bestByKey.values()];
 }
 
-// Groups already-deduped findings by severity (in SEVERITY_ORDER, omitting
-// empty groups), then by file within each severity group. File order
-// within a severity is first-seen order among that severity's findings.
-function groupBySeverityThenFile(findings: Finding[]): Map<Finding["severity"], Map<string, Finding[]>> {
-  const bySeverity = new Map<Finding["severity"], Map<string, Finding[]>>();
 
-  for (const severity of SEVERITY_ORDER) {
-    const byFile = new Map<string, Finding[]>();
-    for (const finding of findings) {
-      if (finding.severity !== severity) continue;
-      const bucket = byFile.get(finding.file) ?? [];
-      bucket.push(finding);
-      byFile.set(finding.file, bucket);
+
+
+
+
+
+
+
+/**
+ * Turns a DispatchResult into the two things a review writes: inline comments
+ * anchored to the diff, and a summary comment for everything else.
+ *
+ * `diff` is what makes anchoring possible AND safe: GitHub 422s the entire
+ * review if any comment targets a line outside the diff, so a finding is only
+ * anchored when the diff itself proves the line is addressable (see
+ * diff-anchors). Anything else — no line number, a file not touched by this PR,
+ * a line outside every hunk — is rendered into the summary instead of being
+ * silently dropped.
+ *
+ * `inline: false` (used for the `--dry-run`/no-diff paths and as the failure
+ * fallback) forces EVERY finding into the summary body, so the caller always has
+ * a single self-contained comment it can post.
+ */
+export function orchestrate(
+  dispatchResult: DispatchResult,
+  diff = "",
+  options: { inline?: boolean } = {},
+): OrchestrationResult {
+  // Severity order is load-bearing, not cosmetic: a reader must meet the
+  // blocking findings before the nits, whether they're reading the summary or
+  // scanning the inline comments. dedupeFindings preserves insertion order, so
+  // sort explicitly. (The old severity-grouped renderer got this for free; the
+  // regression it would otherwise have introduced was caught by AC-7.2.)
+  const dedupedFindings = dedupeFindings(dispatchResult.findings).sort(
+    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
+  );
+  const inlineEnabled = options.inline !== false && diff !== "";
+
+  const anchors = inlineEnabled ? commentableLines(diff) : new Map<string, Set<number>>();
+
+  const inlineComments: InlineComment[] = [];
+  const unanchored: Finding[] = [];
+  for (const finding of dedupedFindings) {
+    if (inlineEnabled && isCommentable(anchors, finding.file, finding.line)) {
+      inlineComments.push({
+        path: finding.file,
+        line: finding.line as number,
+        body: renderInlineComment(finding),
+      });
+    } else {
+      unanchored.push(finding);
     }
-    if (byFile.size > 0) {
-      bySeverity.set(severity, byFile);
-    }
   }
 
-  return bySeverity;
-}
-
-function renderFinding(finding: Finding): string {
-  const location = finding.line !== undefined && finding.line !== null ? `L${finding.line}` : "general";
-  return `- **[${location}]** ${finding.message} _(${finding.category}, rule: ${finding.ruleName})_`;
-}
-
-function renderFindingsSection(findings: Finding[]): string {
-  const bySeverity = groupBySeverityThenFile(findings);
-  const sections: string[] = [];
-
-  for (const severity of SEVERITY_ORDER) {
-    const byFile = bySeverity.get(severity);
-    if (!byFile) continue;
-
-    const fileBlocks = [...byFile.entries()].map(([file, fileFindings]) => {
-      const lines = fileFindings.map(renderFinding).join("\n");
-      return `**${file}**\n${lines}`;
-    });
-
-    sections.push(`### ${SEVERITY_LABEL[severity]}\n\n${fileBlocks.join("\n\n")}`);
-  }
-
-  return sections.join("\n\n");
-}
-
-// Smoke-test finding: this section used to name the failed rules and say
-// nothing about WHY, leaving a maintainer with no next step. Append the reason
-// when dispatch could classify one (see DispatchResult.ruleFailureReasons);
-// stay exactly as before when it couldn't, so a missing reason never renders as
-// "undefined".
-function renderFailedRulesSection(
-  rulesFailed: string[],
-  reasons: Record<string, string> | undefined,
-): string {
-  const items = rulesFailed
-    .map((ruleName) => {
-      const reason = reasons?.[ruleName];
-      return reason ? `- ${ruleName} — ${reason}` : `- ${ruleName}`;
-    })
-    .join("\n");
-  return `### ⚠️ Rules that failed\n\nThe following rules failed to run and were skipped:\n\n${items}`;
-}
-
-export function orchestrate(dispatchResult: DispatchResult): OrchestrationResult {
-  const dedupedFindings = dedupeFindings(dispatchResult.findings);
-  const hasFailedRules = dispatchResult.rulesFailed.length > 0;
-
-  const bodyParts = ["## Code Review"];
-
-  if (dedupedFindings.length > 0) {
-    bodyParts.push(renderFindingsSection(dedupedFindings));
-  } else if (!hasFailedRules) {
-    // AC-7.4: never render a blank/near-empty comment — a blank bot
-    // comment reads as a bug, not "all clear".
-    bodyParts.push("No issues found.");
-  }
-
-  if (hasFailedRules) {
-    bodyParts.push(
-      renderFailedRulesSection(dispatchResult.rulesFailed, dispatchResult.ruleFailureReasons),
-    );
-  }
+  const commentBody = renderSummaryComment({
+    allFindings: dedupedFindings,
+    inlineCount: inlineComments.length,
+    unanchored,
+    filesReviewed: changedFiles(diff),
+    rulesRun: dispatchResult.rulesRun,
+    rulesFailed: dispatchResult.rulesFailed,
+    ruleFailureReasons: dispatchResult.ruleFailureReasons,
+    inlineUnavailable: !inlineEnabled && dedupedFindings.length > 0,
+  });
 
   return {
-    commentBody: bodyParts.join("\n\n"),
+    commentBody,
+    inlineComments,
     findingsCount: dedupedFindings.length,
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,

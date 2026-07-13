@@ -163,7 +163,11 @@ export interface ReviewDependencies {
     useAdvisor: boolean,
     orchestratorModel?: string,
   ) => Promise<DispatchResult>;
-  orchestrate: (dispatchResult: DispatchResult) => OrchestrationResult;
+  orchestrate: (
+    dispatchResult: DispatchResult,
+    diff?: string,
+    options?: { inline?: boolean },
+  ) => OrchestrationResult;
 }
 
 // Named exit codes (Task 8 review fix #3; refined by review fix #1) — see
@@ -362,20 +366,64 @@ export async function review(
   }
 
   const dispatchResult = await dispatchRulesFn(rules, diff, config.advisor === "on", config.model);
-  const orchestration = orchestrateFn(dispatchResult);
 
-  const bodyParts = [orchestration.commentBody];
-  if (loadErrors.length > 0) {
-    bodyParts.push(renderLoadErrorsSection(loadErrors));
-  }
-  bodyParts.push(formatMarker(pr.headSha));
-  const body = bodyParts.join("\n\n");
+  // Findings are anchored to the diff and posted as INLINE review comments; only
+  // what can't be anchored (no line number, or a line outside this PR's hunks)
+  // goes in the summary body. Passing the diff is what makes that decision safe —
+  // see orchestrate()/diff-anchors.
+  let orchestration = orchestrateFn(dispatchResult, diff, { inline: true });
 
-  // AC-8.4: --dry-run prints the body instead of writing to the VCS.
+  const buildBody = (o: OrchestrationResult): string => {
+    const bodyParts = [o.commentBody];
+    if (loadErrors.length > 0) bodyParts.push(renderLoadErrorsSection(loadErrors));
+    bodyParts.push(formatMarker(pr.headSha));
+    return bodyParts.join("\n\n");
+  };
+
+  // AC-8.4: --dry-run prints instead of writing to the VCS — including a preview
+  // of the inline comments it WOULD have posted, so a dry run shows the whole
+  // review, not just half of it.
   if (config.dryRun) {
-    console.log(body);
+    for (const comment of orchestration.inlineComments) {
+      console.log(`\n----- inline comment: ${comment.path}:${comment.line} -----`);
+      console.log(comment.body);
+    }
+    if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
+    console.log(buildBody(orchestration));
   } else {
-    await config.vcsAdapter.upsertComment(config.pr, body, botComment);
+    // ORDER MATTERS (review finding). Idempotency rests entirely on the SHA
+    // marker, which lives in the SUMMARY comment: decideDedup skips the whole run
+    // when the marker already names this head SHA. Inline review comments, by
+    // contrast, are append-only — there is no upsert for them.
+    //
+    // So the marker is written FIRST. If the inline post then fails, we edit the
+    // summary to carry every finding. If we posted inline first and the summary
+    // write then threw, no marker would exist, and the next run on the same SHA
+    // would post every inline comment a SECOND time — a duplicate-comment storm
+    // strictly worse than the old behavior.
+    await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), botComment);
+
+    if (orchestration.inlineComments.length > 0) {
+      try {
+        await config.vcsAdapter.createInlineReview(
+          config.pr,
+          pr.headSha,
+          orchestration.inlineComments,
+        );
+      } catch (err) {
+        // Recoverable by design: GitHub rejects the WHOLE review if any single
+        // anchor is off-diff. Rather than lose every finding to that, re-render
+        // the summary with all of them inline-in-body and edit it in place. A
+        // finding is only ever RELOCATED, never lost.
+        console.warn(
+          `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
+            `rewriting the summary comment to carry every finding instead`,
+        );
+        orchestration = orchestrateFn(dispatchResult, diff, { inline: false });
+        const existing = await config.vcsAdapter.findBotComment(config.pr);
+        await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), existing);
+      }
+    }
   }
 
   const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;

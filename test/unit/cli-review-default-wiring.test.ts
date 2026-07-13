@@ -20,11 +20,13 @@ const hoisted = vi.hoisted(() => ({
   findBotComment: vi.fn(),
   upsertComment: vi.fn(),
   getRuleFilesFromBase: vi.fn(),
+  createInlineReview: vi.fn(),
 }));
 
 vi.mock("../../src/vcs/github-adapter.js", () => ({
   GitHubAdapter: class {
     getPullRequest = hoisted.getPullRequest;
+    createInlineReview = hoisted.createInlineReview;
     getDiff = hoisted.getDiff;
     findBotComment = hoisted.findBotComment;
     upsertComment = hoisted.upsertComment;
@@ -96,7 +98,8 @@ describe("review — default dependency wiring", () => {
       rulesFailed: [],
     });
     vi.mocked(orchestrate).mockReturnValue({
-      commentBody: "## Code Review\n\nNo issues found.",
+      commentBody: "**No actionable comments.** ✅",
+      inlineComments: [],
       findingsCount: 0,
       rulesRun: ["rule-a"],
       rulesFailed: [],

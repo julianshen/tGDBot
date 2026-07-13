@@ -181,7 +181,9 @@ describe("orchestrate", () => {
     );
 
     expect(result.commentBody.trim().length).toBeGreaterThan(0);
-    expect(result.commentBody).toMatch(/no issues/i);
+    // AC-7.4 guarantee is unchanged (never render a blank/near-empty comment);
+    // only the wording moved to the CodeRabbit-style header.
+    expect(result.commentBody).toMatch(/no actionable comments/i);
     expect(result.findingsCount).toBe(0);
   });
 
@@ -216,7 +218,10 @@ describe("orchestrate", () => {
     const result = orchestrate(makeDispatchResult({ findings: [generalFinding] }));
 
     expect(result.findingsCount).toBe(1);
-    expect(result.commentBody).toContain("**[general]**");
+    // A finding with no line can't be anchored, so it goes to the summary and is
+    // identified by FILE alone — the guarantee is that it still renders, and
+    // never leaks "undefined"/"null" into the comment.
+    expect(result.commentBody).toContain("`src/foo.ts`");
     expect(result.commentBody).not.toMatch(/\[L(undefined|null)\]/);
     expect(result.commentBody).toContain("Missing license header");
   });
@@ -236,7 +241,10 @@ describe("orchestrate", () => {
     const result = orchestrate(makeDispatchResult({ findings: [generalFinding] }));
 
     expect(result.findingsCount).toBe(1);
-    expect(result.commentBody).toContain("**[general]**");
+    // A finding with no line can't be anchored, so it goes to the summary and is
+    // identified by FILE alone — the guarantee is that it still renders, and
+    // never leaks "undefined"/"null" into the comment.
+    expect(result.commentBody).toContain("`src/bar.ts`");
     expect(result.commentBody).toContain("File-level issue");
   });
 
@@ -286,7 +294,178 @@ describe("failed rules carry a reason (smoke-test finding)", () => {
   it("is backward compatible: no ruleFailureReasons at all still renders the old bare list", () => {
     const result = orchestrate({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
 
-    expect(result.commentBody).toContain("- rule-a");
+    expect(result.commentBody).toContain("`rule-a`");
     expect(result.commentBody).not.toMatch(/undefined/);
+  });
+});
+
+// Inline review comments (CodeRabbit/Cursor model): a finding belongs next to
+// the code it is about. orchestrate() now splits findings into ones it can
+// ANCHOR to a line of the diff (posted inline) and ones it cannot (rendered in
+// the summary). The invariant that matters most: every finding lands in exactly
+// ONE of those two places — never dropped, never duplicated.
+describe("inline anchoring", () => {
+  const DIFF = `diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -10,2 +10,3 @@
+ ctx
++added
++added2
+`;
+
+  const anchored = () =>
+    makeFinding({ file: "src/a.ts", line: 11, message: "Bad thing here.", severity: "blocking" });
+  const offDiffLine = () =>
+    makeFinding({ file: "src/a.ts", line: 900, message: "Line not in the diff.", severity: "warning" });
+  const otherFile = () =>
+    makeFinding({ file: "src/untouched.ts", line: 3, message: "File not in the PR.", severity: "warning" });
+  const noLine = () =>
+    makeFinding({ file: "src/a.ts", line: undefined, message: "No line at all.", severity: "suggestion" });
+
+  it("anchors a finding whose line IS in the diff, as an inline comment", () => {
+    const result = orchestrate(makeDispatchResult({ findings: [anchored()] }), DIFF);
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 11 });
+    expect(result.inlineComments[0].body).toContain("🔴 Blocking");
+    expect(result.inlineComments[0].body).toContain("Prompt for AI Agents");
+    // Counted, not repeated, in the summary.
+    expect(result.commentBody).toContain("Actionable comments posted: 1");
+    expect(result.commentBody).not.toContain("Bad thing here.");
+  });
+
+  // THE INVARIANT. GitHub 422s the whole review if any anchor is off-diff, so
+  // these three must be routed to the summary — but they must still be SEEN.
+  it("never loses a finding: no line, off-diff line, and untouched file all land in the summary", () => {
+    const result = orchestrate(
+      makeDispatchResult({ findings: [anchored(), offDiffLine(), otherFile(), noLine()] }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1); // only the anchorable one
+    expect(result.findingsCount).toBe(4); // all four still counted
+
+    // The other three are rendered IN FULL in the summary.
+    expect(result.commentBody).toContain("Line not in the diff.");
+    expect(result.commentBody).toContain("File not in the PR.");
+    expect(result.commentBody).toContain("No line at all.");
+    expect(result.commentBody).toContain("Additional comments (3)");
+    // Total = inline + summary, so nothing is double-counted.
+    expect(result.commentBody).toContain("Actionable comments posted: 4");
+  });
+
+  it("never duplicates: an anchored finding appears inline and NOT in the summary body", () => {
+    const result = orchestrate(makeDispatchResult({ findings: [anchored()] }), DIFF);
+
+    const inSummary = result.commentBody.includes("Bad thing here.");
+    const inInline = result.inlineComments[0].body.includes("Bad thing here.");
+    expect(inInline).toBe(true);
+    expect(inSummary).toBe(false);
+  });
+
+  it("inline: false forces EVERY finding into the summary (the fallback path)", () => {
+    const result = orchestrate(
+      makeDispatchResult({ findings: [anchored(), noLine()] }),
+      DIFF,
+      { inline: false },
+    );
+
+    expect(result.inlineComments).toEqual([]);
+    expect(result.commentBody).toContain("Bad thing here."); // the anchorable one too
+    expect(result.commentBody).toContain("No line at all.");
+    expect(result.commentBody).toMatch(/Inline comments could not be posted/i);
+  });
+
+  it("with no diff, nothing is anchored (and nothing is lost)", () => {
+    const result = orchestrate(makeDispatchResult({ findings: [anchored()] }));
+
+    expect(result.inlineComments).toEqual([]);
+    expect(result.commentBody).toContain("Bad thing here.");
+  });
+
+  it("lists the reviewed files and the rules that ran in collapsed sections", () => {
+    const result = orchestrate(
+      makeDispatchResult({ findings: [], rulesRun: ["terra-review"] }),
+      DIFF,
+    );
+
+    expect(result.commentBody).toContain("📒 Files reviewed (1)");
+    expect(result.commentBody).toContain("`src/a.ts`");
+    expect(result.commentBody).toContain("⚙️ Rules run (1)");
+    expect(result.commentBody).toContain("`terra-review`");
+    expect(result.commentBody).toContain("No actionable comments");
+  });
+
+  // Finding text is LLM output over an ATTACKER-CONTROLLED diff, and it lands in
+  // a world-readable comment inside <details> blocks. It must not be able to
+  // forge review structure or escape its container.
+  it("neutralises HTML/comment injection in finding text", () => {
+    const evil = makeFinding({
+      file: "src/a.ts",
+      line: 11,
+      message: "x --><script>alert(1)</script></details> ## ✅ Approved",
+    });
+
+    const result = orchestrate(makeDispatchResult({ findings: [evil] }), DIFF);
+    const body = result.inlineComments[0].body;
+
+    expect(body).not.toContain("<script");
+    expect(body).not.toContain("</details> ## ✅ Approved"); // can't close our block
+    expect(body).not.toContain("-->"); // can't terminate an HTML comment we open
+  });
+});
+
+// Found on the FIRST live run against a real PR: a finding whose first sentence
+// ran to 175 chars fell through the "short sentence" case and the entire
+// five-sentence message was emitted as one giant bold headline — a wall of bold,
+// the opposite of the scannable title+prose the format exists for.
+describe("headline splitting (live-run finding)", () => {
+  const DIFF = "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -1,1 +1,2 @@\n ctx\n+added\n";
+  const render = (message: string): string =>
+    orchestrate(makeDispatchResult({ findings: [makeFinding({ file: "x.ts", line: 2, message })] }), DIFF)
+      .inlineComments[0].body;
+  // The VISIBLE prose — everything before the collapsed 🤖 prompt block, which
+  // deliberately repeats the message (that repetition is what makes it a
+  // self-contained, copy-pasteable instruction). Duplication assertions below are
+  // about what a reader SEES, not about the prompt payload.
+  const prose = (message: string): string => render(message).split("<details>")[0];
+
+  it("keeps a short first sentence as the headline and the rest as prose", () => {
+    const body = render("Off-by-one in the loop. It should start at zero, not one.");
+    expect(body).toContain("**Off-by-one in the loop.**");
+    expect(body).toContain("It should start at zero, not one.");
+  });
+
+  // Review finding: truncating a too-long first sentence into a headline and then
+  // printing that same sentence two lines below reads as a stutter. A headline is
+  // a TITLE — if one can't be derived, there simply isn't one.
+  it("omits the headline entirely when no sentence is short enough — never a bold wall, never a stutter", () => {
+    const longFirst =
+      "The reaction toggle remains a check-then-act operation because it branches on the previously computed alreadyReacted value and then separately calls RemoveReaction or AddReaction. Concurrent callers can lose a toggle.";
+    const visible = prose(longFirst);
+
+    // No bold headline at all...
+    expect(visible).not.toMatch(/\*\*.*check-then-act/);
+    // ...and the message appears EXACTLY once in the visible prose (no stutter).
+    expect((visible.match(/check-then-act operation because/g) ?? []).length).toBe(1);
+    expect(visible).toContain("Concurrent callers can lose a toggle.");
+  });
+
+  it("never prints a single-sentence finding twice (headline + duplicate prose)", () => {
+    const visible = prose("Missing null check.");
+    expect((visible.match(/Missing null check/g) ?? []).length).toBe(1); // headline IS the message
+  });
+
+  it("collapses newlines in the headline so bold never breaks", () => {
+    const body = render("Problems:\n- naming\n- nesting. And more prose here.");
+    const headline = /\*\*(.+?)\*\*/s.exec(body)?.[1] ?? "";
+    expect(headline).not.toContain("\n");
+  });
+
+  it("a single short sentence yields a headline and no empty prose paragraph", () => {
+    const body = render("Missing null check.");
+    expect(body).toContain("**Missing null check.**");
+    expect(body).not.toMatch(/\*\*Missing null check\.\*\*\n\n\n/);
   });
 });
