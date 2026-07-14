@@ -590,3 +590,45 @@ describe("GitHubAdapter", () => {
     });
   });
 });
+
+// ADR-007: a multi-line committable suggestion spans start_line..line. GitHub
+// requires start_side alongside start_line, and start_line < line.
+describe("createInlineReview: multi-line suggestion ranges", () => {
+  it("sends start_line + start_side for a multi-line range, and omits them for a single line", async () => {
+    const calls: { args: string[]; stdin?: string }[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      calls.push({ args, stdin });
+      return "{}";
+    };
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.createInlineReview("42", "deadbeef", [
+      { path: "a.ts", line: 13, startLine: 11, body: "multi" },
+      { path: "b.ts", line: 5, body: "single" },
+    ]);
+
+    const payload = JSON.parse(calls[0].stdin as string) as {
+      commit_id: string;
+      event: string;
+      comments: Record<string, unknown>[];
+    };
+
+    expect(payload.commit_id).toBe("deadbeef");
+    expect(payload.event).toBe("COMMENT");
+    expect(payload.comments[0]).toEqual({
+      path: "a.ts",
+      line: 13, // LAST line of the range
+      side: "RIGHT",
+      start_line: 11,
+      start_side: "RIGHT",
+      body: "multi",
+    });
+    // A single-line comment must NOT carry start_line (GitHub rejects start_line === line).
+    expect(payload.comments[1]).toEqual({
+      path: "b.ts",
+      line: 5,
+      side: "RIGHT",
+      body: "single",
+    });
+  });
+});

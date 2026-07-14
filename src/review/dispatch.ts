@@ -34,7 +34,36 @@ export type { DispatchResult, Finding } from "./types.js";
 // this themselves (TASKS.md Task 5 technical design).
 const FINDING_JSON_CONTRACT = `
 Respond with ONLY a JSON array matching this shape (no prose, no markdown fences):
-[{ "file": string, "line": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "message": string }]
+[{
+  "file": string,
+  "line": number | null,
+  "endLine": number | null,
+  "severity": "blocking" | "warning" | "suggestion",
+  "category": string,
+  "title": string,
+  "message": string,
+  "suggestion": string | null
+}]
+
+- "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
+  e.g. "The loop uses <= n, so it sums one element too many." Write it as a
+  statement of the problem, not a restatement of the file name.
+- "message": the full explanation — why it is wrong and what to do.
+- "suggestion": the EXACT replacement text for lines "line".."endLine", or null.
+  DO provide one whenever the fix is a concrete, local edit you are confident in
+  — an off-by-one, a wrong operator or comparison, a missing nil/error check, a
+  swapped argument, a typo'd identifier. These are exactly the cases a one-click
+  fix is for, and omitting a suggestion there wastes the reviewer's time.
+  Rules:
+    * Verbatim code only. NOT a diff, NOT wrapped in markdown fences, no "..."
+      or elisions, no commentary.
+    * It replaces the WHOLE range "line".."endLine" — include every line of that
+      range, with the file's existing indentation.
+    * Omit it (null) for anything you cannot express as a literal replacement of
+      a contiguous line range (design changes, "add a test elsewhere", etc.).
+- "endLine": the last line the suggestion replaces (inclusive). Omit/null when
+  the suggestion replaces only "line", or when there is no suggestion.
+
 If you find nothing, respond with [] exactly.
 `.trim();
 
@@ -650,7 +679,16 @@ export function buildDispatchPrompt(
 
   parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
-    `{ "findings": [{ "file": string, "line": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "message": string, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
+    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
+    // ADR-007/ADR-008: the orchestrator MERGES the subagents' findings and re-emits
+    // them, so every field it is not told to keep is silently dropped at this last
+    // hop. That is exactly what happened on the first live run: the reviewers were
+    // authoring `title` and `suggestion`, and the orchestrator threw both away —
+    // the comment fell back to a derived headline and never showed a Commit button.
+    // Copy them through VERBATIM; never rewrite a suggestion (it is literal code
+    // destined for the file, and a paraphrase would commit something the reviewer
+    // never proposed).
+    `Copy each finding's "title", "message", "suggestion" and "endLine" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
     // Attribution fix (see order-mapping note above): the old wording defined
     // rulesFailed as tasks that "produced no usable output", which the
     // orchestrator wrongly applied to a task that RAN and returned an empty or
@@ -683,6 +721,13 @@ const VALID_SEVERITIES = new Set(["blocking", "warning", "suggestion"]);
 // silently keeping the well-formed findings and dropping the bad ones —
 // a response that gets the shape wrong for one finding is not trustworthy
 // for the others either.
+// The optional ADR-007/ADR-008 fields. Kept LENIENT on purpose: a rule that emits
+// a malformed `title`/`suggestion`/`endLine` should lose that ENRICHMENT, not have
+// its whole finding (or its rule's whole run) thrown away — the finding's core
+// (file/line/severity/message) is still worth posting. So these are validated
+// where they are USED, and simply dropped when wrong, rather than failing the
+// finding here.
+
 function isValidFinding(value: unknown): value is Finding {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
@@ -698,7 +743,32 @@ function isValidFinding(value: unknown): value is Finding {
   ) {
     return false;
   }
+  // NOTE: title/suggestion/endLine are deliberately NOT validated here. They are
+  // OPTIONAL ENRICHMENT, and rejecting a finding over one would be catastrophic:
+  // isValidFinding feeds looksLikeDispatchResult, which is all-or-nothing — a
+  // single bad field on a single finding would discard the ENTIRE orchestrator
+  // result, and (with the advisor on, the default) recovery is disabled, so the
+  // comment would announce "✅ No actionable comments" on a review that found
+  // blocking issues. `"endLine": "12"` — a number emitted as a string — is a
+  // routine LLM slip, and these are three brand-new model-authored fields. They
+  // are stripped in normalizeFinding() instead. Found in review; the first draft
+  // shipped exactly this kill switch.
   return true;
+}
+
+/**
+ * Drops any optional enrichment that is the wrong type, keeping the finding.
+ * The core (file/line/severity/category/message/ruleName) is already validated;
+ * a malformed title/suggestion/endLine costs only itself.
+ */
+function normalizeFinding(finding: Finding): Finding {
+  const raw = finding as unknown as Record<string, unknown>;
+  return {
+    ...finding,
+    title: typeof raw.title === "string" ? raw.title : undefined,
+    suggestion: typeof raw.suggestion === "string" ? raw.suggestion : undefined,
+    endLine: Number.isInteger(raw.endLine) ? (raw.endLine as number) : undefined,
+  };
 }
 
 function looksLikeDispatchResult(value: unknown): value is DispatchResult {
@@ -747,7 +817,7 @@ function parseDispatchResult(text: string | undefined, rules: RuleDefinition[]):
     return fallbackResult(rules);
   }
 
-  return parsed;
+  return { ...parsed, findings: parsed.findings.map(normalizeFinding) };
 }
 
 // Like isValidFinding but WITHOUT requiring ruleName — a dispatched task's raw
@@ -762,6 +832,9 @@ function isValidRawFinding(value: unknown): boolean {
   if (typeof c.category !== "string") return false;
   if (typeof c.message !== "string") return false;
   if (c.line !== undefined && c.line !== null && typeof c.line !== "number") return false;
+  // Same rule as isValidFinding: optional enrichment must never invalidate a
+  // finding. extractFindingsArray uses `p.every(isValidRawFinding)`, so a bad
+  // `title` here would lose ALL of that rule's recovered findings.
   return true;
 }
 
@@ -806,8 +879,69 @@ function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[]
       category: c.category as string,
       message: c.message as string,
       ruleName,
+      // ADR-007/008 enrichment. Carried through the RECOVERY path too — a rule
+      // whose findings had to be recovered from its raw output must not silently
+      // lose its titles and suggestions.
+      title: typeof c.title === "string" ? c.title : undefined,
+      suggestion: typeof c.suggestion === "string" ? c.suggestion : undefined,
+      endLine: typeof c.endLine === "number" ? c.endLine : undefined,
     };
   });
+}
+
+/**
+ * ADR-007 PROVENANCE. A committable suggestion must be traceable to a suggestion a
+ * dispatched reviewer ACTUALLY emitted for that exact (file, line).
+ *
+ * Why this is a control and not a nicety: the ORCHESTRATOR is an LLM that has also
+ * read the attacker-controlled diff, and it re-emits every finding as its own JSON.
+ * Telling it "copy the suggestion verbatim, never rewrite" is a prompt — a hope. It
+ * could invent a suggestion for any (file, line) in the diff, or mutate an honest
+ * one, and the reviewer's real finding would serve as cover for it. Since the
+ * subagents' raw outputs are already captured (details.results[i].finalOutput), we
+ * can turn that hope into an INVARIANT by byte-matching.
+ *
+ * Unverifiable => dropped. If the captured results can't be mapped (so we cannot
+ * know what any subagent actually proposed), no suggestion is committable. The
+ * finding itself is always kept — losing a one-click fix is a fair price.
+ */
+function suggestionProvenanceKeys(
+  captured: CapturedTaskResult[],
+  rules: RuleDefinition[],
+): Set<string> {
+  const keys = new Set<string>();
+  captured.forEach((c, i) => {
+    const rule = rules[i];
+    if (!rule || !c.finalOutput) return;
+    for (const finding of parseFindingsFromFinalOutput(c.finalOutput, rule.name)) {
+      if (typeof finding.suggestion === "string") {
+        keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
+      }
+    }
+  });
+  return keys;
+}
+
+function provenanceKey(file: string, line: number | undefined, suggestion: string): string {
+  return JSON.stringify([file, line ?? null, suggestion]);
+}
+
+/** Strips any suggestion the orchestrator cannot prove a subagent actually made. */
+function enforceSuggestionProvenance(result: DispatchResult, allowed: Set<string>): DispatchResult {
+  let dropped = 0;
+  const findings = result.findings.map((f) => {
+    if (typeof f.suggestion !== "string") return f;
+    if (allowed.has(provenanceKey(f.file, f.line, f.suggestion))) return f;
+    dropped += 1;
+    return { ...f, suggestion: undefined, endLine: undefined };
+  });
+  if (dropped > 0) {
+    console.warn(
+      `dispatchRules: dropped ${dropped} committable suggestion(s) that no dispatched reviewer ` +
+        `actually produced for that file/line (orchestrator provenance check)`,
+    );
+  }
+  return { ...result, findings };
 }
 
 // A task ran successfully iff it exited 0 with no error/timeout/detach.
@@ -1078,7 +1212,20 @@ export async function dispatchRules(
     // Recover dropped findings only when advisor is OFF — see
     // reconcileWithCapturedResults' doc comment for why recovering while the
     // advisor pass is active would undo its false-positive filtering.
-    return reconcileWithCapturedResults(orchestratorResult, capturedTaskResults, rules, !useAdvisor);
+    const reconciled = reconcileWithCapturedResults(
+      orchestratorResult,
+      capturedTaskResults,
+      rules,
+      !useAdvisor,
+    );
+
+    // ADR-007: a suggestion is committable code. It may only survive if a dispatched
+    // reviewer actually proposed it for that exact file/line — never because the
+    // orchestrator said so. Unverifiable => stripped.
+    return enforceSuggestionProvenance(
+      reconciled,
+      suggestionProvenanceKeys(capturedTaskResults, rules),
+    );
   } catch (err) {
     // Setup/session-creation failure (createIsolatedSessionCwd,
     // createIsolatedAgentDir, or createSession threw). Degrade to

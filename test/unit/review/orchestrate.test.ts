@@ -469,3 +469,194 @@ describe("headline splitting (live-run finding)", () => {
     expect(body).not.toMatch(/\*\*Missing null check\.\*\*\n\n\n/);
   });
 });
+
+// ADR-007: a committable suggestion REPLACES the range line..endLine, so BOTH
+// ends must be inside the diff — GitHub 422s the entire review otherwise. The
+// tradeoff when the range isn't fully addressable is deliberate: drop the
+// SUGGESTION, keep the FINDING. Losing the one-click fix is a fair price; losing
+// the finding is not.
+describe("ADR-007: suggestion ranges are validated against the diff", () => {
+  // Hunk covers new lines 10..13.
+  const DIFF = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -10,1 +10,4 @@
+ ctx
++one
++two
++three
+`;
+
+  const find = (over: Partial<Finding>): Finding =>
+    makeFinding({ file: "a.ts", line: 11, message: "m", ...over });
+
+  it("anchors a multi-line suggestion across the range (startLine..line)", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [find({ line: 11, endLine: 13, suggestion: "x\ny\nz" })] }),
+      DIFF,
+    );
+
+    // GitHub's convention: `line` is the LAST line, `startLine` the first.
+    expect(r.inlineComments[0]).toMatchObject({ path: "a.ts", startLine: 11, line: 13 });
+    expect(r.inlineComments[0].body).toContain("Committable suggestion");
+  });
+
+  it("drops the SUGGESTION but keeps the FINDING when endLine is outside the diff", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [find({ line: 11, endLine: 999, suggestion: "x" })] }),
+      DIFF,
+    );
+
+    // Still posted, still anchored to its own line...
+    expect(r.inlineComments).toHaveLength(1);
+    expect(r.inlineComments[0]).toMatchObject({ line: 11 });
+    expect(r.inlineComments[0].startLine).toBeUndefined();
+    // ...but with no committable block, because the range would 422 the review.
+    expect(r.inlineComments[0].body).not.toContain("Committable suggestion");
+    expect(r.findingsCount).toBe(1);
+  });
+
+  it("treats a single-line suggestion (no endLine) as a one-line range", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [find({ line: 12, suggestion: "fixed();" })] }),
+      DIFF,
+    );
+
+    expect(r.inlineComments[0]).toMatchObject({ line: 12 });
+    expect(r.inlineComments[0].startLine).toBeUndefined();
+    expect(r.inlineComments[0].body).toContain("Committable suggestion");
+  });
+
+  it("--suggestions off keeps the finding and the anchor, minus the commit button", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [find({ line: 11, endLine: 13, suggestion: "x" })] }),
+      DIFF,
+      { suggestions: false },
+    );
+
+    expect(r.inlineComments).toHaveLength(1);
+    expect(r.inlineComments[0].body).not.toContain("Committable suggestion");
+  });
+});
+
+// Review fixes on ADR-007's first draft. Each of these was a real defect.
+describe("ADR-007: review fixes", () => {
+  // Two hunks: new lines 10-12 and 50-52.
+  const TWO_HUNKS = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -10,1 +10,3 @@
+ c
++x
++y
+@@ -50,1 +50,3 @@
+ c
++p
++q
+`;
+  const f = (over: Partial<Finding>): Finding =>
+    makeFinding({ file: "a.ts", line: 10, message: "m", ...over });
+
+  // CRITICAL: commentableLines merges a file's hunks into ONE set, so checking only
+  // the ENDPOINTS lets a range straddle two hunks. GitHub requires the range to be
+  // within a single hunk and 422s the ENTIRE review otherwise — killing every
+  // inline comment on the run, the exact failure diff-anchors exists to prevent.
+  it("rejects a range whose ends are in DIFFERENT hunks (endpoint-only checking 422s the review)", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [f({ line: 10, endLine: 51, suggestion: "x" })] }),
+      TWO_HUNKS,
+    );
+
+    // Anchored to its own line, no range, no committable block.
+    expect(r.inlineComments[0].startLine).toBeUndefined();
+    expect(r.inlineComments[0].line).toBe(10);
+    expect(r.inlineComments[0].body).not.toContain("Committable suggestion");
+    expect(r.findingsCount).toBe(1); // finding kept
+  });
+
+  it("accepts a range fully inside ONE hunk", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [f({ line: 10, endLine: 12, suggestion: "x\ny\nz" })] }),
+      TWO_HUNKS,
+    );
+    expect(r.inlineComments[0]).toMatchObject({ startLine: 10, line: 12 });
+    expect(r.inlineComments[0].body).toContain("Committable suggestion");
+  });
+
+  // A 3-line replacement collapsed onto 1 line would duplicate the other 2 — a
+  // wrong one-click fix, which the ADR itself says is worse than none.
+  it("DROPS the suggestion when endLine < line instead of silently anchoring one line", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [f({ line: 12, endLine: 10, suggestion: "a\nb\nc" })] }),
+      TWO_HUNKS,
+    );
+    expect(r.inlineComments[0].body).not.toContain("Committable suggestion");
+    expect(r.findingsCount).toBe(1);
+  });
+
+  it("DROPS the suggestion when endLine is not an integer", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [f({ line: 10, endLine: 11.5, suggestion: "x" })] }),
+      TWO_HUNKS,
+    );
+    expect(r.inlineComments[0].body).not.toContain("Committable suggestion");
+  });
+
+  // An EMPTY ```suggestion block is how GitHub expresses "delete these lines".
+  it("never renders an empty suggestion (a one-click DELETE nobody authored)", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [f({ line: 10, endLine: 12, suggestion: "  \n " })] }),
+      TWO_HUNKS,
+    );
+    expect(r.inlineComments[0].body).not.toContain("Committable suggestion");
+    expect(r.inlineComments[0].startLine).toBeUndefined(); // and no range anchor
+  });
+
+  // Blast-radius cap: a mistaken click here is arbitrary execution WITH SECRETS,
+  // not merely bad code in a PR.
+  it("never offers a COMMIT BUTTON on files that execute with secrets — but still shows the fix", () => {
+    for (const file of [
+      ".github/workflows/ci.yml",
+      "package.json",
+      "Dockerfile",
+      "pnpm-lock.yaml",
+      "Makefile",
+    ]) {
+      const diff = `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1,1 +1,2 @@\n c\n+x\n`;
+      const r = orchestrate(
+        makeDispatchResult({
+          findings: [makeFinding({ file, line: 2, message: "m", suggestion: "evil()" })],
+        }),
+        diff,
+      );
+
+      const body = r.inlineComments[0].body;
+      expect(body, file).not.toContain("Committable suggestion");
+      expect(body, file).not.toMatch(/```suggestion/);
+      // ...but the proposed fix is still visible, as an inert block.
+      expect(body, file).toContain("Proposed fix (not committable)");
+      expect(body, file).toContain("evil()");
+    }
+  });
+
+  it("still offers the commit button on ordinary application code", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [f({ line: 10, suggestion: "const ok = 1;" })] }),
+      TWO_HUNKS,
+    );
+    expect(r.inlineComments[0].body).toContain("Committable suggestion");
+  });
+
+  // The safe mode must not be the lossy mode.
+  it("--suggestions off DOWNGRADES the fix to a plain block — it does not delete it", () => {
+    const r = orchestrate(
+      makeDispatchResult({ findings: [f({ line: 10, suggestion: "const x = 1;" })] }),
+      TWO_HUNKS,
+      { suggestions: false },
+    );
+    const body = r.inlineComments[0].body;
+    expect(body).not.toContain("Committable suggestion");
+    expect(body).toContain("Proposed fix (not committable)");
+    expect(body).toContain("const x = 1;"); // the fix is STILL SHOWN
+  });
+});

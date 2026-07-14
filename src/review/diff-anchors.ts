@@ -156,3 +156,31 @@ export function changedFiles(diff: string): string[] {
   }
   return files;
 }
+
+/**
+ * True iff EVERY line in `start`..`end` (inclusive) is commentable.
+ *
+ * ADR-007's committable suggestions replace a whole line range, and GitHub
+ * requires that range to lie within a SINGLE hunk — it 422s the entire review
+ * otherwise, killing every inline comment on the run. Checking only the endpoints
+ * is unsound, because this module merges a file's hunks into one set: two lines in
+ * DIFFERENT hunks would both pass while the lines between them are not in the diff
+ * at all.
+ *
+ * Because context lines are part of the anchor set, "every line in the range is
+ * commentable" is exactly equivalent to "the range is inside one hunk".
+ */
+export function rangeIsCommentable(
+  map: CommentableLines,
+  file: string,
+  start: number,
+  end: number,
+): boolean {
+  if (!Number.isInteger(start) || !Number.isInteger(end) || end < start) return false;
+  const lines = map.get(file);
+  if (!lines) return false;
+  for (let line = start; line <= end; line += 1) {
+    if (!lines.has(line)) return false;
+  }
+  return true;
+}

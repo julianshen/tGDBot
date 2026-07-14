@@ -51,8 +51,13 @@ export interface VcsAdapter {
 export interface InlineReviewComment {
   /** Repo-relative path on the NEW side of the diff. */
   path: string;
-  /** NEW-file line number; must lie inside a diff hunk. */
+  /**
+   * NEW-file line number; must lie inside a diff hunk. For a multi-line range
+   * (ADR-007's committable suggestions) this is the LAST line, per GitHub's API.
+   */
   line: number;
+  /** First line of a multi-line range; omitted for a single-line comment. */
+  startLine?: number;
   body: string;
 }
 

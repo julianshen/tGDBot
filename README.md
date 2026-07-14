@@ -139,6 +139,12 @@ tgd-review-agent review \
                                   # has no relationship to and cannot verify. If nothing here has
                                   # credentials, pi picks its own available model. See "Which model
                                   # orchestrates?" below.
+  --suggestions on|off           # default: on. Renders a GitHub COMMITTABLE suggestion (a one-click
+                                  # "Commit suggestion" button) when a rule supplies a concrete
+                                  # replacement. `off` still SHOWS the proposed fix, as a plain
+                                  # non-committable block. Never offered on files that execute with
+                                  # secrets (.github/**, package.json, Dockerfile, lockfiles, ...).
+                                  # See "Committable suggestions" below for the threat model.
   --dry-run                      # post nothing: print the summary comment AND a preview of every
                                   # inline comment it would have posted (file:line + body)
   --trust-local-rules            # optional: read --rules-dir directly off the local filesystem

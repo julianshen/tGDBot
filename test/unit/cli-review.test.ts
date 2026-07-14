@@ -25,6 +25,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     rulesDir: ".tgd-review/rules",
     disableBuiltinRule: false,
     advisor: "on",
+    suggestions: "on",
     dryRun: false,
     trustLocalRules: false,
     ...overrides,
@@ -733,7 +734,7 @@ describe("inline review comments", () => {
 
     // Re-orchestrated with inline disabled...
     expect(h.orchestrate).toHaveBeenCalledTimes(2);
-    expect(h.orchestrate.mock.calls[1]?.[2]).toEqual({ inline: false });
+    expect(h.orchestrate.mock.calls[1]?.[2]).toEqual({ inline: false, suggestions: true });
     // ...and the summary is REWRITTEN (upserted again) to carry the finding. The
     // marker-bearing summary is posted FIRST by design, so the fallback edits it.
     const calls = h.vcsAdapter.upsertComment.mock.calls;
@@ -774,6 +775,6 @@ describe("inline review comments", () => {
     await review(h.args, depsFrom(h));
 
     expect(h.orchestrate.mock.calls[0]?.[1]).toBe(DIFF);
-    expect(h.orchestrate.mock.calls[0]?.[2]).toEqual({ inline: true });
+    expect(h.orchestrate.mock.calls[0]?.[2]).toEqual({ inline: true, suggestions: true });
   });
 });

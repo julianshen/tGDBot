@@ -13,6 +13,7 @@ describe("parseArgs", () => {
       rulesDir: ".tgd-review/rules",
       disableBuiltinRule: false,
       advisor: "on",
+      suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
     });
@@ -41,6 +42,7 @@ describe("parseArgs", () => {
       rulesDir: "custom/rules",
       disableBuiltinRule: true,
       advisor: "off",
+      suggestions: "on",
       dryRun: true,
       trustLocalRules: true,
     });

@@ -287,6 +287,11 @@ export class GitHubAdapter implements VcsAdapter {
         path: c.path,
         line: c.line,
         side: "RIGHT",
+        // ADR-007: a multi-line committable suggestion spans start_line..line.
+        // GitHub requires start_side alongside start_line, and start_line < line.
+        ...(typeof c.startLine === "number" && c.startLine < c.line
+          ? { start_line: c.startLine, start_side: "RIGHT" }
+          : {}),
         body: c.body,
       })),
     };

@@ -12,8 +12,14 @@ import type { Finding } from "./types.js";
 export interface InlineComment {
   /** Repo-relative path, as it appears on the NEW side of the diff. */
   path: string;
-  /** NEW-file line number. Guaranteed commentable (see diff-anchors). */
+  /**
+   * NEW-file line number the comment anchors to. For a multi-line committable
+   * suggestion this is the LAST line of the range (GitHub's convention), with
+   * `startLine` carrying the first. Guaranteed commentable (see diff-anchors).
+   */
   line: number;
+  /** First line of a multi-line range (ADR-007). Omitted for a single line. */
+  startLine?: number;
   body: string;
 }
 
@@ -62,7 +68,10 @@ function categoryBadge(category: string): string {
 // Code fences themselves are KEPT — findings legitimately contain ```go blocks and
 // they are genuinely useful. Only the `suggestion` (and `suggestions`) info-string
 // is defanged, and only GitHub treats that one as committable.
-const SUGGESTION_FENCE_RE = /^([ \t]*(?:`{3,}|~{3,})[ \t]*)suggestions?\b/gim;
+// The prefix class covers blockquote/list markers too: a fence nested in `> ` or
+// `- ` must be defanged as well — guarantee 1 is load-bearing enough that it must
+// not rest on an unverified detail of how GitHub parses nested fences.
+const SUGGESTION_FENCE_RE = /^([ \t>*+\-]*(?:`{3,}|~{3,})[ \t]*)suggestions?\b/gim;
 
 function sanitizeText(text: string): string {
   return text
@@ -98,17 +107,37 @@ function fenceFor(content: string): string {
 const HEADLINE_MAX = 120;
 
 /**
- * Split a finding into a short bold headline + prose body — the shape CodeRabbit
- * uses, and far more scannable than one undifferentiated paragraph.
+ * ADR-008: prefer the AUTHORED title.
  *
- * Our Finding carries only `message` (no separate title), so the headline has to
- * be derived:
- *   - a first sentence that is short enough  → headline = it, body = the rest
- *   - a first sentence that is too long      → headline = a word-boundary
- *     truncation of it, body = the FULL message (nothing is lost; the headline
- *     is a title, and a title repeating its first line is normal)
- *   - a single short sentence                → headline only, no body
+ * A headline is a title, and a title should be written, not guessed. When a rule
+ * supplies one, use it and let the whole message be the prose. Only fall back to
+ * deriving one from the first sentence when `title` is absent — which keeps every
+ * pre-ADR-008 rule working unchanged.
  */
+function resolveHeadline(finding: Finding, sanitizedMessage: string): { headline: string; body: string } {
+  const title = finding.title ? sanitizeInline(finding.title) : "";
+  if (!title) return splitHeadline(sanitizedMessage);
+
+  // Guard the exact stutter ADR-008 exists to eliminate. The most natural thing a
+  // model does is open `message` by restating the title — which would print the
+  // same sentence twice, once in bold. If the message's first sentence IS the
+  // title, drop it from the prose.
+  const split = splitHeadline(sanitizedMessage);
+  const sameSentence =
+    split.headline && normalizeForCompare(split.headline) === normalizeForCompare(title);
+  const body = sameSentence ? split.body : sanitizedMessage;
+
+  return { headline: truncate(title, HEADLINE_MAX), body };
+}
+
+function normalizeForCompare(text: string): string {
+  return text.toLowerCase().replace(/[\s.!?]+/g, " ").trim();
+}
+
+function truncate(text: string, max: number): string {
+  return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
+}
+
 function splitHeadline(message: string): { headline: string; body: string } {
   const trimmed = message.trim();
 
@@ -136,10 +165,10 @@ function splitHeadline(message: string): { headline: string; body: string } {
  * already names the file and line, so acting on the finding doesn't require
  * re-deriving the context.
  */
-export function renderInlineComment(finding: Finding): string {
+export function renderInlineComment(finding: Finding, options: RenderOptions = {}): string {
   const full = sanitizeText(finding.message);
   const file = sanitizeInline(finding.file);
-  const { headline, body } = splitHeadline(full);
+  const { headline, body } = resolveHeadline(finding, full);
   const lineRef = typeof finding.line === "number" ? ` around line ${finding.line}` : "";
 
   // Exactly ONE of these shapes — never the message twice:
@@ -152,6 +181,15 @@ export function renderInlineComment(finding: Finding): string {
     if (body) parts.push("", body);
   } else {
     parts.push(full);
+  }
+
+  // ADR-007. Only ever from the structured field — never from `message`.
+  const suggestion = finding.suggestion?.trim() ? capSuggestion(finding.suggestion) : undefined;
+  if (suggestion) {
+    // `--suggestions off` DOWNGRADES to a plain, non-committable block. It must not
+    // delete the fix: the reviewer who picked the safe mode is the last person who
+    // should lose information (caught in review — the first draft dropped it).
+    parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
   }
 
   const prompt = `In \`${file}\`${lineRef}: ${full}\n\nFix only this issue, keep the change minimal, and make sure the tests still pass.`;
@@ -174,6 +212,74 @@ export function renderInlineComment(finding: Finding): string {
 
 function metaLine(finding: Finding): string {
   return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | _\`${sanitizeInline(finding.ruleName)}\`_`;
+}
+
+export interface RenderOptions {
+  /**
+   * ADR-007: whether to render committable ```suggestion blocks. `--suggestions
+   * off` turns them into plain, non-committable code blocks for repos that don't
+   * want a one-click commit path from LLM-authored text.
+   */
+  suggestions?: boolean;
+}
+
+/**
+ * ADR-007: a GitHub COMMITTABLE SUGGESTION — a one-click "Commit suggestion"
+ * button on the anchored line range.
+ *
+ * THE SECURITY BOUNDARY. ADR-006 deliberately defangs any ```suggestion fence
+ * appearing in free-text `message`, because that text is LLM output over an
+ * ATTACKER-CONTROLLED diff and prompt injection could otherwise mint a
+ * committable block. This function is the ONLY place a real one can be created,
+ * and it can only be reached from the structured, validated `suggestion` field:
+ *
+ *  - the fence is sized longer than any backtick run INSIDE the suggestion, so
+ *    the content cannot close it early and inject markdown/HTML around the block;
+ *  - the content is emitted verbatim and never sanitized, because it is CODE
+ *    destined for the file — escaping it would corrupt what gets committed. It is
+ *    inert: everything between the fences is literal, and GitHub scopes the commit
+ *    to the anchored line range;
+ *  - the explicit warning below is not decoration. A suggestion is the one thing
+ *    this tool emits that a human can accept without reading the reasoning.
+ */
+function renderSuggestionBlock(suggestion: string, committable: boolean): string {
+  const fence = fenceFor(suggestion);
+  const body = suggestion.replace(/\s+$/, "");
+  if (!committable) {
+    return [
+      "<details>",
+      "<summary>💡 Proposed fix (not committable)</summary>",
+      "",
+      `${fence}text`,
+      body,
+      fence,
+      "",
+      "</details>",
+    ].join("\n");
+  }
+  return [
+    "<details>",
+    "<summary>📝 Committable suggestion</summary>",
+    "",
+    "> ‼️ **IMPORTANT**",
+    "> Review this carefully before committing. It is generated from an automated",
+    "> review of an untrusted diff — make sure it replaces exactly the highlighted",
+    "> lines, is complete, is correctly indented, and actually does what you want.",
+    "",
+    `${fence}suggestion`,
+    body,
+    fence,
+    "",
+    "</details>",
+  ].join("\n");
+}
+
+// GitHub caps a comment body at 65,536 characters. An unbounded suggestion would
+// blow past it and make createInlineReview fail — which loses EVERY inline comment
+// on the run, not just this one. Cap it and say so, rather than gamble the review.
+const SUGGESTION_MAX = 8000;
+function capSuggestion(suggestion: string): string | undefined {
+  return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
 
 export interface SummaryInput {
@@ -199,7 +305,7 @@ function renderUnanchoredFinding(finding: Finding): string {
   const file = sanitizeInline(finding.file);
   const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
   const full = sanitizeText(finding.message);
-  const { headline, body } = splitHeadline(full);
+  const { headline, body } = resolveHeadline(finding, full);
 
   const parts = [`**\`${loc}\`**`, "", metaLine(finding), ""];
   if (headline) {

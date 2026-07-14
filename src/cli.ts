@@ -31,6 +31,13 @@ export interface CliArgs {
   rulesDir: string;
   disableBuiltinRule: boolean;
   advisor: "on" | "off";
+  /**
+   * ADR-007: whether to render committable ```suggestion blocks (one-click
+   * "Commit suggestion"). Default on. `off` downgrades them to plain,
+   * non-committable code blocks — for repos that do not want a one-click commit
+   * path from text an automated reviewer derived from an untrusted diff.
+   */
+  suggestions: "on" | "off";
   dryRun: boolean;
   trustLocalRules: boolean;
 }
@@ -40,6 +47,7 @@ const DEFAULTS = {
   rulesDir: ".tgd-review/rules",
   disableBuiltinRule: false,
   advisor: "on" as const,
+  suggestions: "on" as const,
   dryRun: false,
   trustLocalRules: false,
 };
@@ -85,6 +93,7 @@ export function parseArgs(argv: string[]): CliArgs {
       "rules-dir": { type: "string" },
       "disable-builtin-rule": { type: "boolean" },
       advisor: { type: "string" },
+      suggestions: { type: "string" },
       model: { type: "string" },
       "dry-run": { type: "boolean" },
       "trust-local-rules": { type: "boolean" },
@@ -120,6 +129,11 @@ export function parseArgs(argv: string[]): CliArgs {
     throw new Error(`Invalid --advisor value: "${advisor}" (expected "on" or "off")`);
   }
 
+  const suggestions = (values.suggestions as string | undefined) ?? DEFAULTS.suggestions;
+  if (suggestions !== "on" && suggestions !== "off") {
+    throw new Error(`Invalid --suggestions value: "${suggestions}" (expected "on" or "off")`);
+  }
+
   // Issue #1 (round 2), review fix: validate --model HERE, like --vcs/--advisor.
   // `??` is nullish-only, so an EMPTY string would otherwise sail past the
   // rule-derived default and land back on pi's ambient default — silently
@@ -142,6 +156,7 @@ export function parseArgs(argv: string[]): CliArgs {
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
+    suggestions,
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
     trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,
   };
@@ -166,7 +181,7 @@ export interface ReviewDependencies {
   orchestrate: (
     dispatchResult: DispatchResult,
     diff?: string,
-    options?: { inline?: boolean },
+    options?: { inline?: boolean; suggestions?: boolean },
   ) => OrchestrationResult;
 }
 
@@ -371,7 +386,10 @@ export async function review(
   // what can't be anchored (no line number, or a line outside this PR's hunks)
   // goes in the summary body. Passing the diff is what makes that decision safe —
   // see orchestrate()/diff-anchors.
-  let orchestration = orchestrateFn(dispatchResult, diff, { inline: true });
+  // Only an explicit "off" disables them — an absent value means the documented
+  // default (on), never a silent downgrade.
+  const renderOpts = { suggestions: config.suggestions !== "off" };
+  let orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
 
   const buildBody = (o: OrchestrationResult): string => {
     const bodyParts = [o.commentBody];
@@ -419,7 +437,7 @@ export async function review(
           `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
             `rewriting the summary comment to carry every finding instead`,
         );
-        orchestration = orchestrateFn(dispatchResult, diff, { inline: false });
+        orchestration = orchestrateFn(dispatchResult, diff, { inline: false, ...renderOpts });
         const existing = await config.vcsAdapter.findBotComment(config.pr);
         await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), existing);
       }
