@@ -29,6 +29,19 @@ just can no longer *act* (no code execution, no file mutation, no external
 contact) — this closes the RCE-class risk while leaving a narrower,
 output-integrity-only residual risk, tracked in `DEBT.md`.
 
+**Findings are now posted as inline review comments on the diff, and that surface
+has powers an issue comment does not.** GitHub renders a ` ```suggestion ` fence
+inside a *review comment* as a **committable suggestion with a one-click "Commit
+suggestion" button** — the same fence is inert in an issue comment. Since finding
+text is LLM output over the (attacker-controlled) diff, an unhardened renderer
+would have put attacker-chosen code one click from the PR branch. The renderer
+therefore **defangs the `suggestion` info-string** in all finding-derived text
+(ordinary code fences still render normally, because they are genuinely useful),
+sizes the collapsed AI-prompt block's fence to its content so a message cannot
+escape it, and sanitizes the `file`/`category` fields out of their code spans.
+See ADR-006. This is enforced by `test/unit/review/comment-format.test.ts` and
+recorded in `REGRESSION-CATALOG.md`.
+
 One related attack vector **is** fully closed, natively by the CLI itself:
 rule files (`.tgd-review/rules/*.md`) are loaded from the PR's **base**
 branch via the VCS provider's API, never from the PR's own checkout — see
@@ -126,7 +139,8 @@ tgd-review-agent review \
                                   # has no relationship to and cannot verify. If nothing here has
                                   # credentials, pi picks its own available model. See "Which model
                                   # orchestrates?" below.
-  --dry-run                      # print the synthesized comment body to stdout instead of posting it
+  --dry-run                      # post nothing: print the summary comment AND a preview of every
+                                  # inline comment it would have posted (file:line + body)
   --trust-local-rules            # optional: read --rules-dir directly off the local filesystem
                                   # instead of fetching from the base branch — a developer
                                   # convenience for iterating on an uncommitted rule file, NOT a
@@ -172,6 +186,13 @@ previous commit's comments **remain** on the PR as history (the same behaviour
 CodeRabbit has — there is no upsert for review comments, only for the summary).
 If the head SHA hasn't changed, the run is skipped entirely, so the same comments
 are never posted twice.
+
+**A rule that fails says why.** If a rule's subagent can't run — most commonly
+because the machine has no credentials for the provider that rule is pinned to —
+the summary names it with an actionable reason
+(``- tgd-review — no working credentials for provider `anthropic` on the machine
+running the review``). The *raw* provider error goes to the CI logs, never into
+the world-readable comment.
 
 **Nothing is ever lost.** GitHub rejects an inline comment on a line that isn't
 part of the diff — and rejects the *entire* review if even one is invalid. So a
