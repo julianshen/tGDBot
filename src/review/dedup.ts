@@ -47,12 +47,18 @@ export interface ReviewConfigForDedup {
 export function computeReviewConfigHash(config: ReviewConfigForDedup): string {
   // A positional array (not an object) so the serialization can't drift on key
   // ordering; every field that affects review output is included explicitly.
+  // rulesDir separators are normalized to POSIX `/` so the SAME logical rules
+  // directory hashes identically regardless of the OS the CLI runs on — e.g. a
+  // `--trust-local-rules` run passing `.tgd-review\rules` on Windows must not
+  // read as a config change versus `.tgd-review/rules` in Linux CI and force a
+  // spurious re-review. (The default value has no backslashes, so this leaves
+  // existing hashes unchanged.)
   const canonical = JSON.stringify([
     config.advisor,
     config.suggestions,
     config.disableBuiltinRule,
     config.trustLocalRules,
-    config.rulesDir,
+    config.rulesDir.replace(/\\/g, "/"),
     config.model ?? null,
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);

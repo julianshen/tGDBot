@@ -128,6 +128,12 @@ describe("computeReviewConfigHash", () => {
     expect(computeReviewConfigHash(makeConfig({ rulesDir: "other/rules" }))).not.toBe(base);
     expect(computeReviewConfigHash(makeConfig({ model: "openai-codex/gpt-5.6-terra" }))).not.toBe(base);
   });
+
+  it("normalizes rulesDir separators so the same logical dir hashes identically across OSes", () => {
+    expect(computeReviewConfigHash(makeConfig({ rulesDir: ".tgd-review\\rules" }))).toBe(
+      computeReviewConfigHash(makeConfig({ rulesDir: ".tgd-review/rules" })),
+    );
+  });
 });
 
 describe("formatMarker", () => {
