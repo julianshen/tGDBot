@@ -141,6 +141,11 @@ tgd-review-agent review \
                                   # non-committable block. Never offered on files that execute with
                                   # secrets (.github/**, package.json, Dockerfile, lockfiles, ...).
                                   # See "Committable suggestions" below for the threat model.
+  --max-diff-chars <n>           # optional hard cost ceiling: the dispatch prompt embeds the diff
+                                  # once per rule (cost scales with rules × diff size), so when set
+                                  # and the diff exceeds it, the run SKIPS with a visible notice
+                                  # (exit 0, nothing posted) instead of silently spending. Absent =
+                                  # unlimited. The status line then carries reason: "diff-too-large".
   --dry-run                      # post nothing: print the summary comment AND a preview of every
                                   # inline comment it would have posted (file:line + body)
   --trust-local-rules            # optional: read --rules-dir directly off the local filesystem
