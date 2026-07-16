@@ -29,6 +29,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     suggestions: "on",
     dryRun: false,
     trustLocalRules: false,
+    dispatch: "direct",
     ...overrides,
   };
 }

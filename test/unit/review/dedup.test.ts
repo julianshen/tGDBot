@@ -32,6 +32,7 @@ function makeConfig(overrides: Partial<ReviewConfigForDedup> = {}): ReviewConfig
     trustLocalRules: false,
     rulesDir: ".tgd-review/rules",
     model: undefined,
+    dispatch: "direct",
     ...overrides,
   };
 }
@@ -127,6 +128,7 @@ describe("computeReviewConfigHash", () => {
     expect(computeReviewConfigHash(makeConfig({ trustLocalRules: true }))).not.toBe(base);
     expect(computeReviewConfigHash(makeConfig({ rulesDir: "other/rules" }))).not.toBe(base);
     expect(computeReviewConfigHash(makeConfig({ model: "openai-codex/gpt-5.6-terra" }))).not.toBe(base);
+    expect(computeReviewConfigHash(makeConfig({ dispatch: "legacy" }))).not.toBe(base);
   });
 
   it("normalizes rulesDir separators so the same logical dir hashes identically across OSes", () => {

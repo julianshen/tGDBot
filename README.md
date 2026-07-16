@@ -145,6 +145,12 @@ tgd-review-agent review \
                                   # and the diff exceeds it, the run SKIPS with a visible notice
                                   # (exit 0, nothing posted) instead of silently spending. Absent =
                                   # unlimited. The status line then carries reason: "diff-too-large".
+  --dispatch direct|legacy       # default: direct. "direct" runs one reviewer session per rule via
+                                  # the pi SDK's public API and merges findings deterministically in
+                                  # code — no orchestrating LLM on the data path, so attribution and
+                                  # accounting are exact by construction. "legacy" is the previous
+                                  # LLM-orchestrated pi-subagents fan-out, kept for one release as an
+                                  # escape hatch.
   --dry-run                      # post nothing: print the summary comment AND a preview of every
                                   # inline comment it would have posted (file:line + body)
   --trust-local-rules            # optional: read --rules-dir directly off the local filesystem

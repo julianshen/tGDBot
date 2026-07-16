@@ -101,7 +101,7 @@ function warnIfDiffCostRisk(rules: EffectiveRule[], diff: string): void {
   }
 }
 
-function buildTaskText(rule: EffectiveRule, diff: string): string {
+export function buildTaskText(rule: EffectiveRule, diff: string): string {
   return [rule.body.trim(), READ_ONLY_INSTRUCTION, FINDING_JSON_CONTRACT, "---", "Diff:", diff].join(
     "\n\n",
   );

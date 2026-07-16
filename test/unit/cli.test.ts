@@ -16,6 +16,7 @@ describe("parseArgs", () => {
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
+      dispatch: "direct",
     });
   });
 
@@ -34,6 +35,8 @@ describe("parseArgs", () => {
       "off",
       "--dry-run",
       "--trust-local-rules",
+      "--dispatch",
+      "legacy",
     ]);
 
     expect(result).toEqual({
@@ -45,6 +48,24 @@ describe("parseArgs", () => {
       suggestions: "on",
       dryRun: true,
       trustLocalRules: true,
+      dispatch: "legacy",
+    });
+  });
+
+  // Design-review P0: --dispatch selects the engine (direct is the default).
+  describe("--dispatch", () => {
+    it("defaults to direct", () => {
+      expect(parseArgs(["review", "--pr", "42"]).dispatch).toBe("direct");
+    });
+
+    it("accepts legacy", () => {
+      expect(parseArgs(["review", "--pr", "42", "--dispatch", "legacy"]).dispatch).toBe("legacy");
+    });
+
+    it("rejects anything else with an error naming the flag", () => {
+      expect(() => parseArgs(["review", "--pr", "42", "--dispatch", "turbo"])).toThrow(
+        /--dispatch/,
+      );
     });
   });
 

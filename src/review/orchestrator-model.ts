@@ -168,6 +168,38 @@ export function resolveOrchestratorModel(
   return undefined;
 }
 
+/**
+ * Direct dispatch (P0): resolve one RULE's session model. Unlike the
+ * orchestrator's candidate ladder this is a single spec — the rule's own
+ * (effective) pin — so failure is an ERROR STRING for the caller to classify
+ * into the rule's failure reason, not a silent fallback. The thinking-level
+ * suffix (`:high` etc.) is split off and returned separately so the session
+ * can be created at the pinned level.
+ */
+export function resolveRuleSessionModel(
+  provider: string,
+  modelSpec: string,
+): {
+  model?: CreateAgentSessionOptions["model"];
+  thinkingLevel?: string;
+  error?: string;
+} {
+  const { registry } = createRegistry();
+  const suffixMatch = THINKING_SUFFIX_RE.exec(modelSpec);
+  const modelId = modelSpec.replace(THINKING_SUFFIX_RE, "");
+  const model = registry.find(provider, modelId);
+  if (!model) {
+    return { error: `model "${provider}/${modelId}" is not in the pi model registry` };
+  }
+  if (!registry.hasConfiguredAuth(model)) {
+    return { error: `no configured credentials for provider ${provider} on this machine` };
+  }
+  // pi's thinking levels; "off" is a legacy alias for "none".
+  const rawLevel = suffixMatch?.[0].slice(1).toLowerCase();
+  const thinkingLevel = rawLevel === "off" ? "none" : rawLevel;
+  return { model: model as CreateAgentSessionOptions["model"], thinkingLevel };
+}
+
 export interface EffectiveRulesResult {
   /** Every rule, with unpinned ones filled from the resolved default. */
   effective: EffectiveRule[];

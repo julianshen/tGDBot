@@ -6,6 +6,7 @@ import { parseArgs as nodeParseArgs } from "node:util";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
+import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
@@ -44,6 +45,16 @@ export interface CliArgs {
   dryRun: boolean;
   trustLocalRules: boolean;
   /**
+   * Design-review P0: which dispatch engine runs the rules.
+   *  - "direct" (default): one AgentSession per rule via the pi SDK's public
+   *    API, merged deterministically in TypeScript — no orchestrating LLM on
+   *    the data path. See src/review/direct-dispatch.ts.
+   *  - "legacy": the previous LLM-orchestrated pi-subagents fan-out
+   *    (src/review/dispatch.ts). Kept for one release as the escape hatch
+   *    while the direct engine gets live mileage.
+   */
+  dispatch: "direct" | "legacy";
+  /**
    * Design-review item #13: a HARD cost ceiling on diff size. The dispatch
    * prompt embeds the diff once per rule (O(rules × diff) tokens — see
    * dispatch.ts's warnIfDiffCostRisk, which only WARNS). When set and the
@@ -65,6 +76,7 @@ const DEFAULTS = {
   suggestions: "on" as const,
   dryRun: false,
   trustLocalRules: false,
+  dispatch: "direct" as const,
 };
 
 /**
@@ -113,6 +125,7 @@ export function parseArgs(argv: string[]): CliArgs {
       "dry-run": { type: "boolean" },
       "trust-local-rules": { type: "boolean" },
       "max-diff-chars": { type: "string" },
+      dispatch: { type: "string" },
     },
   });
 
@@ -150,6 +163,11 @@ export function parseArgs(argv: string[]): CliArgs {
     throw new Error(`Invalid --suggestions value: "${suggestions}" (expected "on" or "off")`);
   }
 
+  const dispatch = (values.dispatch as string | undefined) ?? DEFAULTS.dispatch;
+  if (dispatch !== "direct" && dispatch !== "legacy") {
+    throw new Error(`Invalid --dispatch value: "${dispatch}" (expected "direct" or "legacy")`);
+  }
+
   // Issue #1 (round 2), review fix: validate --model HERE, like --vcs/--advisor.
   // `??` is nullish-only, so an EMPTY string would otherwise sail past the
   // rule-derived default and land back on pi's ambient default — silently
@@ -185,6 +203,7 @@ export function parseArgs(argv: string[]): CliArgs {
     vcs,
     model,
     maxDiffChars,
+    dispatch,
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
@@ -387,17 +406,23 @@ export async function review(
 ): Promise<number> {
   const resolveConfigFn = deps.resolveConfig ?? resolveConfigReal;
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
-  // The adapter exists because `dispatchRulesReal` (whose 4th positional param
-  // is its injectable session FACTORY, with `orchestratorModel` only 5th) is not
-  // assignable to ReviewDependencies["dispatchRules"], whose 4th param IS the
-  // model. tsc rejects both the direct assignment and the slot-swapped call, so
-  // this is a plain shape mismatch, not a silent landmine — but the awkwardness
-  // is real, and is why the tests below pin the exact argument positions.
-  // Passing `undefined` for the factory keeps dispatchRules' real default.
+  // Design-review P0: `--dispatch` selects the engine. "direct" (default) is
+  // the deterministic one-session-per-rule path; "legacy" is the previous
+  // LLM-orchestrated pi-subagents fan-out, kept as the escape hatch. Both
+  // adapters exist because each real function's 4th positional param is its
+  // injectable session-factory/deps bag (with `orchestratorModel`/default
+  // model only 5th), which is not assignable to
+  // ReviewDependencies["dispatchRules"], whose 4th param IS the model. tsc
+  // rejects both the direct assignment and the slot-swapped call, so this is
+  // a plain shape mismatch, not a silent landmine — the tests pin the exact
+  // argument positions.
   const dispatchRulesFn =
     deps.dispatchRules ??
-    ((rules: RuleDefinition[], diff: string, useAdvisor: boolean, orchestratorModel?: string) =>
-      dispatchRulesReal(rules, diff, useAdvisor, undefined, orchestratorModel));
+    (args.dispatch === "legacy"
+      ? (rules: RuleDefinition[], diff: string, useAdvisor: boolean, orchestratorModel?: string) =>
+          dispatchRulesReal(rules, diff, useAdvisor, undefined, orchestratorModel)
+      : (rules: RuleDefinition[], diff: string, useAdvisor: boolean, orchestratorModel?: string) =>
+          dispatchRulesDirectReal(rules, diff, useAdvisor, {}, orchestratorModel));
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
 
   const config = resolveConfigFn(args);
