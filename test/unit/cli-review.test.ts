@@ -228,6 +228,46 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+  // Codex review fix (PR #5): a diff bigger than the adapter's execFile buffer
+  // makes getDiff() itself REJECT — before the length check could run. With the
+  // ceiling flag set, that must still produce the promised graceful skip (it
+  // hits exactly the largest PRs the flag guards); without the flag, the
+  // rejection stays fatal, the pre-existing behavior.
+  it("codex fix: a getDiff maxBuffer rejection with --max-diff-chars set becomes the diff-too-large skip", async () => {
+    const h = makeHarness({ args: makeArgs({ maxDiffChars: 500000 }), botComment: null });
+    const bufferError = Object.assign(new Error("stdout maxBuffer length exceeded"), {
+      code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+    });
+    h.vcsAdapter.getDiff.mockRejectedValue(bufferError);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.loadRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      `TGD_REVIEW_RESULT: ${JSON.stringify({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [], reason: "diff-too-large" })}`,
+    );
+
+    vi.restoreAllMocks();
+  });
+
+  it("codex fix: the same maxBuffer rejection WITHOUT --max-diff-chars still propagates (fatal, pre-existing behavior)", async () => {
+    const h = makeHarness({ botComment: null });
+    h.vcsAdapter.getDiff.mockRejectedValue(
+      Object.assign(new Error("stdout maxBuffer length exceeded"), {
+        code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+      }),
+    );
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/maxBuffer/);
+
+    vi.restoreAllMocks();
+  });
+
   it("design-review #13: a diff exactly at (not over) --max-diff-chars still reviews normally", async () => {
     const h = makeHarness({
       args: makeArgs({ maxDiffChars: 18 }), // getDiff stub returns exactly 18 chars

@@ -290,6 +290,19 @@ function resolveSafeRuleFilePath(tempDir: string, filePath: string): string | nu
   return dest;
 }
 
+// Matches Node's child_process "output exceeded maxBuffer" rejection — the
+// shape realExecGh's capped execFile produces when a diff is bigger than its
+// buffer. Checked by CODE first (stable across Node versions since 12), with
+// the message as a fallback for exec wrappers that re-throw plain Errors.
+// Deliberately narrow: a network/auth failure from getDiff must NOT be
+// mistaken for "diff too large" — only this specific shape converts to the
+// --max-diff-chars skip; everything else stays fatal.
+function isOutputBufferExceededError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /maxBuffer .*exceeded/i.test(err.message);
+}
+
 /**
  * ADR-002 / CLI-native fix: resolves this run's rule files, honoring
  * `config.trustLocalRules`:
@@ -412,7 +425,33 @@ export async function review(
     return EXIT_OK;
   }
 
-  const diff = await config.vcsAdapter.getDiff(config.pr);
+  // Codex review fix (PR #5): a diff can be too large to even FETCH — the
+  // GitHub adapter's execFile buffer is capped (10 MiB), and a bigger diff
+  // makes getDiff() reject with a maxBuffer error BEFORE the length check
+  // below could ever run. With --max-diff-chars set, that rejection is proof
+  // positive the diff is over any expressible ceiling, so it gets the same
+  // graceful skip the flag promises — hitting exactly the largest PRs the
+  // ceiling exists to guard. Without the flag, the rejection stays fatal
+  // (the pre-existing behavior: the user asked for no ceiling).
+  let diff: string;
+  try {
+    diff = await config.vcsAdapter.getDiff(config.pr);
+  } catch (err) {
+    if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
+    console.warn(
+      `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +
+        `(${(err as Error).message}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
+        `this as over the ceiling and skipping the review (nothing was posted).`,
+    );
+    logStatus({
+      status: "skipped",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "diff-too-large",
+    });
+    return EXIT_OK;
+  }
 
   // Design-review #13: hard cost ceiling. The dispatch prompt embeds the diff
   // once per rule (O(rules × diff) tokens); warnIfDiffCostRisk in dispatch.ts
