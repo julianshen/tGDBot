@@ -535,6 +535,27 @@ export async function review(
     // strictly worse than the old behavior.
     await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), botComment);
 
+    // Design-review #10: collapse the PREVIOUS runs' inline threads before
+    // posting this run's. Inline review comments are append-only, so without
+    // this every past head SHA's comments accumulate uncollapsed forever.
+    // Resolved threads stay visible as history — nothing is deleted, and only
+    // threads the bot itself started are touched. Runs AFTER the marker write
+    // (idempotency must never depend on cosmetic cleanup) and BEFORE the new
+    // inline post (so this run's comments are the only unresolved ones left).
+    // Strictly best-effort: a failure here must not abort or degrade the
+    // review — warn and carry on.
+    try {
+      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.pr);
+      if (resolved > 0) {
+        console.log(`tgd-review-agent: resolved ${resolved} stale inline comment thread(s) from previous runs`);
+      }
+    } catch (err) {
+      console.warn(
+        `tgd-review-agent: could not resolve stale inline comment threads (${(err as Error).message}); ` +
+          `continuing — old threads stay expanded but this run is unaffected`,
+      );
+    }
+
     if (orchestration.inlineComments.length > 0) {
       try {
         await config.vcsAdapter.createInlineReview(

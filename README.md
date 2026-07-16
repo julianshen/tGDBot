@@ -189,10 +189,12 @@ carries the `<!-- tgd-review-agent:sha=... -->` marker, which is what makes the
 bot idempotent per commit.
 
 On a new commit the review runs again and posts fresh inline comments; the
-previous commit's comments **remain** on the PR as history (the same behaviour
-CodeRabbit has — there is no upsert for review comments, only for the summary).
-If the head SHA hasn't changed, the run is skipped entirely, so the same comments
-are never posted twice.
+previous run's inline threads are **resolved (collapsed), never deleted** — they
+stay on the PR as reviewable history, but folded out of the way so comments
+don't pile up across pushes. Only threads the bot itself started are touched; a
+human's thread is never resolved by the tool, and a failure to resolve is
+non-fatal (the new review still posts). If the head SHA hasn't changed, the run
+is skipped entirely, so the same comments are never posted twice.
 
 **A rule that fails says why.** If a rule's subagent can't run — most commonly
 because the machine has no credentials for the provider that rule is pinned to —

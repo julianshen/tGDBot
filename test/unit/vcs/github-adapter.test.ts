@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
+import { INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
 import type { BotComment } from "../../../src/vcs/adapter.js";
 
 const fixturePath = (name: string): string =>
@@ -648,6 +649,216 @@ describe("GitHubAdapter", () => {
 
       expect(files).toEqual([]);
     });
+  });
+});
+
+// Design-review #10: resolveStaleReviewThreads collapses the bot's OWN
+// unresolved inline threads via GraphQL — never a human's thread, never an
+// already-resolved one, and never by deleting anything.
+describe("resolveStaleReviewThreads", () => {
+  // execGh stub speaking all four dialects the method uses: `gh api user`,
+  // `gh repo view`, the reviewThreads GraphQL query, and the resolve mutation.
+  function makeResolveExecGh(pages: object[]): {
+    execGh: ExecGh;
+    resolvedThreadIds: () => string[];
+  } {
+    const mutations: string[] = [];
+    let page = 0;
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args[0] === "repo" && args[1] === "view") {
+        return JSON.stringify({ nameWithOwner: "octo-org/octo-repo" });
+      }
+      if (args[0] === "api" && args[1] === "graphql") {
+        const query = args.find((a) => a.startsWith("query="));
+        if (query?.startsWith("query=mutation(")) {
+          const threadId = args.find((a) => a.startsWith("threadId="));
+          mutations.push(threadId?.slice("threadId=".length) ?? "");
+          return JSON.stringify({ data: { resolveReviewThread: { thread: { id: "x" } } } });
+        }
+        return JSON.stringify(pages[Math.min(page++, pages.length - 1)]);
+      }
+      throw new Error(`unexpected gh invocation: ${args.join(" ")}`);
+    };
+    return { execGh, resolvedThreadIds: () => mutations };
+  }
+
+  // A tool-posted inline body: what renderInlineComment emits always ends
+  // with INLINE_COMMENT_MARKER. `body` defaults to that shape; pass a custom
+  // body to model a MANUAL comment written by the same account.
+  function threadsPage(
+    nodes: { id: string; isResolved: boolean; author: string; body?: string }[],
+    endCursor: string | null = null,
+  ): object {
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: endCursor !== null, endCursor },
+              nodes: nodes.map((n) => ({
+                id: n.id,
+                isResolved: n.isResolved,
+                comments: {
+                  nodes: [
+                    {
+                      author: { login: n.author },
+                      body: n.body ?? `**Some finding**\n\n${INLINE_COMMENT_MARKER}`,
+                    },
+                  ],
+                },
+              })),
+            },
+          },
+        },
+      },
+    };
+  }
+
+  it("resolves only the bot's own UNRESOLVED threads — a human's thread and an already-resolved one are untouched", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([
+      threadsPage([
+        { id: "T-bot-open", isResolved: false, author: "tgd-review-agent[bot]" },
+        { id: "T-human-open", isResolved: false, author: "some-human" },
+        { id: "T-bot-done", isResolved: true, author: "tgd-review-agent[bot]" },
+      ]),
+    ]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const count = await adapter.resolveStaleReviewThreads("42");
+
+    expect(count).toBe(1);
+    expect(resolvedThreadIds()).toEqual(["T-bot-open"]);
+  });
+
+  // Codex review (PR #6): same-account MANUAL comments must never be
+  // auto-resolved. When the CLI runs under a developer's personal gh login,
+  // the author check alone can't tell the tool's comments from the human's —
+  // the inline marker is what does.
+  it("codex fix: a same-account thread WITHOUT the inline marker (a manual comment) is never resolved", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([
+      threadsPage([
+        {
+          id: "T-manual",
+          isResolved: false,
+          author: "tgd-review-agent[bot]",
+          body: "I hand-wrote this note about the design; please discuss.",
+        },
+        { id: "T-tool", isResolved: false, author: "tgd-review-agent[bot]" },
+      ]),
+    ]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const count = await adapter.resolveStaleReviewThreads("42");
+
+    expect(count).toBe(1);
+    expect(resolvedThreadIds()).toEqual(["T-tool"]);
+  });
+
+  it("paginates: threads past the first page are still found and resolved", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([
+      threadsPage([{ id: "T-page1", isResolved: false, author: "tgd-review-agent[bot]" }], "CUR1"),
+      threadsPage([{ id: "T-page2", isResolved: false, author: "tgd-review-agent[bot]" }]),
+    ]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const count = await adapter.resolveStaleReviewThreads("42");
+
+    expect(count).toBe(2);
+    expect(resolvedThreadIds()).toEqual(["T-page1", "T-page2"]);
+  });
+
+  it("returns 0 and mutates nothing when there are no stale bot threads", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([threadsPage([])]);
+    const adapter = new GitHubAdapter(execGh);
+
+    expect(await adapter.resolveStaleReviewThreads("42")).toBe(0);
+    expect(resolvedThreadIds()).toEqual([]);
+  });
+
+  it("propagates a failure (the CALLER treats it as non-fatal — see cli-review tests)", async () => {
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      throw new Error("gh repo view failed");
+    };
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(/gh repo view failed/);
+  });
+
+  // Gemini review (PR #6): one thread failing to resolve must not abandon the
+  // rest of the cleanup — each mutation is individually guarded, and the
+  // returned count is what actually resolved.
+  it("gemini fix: a single failing mutation warns and continues; the remaining threads still resolve", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const resolvedIds: string[] = [];
+      const execGh: ExecGh = async (args) => {
+        if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+        if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "octo-org/octo-repo" });
+        const query = args.find((a) => a.startsWith("query="));
+        if (query?.startsWith("query=mutation(")) {
+          const threadId = args.find((a) => a.startsWith("threadId="))?.slice("threadId=".length);
+          if (threadId === "T-flaky") throw new Error("HTTP 502 transient");
+          resolvedIds.push(threadId ?? "");
+          return JSON.stringify({ data: { resolveReviewThread: { thread: { id: "x" } } } });
+        }
+        return JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    { id: "T-flaky", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" }, body: INLINE_COMMENT_MARKER }] } },
+                    { id: "T-ok", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" }, body: INLINE_COMMENT_MARKER }] } },
+                  ],
+                },
+              },
+            },
+          },
+        });
+      };
+      const adapter = new GitHubAdapter(execGh);
+
+      const count = await adapter.resolveStaleReviewThreads("42");
+
+      expect(count).toBe(1); // what actually resolved, not what was attempted
+      expect(resolvedIds).toEqual(["T-ok"]);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("T-flaky");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // Gemini review (PR #6): a GraphQL-level failure ({errors:[...]} with no
+  // data) must THROW — the optional chaining would otherwise read it as
+  // "zero threads" and silently return 0, hiding the failure entirely.
+  it("gemini fix: a GraphQL errors-only response rejects instead of silently returning 0", async () => {
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "octo-org/octo-repo" });
+      return JSON.stringify({ errors: [{ message: "Something went wrong" }] });
+    };
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(
+      /missing expected data/,
+    );
+  });
+
+  it("gemini fix: an unexpected gh repo view shape rejects with a message naming the cause (never a bare TypeError)", async () => {
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args[0] === "repo") return JSON.stringify({ unexpected: true });
+      throw new Error("should not get here");
+    };
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(
+      /invalid response from gh repo view/,
+    );
   });
 });
 

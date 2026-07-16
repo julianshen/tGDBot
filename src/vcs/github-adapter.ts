@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
 import type { BotComment, InlineReviewComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "./adapter.js";
 
 /**
@@ -81,6 +82,43 @@ interface GhIssueComment {
 interface GhUser {
   login: string;
 }
+
+// `gh repo view --json nameWithOwner` response — the resolved "owner/name" of
+// the ambient repo context. Needed because `gh api graphql` does NOT do the
+// REST-path `{owner}/{repo}` placeholder substitution; GraphQL variables must
+// carry the real values.
+interface GhRepoViewJson {
+  nameWithOwner: string;
+}
+
+// The slice of the reviewThreads GraphQL response resolveStaleReviewThreads
+// reads. Thread resolution is GraphQL-only (REST has no resolve; deleting
+// would destroy history), which is why this method alone speaks GraphQL.
+interface GhReviewThreadsResponse {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: {
+            id: string;
+            isResolved: boolean;
+            comments?: { nodes?: { author?: { login?: string } | null; body?: string }[] };
+          }[];
+        };
+      };
+    };
+  };
+}
+
+const REVIEW_THREADS_QUERY =
+  "query($owner:String!,$name:String!,$number:Int!,$cursor:String){" +
+  "repository(owner:$owner,name:$name){pullRequest(number:$number){" +
+  "reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}" +
+  "nodes{id isResolved comments(first:1){nodes{author{login} body}}}}}}}";
+
+const RESOLVE_THREAD_MUTATION =
+  "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id}}}";
 
 // One entry of a GitHub Contents API directory listing
 // (`gh api repos/{owner}/{repo}/contents/{path}?ref={sha}` when `path` is a
@@ -319,6 +357,130 @@ export class GitHubAdapter implements VcsAdapter {
       ["api", `repos/{owner}/{repo}/pulls/${id}/reviews`, "-X", "POST", "--input", "-"],
       JSON.stringify(payload),
     );
+  }
+
+  // Caches the resolved "owner/name" (same promise-caching pattern as
+  // getBotLogin): resolveStaleReviewThreads may page + mutate several times,
+  // and `gh repo view` only needs to run once per process.
+  private repoNameWithOwnerPromise: Promise<{ owner: string; name: string }> | null = null;
+
+  private getRepoOwnerAndName(): Promise<{ owner: string; name: string }> {
+    if (!this.repoNameWithOwnerPromise) {
+      this.repoNameWithOwnerPromise = this.execGh(["repo", "view", "--json", "nameWithOwner"]).then(
+        (out) => {
+          const parsed = JSON.parse(out) as GhRepoViewJson;
+          // Gemini review: guard the shape before .indexOf — an unexpected
+          // `gh repo view` response should fail with a message naming the
+          // cause, not a bare TypeError.
+          if (!parsed || typeof parsed.nameWithOwner !== "string") {
+            throw new Error(`invalid response from gh repo view: ${out.slice(0, 200)}`);
+          }
+          const slash = parsed.nameWithOwner.indexOf("/");
+          if (slash <= 0 || slash === parsed.nameWithOwner.length - 1) {
+            throw new Error(
+              `could not parse repo nameWithOwner from gh repo view: "${parsed.nameWithOwner}"`,
+            );
+          }
+          return {
+            owner: parsed.nameWithOwner.slice(0, slash),
+            name: parsed.nameWithOwner.slice(slash + 1),
+          };
+        },
+      );
+    }
+    return this.repoNameWithOwnerPromise;
+  }
+
+  /**
+   * Design-review #10: resolves (collapses) every still-unresolved inline
+   * review thread whose FIRST comment the bot itself authored. GraphQL-only
+   * territory — REST cannot resolve a thread, and deleting comments would
+   * destroy review history, so this is the one method that goes through
+   * `gh api graphql` (which needs an explicit owner/name, hence
+   * getRepoOwnerAndName — the REST `{owner}/{repo}` placeholder magic does not
+   * apply to GraphQL).
+   *
+   * A human's thread is never touched: authorship is checked against the
+   * bot's own verified identity (getBotLogin), the same anti-spoofing
+   * discipline findBotComment uses. Mutations run sequentially — resolving is
+   * cosmetic cleanup, so gentle pacing beats hammering the API concurrently.
+   */
+  async resolveStaleReviewThreads(id: string): Promise<number> {
+    const [botLogin, { owner, name }] = await Promise.all([
+      this.getBotLogin(),
+      this.getRepoOwnerAndName(),
+    ]);
+
+    const staleThreadIds: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const args = [
+        "api",
+        "graphql",
+        "-f",
+        `query=${REVIEW_THREADS_QUERY}`,
+        "-f",
+        `owner=${owner}`,
+        "-f",
+        `name=${name}`,
+        "-F",
+        `number=${id}`,
+        ...(cursor !== null ? ["-f", `cursor=${cursor}`] : []),
+      ];
+      const out = await this.execGh(args);
+      const parsed = JSON.parse(out) as GhReviewThreadsResponse;
+      // Gemini review: a GraphQL-level failure comes back as an `errors`
+      // payload with no data — which the optional chaining below would treat
+      // as "zero threads" and silently return 0. Throw instead, so the
+      // caller's non-fatal warn actually surfaces the failure.
+      if (!parsed.data?.repository?.pullRequest) {
+        throw new Error(`GraphQL reviewThreads response missing expected data: ${out.slice(0, 200)}`);
+      }
+      const threads = parsed.data.repository.pullRequest.reviewThreads;
+      for (const node of threads?.nodes ?? []) {
+        if (node.isResolved) continue;
+        const firstComment = node.comments?.nodes?.[0];
+        if (firstComment?.author?.login !== botLogin) continue;
+        // Codex review (PR #6): author identity alone is NOT enough. A
+        // developer running the CLI under their personal gh login also writes
+        // MANUAL review comments as that same identity — those must never be
+        // auto-resolved. Only threads whose first comment carries the tool's
+        // own inline marker (appended by renderInlineComment, unforgeable from
+        // finding content because sanitizeText defangs `<!--`) are stale.
+        // Comments posted by pre-marker versions of the tool are deliberately
+        // left alone: under-resolving is safe, over-resolving is not.
+        if (!firstComment.body?.includes(INLINE_COMMENT_MARKER)) continue;
+        staleThreadIds.push(node.id);
+      }
+      const pageInfo = threads?.pageInfo;
+      cursor = pageInfo?.hasNextPage ? (pageInfo.endCursor ?? null) : null;
+    } while (cursor !== null);
+
+    // Each mutation is individually guarded (Gemini review): one thread
+    // failing to resolve (deleted comment, race with a human resolving it,
+    // a transient API error) must not abandon the REST of the cleanup — and
+    // this whole method is already best-effort for its caller. The count
+    // returned is what actually resolved, not what was attempted.
+    let resolved = 0;
+    for (const threadId of staleThreadIds) {
+      try {
+        await this.execGh([
+          "api",
+          "graphql",
+          "-f",
+          `query=${RESOLVE_THREAD_MUTATION}`,
+          "-f",
+          `threadId=${threadId}`,
+        ]);
+        resolved += 1;
+      } catch (err) {
+        console.warn(
+          `GitHubAdapter: could not resolve stale review thread ${threadId} ` +
+            `(${(err as Error).message}); continuing with the remaining threads`,
+        );
+      }
+    }
+    return resolved;
   }
 
   /**

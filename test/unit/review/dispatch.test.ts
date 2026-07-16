@@ -906,6 +906,22 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
     expect(result.rulesFailed).toEqual(["terra-review"]);
   });
 
+  // Gemini review (PR #6): a rule may itself pin a thinking suffix
+  // (`model: grok-4.5:high`) while the captured model omits it — the order
+  // cross-check must normalize BOTH sides, or reconciliation silently skips.
+  it("still reconciles when the RULE's model carries a thinking suffix the captured model lacks", async () => {
+    const rules = [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5:high" })];
+    const details = [{ model: "xai/grok-4.5", exitCode: 0, finalOutput: "[]" }];
+    const buggyFinal = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["grok-review"] });
+    const session = makeSubscribableSession(details, buggyFinal);
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
+    // Reconciliation ran (accounting corrected) — it was not silently skipped.
+    expect(result.rulesRun).toEqual(["grok-review"]);
+    expect(result.rulesFailed).toEqual([]);
+  });
+
   it("a session without subscribe() skips reconciliation entirely (uses the orchestrator's result as-is)", async () => {
     const stub = createPiSessionStub(
       JSON.stringify({ findings: [], rulesRun: ["grok-review"], rulesFailed: ["terra-review"] }),
@@ -1076,6 +1092,22 @@ describe("dispatchRules recovery tolerates preamble/trailing prose around the fi
 
     expect(result.rulesRun).toEqual(["grok-review"]);
     expect(result.rulesFailed).toEqual([]);
+    expect(result.findings).toContainEqual({ ...finding, ruleName: "grok-review" });
+  });
+
+  // Gemini review (PR #6): trailing prose can itself contain a `]` (e.g. a
+  // citation like "[3]"), which defeated the old single first-`[`..last-`]`
+  // slice — the parser now walks the closing bracket backwards.
+  it("recovers findings even when the trailing prose contains its own brackets", async () => {
+    const rules = [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })];
+    const finding = { file: "a.go", line: 7, severity: "warning", category: "correctness", message: "off-by-one" };
+    const messyOutput = `[${JSON.stringify(finding)}]\n\nSee my note in [3] above for context.`;
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: messyOutput }];
+    const buggyFinal = JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["grok-review"] });
+    const session = makeSubscribableSession(details, buggyFinal);
+
+    const result = await dispatchRules(rules, "diff", false, async () => session);
+
     expect(result.findings).toContainEqual({ ...finding, ruleName: "grok-review" });
   });
 
