@@ -5,7 +5,7 @@ import path from "node:path";
 import { parseArgs as nodeParseArgs } from "node:util";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
-import { decideDedup, formatMarker } from "./review/dedup.js";
+import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
@@ -354,8 +354,14 @@ export async function review(
   const pr = await config.vcsAdapter.getPullRequest(config.pr);
   const botComment = await config.vcsAdapter.findBotComment(config.pr);
 
-  // AC-8.1: sha match -> skip, exit 0, upsertComment is never called.
-  if (decideDedup(pr, botComment) === "skip-no-new-commits") {
+  // Config-aware dedup: a run is skipped only when this exact head SHA was
+  // already reviewed WITH THE SAME review configuration. Computed from CLI flags
+  // alone (no rule fetch), so the skip decision stays as cheap as before — see
+  // computeReviewConfigHash for what is and isn't captured.
+  const configHash = computeReviewConfigHash(config);
+
+  // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
+  if (decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
     logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
     return EXIT_OK;
   }
@@ -394,7 +400,7 @@ export async function review(
   const buildBody = (o: OrchestrationResult): string => {
     const bodyParts = [o.commentBody];
     if (loadErrors.length > 0) bodyParts.push(renderLoadErrorsSection(loadErrors));
-    bodyParts.push(formatMarker(pr.headSha));
+    bodyParts.push(formatMarker(pr.headSha, configHash));
     return bodyParts.join("\n\n");
   };
 

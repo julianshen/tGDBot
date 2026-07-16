@@ -11,6 +11,7 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
+import { computeReviewConfigHash } from "../../src/review/dedup.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "../../src/vcs/adapter.js";
 import type { LoadResult } from "../../src/rules/loader.js";
@@ -133,12 +134,16 @@ describe("review", () => {
   // AC-8.1: Given a PR whose head SHA matches the bot comment's marker,
   // When review runs, Then it exits 0, logs status: "skipped", and
   // upsertComment is never called.
-  it("AC-8.1: sha match skips the review, exits 0, and never calls upsertComment", async () => {
+  it("AC-8.1: sha AND config match skips the review, exits 0, and never calls upsertComment", async () => {
     const pr = makePr({ headSha: "cafef00d" });
+    // A skip now requires BOTH the head SHA and the review-config hash to match —
+    // the marker records the config the last review ran with (see #4 / dedup).
+    const cfg = computeReviewConfigHash(makeArgs());
     const botComment: BotComment = {
       id: "999",
-      body: "<!-- tgd-review-agent:sha=cafef00d -->",
+      body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
       lastReviewedSha: "cafef00d",
+      reviewedConfig: cfg,
     };
     const h = makeHarness({ pr, botComment });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -176,7 +181,8 @@ describe("review", () => {
     const [prId, body, existing] = h.vcsAdapter.upsertComment.mock.calls[0];
     expect(prId).toBe("42");
     expect(existing).toBeNull();
-    expect(body).toContain("<!-- tgd-review-agent:sha=abc1234 -->");
+    // The marker now carries the review-config hash after the SHA (#4).
+    expect(body).toContain("<!-- tgd-review-agent:sha=abc1234 cfg=");
 
     vi.restoreAllMocks();
   });
@@ -191,6 +197,7 @@ describe("review", () => {
       id: "555",
       body: "<!-- tgd-review-agent:sha=oldsha00 -->",
       lastReviewedSha: "oldsha00",
+      reviewedConfig: "",
     };
     const h = makeHarness({ pr, botComment });
     vi.spyOn(console, "log").mockImplementation(() => {});

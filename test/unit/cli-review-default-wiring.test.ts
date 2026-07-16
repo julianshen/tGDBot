@@ -123,7 +123,7 @@ describe("review — default dependency wiring", () => {
     const [prId, body, existing] = hoisted.upsertComment.mock.calls[0];
     expect(prId).toBe("42");
     expect(existing).toBeNull();
-    expect(body).toContain("<!-- tgd-review-agent:sha=wired1234 -->");
+    expect(body).toContain("<!-- tgd-review-agent:sha=wired1234 cfg=");
 
     // ADR-002 CLI-native fix: rules are now sourced from the PR's base
     // branch via getRuleFilesFromBase, not the literal --rules-dir path.

@@ -46,11 +46,13 @@ export const realExecGh: ExecGh = (args, stdin) =>
 const BOT_MARKER_PREFIX_RE = /<!-- tgd-review-agent:sha=/;
 
 // Matches the bot's own HTML marker comment, e.g.
-// `<!-- tgd-review-agent:sha=abc1234 -->`. Capture group 1 is lastReviewedSha.
-// A comment can match BOT_MARKER_PREFIX_RE without matching this (malformed
-// SHA) — that's still treated as "the bot's marker comment", just with an
-// empty lastReviewedSha (see findBotComment).
-const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40}) -->/;
+// `<!-- tgd-review-agent:sha=abc1234 -->` or, since config-aware dedup,
+// `<!-- tgd-review-agent:sha=abc1234 cfg=1a2b3c4d5e6f -->`. Capture group 1 is
+// lastReviewedSha; group 2 (optional) is the review-config hash, absent on a
+// legacy marker. A comment can match BOT_MARKER_PREFIX_RE without matching this
+// (malformed SHA) — that's still treated as "the bot's marker comment", just
+// with an empty lastReviewedSha/reviewedConfig (see findBotComment).
+const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40})(?: cfg=([0-9a-z]+))? -->/;
 
 interface GhPrViewJson {
   headRefOid: string;
@@ -229,6 +231,7 @@ export class GitHubAdapter implements VcsAdapter {
         id: String(comment.id),
         body: comment.body,
         lastReviewedSha: match?.[1] ?? "",
+        reviewedConfig: match?.[2] ?? "",
       };
     }
     return null;

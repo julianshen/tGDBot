@@ -1208,6 +1208,30 @@ export async function dispatchRules(
       unsubscribe?.();
     }
 
+    // The subagent tool's structured per-task results (details.results) are the
+    // deterministic source of truth this module leans on TWICE below: to
+    // reconcile the orchestrator's self-reported accounting (so a task that ran
+    // can't be mis-reported as failed) and to enforce suggestion provenance (a
+    // committable suggestion must byte-match one a reviewer actually emitted). A
+    // real pi AgentSession exposes subscribe(), so `subscribe` being a function
+    // means we EXPECTED to capture those results. Capturing NONE despite that is
+    // a silent double-degradation: reconciliation falls back to trusting the
+    // LLM's word, and — because the provenance allow-set is then empty — EVERY
+    // committable suggestion is stripped. The most likely cause is the pi SDK's
+    // tool_execution_end event shape drifting from DispatchSessionEvent (which is
+    // typed loosely, `any`, precisely because it mirrors an SDK-internal union).
+    // Warn loudly so an SDK upgrade that breaks capture surfaces here instead of
+    // quietly halving the review's guarantees. (Test stubs without subscribe are
+    // unaffected — they never expected capture.)
+    if (typeof session.subscribe === "function" && capturedTaskResults.length === 0) {
+      console.warn(
+        "dispatchRules: session exposes subscribe() but captured ZERO subagent task results — " +
+          "deterministic reconciliation is disabled and every committable suggestion will be " +
+          "stripped for this run. The orchestrator may not have called the subagent tool, or the " +
+          "pi SDK's tool_execution_end event shape may have changed (see DispatchSessionEvent).",
+      );
+    }
+
     const orchestratorResult = parseDispatchResult(finalText, rules);
     // Recover dropped findings only when advisor is OFF — see
     // reconcileWithCapturedResults' doc comment for why recovering while the

@@ -70,6 +70,7 @@ describe("GitHubAdapter", () => {
       id: "222",
       body: "## tGD Review\n\nNo blocking issues found.\n\n<!-- tgd-review-agent:sha=abc1234 -->",
       lastReviewedSha: "abc1234",
+      reviewedConfig: "",
     });
     expect(execGh).toHaveBeenCalledWith([
       ...PAGINATED_COMMENTS_ARGS_PREFIX,
@@ -128,6 +129,7 @@ describe("GitHubAdapter", () => {
       id: "999",
       body: "<!-- tgd-review-agent:sha=old -->",
       lastReviewedSha: "old",
+      reviewedConfig: "",
     };
 
     await adapter.upsertComment("42", "updated review body", existing);
@@ -183,6 +185,7 @@ describe("GitHubAdapter", () => {
       id: "222",
       body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 -->",
       lastReviewedSha: "abc1234",
+      reviewedConfig: "",
     });
   });
 
@@ -267,6 +270,7 @@ describe("GitHubAdapter", () => {
       id: "555",
       body: "## tGD Review\n\nNo blocking issues found.\n\n<!-- tgd-review-agent:sha=CORRUPTED!! -->",
       lastReviewedSha: "",
+      reviewedConfig: "",
     });
   });
 
@@ -300,6 +304,33 @@ describe("GitHubAdapter", () => {
       id: "111",
       body: "## tGD Review\n\n<!-- tgd-review-agent:sha=aaa1111 -->",
       lastReviewedSha: "aaa1111",
+      reviewedConfig: "",
+    });
+  });
+
+  // Config-aware dedup: a marker carrying a `cfg=` segment must have that hash
+  // parsed into reviewedConfig, so decideDedup can tell whether the review
+  // config changed since the last run. A legacy marker (no cfg) yields "".
+  it("config-aware dedup: findBotComment parses the cfg= hash from a config-aware marker into reviewedConfig", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      return JSON.stringify([
+        {
+          id: 777,
+          body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 cfg=1a2b3c4d5e6f -->",
+          user: { login: "tgd-review-agent[bot]" },
+        },
+      ]);
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    const botComment = await adapter.findBotComment("42");
+
+    expect(botComment).toEqual({
+      id: "777",
+      body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 cfg=1a2b3c4d5e6f -->",
+      lastReviewedSha: "abc1234",
+      reviewedConfig: "1a2b3c4d5e6f",
     });
   });
 
