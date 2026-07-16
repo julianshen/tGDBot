@@ -1,3 +1,4 @@
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -119,12 +120,39 @@ describe("loadRules", () => {
     expect(result.rules).toHaveLength(1);
     const [builtin] = result.rules;
     expect(builtin?.name).toBe("tgd-review");
-    expect(builtin?.provider).toBe("anthropic");
-    expect(builtin?.model).toBe("claude-opus-4-5");
+    // Design-review #6: the builtin rule is UNPINNED — it runs on the
+    // deployment's default model (--model, settings default, or the first
+    // credentialed provider), which is what makes zero-config work with ANY
+    // one provider key rather than requiring anthropic's specifically.
+    expect(builtin?.provider).toBeUndefined();
+    expect(builtin?.model).toBeUndefined();
     expect(builtin?.sourcePath.endsWith(path.join("rules", "builtin", "tgd-review.md"))).toBe(
       true,
     );
     expect(builtin?.body.length).toBeGreaterThan(0);
+  });
+
+  // Design-review #6: provider/model are optional — a rule with only `name`
+  // loads fine (it runs on the default model)...
+  it("design-review #6: a rule with no provider/model pin loads successfully", async () => {
+    const dir = path.join(fixturesDir, "unpinned-rule-dir");
+    await mkdir(dir, { recursive: true });
+    await writeFile(
+      path.join(dir, "unpinned.md"),
+      "---\nname: unpinned-rule\n---\n\nReview the diff.\n",
+      "utf-8",
+    );
+    try {
+      const result = await loadRules(dir, false);
+
+      expect(result.errors).toEqual([]);
+      expect(result.rules).toHaveLength(1);
+      expect(result.rules[0].name).toBe("unpinned-rule");
+      expect(result.rules[0].provider).toBeUndefined();
+      expect(result.rules[0].model).toBeUndefined();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   // AC-4.5: Given includeBuiltin: false (the --disable-builtin-rule flag),

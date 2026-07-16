@@ -4,7 +4,7 @@
 // per-task results, suggestion provenance (ADR-007), and failure
 // classification. Split out of dispatch.ts (design-review #8) — pure and
 // synchronous, no SDK, no I/O beyond console.warn.
-import type { RuleDefinition } from "../rules/types.js";
+import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
 import type { DispatchResult, Finding } from "./types.js";
 
 // One dispatched task's structured outcome, read from the subagent tool's
@@ -314,7 +314,7 @@ function sanitizeForComment(value: string): string {
  * maintainer needs from the comment is the actionable class of failure plus which
  * provider it was, and that is exactly what this returns.
  */
-function classifyTaskFailure(c: CapturedTaskResult, rule: RuleDefinition): string {
+function classifyTaskFailure(c: CapturedTaskResult, rule: EffectiveRule): string {
   if (c.timedOut) return "timed out";
   if (c.detached) return "detached before finishing";
   const error = c.error ?? "";
@@ -365,7 +365,7 @@ function classifyTaskFailure(c: CapturedTaskResult, rule: RuleDefinition): strin
 export function reconcileWithCapturedResults(
   orchestrator: DispatchResult,
   captured: CapturedTaskResult[],
-  rules: RuleDefinition[],
+  rules: EffectiveRule[],
   recoverFindings: boolean,
 ): DispatchResult {
   if (captured.length !== rules.length) return orchestrator;

@@ -22,10 +22,13 @@ export interface CliArgs {
   pr: string;
   vcs: "github" | "gitlab";
   /**
-   * Issue #1 (round 2): "<provider>/<model>" for the ORCHESTRATING session.
-   * Optional. Resolution order is --model -> pi's settings default -> each
-   * rule's own model -> pi's auth-aware default, and EVERY candidate must have
-   * configured credentials on this machine (see resolveOrchestratorModel).
+   * "<provider>/<model>" — the DEFAULT model (design-review #6). Runs the
+   * ORCHESTRATING session and every rule that doesn't pin its own
+   * provider/model. Optional. Resolution order for each consumer is --model ->
+   * pi's settings default -> (orchestrator only: each pinned rule's model) ->
+   * pi's auth-aware default, and every candidate must have configured
+   * credentials on this machine (see resolveOrchestratorModel /
+   * resolveEffectiveRules).
    */
   model?: string;
   rulesDir: string;
