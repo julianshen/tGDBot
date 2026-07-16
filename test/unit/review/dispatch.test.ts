@@ -1984,6 +1984,30 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
     expect(stub.prompts[0]).toContain('model: "openai/gpt-5.6-terra"');
   });
 
+  // Codex review (PR #7): resolveEffectiveRules used to rebuild the filled
+  // default from `${model.provider}/${model.id}` — the registry's OWN fields,
+  // which parseModelRef/find() resolve from a suffix-stripped spec. That
+  // silently dropped a `:high`-style thinking suffix for every unpinned rule
+  // the default filled. It must preserve the ORIGINAL candidate spec instead.
+  it("preserves a thinking-level suffix on --model when filling an unpinned rule", async () => {
+    const stub = createPiSessionStub(
+      JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+    );
+
+    const result = await dispatchRules(
+      [unpinnedRule()],
+      "diff",
+      false,
+      async () => stub.session,
+      "anthropic/claude-opus-4-5:high",
+    );
+
+    expect(result.rulesRun).toEqual(["unpinned-rule"]);
+    expect(result.rulesFailed).toEqual([]);
+    // The suffix must survive into the resolved per-rule model, not be dropped.
+    expect(stub.prompts[0]).toContain('model: "anthropic/claude-opus-4-5:high"');
+  });
+
   it("falls back to the registry's first credentialed provider when no --model/settings default exists", async () => {
     hoisted.getAvailableMock.mockReturnValueOnce([{ provider: "groq", id: "kimi-k2" }]);
     const stub = createPiSessionStub(

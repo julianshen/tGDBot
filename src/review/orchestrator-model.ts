@@ -258,7 +258,15 @@ export function resolveEffectiveRules(
     const ref = parseModelRef(spec);
     const model = ref ? registry.find(ref.provider, ref.modelId) : undefined;
     if (model && registry.hasConfiguredAuth(model)) {
-      defaultSpec = `${model.provider}/${model.id}`;
+      // Codex review (PR #7): preserve the ORIGINAL candidate spec (which may
+      // carry a thinking-level suffix like ":high") rather than reconstructing
+      // from `model.provider`/`model.id` — the registry lookup above already
+      // stripped the suffix to find the model (parseModelRef), so rebuilding
+      // from the looked-up model's own fields would silently drop it for
+      // every unpinned rule this default fills. resolveRuleSessionModel
+      // downstream re-parses this exact string (same THINKING_SUFFIX_RE) to
+      // recover the level, so preserving it here is sufficient.
+      defaultSpec = spec.trim();
       break;
     }
     if (spec === explicitDefault) {

@@ -173,6 +173,16 @@ function makeRealAdvisorSessionFactory(
     const loader = new DefaultResourceLoader({
       cwd,
       agentDir: getAgentDir(),
+      // Codex review (PR #7): noExtensions was missing here, so this loader
+      // still discovered the user's REAL ambient extensions (from the real
+      // agentDir's extensions/settings) alongside rpiv-advisor — breaking the
+      // "everything else off" hermeticity this comment already promised, and
+      // letting unrelated installed-extension code run during a review. The
+      // rpiv-advisor path is loaded explicitly via additionalExtensionPaths
+      // regardless of noExtensions (confirmed: createRealDirectSession's own
+      // loader sets noExtensions: true and its extension still loads the same
+      // way), so this is the only change needed.
+      noExtensions: true,
       additionalExtensionPaths: [resolveRpivAdvisorExtensionPath()],
       noSkills: true,
       noPromptTemplates: true,

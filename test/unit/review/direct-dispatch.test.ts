@@ -1,13 +1,59 @@
 // Tests for the DIRECT dispatch engine (design-review P0): one session per
 // rule, deterministic TypeScript merge, advisor as a discrete bounded step.
-// Sessions are injected stubs throughout — the real factories are the only
-// SDK touchers and are exercised live, not here (same testing stance as the
-// legacy engine's injectable createSession).
+// Sessions are injected stubs throughout — the real RULE-session factory is
+// the only SDK toucher exercised live, not here. The real ADVISOR-session
+// factory's hermeticity (below) IS unit tested against a mocked SDK, the same
+// stance dispatch.test.ts takes for the legacy engine's real factory.
 import { describe, expect, it, vi } from "vitest";
 import { dispatchRulesDirect, parseAdvisorDropList } from "../../../src/review/direct-dispatch.js";
 import type { DirectSessionFactory } from "../../../src/review/direct-dispatch.js";
 import type { DispatchSession } from "../../../src/review/dispatch.js";
+import { resolveRpivAdvisorExtensionPath } from "../../../src/review/extensions.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
+
+// Hoisted so the SDK mock below can reference it before direct-dispatch.ts is
+// imported (vi.mock is hoisted to the top of the module by vitest).
+const hoisted = vi.hoisted(() => {
+  const resourceLoaderInstances: { options: Record<string, unknown> }[] = [];
+  class FakeResourceLoader {
+    options: Record<string, unknown>;
+    reload = vi.fn().mockResolvedValue(undefined);
+    constructor(options: Record<string, unknown>) {
+      this.options = options;
+      resourceLoaderInstances.push(this);
+    }
+  }
+  const createAgentSessionMock = vi.fn();
+  const findModelMock = vi.fn((provider: string, modelId: string) => ({
+    id: modelId,
+    provider,
+    name: `${provider}/${modelId}`,
+  }));
+  const modelRegistryCreate = vi.fn(() => ({
+    find: findModelMock,
+    hasConfiguredAuth: vi.fn(() => true),
+    getAvailable: vi.fn((): { provider: string; id: string }[] => []),
+  }));
+  return {
+    resourceLoaderInstances,
+    FakeResourceLoader,
+    createAgentSessionMock,
+    sessionManagerInMemory: vi.fn(() => "fake-session-manager"),
+    getAgentDirMock: vi.fn(() => "/fake/agent/dir"),
+    authStorageCreate: vi.fn(() => "fake-auth-storage"),
+    modelRegistryCreate,
+  };
+});
+
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+  DefaultResourceLoader: hoisted.FakeResourceLoader,
+  createAgentSession: hoisted.createAgentSessionMock,
+  createReadOnlyTools: vi.fn(() => ({})),
+  SessionManager: { inMemory: hoisted.sessionManagerInMemory },
+  getAgentDir: hoisted.getAgentDirMock,
+  AuthStorage: { create: hoisted.authStorageCreate },
+  ModelRegistry: { create: hoisted.modelRegistryCreate },
+}));
 
 function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
   return {
@@ -284,6 +330,33 @@ describe("dispatchRulesDirect", () => {
     await dispatchRulesDirect([makeRule()], "diff", false, { createSession: factory });
 
     expect(process.env.PI_CODING_AGENT_DIR).toBe(before);
+  });
+
+  // Codex review (PR #7): the real advisor session's DefaultResourceLoader was
+  // missing `noExtensions: true`, so it still discovered the machine's REAL
+  // ambient extensions alongside rpiv-advisor — breaking the "everything else
+  // off" hermeticity the surrounding code already claimed. The rule session
+  // here uses an injected stub (so this test only exercises the real ADVISOR
+  // factory); createAgentSession/DefaultResourceLoader are mocked so we can
+  // inspect the exact options the advisor's loader was constructed with.
+  it("constructs the real advisor session's loader with noExtensions: true (only rpiv-advisor active)", async () => {
+    hoisted.resourceLoaderInstances.length = 0;
+    hoisted.createAgentSessionMock.mockReset();
+    hoisted.createAgentSessionMock.mockResolvedValueOnce({
+      session: {
+        async prompt() {},
+        getLastAssistantText: () => '{"drop": []}',
+      },
+    });
+    const { factory } = makeFactory({ "rule-a": JSON.stringify([finding("a.ts", "bug")]) });
+
+    await dispatchRulesDirect([makeRule()], "diff", true, { createSession: factory });
+
+    expect(hoisted.resourceLoaderInstances).toHaveLength(1);
+    expect(hoisted.resourceLoaderInstances[0]?.options.noExtensions).toBe(true);
+    expect(hoisted.resourceLoaderInstances[0]?.options.additionalExtensionPaths).toEqual([
+      resolveRpivAdvisorExtensionPath(),
+    ]);
   });
 });
 
