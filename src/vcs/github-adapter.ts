@@ -69,6 +69,7 @@ interface GhPrViewJson {
   baseRefOid: string;
   title: string;
   body: string;
+  url?: string;
 }
 
 interface GhIssueComment {
@@ -152,8 +153,11 @@ export class GitHubAdapter implements VcsAdapter {
   }
 
   /**
-   * AC-2.1: parses `gh pr view <id> --json headRefOid,baseRefOid,title,body`
-   * output into a PullRequestInfo with the correct headSha/baseSha/title/description.
+   * AC-2.1: parses `gh pr view <id> --json headRefOid,baseRefOid,title,body,url`
+   * output into a PullRequestInfo with the correct headSha/baseSha/title/
+   * description/url. `url` (the PR's canonical web URL) is what surfaces the
+   * owner/repo `gh` actually resolved from its ambient context — review() logs
+   * it so a mis-inferred repo target is visible, not silent.
    */
   async getPullRequest(id: string): Promise<PullRequestInfo> {
     const out = await this.execGh([
@@ -161,7 +165,7 @@ export class GitHubAdapter implements VcsAdapter {
       "view",
       id,
       "--json",
-      "headRefOid,baseRefOid,title,body",
+      "headRefOid,baseRefOid,title,body,url",
     ]);
     const parsed = JSON.parse(out) as GhPrViewJson;
     return {
@@ -170,6 +174,7 @@ export class GitHubAdapter implements VcsAdapter {
       baseSha: parsed.baseRefOid,
       title: parsed.title,
       description: parsed.body,
+      url: parsed.url,
     };
   }
 

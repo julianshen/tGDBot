@@ -45,6 +45,9 @@ describe("GitHubAdapter", () => {
       baseSha: "def4567890def4567890def4567890def4567890",
       title: "Add feature X",
       description: "This PR adds feature X.\n\nCloses #12",
+      // Design-review #9: the canonical PR URL carries the owner/repo `gh`
+      // actually resolved; review() logs it so a mis-inferred target is visible.
+      url: "https://github.com/octo-org/octo-repo/pull/42",
     });
     // Never calls the real gh CLI directly — always routed through execGh.
     expect(execGh).toHaveBeenCalledWith([
@@ -52,7 +55,7 @@ describe("GitHubAdapter", () => {
       "view",
       "42",
       "--json",
-      "headRefOid,baseRefOid,title,body",
+      "headRefOid,baseRefOid,title,body,url",
     ]);
   });
 
@@ -494,7 +497,7 @@ describe("GitHubAdapter", () => {
 
       expect(execFileMock).toHaveBeenCalledWith(
         "gh",
-        ["pr", "view", "1", "--json", "headRefOid,baseRefOid,title,body"],
+        ["pr", "view", "1", "--json", "headRefOid,baseRefOid,title,body,url"],
         { maxBuffer: 10 * 1024 * 1024 },
         expect.any(Function),
       );
