@@ -164,19 +164,36 @@ describe("workflow rule-file trust boundary: sourced from the base branch via th
     return doc.jobs.review.steps;
   }
 
-  function getReviewStep(): { run?: unknown; name?: unknown } {
-    const reviewStep = getSteps().find(
-      (step) => typeof step.run === "string" && step.run.includes("review --pr"),
-    );
-    if (!reviewStep) {
-      throw new Error("could not find the `review --pr` step in the workflow's steps");
+  // The self-review invocation is CURRENTLY DISABLED — it lives as a
+  // commented-out step in the workflow because no provider API key
+  // (ANTHROPIC_API_KEY) is configured on this repo yet, so running it would exit
+  // 2 and fail the job. These trust-boundary assertions therefore read the
+  // invocation from the raw source (stripping any leading `#`) rather than from
+  // the parsed active steps, so they keep guarding its shape for when it's
+  // re-enabled by uncommenting it.
+  function getReviewRunLine(): string {
+    const line = workflowSource
+      .split("\n")
+      .map((raw) => raw.trim().replace(/^#\s?/, ""))
+      .find((raw) => raw.startsWith("- run:") && raw.includes("review --pr"));
+    if (!line) {
+      throw new Error("could not find the `review --pr` invocation in the workflow source");
     }
-    return reviewStep;
+    return line;
   }
 
-  it("the `review --pr` step no longer passes an explicit --rules-dir override — the CLI's own default now sources from the base branch", () => {
-    const reviewStep = getReviewStep();
-    const run = reviewStep.run as string;
+  it("the self-review step is currently commented out (disabled) pending a provider API key secret", () => {
+    // No ACTIVE step invokes the review CLI right now.
+    const activeReviewStep = getSteps().find(
+      (step) => typeof step.run === "string" && step.run.includes("review --pr"),
+    );
+    expect(activeReviewStep).toBeUndefined();
+    // ...but the invocation is preserved (commented) so it can be re-enabled.
+    expect(workflowSource).toContain("review --pr");
+  });
+
+  it("the (preserved) `review --pr` invocation passes no explicit --rules-dir override — the CLI's own default sources from the base branch", () => {
+    const run = getReviewRunLine();
 
     expect(run).not.toContain("--rules-dir");
     expect(run).not.toContain("/tmp/base-rules-checkout");
@@ -200,9 +217,8 @@ describe("workflow rule-file trust boundary: sourced from the base branch via th
     expect(workflowSource).not.toContain("pull_request.base.sha");
   });
 
-  it("the review step still passes --pr (the CLI resolves baseSha itself via gh pr view)", () => {
-    const reviewStep = getReviewStep();
-    const run = reviewStep.run as string;
+  it("the (preserved) review invocation still passes --pr (the CLI resolves baseSha itself via gh pr view)", () => {
+    const run = getReviewRunLine();
 
     expect(run).toContain("review --pr");
   });
