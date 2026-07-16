@@ -374,7 +374,7 @@ async function createRealDispatchSession(
   // the moment the problem actually exists.
   //
   // It is also self-silencing on the happy path: when provider credentials DO
-  // resolve (from auth.json or from env vars, as the shipped CI workflow does),
+  // resolve (from auth.json, or from env vars such as ANTHROPIC_API_KEY),
   // no fallback message is produced and this stays quiet. That matters — a
   // warning that fires on every healthy run is a warning everyone learns to
   // ignore.
@@ -497,10 +497,10 @@ interface IsolatedAgentDir {
   /**
    * Anything other than "linked" means the hermetic dir has NO credentials
    * file, so provider auth must come from environment variables. That is NOT
-   * an error on its own — the shipped GitHub Actions workflow authenticates
-   * purely via env vars (ANTHROPIC_API_KEY etc.) with no auth.json anywhere,
-   * and that must keep working silently. It IS the most useful fact to attach
-   * to a downstream auth failure — see describeAuthContext.
+   * an error on its own — running with env-var-based auth (ANTHROPIC_API_KEY
+   * etc.) and no auth.json anywhere is a normal setup (e.g. any CI you run this
+   * in), and that must keep working silently. It IS the most useful fact to
+   * attach to a downstream auth failure — see describeAuthContext.
    */
   authStatus: AuthLinkStatus;
 }

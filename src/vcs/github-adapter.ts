@@ -115,23 +115,6 @@ function isNotFoundError(err: unknown): boolean {
   return err instanceof Error && /HTTP 404/.test(err.message);
 }
 
-// `gh api user` under a GitHub Actions GITHUB_TOKEN (an installation /
-// "integration" token) rejects with HTTP 403 "Resource not accessible by
-// integration": the /user endpoint requires user-to-server auth, which an
-// installation token is not. getBotLogin uses this to fall back to the Actions
-// bot identity instead of aborting the whole review. Same stderr-message
-// convention as isNotFoundError above.
-function isForbiddenError(err: unknown): boolean {
-  return err instanceof Error && /HTTP 403/.test(err.message);
-}
-
-// The comment author for the default GitHub Actions GITHUB_TOKEN. When
-// `gh api user` is inaccessible (403), the comments this tool posts are authored
-// by this identity, so it is what findBotComment must match against.
-// Overridable via TGD_REVIEW_BOT_LOGIN for a GitHub App posting under a
-// different bot slug.
-const ACTIONS_BOT_LOGIN = "github-actions[bot]";
-
 /**
  * GitHubAdapter: VcsAdapter implementation backed by the `gh` CLI.
  *
@@ -152,35 +135,18 @@ export class GitHubAdapter implements VcsAdapter {
   private botLoginPromise: Promise<string> | null = null;
 
   /**
-   * Resolves the identity `gh` is currently authenticated as.
-   *
-   * A PAT can query `gh api user` and resolves to its real user login. A GitHub
-   * Actions GITHUB_TOKEN, however, CANNOT: the /user endpoint requires
-   * user-to-server auth, so `gh api user` rejects with HTTP 403 "Resource not
-   * accessible by integration" — the exact failure that aborted every CI review
-   * before this fix (the shipped workflow authenticates via GITHUB_TOKEN). In
-   * that environment the comments this tool posts are authored by
-   * `github-actions[bot]`, so we fall back to that identity (overridable via
-   * TGD_REVIEW_BOT_LOGIN for a GitHub App posting under a different slug) rather
-   * than failing the whole review before it starts.
-   *
-   * This keeps the anti-spoofing guarantee findBotComment relies on intact: an
-   * outside user cannot post a comment authored by `github-actions[bot]` (only
-   * the Actions token can), so matching that login is exactly as unforgeable as
-   * matching a resolved PAT identity. Only a 403 triggers the fallback; any
-   * other failure (network, real auth error, malformed response) still
-   * propagates.
+   * Resolves the identity `gh` is currently authenticated as, via
+   * `gh api user`. This tool is run from an environment authenticated as a real
+   * user (a developer's terminal, or CI you provide a token for), so `gh api
+   * user` resolves that user's login — the identity findBotComment matches
+   * against so a spoofed marker from another author can't trick dedup.
    */
   private getBotLogin(): Promise<string> {
     if (!this.botLoginPromise) {
-      this.botLoginPromise = this.execGh(["api", "user"])
-        .then((out) => (JSON.parse(out) as GhUser).login)
-        .catch((err: unknown) => {
-          if (isForbiddenError(err)) {
-            return process.env.TGD_REVIEW_BOT_LOGIN?.trim() || ACTIONS_BOT_LOGIN;
-          }
-          throw err;
-        });
+      this.botLoginPromise = this.execGh(["api", "user"]).then((out) => {
+        const parsed = JSON.parse(out) as GhUser;
+        return parsed.login;
+      });
     }
     return this.botLoginPromise;
   }
@@ -357,8 +323,8 @@ export class GitHubAdapter implements VcsAdapter {
    * rather than any local git checkout/worktree — this is what lets the CLI
    * enforce the "rules come from the base branch, not the PR's own
    * checkout" trust boundary anywhere `gh` is authenticated (a developer's
-   * own terminal, any CI system), not just inside a GitHub Actions workflow
-   * with local git worktree support.
+   * own terminal, or any CI system), with no local git worktree ceremony
+   * required.
    *
    * Lists `rulesDir` as a directory first; a 404 (directory doesn't exist
    * on the base branch) resolves to `[]` — the same "no rules dir = zero

@@ -66,11 +66,11 @@ const DEFAULTS = {
  * provider's API (`gh api` for GitHub) — never from whatever happens to be
  * checked out locally. This is what closes the rule-file trust-boundary gap
  * described in ADR-002: a PR cannot introduce or modify a rule that affects
- * its own review, and this now holds true wherever the CLI runs (a
- * developer's own terminal, any CI system with `gh` authenticated), not
- * just inside a GitHub Actions workflow with a bespoke `git worktree`
- * step. See `--trust-local-rules` below for the escape hatch back to the
- * old local-filesystem behavior.
+ * its own review, and this holds true wherever the CLI runs — a developer's
+ * own terminal, or any CI system with `gh` authenticated — without any
+ * bespoke `git worktree`/checkout ceremony around it. See
+ * `--trust-local-rules` below for the escape hatch back to the old
+ * local-filesystem behavior.
  *
  * `--trust-local-rules` (default false): skips the base-branch-via-API
  * fetch entirely and reverts `--rules-dir` to its OLD meaning — a literal
@@ -109,10 +109,10 @@ export function parseArgs(argv: string[]): CliArgs {
   // Defense-in-depth (DEBT.md security item, Low): --pr is interpolated
   // into `gh api repos/{owner}/{repo}/issues/${id}/comments`-style paths in
   // github-adapter.ts. Not currently exploitable — execFile is invoked with
-  // array args (no shell), and the shipped workflow only ever passes
-  // `github.event.pull_request.number`, a genuine integer — but a plain
-  // positive-integer check costs nothing and closes off any future
-  // path/query-string interpolation from accepting non-numeric input.
+  // array args (no shell), and in practice callers pass a genuine integer PR
+  // number — but a plain positive-integer check costs nothing and closes off
+  // any future path/query-string interpolation from accepting non-numeric
+  // input.
   if (!/^\d+$/.test(values.pr as string)) {
     throw new Error(
       `Invalid --pr value: "${values.pr as string}" (expected a positive integer, e.g. --pr 42)`,
