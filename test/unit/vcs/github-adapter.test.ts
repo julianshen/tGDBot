@@ -370,6 +370,96 @@ describe("GitHubAdapter", () => {
     await expect(adapter.findBotComment("42")).rejects.toThrow(SyntaxError);
   });
 
+  // --- Integration-token fix: `gh api user` 403 under a GitHub Actions
+  // GITHUB_TOKEN (the CI failure that aborted every review) ---
+
+  it("integration-token fix: findBotComment falls back to github-actions[bot] when `gh api user` returns 403", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") {
+        throw new Error(
+          "Command failed: gh api user\ngh: Resource not accessible by integration (HTTP 403)",
+        );
+      }
+      return JSON.stringify([
+        {
+          id: 42,
+          body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 -->",
+          user: { login: "github-actions[bot]" },
+        },
+      ]);
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    const botComment = await adapter.findBotComment("42");
+
+    // The bot's own comment (authored by github-actions[bot]) is matched even
+    // though `gh api user` was inaccessible — the review proceeds instead of
+    // aborting.
+    expect(botComment).toEqual({
+      id: "42",
+      body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 -->",
+      lastReviewedSha: "abc1234",
+      reviewedConfig: "",
+    });
+  });
+
+  it("integration-token fix: a 403 fallback still rejects a comment spoofed by a different (non-bot) author", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") {
+        throw new Error("gh: Resource not accessible by integration (HTTP 403)");
+      }
+      // Same marker, but authored by an outside user — must NOT be treated as
+      // the bot's own (anti-spoofing property preserved through the fallback).
+      return JSON.stringify([
+        {
+          id: 99,
+          body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 -->",
+          user: { login: "attacker" },
+        },
+      ]);
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    expect(await adapter.findBotComment("42")).toBeNull();
+  });
+
+  it("integration-token fix: TGD_REVIEW_BOT_LOGIN overrides the fallback identity on a 403", async () => {
+    const prev = process.env.TGD_REVIEW_BOT_LOGIN;
+    process.env.TGD_REVIEW_BOT_LOGIN = "my-app[bot]";
+    try {
+      const execGh = vi.fn(async (args: string[]) => {
+        if (args[0] === "api" && args[1] === "user") {
+          throw new Error("gh: Resource not accessible by integration (HTTP 403)");
+        }
+        return JSON.stringify([
+          {
+            id: 7,
+            body: "<!-- tgd-review-agent:sha=abc1234 -->",
+            user: { login: "my-app[bot]" },
+          },
+        ]);
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      expect((await adapter.findBotComment("42"))?.id).toBe("7");
+    } finally {
+      if (prev === undefined) delete process.env.TGD_REVIEW_BOT_LOGIN;
+      else process.env.TGD_REVIEW_BOT_LOGIN = prev;
+    }
+  });
+
+  it("integration-token fix: a non-403 `gh api user` failure still propagates (not masked as the bot identity)", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") {
+        throw new Error("gh: Bad credentials (HTTP 401)");
+      }
+      return readFixture("gh-comments.json");
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.findBotComment("42")).rejects.toThrow(/HTTP 401/);
+  });
+
   // --- Review fix #4 (test gap): realExecGh coverage ---
 
   describe("realExecGh (test gap fix: real child_process.execFile-backed implementation)", () => {
