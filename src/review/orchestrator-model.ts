@@ -194,9 +194,13 @@ export function resolveRuleSessionModel(
   if (!registry.hasConfiguredAuth(model)) {
     return { error: `no configured credentials for provider ${provider} on this machine` };
   }
-  // pi's thinking levels; "off" is a legacy alias for "none".
+  // Codex review (PR #7): the SDK's own ThinkingLevel type is "off" |
+  // "minimal" | "low" | "medium" | "high" | "xhigh" | "max" — "off" IS the
+  // valid disabled value; "none" is not a value the SDK accepts at all. A
+  // rule/--model suffix of `:none` is normalized to "off" so both spellings
+  // reach createAgentSession as the one value it actually recognizes.
   const rawLevel = suffixMatch?.[0].slice(1).toLowerCase();
-  const thinkingLevel = rawLevel === "off" ? "none" : rawLevel;
+  const thinkingLevel = rawLevel === "none" ? "off" : rawLevel;
   return { model: model as CreateAgentSessionOptions["model"], thinkingLevel };
 }
 

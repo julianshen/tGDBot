@@ -358,6 +358,38 @@ describe("dispatchRulesDirect", () => {
       resolveRpivAdvisorExtensionPath(),
     ]);
   });
+
+  // Codex review (PR #7): the SDK's own ThinkingLevel type is "off" |
+  // "minimal" | "low" | "medium" | "high" | "xhigh" | "max" — "off" IS the
+  // valid disabled value; "none" is not accepted at all. resolveRuleSessionModel
+  // used to map "off" -> "none" (backwards), which would hand createAgentSession
+  // an invalid thinkingLevel exactly when a rule asked to disable thinking.
+  // This exercises the REAL rule-session factory (no createSession override)
+  // against the mocked SDK to assert the value actually reaching
+  // createAgentSession.
+  it("normalizes both ':off' and ':none' rule-model suffixes to the SDK's valid \"off\" thinking level", async () => {
+    for (const suffix of ["off", "none"]) {
+      hoisted.createAgentSessionMock.mockReset();
+      hoisted.createAgentSessionMock.mockResolvedValueOnce({
+        session: {
+          async prompt() {},
+          getLastAssistantText: () => "[]",
+        },
+      });
+
+      await dispatchRulesDirect(
+        [makeRule({ model: `claude-opus-4-5:${suffix}` })],
+        "diff",
+        false,
+        {},
+      );
+
+      const callArgs = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as {
+        thinkingLevel?: string;
+      };
+      expect(callArgs.thinkingLevel).toBe("off");
+    }
+  });
 });
 
 describe("parseAdvisorDropList", () => {
