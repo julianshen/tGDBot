@@ -23,8 +23,6 @@ export interface LoadResult {
 // alongside the compiled loader.js at dist/rules/builtin/tgd-review.md.
 const BUILTIN_RULE_PATH = fileURLToPath(new URL("./builtin/tgd-review.md", import.meta.url));
 
-const REQUIRED_STRING_FIELDS = ["name", "provider", "model"] as const;
-
 interface ParsedRuleFile {
   rule?: RuleDefinition;
   error?: string;
@@ -51,16 +49,31 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
   }
   const data = parsed.data as Record<string, unknown>;
 
-  const missingField = REQUIRED_STRING_FIELDS.find((field) => !isNonEmptyString(data[field]));
-  if (missingField) {
-    return { error: `rule file is missing required frontmatter field "${missingField}"` };
+  if (!isNonEmptyString(data.name)) {
+    return { error: `rule file is missing required frontmatter field "name"` };
+  }
+
+  // Design-review #6: `provider`/`model` are optional (an unpinned rule runs
+  // on the default model — see resolveEffectiveRules), but when used they must
+  // come as a PAIR. A provider without a model (or vice versa) is ambiguous —
+  // half a pin is certainly a mistake, and silently guessing the other half
+  // would run the rule somewhere its author never intended.
+  const hasProvider = isNonEmptyString(data.provider);
+  const hasModel = isNonEmptyString(data.model);
+  if (hasProvider !== hasModel) {
+    const present = hasProvider ? "provider" : "model";
+    const missing = hasProvider ? "model" : "provider";
+    return {
+      error:
+        `rule file sets frontmatter field "${present}" without "${missing}" — ` +
+        `pin both (provider AND model) or neither (the rule then runs on the default model)`,
+    };
   }
 
   return {
     rule: {
-      name: data.name as string,
-      provider: data.provider as string,
-      model: data.model as string,
+      name: data.name,
+      ...(hasProvider ? { provider: data.provider as string, model: data.model as string } : {}),
       body: parsed.content.trim(),
       sourcePath,
     },

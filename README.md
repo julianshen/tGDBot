@@ -128,13 +128,12 @@ tgd-review-agent review \
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
-  --model <provider>/<model>     # optional: the model that ORCHESTRATES the review (merges each
-                                  # rule's findings). Each rule still runs on its OWN pinned model.
-                                  # Default: the first rule whose model has working credentials on
-                                  # this machine — NOT pi's ambient defaultModel, which this tool
-                                  # has no relationship to and cannot verify. If nothing here has
-                                  # credentials, pi picks its own available model. See "Which model
-                                  # orchestrates?" below.
+  --model <provider>/<model>     # optional: the DEFAULT model. Runs the review's orchestrating
+                                  # session AND any rule that doesn't pin its own provider/model
+                                  # (pinned rules always keep their pin). Default when absent:
+                                  # pi's settings default if credentialed, else the first provider
+                                  # with working credentials on this machine. See "Which model
+                                  # runs what?" below.
   --suggestions on|off           # default: on. Renders a GitHub COMMITTABLE suggestion (a one-click
                                   # "Commit suggestion" button) when a rule supplies a concrete
                                   # replacement. `off` still SHOWS the proposed fix, as a plain
@@ -146,6 +145,12 @@ tgd-review-agent review \
                                   # and the diff exceeds it, the run SKIPS with a visible notice
                                   # (exit 0, nothing posted) instead of silently spending. Absent =
                                   # unlimited. The status line then carries reason: "diff-too-large".
+  --dispatch direct|legacy       # default: direct. "direct" runs one reviewer session per rule via
+                                  # the pi SDK's public API and merges findings deterministically in
+                                  # code — no orchestrating LLM on the data path, so attribution and
+                                  # accounting are exact by construction. "legacy" is the previous
+                                  # LLM-orchestrated pi-subagents fan-out, kept for one release as an
+                                  # escape hatch.
   --dry-run                      # post nothing: print the summary comment AND a preview of every
                                   # inline comment it would have posted (file:line + body)
   --trust-local-rules            # optional: read --rules-dir directly off the local filesystem
@@ -212,12 +217,15 @@ in the summary under **💬 Additional comments**. And if the inline post is
 rejected outright, the run falls back to a summary containing *every* finding. A
 finding is only ever relocated, never dropped.
 
-### Which model orchestrates?
+### Which model runs what?
 
-Every rule file is pinned to its own `provider`/`model` — that is the point of
-the tool, and it is unchanged. But the **orchestrating** session (the one that
-dispatches the rules as parallel subagents and merges their findings) needs a
-model too.
+A rule file MAY pin its own `provider`/`model`; a rule without a pin runs on
+the **default model** — `--model` if passed, else pi's settings default
+(credentialed), else the first provider with working credentials. This is what
+makes a rule set portable: a repo can ship rules with no pins at all, and
+whoever runs the CLI supplies one flag (or just one API key). The
+**orchestrating** session (the one that dispatches the rules as parallel
+subagents and merges their findings) needs a model too.
 
 It used to have none, so pi silently fell back to the machine's ambient
 `defaultProvider`/`defaultModel` from `~/.pi/agent/settings.json`. That coupled
@@ -269,9 +277,10 @@ directory, only the vendored built-in `tgd-review` rule.
 1. Clone the repo fresh and confirm there is no `.tgd-review/rules/`
    directory (nothing to author, nothing to configure).
 2. `npm ci && npm run build`.
-3. Export the provider API key your builtin rule's `provider`/`model` needs
-   (the vendored rule uses `anthropic`/`claude-opus-4-5` — set
-   `ANTHROPIC_API_KEY`) and make sure `gh auth login` / `GH_TOKEN` is set up.
+3. Export ANY one provider API key (e.g. `ANTHROPIC_API_KEY` or
+   `OPENAI_API_KEY` — the vendored builtin rule is unpinned, so it runs on
+   whatever provider is credentialed, or on `--model` if you pass one) and
+   make sure `gh auth login` / `GH_TOKEN` is set up.
 4. Run `node dist/cli.js review --pr <a-real-open-PR-number> --dry-run`
    against a real repo/PR you have `gh` access to.
 5. Confirm the printed comment body reflects the built-in `tgd-review`
@@ -300,24 +309,38 @@ export interface RuleDefinition {
 }
 ```
 
-`name`, `provider`, and `model` are all **required, non-empty strings** in
-the frontmatter — a file missing any one of them is skipped (recorded as a
-load error, surfaced in the run's log/comment) rather than failing the whole
-run. Everything after the closing `---` becomes the rule's Markdown `body`,
-which is sent verbatim as the dispatched subagent's task prompt (with a
-fixed JSON-output contract appended automatically — you don't need to ask
-for JSON yourself).
+`name` is **required**. `provider`/`model` are **optional** — a rule file
+describes *what to review*; *which model runs it* is a deployment decision.
+An unpinned rule runs on the default model: `--model` if you pass it, else
+pi's own settings default, else the first provider with working credentials
+on the machine running the review. When you DO pin, `provider` and `model`
+must come as a **pair** (one without the other is a load error). A file that
+fails validation is skipped (recorded as a load error, surfaced in the run's
+log/comment) rather than failing the whole run. Everything after the closing
+`---` becomes the rule's Markdown `body`, which is sent verbatim as the
+dispatched subagent's task prompt (with a fixed JSON-output contract appended
+automatically — you don't need to ask for JSON yourself).
 
 ```markdown
 ---
 name: security-review
-provider: anthropic
-model: claude-opus-4-5
 ---
 
 Review this diff for security issues: injection, secret leakage, auth
 bypass, unsafe deserialization. Report only findings you are highly
 confident about.
+```
+
+Pin a specific model only when the rule genuinely needs one (e.g. a cheap
+model for a narrow style rule, or a specific provider's strengths):
+
+```markdown
+---
+name: deep-security-review
+provider: anthropic
+model: claude-opus-4-5
+---
+...
 ```
 
 `provider` should be one of the pi SDK's known provider ids (see "Provider

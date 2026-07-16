@@ -26,7 +26,7 @@ const HERMETIC_AGENT_LINK_FILES = [AUTH_FILE, MODELS_FILE, SETTINGS_FILE];
 // `npm run build` — the build script copies this .md file alongside the
 // compiled dispatch.js at dist/review/builtin-agents/reviewer.md (same
 // pattern as src/rules/loader.ts's BUILTIN_RULE_PATH).
-const VENDORED_REVIEWER_AGENT_PATH = fileURLToPath(
+export const VENDORED_REVIEWER_AGENT_PATH = fileURLToPath(
   new URL("./builtin-agents/reviewer.md", import.meta.url),
 );
 

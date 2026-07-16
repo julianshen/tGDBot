@@ -1,7 +1,5 @@
 ---
 name: tgd-review
-provider: anthropic
-model: claude-opus-4-5
 ---
 
 You are reviewing a pull request diff. Give the change a thorough, multi-axis

@@ -37,7 +37,7 @@ import {
 } from "./dispatch-results.js";
 import type { CapturedTaskResult } from "./dispatch-results.js";
 import { resolvePiSubagentsExtensionPath, resolveRpivAdvisorExtensionPath } from "./extensions.js";
-import { resolveOrchestratorModel } from "./orchestrator-model.js";
+import { resolveEffectiveRules, resolveOrchestratorModel } from "./orchestrator-model.js";
 import type { OrchestratorModelRequest } from "./orchestrator-model.js";
 import {
   createIsolatedAgentDir,
@@ -260,6 +260,17 @@ async function runDispatch(
   // Issue #1: set only when the hermetic agent dir ended up WITHOUT auth.json.
   // Appended to a downstream pi auth error so the failure names its own cause.
   let missingAuthDiagnostic: string | undefined;
+  // CodeRabbit review (PR #7): hoisted OUTSIDE the try so the outer catch below
+  // can still merge these specific reasons. resolveEffectiveRules can classify
+  // some rules as unresolved (with a precise reason) and THEN a later step in
+  // this same try (createSession, etc.) can throw — without hoisting, that
+  // outer catch's fallbackResult(rules) would overwrite those precise reasons
+  // with the generic "did not complete" message, exactly what withUnresolved
+  // exists to prevent.
+  let unresolvedForFallback: Record<string, string> = Object.create(null) as Record<
+    string,
+    string
+  >;
 
   try {
     sessionCwd = await createIsolatedSessionCwd();
@@ -279,21 +290,48 @@ async function runDispatch(
       agentDirEnvOverridden = true;
     }
 
+    // Design-review #6 (model decoupling): rules may be UNPINNED. Fill each
+    // unpinned rule with the deployment default (--model → settings default →
+    // first credentialed provider) — resolved here, after the agent-dir env is
+    // in place, so the registry sees the same credentials the sessions will.
+    // A rule that cannot be given ANY model is reported failed with its
+    // reason; it is never silently dropped and never burns a model call.
+    const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
+    unresolvedForFallback = unresolved;
+    const unresolvedNames = Object.keys(unresolved);
+    if (effective.length === 0) {
+      for (const name of unresolvedNames) {
+        console.warn(`dispatchRules: rule "${name}" not dispatched: ${unresolved[name]}`);
+      }
+      return { findings: [], rulesRun: [], rulesFailed: unresolvedNames, ruleFailureReasons: unresolved };
+    }
+    // Appends the never-dispatched rules' failures to whatever the dispatch
+    // produced, so the summary names every rule exactly once.
+    const withUnresolved = (result: DispatchResult): DispatchResult =>
+      unresolvedNames.length === 0
+        ? result
+        : {
+            ...result,
+            rulesFailed: [...result.rulesFailed, ...unresolvedNames],
+            ruleFailureReasons: { ...(result.ruleFailureReasons ?? {}), ...unresolved },
+          };
+
     // Candidates for the orchestrating session's model, highest priority first.
     // An explicit --model is a single, user-demanded candidate (failures are
     // narrated). Otherwise every rule's own pinned model is a candidate, tried
     // in order — the first one with working credentials on THIS box wins, so a
-    // rule pinned to a provider this box isn't authenticated for (e.g. the CI
-    // workflow only sets ANTHROPIC_API_KEY) is skipped rather than fatal.
-    // resolveOrchestratorModel returns undefined if none are usable, which lets
-    // pi apply its own auth-aware default — the pre-existing behavior.
+    // rule pinned to a provider this box isn't authenticated for (e.g. a CI
+    // environment that only sets ANTHROPIC_API_KEY) is skipped rather than
+    // fatal. resolveOrchestratorModel returns undefined if none are usable,
+    // which lets pi apply its own auth-aware default — the pre-existing
+    // behavior.
     const modelRequest: OrchestratorModelRequest = {
       explicit: orchestratorModel,
-      ruleCandidates: rules.map((r) => `${r.provider}/${r.model}`),
+      ruleCandidates: effective.map((r) => `${r.provider}/${r.model}`),
     };
 
     const session = await createSession(useAdvisor, sessionCwd, modelRequest);
-    const prompt = buildDispatchPrompt(rules, diff, useAdvisor);
+    const prompt = buildDispatchPrompt(effective, diff, useAdvisor);
 
     // Capture the subagent tool's structured per-task results (details.results)
     // so we can deterministically reconcile the orchestrator's self-reported
@@ -335,7 +373,7 @@ async function runDispatch(
           ? ` — ${missingAuthDiagnostic}`
           : "";
       console.warn(`dispatchRules: session.prompt() threw (${message})${authHint}`);
-      return fallbackResult(rules);
+      return withUnresolved(fallbackResult(effective));
     } finally {
       unsubscribe?.();
     }
@@ -356,7 +394,7 @@ async function runDispatch(
     // quietly halving the review's guarantees. (Test stubs without subscribe are
     // unaffected — they never expected capture.)
     if (
-      rules.length > 0 &&
+      effective.length > 0 &&
       typeof session.subscribe === "function" &&
       capturedTaskResults.length === 0
     ) {
@@ -368,33 +406,43 @@ async function runDispatch(
       );
     }
 
-    const orchestratorResult = parseDispatchResult(finalText, rules);
+    const orchestratorResult = parseDispatchResult(finalText, effective);
     // Recover dropped findings only when advisor is OFF — see
     // reconcileWithCapturedResults' doc comment for why recovering while the
     // advisor pass is active would undo its false-positive filtering.
     const reconciled = reconcileWithCapturedResults(
       orchestratorResult,
       capturedTaskResults,
-      rules,
+      effective,
       !useAdvisor,
     );
 
     // ADR-007: a suggestion is committable code. It may only survive if a dispatched
     // reviewer actually proposed it for that exact file/line — never because the
     // orchestrator said so. Unverifiable => stripped.
-    return enforceSuggestionProvenance(
-      reconciled,
-      suggestionProvenanceKeys(capturedTaskResults, rules),
+    return withUnresolved(
+      enforceSuggestionProvenance(
+        reconciled,
+        suggestionProvenanceKeys(capturedTaskResults, effective),
+      ),
     );
   } catch (err) {
     // Setup/session-creation failure (createIsolatedSessionCwd,
     // createIsolatedAgentDir, or createSession threw). Degrade to
     // fallbackResult rather than propagating, upholding the never-throws
-    // safety-boundary contract.
+    // safety-boundary contract. Merge in any unresolved-rule reasons
+    // resolveEffectiveRules already classified before this failure (CodeRabbit
+    // review, PR #7) — a precise "no default model" reason must survive even
+    // when a LATER step in this same try then throws; the generic message
+    // below is only for the rules that didn't already have one.
     console.warn(
       `dispatchRules: setup or session creation failed (${(err as Error).message})`,
     );
-    return fallbackResult(rules);
+    const fallback = fallbackResult(rules);
+    return {
+      ...fallback,
+      ruleFailureReasons: { ...fallback.ruleFailureReasons, ...unresolvedForFallback },
+    };
   } finally {
     // Restore PI_CODING_AGENT_DIR to exactly its prior state (unset vs. a
     // specific value) before anything else, so the override never leaks past

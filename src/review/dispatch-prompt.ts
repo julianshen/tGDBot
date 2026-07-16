@@ -4,7 +4,7 @@
 // as one PARALLEL "subagent" tool call. Split out of dispatch.ts
 // (design-review #8) — pure string building, no SDK, no I/O beyond the
 // cost-risk console.warn.
-import type { RuleDefinition } from "../rules/types.js";
+import type { EffectiveRule } from "../rules/types.js";
 
 // Appended to every rule's task automatically — rule authors never write
 // this themselves (TASKS.md Task 5 technical design).
@@ -88,7 +88,7 @@ const ADVISOR_INSTRUCTION =
 // rather than silent.
 const DIFF_COST_WARNING_THRESHOLD_CHARS = 500_000; // ~125k tokens at ~4 chars/token
 
-function warnIfDiffCostRisk(rules: RuleDefinition[], diff: string): void {
+function warnIfDiffCostRisk(rules: EffectiveRule[], diff: string): void {
   const totalChars = diff.length * rules.length;
   if (rules.length > 1 && totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
     console.warn(
@@ -101,7 +101,7 @@ function warnIfDiffCostRisk(rules: RuleDefinition[], diff: string): void {
   }
 }
 
-function buildTaskText(rule: RuleDefinition, diff: string): string {
+export function buildTaskText(rule: EffectiveRule, diff: string): string {
   return [rule.body.trim(), READ_ONLY_INSTRUCTION, FINDING_JSON_CONTRACT, "---", "Diff:", diff].join(
     "\n\n",
   );
@@ -113,7 +113,7 @@ function buildTaskText(rule: RuleDefinition, diff: string): string {
 // in this module (parseDispatchResult) and does not affect the return
 // value.
 export function buildDispatchPrompt(
-  rules: RuleDefinition[],
+  rules: EffectiveRule[],
   diff: string,
   useAdvisor: boolean,
 ): string {

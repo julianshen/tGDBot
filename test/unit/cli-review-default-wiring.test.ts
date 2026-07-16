@@ -43,6 +43,10 @@ vi.mock("../../src/review/dispatch.js", () => ({
   dispatchRules: vi.fn(),
 }));
 
+vi.mock("../../src/review/direct-dispatch.js", () => ({
+  dispatchRulesDirect: vi.fn(),
+}));
+
 vi.mock("../../src/review/orchestrate.js", () => ({
   orchestrate: vi.fn(),
 }));
@@ -51,6 +55,7 @@ import { review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { loadRules } from "../../src/rules/loader.js";
 import { dispatchRules } from "../../src/review/dispatch.js";
+import { dispatchRulesDirect } from "../../src/review/direct-dispatch.js";
 import { orchestrate } from "../../src/review/orchestrate.js";
 
 function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
@@ -62,6 +67,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     advisor: "on",
     dryRun: false,
     trustLocalRules: false,
+    dispatch: "direct",
     ...overrides,
   };
 }
@@ -92,7 +98,7 @@ describe("review — default dependency wiring", () => {
       ],
       errors: [],
     });
-    vi.mocked(dispatchRules).mockResolvedValue({
+    vi.mocked(dispatchRulesDirect).mockResolvedValue({
       findings: [],
       rulesRun: ["rule-a"],
       rulesFailed: [],
@@ -138,18 +144,17 @@ describe("review — default dependency wiring", () => {
     const [loadedDir, includeBuiltin] = vi.mocked(loadRules).mock.calls[0];
     expect(loadedDir).not.toBe(".tgd-review/rules");
     expect(includeBuiltin).toBe(true);
-    // Issue #1 (round 2): review() now wires dispatchRules through an adapter so
-    // the --model string lands in the 5th (orchestratorModel) slot, NOT the 4th
-    // (createSession factory). The 4th must stay `undefined` so dispatchRules
-    // keeps its real default factory — asserting it here is what would catch a
-    // regression that silently passes the model string as the session factory.
-    expect(dispatchRules).toHaveBeenCalledWith(
+    // Design-review P0: the DEFAULT engine is the direct one. Its adapter
+    // keeps the deps bag in slot 4 ({} → real factories) and the default
+    // model in slot 5 — asserting both catches a slot swap.
+    expect(dispatchRulesDirect).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ name: "rule-a" })]),
       "diff --git a/x b/x",
       true,
-      undefined, // createSession → real default (NOT the model string)
-      undefined, // orchestratorModel → none given; dispatchRules derives it from the rules
+      {}, // deps bag → real factories (NOT the model string)
+      undefined, // default model → none given
     );
+    expect(dispatchRules).not.toHaveBeenCalled(); // legacy engine untouched
     expect(orchestrate).toHaveBeenCalledTimes(1);
 
     logSpy.mockRestore();
@@ -165,10 +170,9 @@ describe("review — default dependency wiring", () => {
   // `undefined`, so the assertion above cannot tell them apart. Setting a model
   // makes it behavioral — a slot swap (the model string landing in the
   // session-factory slot) fails loudly here.
-  it("passes --model into the orchestratorModel slot (5th), never the session-factory slot (4th)", async () => {
-    const { dispatchRules } = await import("../../src/review/dispatch.js");
-    vi.mocked(dispatchRules).mockClear();
-    vi.mocked(dispatchRules).mockResolvedValue({
+  it("passes --model into the default-model slot (5th), never the deps slot (4th)", async () => {
+    vi.mocked(dispatchRulesDirect).mockClear();
+    vi.mocked(dispatchRulesDirect).mockResolvedValue({
       findings: [],
       rulesRun: ["rule-a"],
       rulesFailed: [],
@@ -177,6 +181,30 @@ describe("review — default dependency wiring", () => {
 
     await review(makeArgs({ model: "x/y" }));
 
+    expect(dispatchRulesDirect).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      true,
+      {}, // deps bag → real factories
+      "x/y", // default model
+    );
+    logSpy.mockRestore();
+  });
+
+  // Design-review P0: --dispatch legacy selects the previous LLM-orchestrated
+  // engine, with its own slot layout (4th = session factory, 5th = model).
+  it("--dispatch legacy wires the legacy engine with --model in ITS 5th slot", async () => {
+    vi.mocked(dispatchRules).mockClear();
+    vi.mocked(dispatchRulesDirect).mockClear();
+    vi.mocked(dispatchRules).mockResolvedValue({
+      findings: [],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(makeArgs({ dispatch: "legacy", model: "x/y" }));
+
     expect(dispatchRules).toHaveBeenCalledWith(
       expect.anything(),
       expect.any(String),
@@ -184,6 +212,7 @@ describe("review — default dependency wiring", () => {
       undefined, // createSession → real default
       "x/y", // orchestratorModel
     );
+    expect(dispatchRulesDirect).not.toHaveBeenCalled();
     logSpy.mockRestore();
   });
 });

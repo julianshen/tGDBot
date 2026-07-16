@@ -21,6 +21,13 @@ export interface ReviewConfigForDedup {
   trustLocalRules: boolean;
   rulesDir: string;
   model?: string;
+  /**
+   * Design-review P0: the dispatch engine changes how findings are produced,
+   * so switching it must re-trigger a review on an unchanged head. NOTE:
+   * adding this field changed every pre-existing hash — one extra (safe)
+   * re-review per open PR after upgrading, then hashes are stable again.
+   */
+  dispatch: "direct" | "legacy";
 }
 
 /**
@@ -60,6 +67,7 @@ export function computeReviewConfigHash(config: ReviewConfigForDedup): string {
     config.trustLocalRules,
     config.rulesDir.replace(/\\/g, "/"),
     config.model ?? null,
+    config.dispatch,
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
 }

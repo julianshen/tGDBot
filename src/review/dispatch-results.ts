@@ -4,7 +4,7 @@
 // per-task results, suggestion provenance (ADR-007), and failure
 // classification. Split out of dispatch.ts (design-review #8) — pure and
 // synchronous, no SDK, no I/O beyond console.warn.
-import type { RuleDefinition } from "../rules/types.js";
+import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
 import type { DispatchResult, Finding } from "./types.js";
 
 // One dispatched task's structured outcome, read from the subagent tool's
@@ -165,7 +165,7 @@ function isValidRawFinding(value: unknown): boolean {
 // undefined if neither yields a valid findings array. The reviewer's own system
 // prompt is the primary defense (it's instructed to emit ONLY the array); this
 // leniency is a safety net so a stray preamble doesn't silently lose findings.
-function extractFindingsArray(text: string): unknown[] | undefined {
+export function extractFindingsArray(text: string): unknown[] | undefined {
   const stripped = stripCodeFences(text);
   const tryParse = (s: string): unknown[] | undefined => {
     try {
@@ -196,7 +196,7 @@ function extractFindingsArray(text: string): unknown[] | undefined {
 
 // Parses one task's raw finalOutput into Finding[] stamped with ruleName.
 // Best-effort — returns [] on any parse/shape problem, never throws.
-function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
+export function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
   const parsed = extractFindingsArray(text);
   if (!parsed) return [];
   return parsed.map((f) => {
@@ -314,7 +314,7 @@ function sanitizeForComment(value: string): string {
  * maintainer needs from the comment is the actionable class of failure plus which
  * provider it was, and that is exactly what this returns.
  */
-function classifyTaskFailure(c: CapturedTaskResult, rule: RuleDefinition): string {
+export function classifyTaskFailure(c: CapturedTaskResult, rule: EffectiveRule): string {
   if (c.timedOut) return "timed out";
   if (c.detached) return "detached before finishing";
   const error = c.error ?? "";
@@ -365,7 +365,7 @@ function classifyTaskFailure(c: CapturedTaskResult, rule: RuleDefinition): strin
 export function reconcileWithCapturedResults(
   orchestrator: DispatchResult,
   captured: CapturedTaskResult[],
-  rules: RuleDefinition[],
+  rules: EffectiveRule[],
   recoverFindings: boolean,
 ): DispatchResult {
   if (captured.length !== rules.length) return orchestrator;

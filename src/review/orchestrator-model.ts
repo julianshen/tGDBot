@@ -6,7 +6,17 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { AuthStorage, ModelRegistry, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
+import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
 import { AUTH_FILE, MODELS_FILE, SETTINGS_FILE } from "./session-hermetics.js";
+
+// The registry, read through the CURRENT agent dir (which, inside a dispatch
+// run, is the hermetic dir whose auth/models/settings are symlinks to the real
+// ones — so this credential view matches the sessions' exactly).
+function createRegistry(): { registry: ModelRegistry; agentDir: string } {
+  const agentDir = getAgentDir();
+  const authStorage = AuthStorage.create(path.join(agentDir, AUTH_FILE));
+  return { registry: ModelRegistry.create(authStorage, path.join(agentDir, MODELS_FILE)), agentDir };
+}
 
 /**
  * What model the ORCHESTRATING session should use, in priority order.
@@ -105,9 +115,7 @@ export function resolveOrchestratorModel(
   // PI_CODING_AGENT_DIR already points at the hermetic dir (see dispatchRules),
   // whose auth.json/models.json/settings.json are symlinks to the real ones — so
   // this credential view matches the session's exactly.
-  const agentDir = getAgentDir();
-  const authStorage = AuthStorage.create(path.join(agentDir, AUTH_FILE));
-  const registry = ModelRegistry.create(authStorage, path.join(agentDir, MODELS_FILE));
+  const { registry, agentDir } = createRegistry();
 
   const settingsDefault = readSettingsDefaultSpec(agentDir);
   // Deduped, order-preserving: the same spec can legitimately appear more than
@@ -158,4 +166,149 @@ export function resolveOrchestratorModel(
       `[${candidates.join(", ")}]; falling back to pi's default model`,
   );
   return undefined;
+}
+
+/**
+ * Direct dispatch (P0): resolve one RULE's session model. Unlike the
+ * orchestrator's candidate ladder this is a single spec — the rule's own
+ * (effective) pin — so failure is an ERROR STRING for the caller to classify
+ * into the rule's failure reason, not a silent fallback. The thinking-level
+ * suffix (`:high` etc.) is split off and returned separately so the session
+ * can be created at the pinned level.
+ */
+export function resolveRuleSessionModel(
+  provider: string,
+  modelSpec: string,
+): {
+  model?: CreateAgentSessionOptions["model"];
+  thinkingLevel?: string;
+  error?: string;
+} {
+  const { registry } = createRegistry();
+  const suffixMatch = THINKING_SUFFIX_RE.exec(modelSpec);
+  const modelId = modelSpec.replace(THINKING_SUFFIX_RE, "");
+  const model = registry.find(provider, modelId);
+  if (!model) {
+    return { error: `model "${provider}/${modelId}" is not in the pi model registry` };
+  }
+  if (!registry.hasConfiguredAuth(model)) {
+    return { error: `no configured credentials for provider ${provider} on this machine` };
+  }
+  // Codex review (PR #7): the SDK's own ThinkingLevel type is "off" |
+  // "minimal" | "low" | "medium" | "high" | "xhigh" | "max" — "off" IS the
+  // valid disabled value; "none" is not a value the SDK accepts at all. A
+  // rule/--model suffix of `:none` is normalized to "off" so both spellings
+  // reach createAgentSession as the one value it actually recognizes.
+  const rawLevel = suffixMatch?.[0].slice(1).toLowerCase();
+  const thinkingLevel = rawLevel === "none" ? "off" : rawLevel;
+  return { model: model as CreateAgentSessionOptions["model"], thinkingLevel };
+}
+
+export interface EffectiveRulesResult {
+  /** Every rule, with unpinned ones filled from the resolved default. */
+  effective: EffectiveRule[];
+  /**
+   * ruleName -> why it could NOT be given a model (only possible when the rule
+   * is unpinned AND no default resolved: no credentialed --model, no
+   * credentialed settings default, zero credentialed providers). These rules
+   * must be reported failed with this reason, never silently dropped.
+   */
+  unresolved: Record<string, string>;
+}
+
+/**
+ * Design-review #6 (model decoupling): a rule's `provider`/`model` are now
+ * optional. This fills every UNPINNED rule with the deployment's default
+ * model, resolved once, in priority order:
+ *
+ *   1. `--model` — if credentialed on this machine (warned about when not:
+ *      the user asked for it by name).
+ *   2. pi's own settings default — if credentialed.
+ *   3. the first credentialed model in the registry (`getAvailable()[0]`),
+ *      pi's own auth-aware notion of "the model this machine can run".
+ *
+ * PINNED rules pass through untouched — even when their provider has no
+ * credentials here. That is deliberate: a pin is the rule author's explicit
+ * choice, and the existing dispatch-time failure ("no working credentials for
+ * provider X") names the problem far more usefully than a silent re-route to
+ * a different model would.
+ *
+ * Never throws. When nothing resolves at all, unpinned rules land in
+ * `unresolved` with a reason the caller MUST surface as a rule failure.
+ */
+export function resolveEffectiveRules(
+  rules: RuleDefinition[],
+  explicitDefault?: string,
+): EffectiveRulesResult {
+  const unpinned = rules.filter((r) => r.provider === undefined || r.model === undefined);
+  if (unpinned.length === 0) {
+    return { effective: rules as EffectiveRule[], unresolved: {} };
+  }
+
+  const { registry, agentDir } = createRegistry();
+
+  // Resolve the ONE default spec all unpinned rules share.
+  let defaultSpec: string | undefined;
+  const settingsDefault = readSettingsDefaultSpec(agentDir);
+  // Deduped, same reasoning as resolveOrchestratorModel's candidates above
+  // (CodeRabbit review, PR #7): --model and the settings default can
+  // legitimately be the same spec, and without dedup a rejected model would
+  // get the explicit-only warning printed twice.
+  const candidates = [
+    ...(explicitDefault ? [explicitDefault] : []),
+    ...(settingsDefault ? [settingsDefault] : []),
+  ].filter((spec, i, all) => all.indexOf(spec) === i);
+  for (const spec of candidates) {
+    const ref = parseModelRef(spec);
+    const model = ref ? registry.find(ref.provider, ref.modelId) : undefined;
+    if (model && registry.hasConfiguredAuth(model)) {
+      // Codex review (PR #7): preserve the ORIGINAL candidate spec (which may
+      // carry a thinking-level suffix like ":high") rather than reconstructing
+      // from `model.provider`/`model.id` — the registry lookup above already
+      // stripped the suffix to find the model (parseModelRef), so rebuilding
+      // from the looked-up model's own fields would silently drop it for
+      // every unpinned rule this default fills. resolveRuleSessionModel
+      // downstream re-parses this exact string (same THINKING_SUFFIX_RE) to
+      // recover the level, so preserving it here is sufficient.
+      defaultSpec = spec.trim();
+      break;
+    }
+    if (spec === explicitDefault) {
+      console.warn(
+        `tgd-review-agent: --model "${spec}" is not a credentialed model on this machine; ` +
+          `trying the next default candidate for unpinned rules`,
+      );
+    }
+  }
+  if (!defaultSpec) {
+    const available = registry.getAvailable();
+    if (available.length > 0) {
+      defaultSpec = `${available[0].provider}/${available[0].id}`;
+    }
+  }
+
+  if (!defaultSpec) {
+    const unresolved: Record<string, string> = Object.create(null) as Record<string, string>;
+    const reason =
+      "rule has no provider/model pin and no default model could be resolved " +
+      "(no credentialed --model or settings default, and no provider on this machine " +
+      "has configured credentials)";
+    for (const rule of unpinned) unresolved[rule.name] = reason;
+    return {
+      effective: rules.filter((r): r is EffectiveRule => r.provider !== undefined && r.model !== undefined),
+      unresolved,
+    };
+  }
+
+  const slash = defaultSpec.indexOf("/");
+  const defaultProvider = defaultSpec.slice(0, slash);
+  const defaultModel = defaultSpec.slice(slash + 1);
+  return {
+    effective: rules.map((r) =>
+      r.provider !== undefined && r.model !== undefined
+        ? (r as EffectiveRule)
+        : { ...r, provider: defaultProvider, model: defaultModel },
+    ),
+    unresolved: {},
+  };
 }
