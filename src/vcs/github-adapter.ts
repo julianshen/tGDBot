@@ -46,11 +46,23 @@ export const realExecGh: ExecGh = (args, stdin) =>
 const BOT_MARKER_PREFIX_RE = /<!-- tgd-review-agent:sha=/;
 
 // Matches the bot's own HTML marker comment, e.g.
-// `<!-- tgd-review-agent:sha=abc1234 -->`. Capture group 1 is lastReviewedSha.
-// A comment can match BOT_MARKER_PREFIX_RE without matching this (malformed
-// SHA) — that's still treated as "the bot's marker comment", just with an
-// empty lastReviewedSha (see findBotComment).
-const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40}) -->/;
+// `<!-- tgd-review-agent:sha=abc1234 -->` or, since config-aware dedup,
+// `<!-- tgd-review-agent:sha=abc1234 cfg=1a2b3c4d5e6f -->`. Capture group 1 is
+// lastReviewedSha; group 2 (optional) is the review-config hash, absent on a
+// legacy marker. A comment can match BOT_MARKER_PREFIX_RE without matching this
+// (malformed SHA) — that's still treated as "the bot's marker comment", just
+// with an empty lastReviewedSha/reviewedConfig (see findBotComment).
+//
+// The `\s*$` anchor is load-bearing (hardening, CodeRabbit review): buildBody
+// (cli.ts) always appends this marker as the LAST thing in the comment body, so
+// the AUTHORITATIVE marker is the trailing one. Without the anchor, `exec`
+// returns the FIRST marker-shaped match anywhere in the body — so a review
+// finding that quoted a marker-shaped string earlier in the comment could be
+// parsed as the reviewed SHA/config, causing an incorrect skip. (Finding text
+// is already sanitized to defang `<!--`/`-->`, so this is defense-in-depth on
+// top of that — but anchoring makes the parse correct by construction rather
+// than resting on the sanitizer.)
+const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40})(?: cfg=([0-9a-z]+))? -->\s*$/;
 
 interface GhPrViewJson {
   headRefOid: string;
@@ -124,9 +136,10 @@ export class GitHubAdapter implements VcsAdapter {
 
   /**
    * Resolves the identity `gh` is currently authenticated as, via
-   * `gh api user`. This works whether auth is via `GITHUB_TOKEN` in Actions
-   * (resolves to `github-actions[bot]`) or a PAT (resolves to a real user
-   * login) — see security fix for findBotComment below.
+   * `gh api user`. This tool is run from an environment authenticated as a real
+   * user (a developer's terminal, or CI you provide a token for), so `gh api
+   * user` resolves that user's login — the identity findBotComment matches
+   * against so a spoofed marker from another author can't trick dedup.
    */
   private getBotLogin(): Promise<string> {
     if (!this.botLoginPromise) {
@@ -229,6 +242,7 @@ export class GitHubAdapter implements VcsAdapter {
         id: String(comment.id),
         body: comment.body,
         lastReviewedSha: match?.[1] ?? "",
+        reviewedConfig: match?.[2] ?? "",
       };
     }
     return null;
@@ -309,8 +323,8 @@ export class GitHubAdapter implements VcsAdapter {
    * rather than any local git checkout/worktree — this is what lets the CLI
    * enforce the "rules come from the base branch, not the PR's own
    * checkout" trust boundary anywhere `gh` is authenticated (a developer's
-   * own terminal, any CI system), not just inside a GitHub Actions workflow
-   * with local git worktree support.
+   * own terminal, or any CI system), with no local git worktree ceremony
+   * required.
    *
    * Lists `rulesDir` as a directory first; a 404 (directory doesn't exist
    * on the base branch) resolves to `[]` — the same "no rules dir = zero

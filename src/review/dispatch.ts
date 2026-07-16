@@ -374,7 +374,7 @@ async function createRealDispatchSession(
   // the moment the problem actually exists.
   //
   // It is also self-silencing on the happy path: when provider credentials DO
-  // resolve (from auth.json or from env vars, as the shipped CI workflow does),
+  // resolve (from auth.json, or from env vars such as ANTHROPIC_API_KEY),
   // no fallback message is produced and this stays quiet. That matters — a
   // warning that fires on every healthy run is a warning everyone learns to
   // ignore.
@@ -497,10 +497,10 @@ interface IsolatedAgentDir {
   /**
    * Anything other than "linked" means the hermetic dir has NO credentials
    * file, so provider auth must come from environment variables. That is NOT
-   * an error on its own — the shipped GitHub Actions workflow authenticates
-   * purely via env vars (ANTHROPIC_API_KEY etc.) with no auth.json anywhere,
-   * and that must keep working silently. It IS the most useful fact to attach
-   * to a downstream auth failure — see describeAuthContext.
+   * an error on its own — running with env-var-based auth (ANTHROPIC_API_KEY
+   * etc.) and no auth.json anywhere is a normal setup (e.g. any CI you run this
+   * in), and that must keep working silently. It IS the most useful fact to
+   * attach to a downstream auth failure — see describeAuthContext.
    */
   authStatus: AuthLinkStatus;
 }
@@ -1206,6 +1206,34 @@ export async function dispatchRules(
       return fallbackResult(rules);
     } finally {
       unsubscribe?.();
+    }
+
+    // The subagent tool's structured per-task results (details.results) are the
+    // deterministic source of truth this module leans on TWICE below: to
+    // reconcile the orchestrator's self-reported accounting (so a task that ran
+    // can't be mis-reported as failed) and to enforce suggestion provenance (a
+    // committable suggestion must byte-match one a reviewer actually emitted). A
+    // real pi AgentSession exposes subscribe(), so `subscribe` being a function
+    // means we EXPECTED to capture those results. Capturing NONE despite that is
+    // a silent double-degradation: reconciliation falls back to trusting the
+    // LLM's word, and — because the provenance allow-set is then empty — EVERY
+    // committable suggestion is stripped. The most likely cause is the pi SDK's
+    // tool_execution_end event shape drifting from DispatchSessionEvent (which is
+    // typed loosely, `any`, precisely because it mirrors an SDK-internal union).
+    // Warn loudly so an SDK upgrade that breaks capture surfaces here instead of
+    // quietly halving the review's guarantees. (Test stubs without subscribe are
+    // unaffected — they never expected capture.)
+    if (
+      rules.length > 0 &&
+      typeof session.subscribe === "function" &&
+      capturedTaskResults.length === 0
+    ) {
+      console.warn(
+        "dispatchRules: session exposes subscribe() but captured ZERO subagent task results — " +
+          "deterministic reconciliation is disabled and every committable suggestion will be " +
+          "stripped for this run. The orchestrator may not have called the subagent tool, or the " +
+          "pi SDK's tool_execution_end event shape may have changed (see DispatchSessionEvent).",
+      );
     }
 
     const orchestratorResult = parseDispatchResult(finalText, rules);

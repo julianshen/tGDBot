@@ -5,7 +5,7 @@ import path from "node:path";
 import { parseArgs as nodeParseArgs } from "node:util";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
-import { decideDedup, formatMarker } from "./review/dedup.js";
+import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
@@ -66,11 +66,11 @@ const DEFAULTS = {
  * provider's API (`gh api` for GitHub) — never from whatever happens to be
  * checked out locally. This is what closes the rule-file trust-boundary gap
  * described in ADR-002: a PR cannot introduce or modify a rule that affects
- * its own review, and this now holds true wherever the CLI runs (a
- * developer's own terminal, any CI system with `gh` authenticated), not
- * just inside a GitHub Actions workflow with a bespoke `git worktree`
- * step. See `--trust-local-rules` below for the escape hatch back to the
- * old local-filesystem behavior.
+ * its own review, and this holds true wherever the CLI runs — a developer's
+ * own terminal, or any CI system with `gh` authenticated — without any
+ * bespoke `git worktree`/checkout ceremony around it. See
+ * `--trust-local-rules` below for the escape hatch back to the old
+ * local-filesystem behavior.
  *
  * `--trust-local-rules` (default false): skips the base-branch-via-API
  * fetch entirely and reverts `--rules-dir` to its OLD meaning — a literal
@@ -109,10 +109,10 @@ export function parseArgs(argv: string[]): CliArgs {
   // Defense-in-depth (DEBT.md security item, Low): --pr is interpolated
   // into `gh api repos/{owner}/{repo}/issues/${id}/comments`-style paths in
   // github-adapter.ts. Not currently exploitable — execFile is invoked with
-  // array args (no shell), and the shipped workflow only ever passes
-  // `github.event.pull_request.number`, a genuine integer — but a plain
-  // positive-integer check costs nothing and closes off any future
-  // path/query-string interpolation from accepting non-numeric input.
+  // array args (no shell), and in practice callers pass a genuine integer PR
+  // number — but a plain positive-integer check costs nothing and closes off
+  // any future path/query-string interpolation from accepting non-numeric
+  // input.
   if (!/^\d+$/.test(values.pr as string)) {
     throw new Error(
       `Invalid --pr value: "${values.pr as string}" (expected a positive integer, e.g. --pr 42)`,
@@ -354,8 +354,14 @@ export async function review(
   const pr = await config.vcsAdapter.getPullRequest(config.pr);
   const botComment = await config.vcsAdapter.findBotComment(config.pr);
 
-  // AC-8.1: sha match -> skip, exit 0, upsertComment is never called.
-  if (decideDedup(pr, botComment) === "skip-no-new-commits") {
+  // Config-aware dedup: a run is skipped only when this exact head SHA was
+  // already reviewed WITH THE SAME review configuration. Computed from CLI flags
+  // alone (no rule fetch), so the skip decision stays as cheap as before — see
+  // computeReviewConfigHash for what is and isn't captured.
+  const configHash = computeReviewConfigHash(config);
+
+  // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
+  if (decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
     logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
     return EXIT_OK;
   }
@@ -394,7 +400,7 @@ export async function review(
   const buildBody = (o: OrchestrationResult): string => {
     const bodyParts = [o.commentBody];
     if (loadErrors.length > 0) bodyParts.push(renderLoadErrorsSection(loadErrors));
-    bodyParts.push(formatMarker(pr.headSha));
+    bodyParts.push(formatMarker(pr.headSha, configHash));
     return bodyParts.join("\n\n");
   };
 

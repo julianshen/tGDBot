@@ -915,6 +915,38 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
     expect(result.rulesRun).toEqual(["grok-review"]);
     expect(result.rulesFailed).toEqual(["terra-review"]);
   });
+
+  // #3 hardening: a session that CAN report structured results (exposes
+  // subscribe) but reports NONE is a silent double-degradation — reconciliation
+  // falls back to the LLM's word and the empty provenance allow-set strips every
+  // committable suggestion. That must not pass silently; a real SDK event-shape
+  // drift should surface here. The result still degrades gracefully to the
+  // orchestrator's own output (never throws), but a warning must be emitted.
+  it("warns when a subscribe-capable session captures zero subagent results (silent capture failure)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Subscribable session that emits NO subagent tool_execution_end event.
+    const session: DispatchSession = {
+      subscribe() {
+        return () => {};
+      },
+      async prompt() {},
+      getLastAssistantText: () =>
+        JSON.stringify({ findings: [], rulesRun: ["grok-review", "terra-review"], rulesFailed: [] }),
+    };
+
+    // try/finally so a failing assertion can't leave console.warn mocked and
+    // leak into later tests (CodeRabbit review).
+    try {
+      const result = await dispatchRules(twoRules(), "diff", false, async () => session);
+
+      // Degrades gracefully to the orchestrator's own result (no reconciliation).
+      expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("captured ZERO subagent task results");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
 });
 
 // Fork-safety fix (hmchangw/chat#490): the orchestrating session is now

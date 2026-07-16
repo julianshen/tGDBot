@@ -78,4 +78,11 @@ export interface BotComment {
   id: string;
   body: string;
   lastReviewedSha: string; // parsed from the HTML marker
+  /**
+   * The review-config hash recorded in the marker (see dedup.ts's
+   * computeReviewConfigHash), or "" for a legacy marker that predates
+   * config-aware dedup. decideDedup uses it to re-review when the config
+   * changed even though the head SHA didn't.
+   */
+  reviewedConfig: string;
 }
