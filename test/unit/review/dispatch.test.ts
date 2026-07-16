@@ -934,13 +934,18 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
         JSON.stringify({ findings: [], rulesRun: ["grok-review", "terra-review"], rulesFailed: [] }),
     };
 
-    const result = await dispatchRules(twoRules(), "diff", false, async () => session);
+    // try/finally so a failing assertion can't leave console.warn mocked and
+    // leak into later tests (CodeRabbit review).
+    try {
+      const result = await dispatchRules(twoRules(), "diff", false, async () => session);
 
-    // Degrades gracefully to the orchestrator's own result (no reconciliation).
-    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
-    const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
-    expect(warned).toContain("captured ZERO subagent task results");
-    warnSpy.mockRestore();
+      // Degrades gracefully to the orchestrator's own result (no reconciliation).
+      expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("captured ZERO subagent task results");
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });
 

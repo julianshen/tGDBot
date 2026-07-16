@@ -52,7 +52,17 @@ const BOT_MARKER_PREFIX_RE = /<!-- tgd-review-agent:sha=/;
 // legacy marker. A comment can match BOT_MARKER_PREFIX_RE without matching this
 // (malformed SHA) — that's still treated as "the bot's marker comment", just
 // with an empty lastReviewedSha/reviewedConfig (see findBotComment).
-const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40})(?: cfg=([0-9a-z]+))? -->/;
+//
+// The `\s*$` anchor is load-bearing (hardening, CodeRabbit review): buildBody
+// (cli.ts) always appends this marker as the LAST thing in the comment body, so
+// the AUTHORITATIVE marker is the trailing one. Without the anchor, `exec`
+// returns the FIRST marker-shaped match anywhere in the body — so a review
+// finding that quoted a marker-shaped string earlier in the comment could be
+// parsed as the reviewed SHA/config, causing an incorrect skip. (Finding text
+// is already sanitized to defang `<!--`/`-->`, so this is defense-in-depth on
+// top of that — but anchoring makes the parse correct by construction rather
+// than resting on the sanitizer.)
+const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40})(?: cfg=([0-9a-z]+))? -->\s*$/;
 
 interface GhPrViewJson {
   headRefOid: string;

@@ -1223,7 +1223,11 @@ export async function dispatchRules(
     // Warn loudly so an SDK upgrade that breaks capture surfaces here instead of
     // quietly halving the review's guarantees. (Test stubs without subscribe are
     // unaffected — they never expected capture.)
-    if (typeof session.subscribe === "function" && capturedTaskResults.length === 0) {
+    if (
+      rules.length > 0 &&
+      typeof session.subscribe === "function" &&
+      capturedTaskResults.length === 0
+    ) {
       console.warn(
         "dispatchRules: session exposes subscribe() but captured ZERO subagent task results — " +
           "deterministic reconciliation is disabled and every committable suggestion will be " +
