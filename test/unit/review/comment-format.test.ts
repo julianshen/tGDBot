@@ -2,8 +2,20 @@
 // feature, and it was previously only exercised transitively through
 // orchestrate() — which is how the security holes below survived to review.
 import { describe, expect, it } from "vitest";
-import { renderInlineComment, renderSummaryComment } from "../../../src/review/comment-format.js";
+import {
+  INLINE_COMMENT_MARKER,
+  renderInlineComment,
+  renderSummaryComment,
+} from "../../../src/review/comment-format.js";
 import type { Finding } from "../../../src/review/types.js";
+
+// Every inline body ends with the tool's trailing marker (what stale-thread
+// resolution keys on); assertions about "the body proper" strip it first.
+function bodyBeforeMarker(body: string): string {
+  const trimmed = body.trimEnd();
+  expect(trimmed.endsWith(INLINE_COMMENT_MARKER)).toBe(true);
+  return trimmed.slice(0, -INLINE_COMMENT_MARKER.length).trimEnd();
+}
 
 function makeFinding(overrides: Partial<Finding> = {}): Finding {
   return {
@@ -78,16 +90,28 @@ describe("renderInlineComment — injection hardening", () => {
     // The fence must be LONGER than any run in the content.
     const fence = /\n(`{4,})\nIn `/.exec(body)?.[1];
     expect(fence, "expected a dynamically-sized fence").toBeTruthy();
-    // ...and the block still closes properly, so </details> is not swallowed.
-    expect(body.trimEnd().endsWith("</details>")).toBe(true);
+    // ...and the block still closes properly, so </details> is not swallowed
+    // (the tool's trailing inline marker is the only thing after it).
+    expect(bodyBeforeMarker(body).endsWith("</details>")).toBe(true);
   });
 
   it("cannot forge or terminate our HTML comment marker", () => {
     const body = renderInlineComment(
       makeFinding({ message: "x --> <!-- tgd-review-agent:sha=deadbeef -->" }),
     );
-    expect(body).not.toContain("<!--");
-    expect(body).not.toContain("-->");
+    // The ONLY raw HTML comment in the body is the tool's own trailing inline
+    // marker (appended after sanitization) — nothing content-derived survives.
+    expect(body.trimEnd().endsWith(INLINE_COMMENT_MARKER)).toBe(true);
+    expect([...body.matchAll(/<!--/g)]).toHaveLength(1);
+    expect([...body.matchAll(/-->/g)]).toHaveLength(1);
+    // The forged sha marker from the message is defanged, not emitted raw.
+    expect(body).not.toContain("<!-- tgd-review-agent:sha=deadbeef -->");
+  });
+
+  it("always ends with the inline marker (what stale-thread resolution keys on)", () => {
+    expect(renderInlineComment(makeFinding({})).trimEnd().endsWith(INLINE_COMMENT_MARKER)).toBe(
+      true,
+    );
   });
 
   it("cannot escape the <details> container or inject HTML", () => {
@@ -238,8 +262,9 @@ describe("ADR-007: committable suggestions come ONLY from the structured field",
       (m) => m[0].length,
     );
     expect(fence.length).toBeGreaterThan(Math.max(...contentRuns));
-    // ...and the block is properly closed, so </details> is not swallowed.
-    expect(body.trimEnd().endsWith("</details>")).toBe(true);
+    // ...and the block is properly closed, so </details> is not swallowed
+    // (the tool's trailing inline marker is the only thing after it).
+    expect(bodyBeforeMarker(body).endsWith("</details>")).toBe(true);
   });
 
   it("--suggestions off downgrades it to a plain, NON-committable block", () => {

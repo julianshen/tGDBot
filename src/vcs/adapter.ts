@@ -35,8 +35,13 @@ export interface VcsAdapter {
    * folds them out of the way.
    *
    * Returns how many threads were resolved. Only threads whose FIRST comment
-   * was authored by the bot's own verified identity are touched — a human's
-   * thread (even one discussing a bot comment) is never resolved by the tool.
+   * was BOTH authored by the bot's own verified identity AND carries the
+   * tool's inline marker (see comment-format.ts's INLINE_COMMENT_MARKER) are
+   * touched. The marker is what distinguishes the tool's comments from MANUAL
+   * comments the same account wrote (a developer running the CLI under their
+   * personal `gh` login reviews by hand as that identity too — Codex review,
+   * PR #6); the author check is what stops another user from forging the
+   * marker. A human's thread is never resolved by the tool.
    *
    * Callers must treat a rejection as non-fatal: this is cosmetic cleanup, and
    * a failure here must never abort or degrade the review being posted.

@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
+import { INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
 import type { BotComment } from "../../../src/vcs/adapter.js";
 
 const fixturePath = (name: string): string =>
@@ -682,8 +683,11 @@ describe("resolveStaleReviewThreads", () => {
     return { execGh, resolvedThreadIds: () => mutations };
   }
 
+  // A tool-posted inline body: what renderInlineComment emits always ends
+  // with INLINE_COMMENT_MARKER. `body` defaults to that shape; pass a custom
+  // body to model a MANUAL comment written by the same account.
   function threadsPage(
-    nodes: { id: string; isResolved: boolean; author: string }[],
+    nodes: { id: string; isResolved: boolean; author: string; body?: string }[],
     endCursor: string | null = null,
   ): object {
     return {
@@ -695,7 +699,14 @@ describe("resolveStaleReviewThreads", () => {
               nodes: nodes.map((n) => ({
                 id: n.id,
                 isResolved: n.isResolved,
-                comments: { nodes: [{ author: { login: n.author } }] },
+                comments: {
+                  nodes: [
+                    {
+                      author: { login: n.author },
+                      body: n.body ?? `**Some finding**\n\n${INLINE_COMMENT_MARKER}`,
+                    },
+                  ],
+                },
               })),
             },
           },
@@ -718,6 +729,30 @@ describe("resolveStaleReviewThreads", () => {
 
     expect(count).toBe(1);
     expect(resolvedThreadIds()).toEqual(["T-bot-open"]);
+  });
+
+  // Codex review (PR #6): same-account MANUAL comments must never be
+  // auto-resolved. When the CLI runs under a developer's personal gh login,
+  // the author check alone can't tell the tool's comments from the human's —
+  // the inline marker is what does.
+  it("codex fix: a same-account thread WITHOUT the inline marker (a manual comment) is never resolved", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([
+      threadsPage([
+        {
+          id: "T-manual",
+          isResolved: false,
+          author: "tgd-review-agent[bot]",
+          body: "I hand-wrote this note about the design; please discuss.",
+        },
+        { id: "T-tool", isResolved: false, author: "tgd-review-agent[bot]" },
+      ]),
+    ]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const count = await adapter.resolveStaleReviewThreads("42");
+
+    expect(count).toBe(1);
+    expect(resolvedThreadIds()).toEqual(["T-tool"]);
   });
 
   it("paginates: threads past the first page are still found and resolved", async () => {
@@ -775,8 +810,8 @@ describe("resolveStaleReviewThreads", () => {
                 reviewThreads: {
                   pageInfo: { hasNextPage: false, endCursor: null },
                   nodes: [
-                    { id: "T-flaky", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" } }] } },
-                    { id: "T-ok", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" } }] } },
+                    { id: "T-flaky", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" }, body: INLINE_COMMENT_MARKER }] } },
+                    { id: "T-ok", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" }, body: INLINE_COMMENT_MARKER }] } },
                   ],
                 },
               },

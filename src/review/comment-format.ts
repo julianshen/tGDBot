@@ -9,6 +9,19 @@
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
 
+/**
+ * Machine-detectable tag appended to every inline comment THIS TOOL posts
+ * (Codex review, PR #6). Stale-thread cleanup must not treat "authored by the
+ * same account" as "posted by this tool": a developer running the CLI under
+ * their personal `gh` login also writes MANUAL review comments as that same
+ * identity, and those must never be auto-resolved. resolveStaleReviewThreads
+ * therefore requires BOTH the verified author match AND this marker in the
+ * thread's first comment. Unforgeable from finding content: sanitizeText
+ * defangs `<!--` in all finding-derived text, so a crafted diff cannot make a
+ * finding smuggle this marker in.
+ */
+export const INLINE_COMMENT_MARKER = "<!-- tgd-review-agent:inline -->";
+
 export interface InlineComment {
   /** Repo-relative path, as it appears on the NEW side of the diff. */
   path: string;
@@ -205,6 +218,11 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
     fence,
     "",
     "</details>",
+    "",
+    // Appended AFTER all sanitized content, like the summary's dedup marker —
+    // this is what lets resolveStaleReviewThreads recognize the tool's own
+    // threads without touching a same-account human's comments.
+    INLINE_COMMENT_MARKER,
   );
 
   return parts.join("\n");

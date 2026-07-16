@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
 import type { BotComment, InlineReviewComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "./adapter.js";
 
 /**
@@ -102,7 +103,7 @@ interface GhReviewThreadsResponse {
           nodes?: {
             id: string;
             isResolved: boolean;
-            comments?: { nodes?: { author?: { login?: string } | null }[] };
+            comments?: { nodes?: { author?: { login?: string } | null; body?: string }[] };
           }[];
         };
       };
@@ -114,7 +115,7 @@ const REVIEW_THREADS_QUERY =
   "query($owner:String!,$name:String!,$number:Int!,$cursor:String){" +
   "repository(owner:$owner,name:$name){pullRequest(number:$number){" +
   "reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}" +
-  "nodes{id isResolved comments(first:1){nodes{author{login}}}}}}}}";
+  "nodes{id isResolved comments(first:1){nodes{author{login} body}}}}}}}";
 
 const RESOLVE_THREAD_MUTATION =
   "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id}}}";
@@ -438,8 +439,17 @@ export class GitHubAdapter implements VcsAdapter {
       const threads = parsed.data.repository.pullRequest.reviewThreads;
       for (const node of threads?.nodes ?? []) {
         if (node.isResolved) continue;
-        const firstAuthor = node.comments?.nodes?.[0]?.author?.login;
-        if (firstAuthor !== botLogin) continue;
+        const firstComment = node.comments?.nodes?.[0];
+        if (firstComment?.author?.login !== botLogin) continue;
+        // Codex review (PR #6): author identity alone is NOT enough. A
+        // developer running the CLI under their personal gh login also writes
+        // MANUAL review comments as that same identity — those must never be
+        // auto-resolved. Only threads whose first comment carries the tool's
+        // own inline marker (appended by renderInlineComment, unforgeable from
+        // finding content because sanitizeText defangs `<!--`) are stale.
+        // Comments posted by pre-marker versions of the tool are deliberately
+        // left alone: under-resolving is safe, over-resolving is not.
+        if (!firstComment.body?.includes(INLINE_COMMENT_MARKER)) continue;
         staleThreadIds.push(node.id);
       }
       const pageInfo = threads?.pageInfo;

@@ -412,7 +412,11 @@ describe("inline anchoring", () => {
 
     expect(body).not.toContain("<script");
     expect(body).not.toContain("</details> ## ✅ Approved"); // can't close our block
-    expect(body).not.toContain("-->"); // can't terminate an HTML comment we open
+    // Can't terminate an HTML comment we open: the ONLY `-->` in the body is
+    // the tool's own trailing inline marker (appended after sanitization) —
+    // nothing content-derived survives.
+    expect([...body.matchAll(/-->/g)]).toHaveLength(1);
+    expect(body.trimEnd().endsWith("<!-- tgd-review-agent:inline -->")).toBe(true);
   });
 });
 
