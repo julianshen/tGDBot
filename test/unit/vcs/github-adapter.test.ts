@@ -750,6 +750,81 @@ describe("resolveStaleReviewThreads", () => {
 
     await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(/gh repo view failed/);
   });
+
+  // Gemini review (PR #6): one thread failing to resolve must not abandon the
+  // rest of the cleanup — each mutation is individually guarded, and the
+  // returned count is what actually resolved.
+  it("gemini fix: a single failing mutation warns and continues; the remaining threads still resolve", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const resolvedIds: string[] = [];
+      const execGh: ExecGh = async (args) => {
+        if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+        if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "octo-org/octo-repo" });
+        const query = args.find((a) => a.startsWith("query="));
+        if (query?.startsWith("query=mutation(")) {
+          const threadId = args.find((a) => a.startsWith("threadId="))?.slice("threadId=".length);
+          if (threadId === "T-flaky") throw new Error("HTTP 502 transient");
+          resolvedIds.push(threadId ?? "");
+          return JSON.stringify({ data: { resolveReviewThread: { thread: { id: "x" } } } });
+        }
+        return JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    { id: "T-flaky", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" } }] } },
+                    { id: "T-ok", isResolved: false, comments: { nodes: [{ author: { login: "tgd-review-agent[bot]" } }] } },
+                  ],
+                },
+              },
+            },
+          },
+        });
+      };
+      const adapter = new GitHubAdapter(execGh);
+
+      const count = await adapter.resolveStaleReviewThreads("42");
+
+      expect(count).toBe(1); // what actually resolved, not what was attempted
+      expect(resolvedIds).toEqual(["T-ok"]);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("T-flaky");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // Gemini review (PR #6): a GraphQL-level failure ({errors:[...]} with no
+  // data) must THROW — the optional chaining would otherwise read it as
+  // "zero threads" and silently return 0, hiding the failure entirely.
+  it("gemini fix: a GraphQL errors-only response rejects instead of silently returning 0", async () => {
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args[0] === "repo") return JSON.stringify({ nameWithOwner: "octo-org/octo-repo" });
+      return JSON.stringify({ errors: [{ message: "Something went wrong" }] });
+    };
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(
+      /missing expected data/,
+    );
+  });
+
+  it("gemini fix: an unexpected gh repo view shape rejects with a message naming the cause (never a bare TypeError)", async () => {
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args[0] === "repo") return JSON.stringify({ unexpected: true });
+      throw new Error("should not get here");
+    };
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(
+      /invalid response from gh repo view/,
+    );
+  });
 });
 
 // ADR-007: a multi-line committable suggestion spans start_line..line. GitHub

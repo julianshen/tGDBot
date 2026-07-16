@@ -177,9 +177,20 @@ function extractFindingsArray(text: string): unknown[] | undefined {
   };
   const strict = tryParse(stripped);
   if (strict) return strict;
+  // Gemini review: TRAILING prose can itself contain a `]` (e.g. "see [3]
+  // above"), which would make a single first-`[`..last-`]` slice unparseable.
+  // Walk the closing bracket backwards until a candidate parses — strictly
+  // more lenient than the old single attempt (whose slice is the first
+  // candidate tried), so nothing that recovered before is lost.
   const first = stripped.indexOf("[");
-  const last = stripped.lastIndexOf("]");
-  if (first >= 0 && last > first) return tryParse(stripped.slice(first, last + 1));
+  if (first >= 0) {
+    let last = stripped.lastIndexOf("]");
+    while (last > first) {
+      const parsed = tryParse(stripped.slice(first, last + 1));
+      if (parsed) return parsed;
+      last = stripped.lastIndexOf("]", last - 1);
+    }
+  }
   return undefined;
 }
 
@@ -360,7 +371,18 @@ export function reconcileWithCapturedResults(
   if (captured.length !== rules.length) return orchestrator;
   const orderTrustworthy = captured.every((c, i) => {
     if (!c.model) return true; // nothing to cross-check — rely on dispatch order
-    return c.model.startsWith(`${rules[i].provider}/${rules[i].model}`);
+    // Gemini review: normalize the thinking suffix on BOTH sides. A rule may
+    // itself pin `model: claude-opus-4-5:high` while the captured model omits
+    // (or differs in) the suffix — a raw startsWith would then fail and
+    // silently SKIP reconciliation, the exact degradation the cross-check
+    // exists to prevent. Same suffix set as orchestrator-model.ts's
+    // THINKING_SUFFIX_RE (pi-subagents strips these when resolving fuzzily);
+    // update both together if pi's thinking levels ever change.
+    const stripThinking = (spec: string): string =>
+      spec.replace(/:(?:none|off|minimal|low|medium|high|max)$/i, "");
+    return stripThinking(c.model).startsWith(
+      stripThinking(`${rules[i].provider}/${rules[i].model}`),
+    );
   });
   if (!orderTrustworthy) return orchestrator;
 

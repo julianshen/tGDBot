@@ -368,6 +368,12 @@ export class GitHubAdapter implements VcsAdapter {
       this.repoNameWithOwnerPromise = this.execGh(["repo", "view", "--json", "nameWithOwner"]).then(
         (out) => {
           const parsed = JSON.parse(out) as GhRepoViewJson;
+          // Gemini review: guard the shape before .indexOf — an unexpected
+          // `gh repo view` response should fail with a message naming the
+          // cause, not a bare TypeError.
+          if (!parsed || typeof parsed.nameWithOwner !== "string") {
+            throw new Error(`invalid response from gh repo view: ${out.slice(0, 200)}`);
+          }
           const slash = parsed.nameWithOwner.indexOf("/");
           if (slash <= 0 || slash === parsed.nameWithOwner.length - 1) {
             throw new Error(
@@ -422,7 +428,14 @@ export class GitHubAdapter implements VcsAdapter {
       ];
       const out = await this.execGh(args);
       const parsed = JSON.parse(out) as GhReviewThreadsResponse;
-      const threads = parsed.data?.repository?.pullRequest?.reviewThreads;
+      // Gemini review: a GraphQL-level failure comes back as an `errors`
+      // payload with no data — which the optional chaining below would treat
+      // as "zero threads" and silently return 0. Throw instead, so the
+      // caller's non-fatal warn actually surfaces the failure.
+      if (!parsed.data?.repository?.pullRequest) {
+        throw new Error(`GraphQL reviewThreads response missing expected data: ${out.slice(0, 200)}`);
+      }
+      const threads = parsed.data.repository.pullRequest.reviewThreads;
       for (const node of threads?.nodes ?? []) {
         if (node.isResolved) continue;
         const firstAuthor = node.comments?.nodes?.[0]?.author?.login;
@@ -433,17 +446,31 @@ export class GitHubAdapter implements VcsAdapter {
       cursor = pageInfo?.hasNextPage ? (pageInfo.endCursor ?? null) : null;
     } while (cursor !== null);
 
+    // Each mutation is individually guarded (Gemini review): one thread
+    // failing to resolve (deleted comment, race with a human resolving it,
+    // a transient API error) must not abandon the REST of the cleanup — and
+    // this whole method is already best-effort for its caller. The count
+    // returned is what actually resolved, not what was attempted.
+    let resolved = 0;
     for (const threadId of staleThreadIds) {
-      await this.execGh([
-        "api",
-        "graphql",
-        "-f",
-        `query=${RESOLVE_THREAD_MUTATION}`,
-        "-f",
-        `threadId=${threadId}`,
-      ]);
+      try {
+        await this.execGh([
+          "api",
+          "graphql",
+          "-f",
+          `query=${RESOLVE_THREAD_MUTATION}`,
+          "-f",
+          `threadId=${threadId}`,
+        ]);
+        resolved += 1;
+      } catch (err) {
+        console.warn(
+          `GitHubAdapter: could not resolve stale review thread ${threadId} ` +
+            `(${(err as Error).message}); continuing with the remaining threads`,
+        );
+      }
     }
-    return staleThreadIds.length;
+    return resolved;
   }
 
   /**
