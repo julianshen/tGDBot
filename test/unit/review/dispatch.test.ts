@@ -952,6 +952,51 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
 // Fork-safety fix (hmchangw/chat#490): the orchestrating session is now
 // PERSISTED so a `context: "fork"` subagent call can never crash regardless of
 // the LLM's choice. See createRealDispatchSession's SessionManager.create.
+// Design-review #5: runDispatch mutates process.env.PI_CODING_AGENT_DIR for a
+// real-factory run, so concurrent dispatchRules calls in one process must be
+// SERIALIZED — the second call must not start (not even its session factory)
+// until the first has fully settled, or the second would capture the first's
+// temp agent dir as the env var's "previous value".
+describe("dispatchRules single-flight guard (env-mutation race)", () => {
+  it("serializes concurrent calls: the second run's factory is not invoked until the first fully completes", async () => {
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const makeSession = (label: string, gate?: Promise<void>): DispatchSession => ({
+      async prompt() {
+        events.push(`${label}:prompt`);
+        if (gate) await gate;
+      },
+      getLastAssistantText: () =>
+        JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+    });
+
+    const first = dispatchRules([makeRule({ name: "rule-a" })], "diff", false, async () => {
+      events.push("factory-1");
+      return makeSession("run-1", firstGate);
+    });
+    const second = dispatchRules([makeRule({ name: "rule-a" })], "diff", false, async () => {
+      events.push("factory-2");
+      return makeSession("run-2");
+    });
+
+    // Give the second call every chance to (incorrectly) start while the first
+    // is still blocked inside prompt().
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(events).toEqual(["factory-1", "run-1:prompt"]);
+
+    releaseFirst();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+
+    expect(events).toEqual(["factory-1", "run-1:prompt", "factory-2", "run-2:prompt"]);
+    expect(firstResult.rulesRun).toEqual(["rule-a"]);
+    expect(secondResult.rulesRun).toEqual(["rule-a"]);
+  });
+});
+
 describe("dispatchRules persisted session (fork-safety)", () => {
   it("createRealDispatchSession uses SessionManager.create (persisted), never .inMemory()", async () => {
     hoisted.createAgentSessionMock.mockClear();

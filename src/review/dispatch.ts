@@ -1106,6 +1106,35 @@ export async function dispatchRules(
    */
   orchestratorModel?: string,
 ): Promise<DispatchResult> {
+  // SINGLE-FLIGHT GUARD (design-review item #5). runDispatch mutates a
+  // process-global — process.env.PI_CODING_AGENT_DIR — for the duration of a
+  // real-factory run and restores it in its finally block. That is safe for the
+  // CLI (one review per process), but this module is exported and importable:
+  // an embedder running two reviews concurrently in one process would have the
+  // second run capture the FIRST run's temp agent dir as "previous value" and
+  // restore it after that dir was deleted — silent cross-contamination. Rather
+  // than document the landmine, serialize: each call waits for the previous one
+  // to fully settle (including env restoration) before starting. The chain
+  // never rejects (runDispatch is itself a never-throws boundary, and the
+  // defensive catch below keeps one hypothetical rejection from wedging every
+  // later call), so this cannot deadlock or leak an error across calls.
+  const run = dispatchChain.then(() =>
+    runDispatch(rules, diff, useAdvisor, createSession, orchestratorModel),
+  );
+  dispatchChain = run.catch(() => undefined);
+  return run;
+}
+
+// The serialization chain for dispatchRules' single-flight guard above.
+let dispatchChain: Promise<unknown> = Promise.resolve();
+
+async function runDispatch(
+  rules: RuleDefinition[],
+  diff: string,
+  useAdvisor: boolean,
+  createSession: DispatchSessionFactory,
+  orchestratorModel?: string,
+): Promise<DispatchResult> {
   // Hermetic agent dir + PI_CODING_AGENT_DIR override (intercom-bridge fix,
   // see createIsolatedAgentDir) are set up ONLY for the real session factory.
   // When a test injects a stub factory, none of this runs — the stub never
