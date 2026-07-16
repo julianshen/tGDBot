@@ -651,6 +651,107 @@ describe("GitHubAdapter", () => {
   });
 });
 
+// Design-review #10: resolveStaleReviewThreads collapses the bot's OWN
+// unresolved inline threads via GraphQL — never a human's thread, never an
+// already-resolved one, and never by deleting anything.
+describe("resolveStaleReviewThreads", () => {
+  // execGh stub speaking all four dialects the method uses: `gh api user`,
+  // `gh repo view`, the reviewThreads GraphQL query, and the resolve mutation.
+  function makeResolveExecGh(pages: object[]): {
+    execGh: ExecGh;
+    resolvedThreadIds: () => string[];
+  } {
+    const mutations: string[] = [];
+    let page = 0;
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args[0] === "repo" && args[1] === "view") {
+        return JSON.stringify({ nameWithOwner: "octo-org/octo-repo" });
+      }
+      if (args[0] === "api" && args[1] === "graphql") {
+        const query = args.find((a) => a.startsWith("query="));
+        if (query?.startsWith("query=mutation(")) {
+          const threadId = args.find((a) => a.startsWith("threadId="));
+          mutations.push(threadId?.slice("threadId=".length) ?? "");
+          return JSON.stringify({ data: { resolveReviewThread: { thread: { id: "x" } } } });
+        }
+        return JSON.stringify(pages[Math.min(page++, pages.length - 1)]);
+      }
+      throw new Error(`unexpected gh invocation: ${args.join(" ")}`);
+    };
+    return { execGh, resolvedThreadIds: () => mutations };
+  }
+
+  function threadsPage(
+    nodes: { id: string; isResolved: boolean; author: string }[],
+    endCursor: string | null = null,
+  ): object {
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              pageInfo: { hasNextPage: endCursor !== null, endCursor },
+              nodes: nodes.map((n) => ({
+                id: n.id,
+                isResolved: n.isResolved,
+                comments: { nodes: [{ author: { login: n.author } }] },
+              })),
+            },
+          },
+        },
+      },
+    };
+  }
+
+  it("resolves only the bot's own UNRESOLVED threads — a human's thread and an already-resolved one are untouched", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([
+      threadsPage([
+        { id: "T-bot-open", isResolved: false, author: "tgd-review-agent[bot]" },
+        { id: "T-human-open", isResolved: false, author: "some-human" },
+        { id: "T-bot-done", isResolved: true, author: "tgd-review-agent[bot]" },
+      ]),
+    ]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const count = await adapter.resolveStaleReviewThreads("42");
+
+    expect(count).toBe(1);
+    expect(resolvedThreadIds()).toEqual(["T-bot-open"]);
+  });
+
+  it("paginates: threads past the first page are still found and resolved", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([
+      threadsPage([{ id: "T-page1", isResolved: false, author: "tgd-review-agent[bot]" }], "CUR1"),
+      threadsPage([{ id: "T-page2", isResolved: false, author: "tgd-review-agent[bot]" }]),
+    ]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const count = await adapter.resolveStaleReviewThreads("42");
+
+    expect(count).toBe(2);
+    expect(resolvedThreadIds()).toEqual(["T-page1", "T-page2"]);
+  });
+
+  it("returns 0 and mutates nothing when there are no stale bot threads", async () => {
+    const { execGh, resolvedThreadIds } = makeResolveExecGh([threadsPage([])]);
+    const adapter = new GitHubAdapter(execGh);
+
+    expect(await adapter.resolveStaleReviewThreads("42")).toBe(0);
+    expect(resolvedThreadIds()).toEqual([]);
+  });
+
+  it("propagates a failure (the CALLER treats it as non-fatal — see cli-review tests)", async () => {
+    const execGh: ExecGh = async (args) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      throw new Error("gh repo view failed");
+    };
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(/gh repo view failed/);
+  });
+});
+
 // ADR-007: a multi-line committable suggestion spans start_line..line. GitHub
 // requires start_side alongside start_line, and start_line < line.
 describe("createInlineReview: multi-line suggestion ranges", () => {

@@ -65,6 +65,7 @@ interface Harness {
     upsertComment: ReturnType<typeof vi.fn>;
     getRuleFilesFromBase: ReturnType<typeof vi.fn>;
     createInlineReview: ReturnType<typeof vi.fn>;
+    resolveStaleReviewThreads: ReturnType<typeof vi.fn>;
   };
   resolveConfig: ReturnType<typeof vi.fn>;
   loadRules: ReturnType<typeof vi.fn>;
@@ -106,6 +107,7 @@ function makeHarness(options: {
     upsertComment: vi.fn().mockResolvedValue(undefined),
     getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
     createInlineReview: vi.fn().mockResolvedValue(undefined),
+    resolveStaleReviewThreads: vi.fn().mockResolvedValue(0),
   };
 
   const config: ResolvedConfig = { ...args, vcsAdapter: vcsAdapter as unknown as VcsAdapter };
@@ -282,6 +284,75 @@ describe("review", () => {
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
 
     vi.restoreAllMocks();
+  });
+
+  // Design-review #10: stale inline threads from previous runs are resolved
+  // (collapsed, never deleted) on the posting path — AFTER the marker-carrying
+  // summary upsert (idempotency never depends on cosmetic cleanup) and only
+  // there: dry-run and skipped runs must not touch existing threads.
+  describe("design-review #10: stale review-thread resolution", () => {
+    it("posting path: resolveStaleReviewThreads is called once, after the summary upsert", async () => {
+      const h = makeHarness({ botComment: null });
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const exitCode = await review(h.args, depsFrom(h));
+
+      expect(exitCode).toBe(0);
+      expect(h.vcsAdapter.resolveStaleReviewThreads).toHaveBeenCalledTimes(1);
+      expect(h.vcsAdapter.resolveStaleReviewThreads).toHaveBeenCalledWith("42");
+      const upsertOrder = h.vcsAdapter.upsertComment.mock.invocationCallOrder[0];
+      const resolveOrder = h.vcsAdapter.resolveStaleReviewThreads.mock.invocationCallOrder[0];
+      expect(resolveOrder).toBeGreaterThan(upsertOrder);
+
+      vi.restoreAllMocks();
+    });
+
+    it("--dry-run never resolves threads (nothing is posted, so nothing is superseded)", async () => {
+      const h = makeHarness({ args: makeArgs({ dryRun: true }), botComment: null });
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await review(h.args, depsFrom(h));
+
+      expect(h.vcsAdapter.resolveStaleReviewThreads).not.toHaveBeenCalled();
+
+      vi.restoreAllMocks();
+    });
+
+    it("a dedup-skipped run never resolves threads", async () => {
+      const cfg = computeReviewConfigHash(makeArgs());
+      const h = makeHarness({
+        pr: makePr({ headSha: "cafef00d" }),
+        botComment: {
+          id: "999",
+          body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
+          lastReviewedSha: "cafef00d",
+          reviewedConfig: cfg,
+        },
+      });
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await review(h.args, depsFrom(h));
+
+      expect(h.vcsAdapter.resolveStaleReviewThreads).not.toHaveBeenCalled();
+
+      vi.restoreAllMocks();
+    });
+
+    it("a resolution failure only warns — the review still completes with exit 0", async () => {
+      const h = makeHarness({ botComment: null });
+      h.vcsAdapter.resolveStaleReviewThreads.mockRejectedValue(new Error("GraphQL rate limited"));
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const exitCode = await review(h.args, depsFrom(h));
+
+      expect(exitCode).toBe(0);
+      expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+      const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+      expect(warned).toContain("could not resolve stale inline comment threads");
+
+      vi.restoreAllMocks();
+    });
   });
 
   // AC-8.2: Given a PR with no existing bot comment, When review runs

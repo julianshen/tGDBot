@@ -26,6 +26,24 @@ export interface VcsAdapter {
     comments: InlineReviewComment[],
   ): Promise<void>;
   /**
+   * Design-review #10 (stale-comment accumulation): RESOLVES (collapses, never
+   * deletes) every still-unresolved inline review thread that THIS BOT started
+   * on the PR — the previous runs' comments, which a new run is about to
+   * supersede. Inline review comments are append-only (there is no upsert for
+   * them, unlike the summary comment), so without this every past head SHA's
+   * comments pile up uncollapsed forever. Resolving keeps them as history but
+   * folds them out of the way.
+   *
+   * Returns how many threads were resolved. Only threads whose FIRST comment
+   * was authored by the bot's own verified identity are touched — a human's
+   * thread (even one discussing a bot comment) is never resolved by the tool.
+   *
+   * Callers must treat a rejection as non-fatal: this is cosmetic cleanup, and
+   * a failure here must never abort or degrade the review being posted.
+   */
+  resolveStaleReviewThreads(id: string): Promise<number>;
+
+  /**
    * ADR-002: fetches every `*.md` rule file under `rulesDir` AS IT EXISTS ON
    * THE PR's BASE BRANCH (`baseSha`), via the VCS provider's own API (e.g.
    * GitHub's Contents API through `gh api`, or a future GitLabAdapter's

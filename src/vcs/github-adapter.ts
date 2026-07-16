@@ -82,6 +82,43 @@ interface GhUser {
   login: string;
 }
 
+// `gh repo view --json nameWithOwner` response — the resolved "owner/name" of
+// the ambient repo context. Needed because `gh api graphql` does NOT do the
+// REST-path `{owner}/{repo}` placeholder substitution; GraphQL variables must
+// carry the real values.
+interface GhRepoViewJson {
+  nameWithOwner: string;
+}
+
+// The slice of the reviewThreads GraphQL response resolveStaleReviewThreads
+// reads. Thread resolution is GraphQL-only (REST has no resolve; deleting
+// would destroy history), which is why this method alone speaks GraphQL.
+interface GhReviewThreadsResponse {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: {
+            id: string;
+            isResolved: boolean;
+            comments?: { nodes?: { author?: { login?: string } | null }[] };
+          }[];
+        };
+      };
+    };
+  };
+}
+
+const REVIEW_THREADS_QUERY =
+  "query($owner:String!,$name:String!,$number:Int!,$cursor:String){" +
+  "repository(owner:$owner,name:$name){pullRequest(number:$number){" +
+  "reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor}" +
+  "nodes{id isResolved comments(first:1){nodes{author{login}}}}}}}}";
+
+const RESOLVE_THREAD_MUTATION =
+  "mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id}}}";
+
 // One entry of a GitHub Contents API directory listing
 // (`gh api repos/{owner}/{repo}/contents/{path}?ref={sha}` when `path` is a
 // directory returns an array of these; when `path` is a file it returns a
@@ -319,6 +356,94 @@ export class GitHubAdapter implements VcsAdapter {
       ["api", `repos/{owner}/{repo}/pulls/${id}/reviews`, "-X", "POST", "--input", "-"],
       JSON.stringify(payload),
     );
+  }
+
+  // Caches the resolved "owner/name" (same promise-caching pattern as
+  // getBotLogin): resolveStaleReviewThreads may page + mutate several times,
+  // and `gh repo view` only needs to run once per process.
+  private repoNameWithOwnerPromise: Promise<{ owner: string; name: string }> | null = null;
+
+  private getRepoOwnerAndName(): Promise<{ owner: string; name: string }> {
+    if (!this.repoNameWithOwnerPromise) {
+      this.repoNameWithOwnerPromise = this.execGh(["repo", "view", "--json", "nameWithOwner"]).then(
+        (out) => {
+          const parsed = JSON.parse(out) as GhRepoViewJson;
+          const slash = parsed.nameWithOwner.indexOf("/");
+          if (slash <= 0 || slash === parsed.nameWithOwner.length - 1) {
+            throw new Error(
+              `could not parse repo nameWithOwner from gh repo view: "${parsed.nameWithOwner}"`,
+            );
+          }
+          return {
+            owner: parsed.nameWithOwner.slice(0, slash),
+            name: parsed.nameWithOwner.slice(slash + 1),
+          };
+        },
+      );
+    }
+    return this.repoNameWithOwnerPromise;
+  }
+
+  /**
+   * Design-review #10: resolves (collapses) every still-unresolved inline
+   * review thread whose FIRST comment the bot itself authored. GraphQL-only
+   * territory — REST cannot resolve a thread, and deleting comments would
+   * destroy review history, so this is the one method that goes through
+   * `gh api graphql` (which needs an explicit owner/name, hence
+   * getRepoOwnerAndName — the REST `{owner}/{repo}` placeholder magic does not
+   * apply to GraphQL).
+   *
+   * A human's thread is never touched: authorship is checked against the
+   * bot's own verified identity (getBotLogin), the same anti-spoofing
+   * discipline findBotComment uses. Mutations run sequentially — resolving is
+   * cosmetic cleanup, so gentle pacing beats hammering the API concurrently.
+   */
+  async resolveStaleReviewThreads(id: string): Promise<number> {
+    const [botLogin, { owner, name }] = await Promise.all([
+      this.getBotLogin(),
+      this.getRepoOwnerAndName(),
+    ]);
+
+    const staleThreadIds: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const args = [
+        "api",
+        "graphql",
+        "-f",
+        `query=${REVIEW_THREADS_QUERY}`,
+        "-f",
+        `owner=${owner}`,
+        "-f",
+        `name=${name}`,
+        "-F",
+        `number=${id}`,
+        ...(cursor !== null ? ["-f", `cursor=${cursor}`] : []),
+      ];
+      const out = await this.execGh(args);
+      const parsed = JSON.parse(out) as GhReviewThreadsResponse;
+      const threads = parsed.data?.repository?.pullRequest?.reviewThreads;
+      for (const node of threads?.nodes ?? []) {
+        if (node.isResolved) continue;
+        const firstAuthor = node.comments?.nodes?.[0]?.author?.login;
+        if (firstAuthor !== botLogin) continue;
+        staleThreadIds.push(node.id);
+      }
+      const pageInfo = threads?.pageInfo;
+      cursor = pageInfo?.hasNextPage ? (pageInfo.endCursor ?? null) : null;
+    } while (cursor !== null);
+
+    for (const threadId of staleThreadIds) {
+      await this.execGh([
+        "api",
+        "graphql",
+        "-f",
+        `query=${RESOLVE_THREAD_MUTATION}`,
+        "-f",
+        `threadId=${threadId}`,
+      ]);
+    }
+    return staleThreadIds.length;
   }
 
   /**
