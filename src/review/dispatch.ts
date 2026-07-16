@@ -260,6 +260,17 @@ async function runDispatch(
   // Issue #1: set only when the hermetic agent dir ended up WITHOUT auth.json.
   // Appended to a downstream pi auth error so the failure names its own cause.
   let missingAuthDiagnostic: string | undefined;
+  // CodeRabbit review (PR #7): hoisted OUTSIDE the try so the outer catch below
+  // can still merge these specific reasons. resolveEffectiveRules can classify
+  // some rules as unresolved (with a precise reason) and THEN a later step in
+  // this same try (createSession, etc.) can throw — without hoisting, that
+  // outer catch's fallbackResult(rules) would overwrite those precise reasons
+  // with the generic "did not complete" message, exactly what withUnresolved
+  // exists to prevent.
+  let unresolvedForFallback: Record<string, string> = Object.create(null) as Record<
+    string,
+    string
+  >;
 
   try {
     sessionCwd = await createIsolatedSessionCwd();
@@ -286,6 +297,7 @@ async function runDispatch(
     // A rule that cannot be given ANY model is reported failed with its
     // reason; it is never silently dropped and never burns a model call.
     const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
+    unresolvedForFallback = unresolved;
     const unresolvedNames = Object.keys(unresolved);
     if (effective.length === 0) {
       for (const name of unresolvedNames) {
@@ -418,11 +430,19 @@ async function runDispatch(
     // Setup/session-creation failure (createIsolatedSessionCwd,
     // createIsolatedAgentDir, or createSession threw). Degrade to
     // fallbackResult rather than propagating, upholding the never-throws
-    // safety-boundary contract.
+    // safety-boundary contract. Merge in any unresolved-rule reasons
+    // resolveEffectiveRules already classified before this failure (CodeRabbit
+    // review, PR #7) — a precise "no default model" reason must survive even
+    // when a LATER step in this same try then throws; the generic message
+    // below is only for the rules that didn't already have one.
     console.warn(
       `dispatchRules: setup or session creation failed (${(err as Error).message})`,
     );
-    return fallbackResult(rules);
+    const fallback = fallbackResult(rules);
+    return {
+      ...fallback,
+      ruleFailureReasons: { ...fallback.ruleFailureReasons, ...unresolvedForFallback },
+    };
   } finally {
     // Restore PI_CODING_AGENT_DIR to exactly its prior state (unset vs. a
     // specific value) before anything else, so the override never leaks past

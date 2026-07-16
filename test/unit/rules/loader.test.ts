@@ -1,4 +1,5 @@
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -135,8 +136,10 @@ describe("loadRules", () => {
   // Design-review #6: provider/model are optional — a rule with only `name`
   // loads fine (it runs on the default model)...
   it("design-review #6: a rule with no provider/model pin loads successfully", async () => {
-    const dir = path.join(fixturesDir, "unpinned-rule-dir");
-    await mkdir(dir, { recursive: true });
+    // CodeRabbit review (PR #7): isolated OS temp dir, never the source tree —
+    // a crash before cleanup must not leave a stray fixture behind, and a
+    // concurrent test reading fixturesDir must never see this file appear.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-unpinned-rule-"));
     await writeFile(
       path.join(dir, "unpinned.md"),
       "---\nname: unpinned-rule\n---\n\nReview the diff.\n",

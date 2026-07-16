@@ -219,6 +219,64 @@ describe("dispatchRulesDirect", () => {
     });
   });
 
+  // CodeRabbit review (PR #7): a hung provider call must not block the whole
+  // run indefinitely — each session's prompt() is wrapped in a bounded
+  // timeout (overridable via deps for tests).
+  describe("prompt timeouts", () => {
+    it("a rule whose session never resolves times out, is classified 'timed out', and never blocks the others", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const hangingSession: DispatchSession = {
+          prompt: () => new Promise(() => {}), // never resolves
+          getLastAssistantText: () => undefined,
+        };
+        const { factory } = makeFactory({ "rule-b": JSON.stringify([finding("b.ts", "ok")]) });
+        const combinedFactory: DirectSessionFactory = async (rule, cwd) =>
+          rule.name === "rule-a" ? hangingSession : factory(rule, cwd);
+
+        const result = await dispatchRulesDirect(
+          [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b", provider: "xai", model: "grok-4.5" })],
+          "diff",
+          false,
+          { createSession: combinedFactory, ruleTimeoutMs: 20 },
+        );
+
+        expect(result.rulesFailed).toEqual(["rule-a"]);
+        expect(result.rulesRun).toEqual(["rule-b"]); // the hung rule never blocks this one
+        expect(result.ruleFailureReasons?.["rule-a"]).toContain("timed out");
+        const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+        expect(warned).toContain("timed out");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("an advisor pass that never resolves times out and keeps all findings (best-effort)", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const { factory } = makeFactory({
+          "rule-a": JSON.stringify([finding("a.ts", "bug")]),
+        });
+
+        const result = await dispatchRulesDirect([makeRule()], "diff", true, {
+          createSession: factory,
+          createAdvisorSession: async () => ({
+            prompt: () => new Promise(() => {}), // never resolves
+            getLastAssistantText: () => undefined,
+          }),
+          advisorTimeoutMs: 20,
+        });
+
+        expect(result.findings).toHaveLength(1); // kept — best-effort
+        const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
+        expect(warned).toContain("advisor pass failed");
+        expect(warned).toContain("timed out");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
   it("does NOT mutate PI_CODING_AGENT_DIR (no hermetic-agent-dir games in direct mode)", async () => {
     const before = process.env.PI_CODING_AGENT_DIR;
     const { factory } = makeFactory({ "rule-a": "[]" });

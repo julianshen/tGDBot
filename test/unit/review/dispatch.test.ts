@@ -1996,6 +1996,44 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
     expect(stub.prompts[0]).toContain('model: "groq/kimi-k2"');
   });
 
+  // CodeRabbit review (PR #7): resolveEffectiveRules' own candidate list must
+  // be deduped exactly like resolveOrchestratorModel's — otherwise --model
+  // equalling the settings default warns about the same rejected model twice.
+  it("dedupes --model against an equal settings default: a rejected model warns only ONCE", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "tgd-test-dedupe-effective-"));
+    writeFileSync(
+      path.join(dir, "settings.json"),
+      JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-5.6-terra" }),
+      "utf-8",
+    );
+    hoisted.getAgentDirMock.mockReturnValue(dir);
+    hoisted.hasConfiguredAuthMock.mockReturnValue(false);
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const factory = vi.fn();
+
+      const result = await dispatchRules(
+        [unpinnedRule()],
+        "diff",
+        false,
+        factory,
+        "openai/gpt-5.6-terra",
+      );
+
+      expect(factory).not.toHaveBeenCalled();
+      expect(result.rulesFailed).toEqual(["unpinned-rule"]);
+      const rejectionWarnings = warnSpy.mock.calls.filter((c) =>
+        c.join(" ").includes('--model "openai/gpt-5.6-terra"'),
+      );
+      expect(rejectionWarnings).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+      hoisted.getAgentDirMock.mockReturnValue("/fake/agent/dir");
+      hoisted.hasConfiguredAuthMock.mockReturnValue(true);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("fails an unpinned rule with a clear reason — and never creates a session — when NO model resolves anywhere", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -2033,6 +2071,36 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
       // The prompt carries ONLY the pinned rule's task.
       expect(stub.prompts[0]).toContain('rule "pinned-rule"');
       expect(stub.prompts[0]).not.toContain('rule "no-model-rule"');
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  // CodeRabbit review (PR #7): a specific "no default model" reason, already
+  // classified by resolveEffectiveRules, must survive even when session
+  // creation ITSELF then throws (a setup-level failure covering the whole
+  // dispatch) — not be overwritten by the outer catch's generic fallback
+  // message. The pinned rule (no reason of its own yet) DOES get the generic
+  // message, since that's genuinely all that's known about its failure.
+  it("preserves a resolveEffectiveRules reason across a later session-creation failure (outer catch)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const pinned = makeRule({ name: "pinned-rule", provider: "xai", model: "grok-4.5" });
+
+      const result = await dispatchRules(
+        [pinned, unpinnedRule("no-model-rule")],
+        "diff",
+        false,
+        async () => {
+          throw new Error("session construction blew up");
+        },
+      );
+
+      expect(result.ruleFailureReasons?.["no-model-rule"]).toContain("no default model");
+      expect(result.ruleFailureReasons?.["pinned-rule"]).toContain(
+        "did not complete",
+      );
+      expect(result.rulesFailed.sort()).toEqual(["no-model-rule", "pinned-rule"]);
     } finally {
       warnSpy.mockRestore();
     }

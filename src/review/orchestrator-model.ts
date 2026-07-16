@@ -245,10 +245,15 @@ export function resolveEffectiveRules(
 
   // Resolve the ONE default spec all unpinned rules share.
   let defaultSpec: string | undefined;
+  const settingsDefault = readSettingsDefaultSpec(agentDir);
+  // Deduped, same reasoning as resolveOrchestratorModel's candidates above
+  // (CodeRabbit review, PR #7): --model and the settings default can
+  // legitimately be the same spec, and without dedup a rejected model would
+  // get the explicit-only warning printed twice.
   const candidates = [
     ...(explicitDefault ? [explicitDefault] : []),
-    ...(readSettingsDefaultSpec(agentDir) ? [readSettingsDefaultSpec(agentDir) as string] : []),
-  ];
+    ...(settingsDefault ? [settingsDefault] : []),
+  ].filter((spec, i, all) => all.indexOf(spec) === i);
   for (const spec of candidates) {
     const ref = parseModelRef(spec);
     const model = ref ? registry.find(ref.provider, ref.modelId) : undefined;

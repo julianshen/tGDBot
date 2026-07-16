@@ -73,6 +73,33 @@ export type AdvisorSessionFactory = (cwd: string) => Promise<DispatchSession>;
 export interface DirectDispatchDeps {
   createSession?: DirectSessionFactory;
   createAdvisorSession?: AdvisorSessionFactory;
+  /** Override for tests. Default RULE_PROMPT_TIMEOUT_MS. */
+  ruleTimeoutMs?: number;
+  /** Override for tests. Default ADVISOR_PROMPT_TIMEOUT_MS. */
+  advisorTimeoutMs?: number;
+}
+
+// CodeRabbit review (PR #7): a hung provider call must not block Promise.all
+// indefinitely — one stalled rule (or the advisor pass) would otherwise leave
+// the whole review run open-ended, with no way for a caller to notice. These
+// are circuit breakers, not a performance budget — generous, because a real
+// multi-tool review turn can legitimately take minutes.
+const RULE_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
+const ADVISOR_PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
+
+// Distinguishes a timeout from any other prompt() rejection so the catch sites
+// below can classify it as "timed out" (classifyTaskFailure) rather than a
+// generic error.
+class PromptTimeoutError extends Error {
+  readonly timedOut = true as const;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout>;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new PromptTimeoutError(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // The vendored reviewer agent's Markdown BODY (frontmatter stripped) is the
@@ -215,6 +242,8 @@ export async function dispatchRulesDirect(
   defaultModel?: string,
 ): Promise<DispatchResult> {
   const createSession = deps.createSession ?? createRealDirectSession;
+  const ruleTimeoutMs = deps.ruleTimeoutMs ?? RULE_PROMPT_TIMEOUT_MS;
+  const advisorTimeoutMs = deps.advisorTimeoutMs ?? ADVISOR_PROMPT_TIMEOUT_MS;
 
   let cwd: string | undefined;
   try {
@@ -244,7 +273,11 @@ export async function dispatchRulesDirect(
       effective.map(async (rule): Promise<Finding[]> => {
         try {
           const session = await createSession(rule, cwd as string);
-          await session.prompt(buildTaskText(rule, diff));
+          await withTimeout(
+            session.prompt(buildTaskText(rule, diff)),
+            ruleTimeoutMs,
+            `rule "${rule.name}" timed out after ${ruleTimeoutMs}ms`,
+          );
           const text = session.getLastAssistantText();
           // extractFindingsArray distinguishes "no parseable findings array"
           // (undefined — the rule FAILED to follow its output contract) from
@@ -261,11 +294,16 @@ export async function dispatchRulesDirect(
           rulesRun.push(rule.name);
           return parseFindingsFromFinalOutput(text, rule.name);
         } catch (err) {
+          const timedOut = err instanceof PromptTimeoutError;
           const message = (err as Error).message;
           rulesFailed.push(rule.name);
           // Same publish-safe classification the legacy path uses; the RAW
-          // error goes to the logs only.
-          ruleFailureReasons[rule.name] = classifyTaskFailure({ error: message }, rule);
+          // error goes to the logs only. A timeout is classified distinctly
+          // ("timed out") rather than as a generic error.
+          ruleFailureReasons[rule.name] = classifyTaskFailure(
+            timedOut ? { timedOut: true } : { error: message },
+            rule,
+          );
           console.warn(
             `dispatchRulesDirect: rule "${rule.name}" (${rule.provider}/${rule.model}) failed: ${message}`,
           );
@@ -285,7 +323,11 @@ export async function dispatchRulesDirect(
         deps.createAdvisorSession ?? makeRealAdvisorSessionFactory(defaultModel, effective);
       try {
         const advisor = await createAdvisorSession(cwd);
-        await advisor.prompt(buildAdvisorPrompt(findings));
+        await withTimeout(
+          advisor.prompt(buildAdvisorPrompt(findings)),
+          advisorTimeoutMs,
+          `advisor pass timed out after ${advisorTimeoutMs}ms`,
+        );
         const drop = parseAdvisorDropList(advisor.getLastAssistantText());
         if (drop === undefined) {
           console.warn(
