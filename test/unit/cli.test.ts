@@ -48,6 +48,28 @@ describe("parseArgs", () => {
     });
   });
 
+  // Design-review #13: --max-diff-chars is a hard cost ceiling on diff size.
+  describe("--max-diff-chars", () => {
+    it("defaults to undefined (unlimited) when not passed", () => {
+      expect(parseArgs(["review", "--pr", "42"]).maxDiffChars).toBeUndefined();
+    });
+
+    it("parses a positive integer value", () => {
+      expect(parseArgs(["review", "--pr", "42", "--max-diff-chars", "500000"]).maxDiffChars).toBe(
+        500000,
+      );
+    });
+
+    it.each(["0", "-5", "1.5", "abc", ""])(
+      "rejects the non-positive-integer value %j with an error naming the flag",
+      (bad) => {
+        expect(() => parseArgs(["review", "--pr", "42", "--max-diff-chars", bad])).toThrow(
+          /--max-diff-chars/,
+        );
+      },
+    );
+  });
+
   // New flag: --trust-local-rules skips the base-branch-via-API fetch
   // entirely and falls back to reading --rules-dir directly off the local
   // filesystem (the OLD behavior) — a developer convenience for iterating

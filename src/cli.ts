@@ -40,6 +40,18 @@ export interface CliArgs {
   suggestions: "on" | "off";
   dryRun: boolean;
   trustLocalRules: boolean;
+  /**
+   * Design-review item #13: a HARD cost ceiling on diff size. The dispatch
+   * prompt embeds the diff once per rule (O(rules × diff) tokens — see
+   * dispatch.ts's warnIfDiffCostRisk, which only WARNS). When set and the
+   * diff exceeds it, the run skips with a visible notice (exit 0, nothing
+   * posted) instead of silently spending. Absent = unlimited (the
+   * pre-existing behavior). Deliberately NOT part of the dedup config hash:
+   * a size-skip writes no marker, so a later run with a higher ceiling is
+   * never wrongly deduped, and for runs under the ceiling the output is
+   * ceiling-independent.
+   */
+  maxDiffChars?: number;
 }
 
 const DEFAULTS = {
@@ -97,6 +109,7 @@ export function parseArgs(argv: string[]): CliArgs {
       model: { type: "string" },
       "dry-run": { type: "boolean" },
       "trust-local-rules": { type: "boolean" },
+      "max-diff-chars": { type: "string" },
     },
   });
 
@@ -149,10 +162,26 @@ export function parseArgs(argv: string[]): CliArgs {
     }
   }
 
+  // Same validation posture as --pr: `parseArgs` is the one place bad input
+  // dies with a naming, actionable message instead of surfacing later as NaN
+  // comparisons. Zero is rejected too — a ceiling every diff exceeds is
+  // certainly a mistyped value, not a real configuration.
+  const maxDiffCharsRaw = values["max-diff-chars"] as string | undefined;
+  let maxDiffChars: number | undefined;
+  if (maxDiffCharsRaw !== undefined) {
+    if (!/^\d+$/.test(maxDiffCharsRaw) || Number(maxDiffCharsRaw) === 0) {
+      throw new Error(
+        `Invalid --max-diff-chars value: "${maxDiffCharsRaw}" (expected a positive integer, e.g. --max-diff-chars 500000)`,
+      );
+    }
+    maxDiffChars = Number(maxDiffCharsRaw);
+  }
+
   return {
     pr: values.pr as string,
     vcs,
     model,
+    maxDiffChars,
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
@@ -201,6 +230,11 @@ interface StatusLog {
   findingsCount: number;
   rulesRun: string[];
   rulesFailed: string[];
+  // Design-review #13: distinguishes WHY a run was skipped. Only present for
+  // the --max-diff-chars ceiling skip ("diff-too-large"); the original dedup
+  // skip keeps its exact pre-existing shape (no reason field) so anyone
+  // already parsing that line sees no change.
+  reason?: string;
   // Task 8 review fix #1: only present (and non-empty) when one or more
   // rule files failed to LOAD (bad/missing frontmatter etc.) — distinct
   // from `rulesFailed`, which is dispatch-time-only. Omitted entirely
@@ -254,6 +288,19 @@ function resolveSafeRuleFilePath(tempDir: string, filePath: string): string | nu
     return null;
   }
   return dest;
+}
+
+// Matches Node's child_process "output exceeded maxBuffer" rejection — the
+// shape realExecGh's capped execFile produces when a diff is bigger than its
+// buffer. Checked by CODE first (stable across Node versions since 12), with
+// the message as a fallback for exec wrappers that re-throw plain Errors.
+// Deliberately narrow: a network/auth failure from getDiff must NOT be
+// mistaken for "diff too large" — only this specific shape converts to the
+// --max-diff-chars skip; everything else stays fatal.
+function isOutputBufferExceededError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" || /maxBuffer .*exceeded/i.test(err.message);
 }
 
 /**
@@ -352,6 +399,18 @@ export async function review(
 
   const config = resolveConfigFn(args);
   const pr = await config.vcsAdapter.getPullRequest(config.pr);
+
+  // Design-review item #9: name the RESOLVED review target up front. The VCS
+  // adapter infers owner/repo from ambient context (`gh`'s git-remote /
+  // GH_REPO/GITHUB_REPOSITORY inference — see GitHubAdapter's class doc), so a
+  // misconfigured environment could silently review the wrong repo. The PR's
+  // canonical URL carries the resolved identity; logging it turns that failure
+  // mode from silent into obvious. Printed BEFORE the dedup decision so even a
+  // skipped run says what it inspected. (Goes to stdout like the other
+  // informational output; the TGD_REVIEW_RESULT marker below exists precisely
+  // so log scrapers can pick the status line out regardless.)
+  console.log(`tgd-review-agent: reviewing ${pr.url ?? `PR #${config.pr}`} (head ${pr.headSha})`);
+
   const botComment = await config.vcsAdapter.findBotComment(config.pr);
 
   // Config-aware dedup: a run is skipped only when this exact head SHA was
@@ -366,7 +425,56 @@ export async function review(
     return EXIT_OK;
   }
 
-  const diff = await config.vcsAdapter.getDiff(config.pr);
+  // Codex review fix (PR #5): a diff can be too large to even FETCH — the
+  // GitHub adapter's execFile buffer is capped (10 MiB), and a bigger diff
+  // makes getDiff() reject with a maxBuffer error BEFORE the length check
+  // below could ever run. With --max-diff-chars set, that rejection is proof
+  // positive the diff is over any expressible ceiling, so it gets the same
+  // graceful skip the flag promises — hitting exactly the largest PRs the
+  // ceiling exists to guard. Without the flag, the rejection stays fatal
+  // (the pre-existing behavior: the user asked for no ceiling).
+  let diff: string;
+  try {
+    diff = await config.vcsAdapter.getDiff(config.pr);
+  } catch (err) {
+    if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
+    console.warn(
+      `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +
+        `(${(err as Error).message}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
+        `this as over the ceiling and skipping the review (nothing was posted).`,
+    );
+    logStatus({
+      status: "skipped",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "diff-too-large",
+    });
+    return EXIT_OK;
+  }
+
+  // Design-review #13: hard cost ceiling. The dispatch prompt embeds the diff
+  // once per rule (O(rules × diff) tokens); warnIfDiffCostRisk in dispatch.ts
+  // only WARNS. When the user set a ceiling and this diff is over it, skip
+  // loudly BEFORE fetching rules or spending a single model token — nothing is
+  // posted (so no marker is written: a later run with a higher ceiling reviews
+  // normally), and the status line says why.
+  if (config.maxDiffChars !== undefined && diff.length > config.maxDiffChars) {
+    console.warn(
+      `tgd-review-agent: diff is ${diff.length} chars, over the --max-diff-chars ceiling of ` +
+        `${config.maxDiffChars}; skipping the review (nothing was posted). Raise or drop the ` +
+        `flag to review this PR.`,
+    );
+    logStatus({
+      status: "skipped",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "diff-too-large",
+    });
+    return EXIT_OK;
+  }
+
   const { rules, errors: loadErrors } = await loadRulesForReview(config, pr, loadRulesFn);
 
   // Task 8 review fix #1: surface load errors via console.error whenever

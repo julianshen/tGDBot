@@ -72,6 +72,16 @@ export interface PullRequestInfo {
   baseSha: string;
   title: string;
   description: string;
+  /**
+   * Canonical web URL of the PR/MR (e.g. https://github.com/owner/repo/pull/42).
+   * Carries the RESOLVED owner/repo identity: adapters infer the repo from
+   * ambient context (`gh`'s git-remote / GH_REPO inference), so review() logs
+   * this URL at the start of every run — making a mis-inferred target visible
+   * instead of silently reviewing the wrong repo. Optional so a minimal future
+   * adapter (or an old test double) without it still works; the log then falls
+   * back to the bare PR number.
+   */
+  url?: string;
 }
 
 export interface BotComment {
