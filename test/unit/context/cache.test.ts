@@ -1,4 +1,5 @@
-import { chmod, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -27,6 +28,119 @@ const key: ContextCacheKey = {
 const createdAt = "2026-07-18T08:00:00.000Z";
 const roots: string[] = [];
 
+function knowledgeGraph(): Record<string, unknown> {
+  return {
+    version: "1.0.0",
+    kind: "codebase",
+    project: {
+      name: "octo-repo",
+      languages: ["typescript"],
+      frameworks: [],
+      description: "Trusted test repository",
+      analyzedAt: createdAt,
+      gitCommitHash: key.baseSha,
+    },
+    nodes: [
+      {
+        id: "file:src/index.ts",
+        type: "file",
+        name: "index.ts",
+        filePath: "src/index.ts",
+        lineRange: [1, 8],
+        summary: "Application entry point",
+        tags: ["entry-point"],
+        complexity: "simple",
+      },
+      {
+        id: "function:main",
+        type: "function",
+        name: "main",
+        filePath: "src/index.ts",
+        lineRange: [2, 7],
+        summary: "Runs the application",
+        tags: [],
+        complexity: "simple",
+      },
+    ],
+    edges: [
+      {
+        source: "file:src/index.ts",
+        target: "function:main",
+        type: "contains",
+        direction: "forward",
+        weight: 1,
+      },
+    ],
+    layers: [
+      { id: "layer:entry", name: "Entry", description: "Entry points", nodeIds: ["file:src/index.ts"] },
+    ],
+    tour: [
+      { order: 1, title: "Start", description: "Read the entry point", nodeIds: ["file:src/index.ts"] },
+    ],
+  };
+}
+
+function domainGraph(): Record<string, unknown> {
+  return {
+    version: "1.0.0",
+    project: {
+      name: "octo-repo",
+      languages: ["typescript"],
+      frameworks: [],
+      description: "Business domains",
+      analyzedAt: createdAt,
+      gitCommitHash: key.baseSha,
+    },
+    nodes: [
+      {
+        id: "domain:reviews",
+        type: "domain",
+        name: "Reviews",
+        summary: "Pull request review domain",
+        tags: ["core"],
+        complexity: "moderate",
+      },
+      {
+        id: "flow:review-pr",
+        type: "flow",
+        name: "Review PR",
+        summary: "Reviews a pull request",
+        tags: ["review"],
+        complexity: "moderate",
+        domainMeta: { entryPoint: "review", entryType: "cli" },
+      },
+      {
+        id: "step:load-context",
+        type: "step",
+        name: "Load Context",
+        filePath: "src/context/cache.ts",
+        lineRange: [1, 10],
+        summary: "Loads trusted context",
+        tags: ["cache"],
+        complexity: "simple",
+      },
+    ],
+    edges: [
+      {
+        source: "domain:reviews",
+        target: "flow:review-pr",
+        type: "contains_flow",
+        direction: "forward",
+        weight: 1,
+      },
+      {
+        source: "flow:review-pr",
+        target: "step:load-context",
+        type: "flow_step",
+        direction: "forward",
+        weight: 1,
+      },
+    ],
+    layers: [],
+    tour: [],
+  };
+}
+
 async function tempRoot(): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), "tgd-context-cache-test-"));
   roots.push(root);
@@ -49,6 +163,17 @@ function input(overrides: Partial<ContextManifestInput> = {}): ContextManifestIn
   };
 }
 
+function zeroDomainInput(): ContextManifestInput {
+  return input({
+    artifacts: [
+      { kind: "context", path: "CONTEXT.md" },
+      { kind: "knowledge-graph", path: ".understand-anything/knowledge-graph.json" },
+      { kind: "zero-domains", path: ".understand-anything/zero-domains.json" },
+      { kind: "mapping-metadata", path: ".understand-anything/mapping-metadata.json" },
+    ],
+  });
+}
+
 async function createStaging(
   root: string,
   options: { zeroDomains?: boolean; baseSha?: string } = {},
@@ -58,7 +183,7 @@ async function createStaging(
   await writeFile(path.join(staging, "CONTEXT.md"), "# Trusted context\n", "utf8");
   await writeFile(
     path.join(staging, ".understand-anything/knowledge-graph.json"),
-    JSON.stringify({ nodes: [], edges: [] }),
+    JSON.stringify(knowledgeGraph()),
     "utf8",
   );
   if (options.zeroDomains) {
@@ -70,7 +195,7 @@ async function createStaging(
   } else {
     await writeFile(
       path.join(staging, ".understand-anything/domain-graph.json"),
-      JSON.stringify({ domains: [] }),
+      JSON.stringify(domainGraph()),
       "utf8",
     );
   }
@@ -90,6 +215,24 @@ async function promoteValid(root: string, overrides: Partial<ContextManifestInpu
 
 async function manifestPath(root: string, cacheKey: ContextCacheKey = key): Promise<string> {
   return path.join(new ContextCache(root).entryPath(cacheKey), "manifest.json");
+}
+
+async function replaceStoredArtifact(
+  root: string,
+  artifactPath: string,
+  contents: unknown,
+): Promise<void> {
+  const file = await manifestPath(root);
+  const manifest = JSON.parse(await readFile(file, "utf8")) as ContextManifest;
+  const serialized = JSON.stringify(contents);
+  await writeFile(path.join(path.dirname(file), artifactPath), serialized, "utf8");
+  manifest.artifacts = manifest.artifacts.map((artifact) =>
+    artifact.path === artifactPath
+      ? { ...artifact, sha256: createHash("sha256").update(serialized).digest("hex") }
+      : artifact,
+  );
+  manifest.manifestHash = computeManifestHash(manifest);
+  await writeFile(file, JSON.stringify(manifest), "utf8");
 }
 
 afterEach(async () => {
@@ -215,20 +358,152 @@ describe("ContextCache", () => {
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
   });
 
+  it.each([
+    ["empty knowledge graph", "knowledge-graph.json", {}],
+    [
+      "malformed knowledge node",
+      "knowledge-graph.json",
+      { ...knowledgeGraph(), nodes: [{ id: "bad", type: "file", tags: "not-an-array" }] },
+    ],
+    ["empty domain graph", "domain-graph.json", {}],
+    [
+      "malformed domain edge",
+      "domain-graph.json",
+      { ...domainGraph(), edges: [{ source: "domain:reviews", target: 42, type: "contains_flow" }] },
+    ],
+  ])("rejects a schema-invalid %s during promotion", async (_label, filename, graph) => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    await writeFile(path.join(staging, ".understand-anything", filename), JSON.stringify(graph), "utf8");
+
+    await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+    await expect(new ContextCache(root).lookupContext(key)).resolves.toBeUndefined();
+  });
+
+  it("misses when stored graph content has a valid digest but an invalid schema", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    await promoteValid(root);
+
+    await replaceStoredArtifact(root, ".understand-anything/knowledge-graph.json", {});
+    await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+
+    await replaceStoredArtifact(root, ".understand-anything/knowledge-graph.json", knowledgeGraph());
+    await replaceStoredArtifact(root, ".understand-anything/domain-graph.json", {
+      ...domainGraph(),
+      nodes: [{ id: "domain:bad", type: "domain", name: 42 }],
+    });
+    await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+  });
+
+  it("rejects malformed optional node metadata and non-object graph entries", async () => {
+    const base = knowledgeGraph();
+    const validNode = (base.nodes as Record<string, unknown>[])[0]!;
+    const invalidNodes: unknown[] = [
+      null,
+      { ...validNode, domainMeta: "invalid" },
+      { ...validNode, domainMeta: { entities: "invalid" } },
+      { ...validNode, domainMeta: { entities: [], businessRules: "invalid" } },
+      { ...validNode, domainMeta: { entities: [], businessRules: [], crossDomainInteractions: "invalid" } },
+      { ...validNode, knowledgeMeta: "invalid" },
+      { ...validNode, knowledgeMeta: { wikilinks: "invalid" } },
+      { ...validNode, knowledgeMeta: { wikilinks: [], backlinks: "invalid" } },
+      { ...validNode, knowledgeMeta: { wikilinks: [], backlinks: [], category: 42 } },
+      { ...validNode, knowledgeMeta: { wikilinks: [], backlinks: [], category: "ok", content: 42 } },
+    ];
+    for (const invalidNode of invalidNodes) {
+      const root = await tempRoot();
+      const staging = await createStaging(root);
+      await writeFile(
+        path.join(staging, ".understand-anything/knowledge-graph.json"),
+        JSON.stringify({ ...base, nodes: [invalidNode] }),
+        "utf8",
+      );
+      await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+    }
+
+    for (const invalidEdge of [null, { source: "file:src/index.ts" }]) {
+      const root = await tempRoot();
+      const staging = await createStaging(root);
+      await writeFile(
+        path.join(staging, ".understand-anything/knowledge-graph.json"),
+        JSON.stringify({ ...base, edges: [invalidEdge] }),
+        "utf8",
+      );
+      await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+    }
+  });
+
+  it("accepts the vendor knowledge graph kind", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    await writeFile(
+      path.join(staging, ".understand-anything/knowledge-graph.json"),
+      JSON.stringify({ ...knowledgeGraph(), kind: "knowledge" }),
+      "utf8",
+    );
+    await expect(new ContextCache(root).promoteContext(staging, input())).resolves.toMatchObject({ status: "ready" });
+  });
+
+  it("keeps alternative-probe I/O errors diagnosable", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const artifactDirectory = path.join(staging, ".understand-anything");
+    await chmod(artifactDirectory, 0o000);
+    try {
+      await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      await chmod(artifactDirectory, 0o700);
+    }
+  });
+
+  it("rejects an undeclared domain alternative during promotion", async () => {
+    const root = await tempRoot();
+    const domainStaging = await createStaging(root);
+    await writeFile(
+      path.join(domainStaging, ".understand-anything/zero-domains.json"),
+      JSON.stringify({ version: 1, status: "zero-domains" }),
+      "utf8",
+    );
+    await expect(new ContextCache(root).promoteContext(domainStaging, input())).rejects.toThrow(/alternative/i);
+
+    const zeroStaging = await createStaging(root, { zeroDomains: true });
+    await writeFile(
+      path.join(zeroStaging, ".understand-anything/domain-graph.json"),
+      JSON.stringify(domainGraph()),
+      "utf8",
+    );
+    await expect(new ContextCache(root).promoteContext(zeroStaging, zeroDomainInput())).rejects.toThrow(/alternative/i);
+  });
+
+  it("misses when an undeclared domain alternative appears in a ready entry", async () => {
+    const domainRoot = await tempRoot();
+    const domainCache = new ContextCache(domainRoot);
+    await promoteValid(domainRoot);
+    await writeFile(
+      path.join(domainCache.entryPath(key), ".understand-anything/zero-domains.json"),
+      JSON.stringify({ version: 1, status: "zero-domains" }),
+      "utf8",
+    );
+    await expect(domainCache.lookupContext(key)).resolves.toBeUndefined();
+
+    const zeroRoot = await tempRoot();
+    const zeroCache = new ContextCache(zeroRoot);
+    const zeroStaging = await createStaging(zeroRoot, { zeroDomains: true });
+    await zeroCache.promoteContext(zeroStaging, zeroDomainInput());
+    await writeFile(
+      path.join(zeroCache.entryPath(key), ".understand-anything/domain-graph.json"),
+      JSON.stringify(domainGraph()),
+      "utf8",
+    );
+    await expect(zeroCache.lookupContext(key)).resolves.toBeUndefined();
+  });
+
   it("accepts the narrowly-defined zero-domain marker instead of a domain graph", async () => {
     const root = await tempRoot();
     const cache = new ContextCache(root);
     const staging = await createStaging(root, { zeroDomains: true });
-    const zeroDomainInput = input({
-      artifacts: [
-        { kind: "context", path: "CONTEXT.md" },
-        { kind: "knowledge-graph", path: ".understand-anything/knowledge-graph.json" },
-        { kind: "zero-domains", path: ".understand-anything/zero-domains.json" },
-        { kind: "mapping-metadata", path: ".understand-anything/mapping-metadata.json" },
-      ],
-    });
-
-    const promoted = await cache.promoteContext(staging, zeroDomainInput);
+    const promoted = await cache.promoteContext(staging, zeroDomainInput());
 
     await expect(cache.lookupContext(key)).resolves.toEqual(promoted);
   });
@@ -251,7 +526,19 @@ describe("ContextCache", () => {
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
   });
 
-  it.each(["../escape", "/absolute", "nested\\escape", "nested/../escape", "nul\0byte"])(
+  it.each([
+    "../escape",
+    "/absolute",
+    "nested\\escape",
+    "nested/../escape",
+    "nul\0byte",
+    "C:/absolute",
+    "C:\\absolute",
+    "C:drive-relative",
+    "\\\\server\\share\\artifact",
+    "\\\\?\\C:\\device-path",
+    "\\\\.\\device",
+  ])(
     "rejects unsafe artifact path %s",
     async (unsafePath) => {
       const root = await tempRoot();
@@ -313,6 +600,33 @@ describe("ContextCache", () => {
         }),
       ),
     ).rejects.toThrow(/duplicate artifact path/i);
+  });
+
+  it("reserves manifest and internal cache-control paths from document records", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const staging = await createStaging(root);
+    const diagnostic = JSON.stringify({ version: 1, status: "preparing" });
+    await writeFile(path.join(staging, "manifest.json"), diagnostic, "utf8");
+
+    await expect(
+      cache.promoteContext(
+        staging,
+        input({ documents: [{ kind: "business-reference", path: "manifest.json" }] }),
+      ),
+    ).rejects.toThrow(/reserved/i);
+    await expect(readFile(path.join(staging, "manifest.json"), "utf8")).resolves.toBe(diagnostic);
+    await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+
+    const internalStaging = await createStaging(root);
+    await mkdir(path.join(internalStaging, ".tgd-cache"));
+    await writeFile(path.join(internalStaging, ".tgd-cache/control.json"), "{}", "utf8");
+    await expect(
+      cache.promoteContext(
+        internalStaging,
+        input({ documents: [{ kind: "business-reference", path: ".tgd-cache/control.json" }] }),
+      ),
+    ).rejects.toThrow(/reserved/i);
   });
 
   it("rejects symlinked artifacts, including symlink escapes", async () => {
@@ -676,6 +990,105 @@ describe("ContextCache", () => {
     await expect(readFile(path.join(staging, "manifest.json"), "utf8")).resolves.toContain('"status":"ready"');
   });
 
+  it("serializes conforming promoters across destination check and publication", async () => {
+    const root = await tempRoot();
+    const firstStaging = await createStaging(root);
+    const secondStaging = await createStaging(root);
+    await writeFile(path.join(secondStaging, "CONTEXT.md"), "# Losing context\n", "utf8");
+    let signalRename!: () => void;
+    const renameReached = new Promise<void>((resolve) => {
+      signalRename = resolve;
+    });
+    let releaseRename!: () => void;
+    const renameGate = new Promise<void>((resolve) => {
+      releaseRename = resolve;
+    });
+    const firstCache = new ContextCache(root, {
+      rename: async (source, destination) => {
+        signalRename();
+        await renameGate;
+        await rename(source, destination);
+      },
+    });
+    const secondCache = new ContextCache(root);
+
+    const firstPromotion = firstCache.promoteContext(firstStaging, input());
+    await renameReached;
+    const secondOutcome = await secondCache.promoteContext(secondStaging, input()).then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+    releaseRename();
+    const firstOutcome = await firstPromotion.then(
+      (value) => ({ status: "fulfilled" as const, value }),
+      (reason: unknown) => ({ status: "rejected" as const, reason }),
+    );
+
+    expect(secondOutcome.status).toBe("rejected");
+    if (secondOutcome.status === "rejected") {
+      expect(secondOutcome.reason).toBeInstanceOf(Error);
+      expect((secondOutcome.reason as Error).message).toMatch(/publication.*progress/i);
+    }
+    expect(firstOutcome.status).toBe("fulfilled");
+    await expect(readFile(path.join(secondStaging, "CONTEXT.md"), "utf8")).resolves.toContain("Losing");
+    await expect(secondCache.lookupContext(key)).resolves.toMatchObject(firstOutcome.status === "fulfilled" ? {
+      manifestHash: firstOutcome.value.manifestHash,
+    } : {});
+  });
+
+  it("preserves a pre-existing publication claim instead of guessing that it is stale", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const staging = await createStaging(root);
+    const claim = `${cache.entryPath(key)}.publishing`;
+    await mkdir(path.dirname(claim), { recursive: true });
+    await mkdir(claim);
+
+    await expect(cache.promoteContext(staging, input())).rejects.toThrow(/publication.*progress/i);
+    await expect(lstat(claim)).resolves.toMatchObject({});
+    await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+  });
+
+  it("reuses an exact ready entry observed behind another publisher's claim", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const ready = await promoteValid(root);
+    const claim = `${cache.entryPath(key)}.publishing`;
+    await mkdir(claim);
+    const staging = await createStaging(root);
+
+    await expect(cache.promoteContext(staging, input())).resolves.toEqual(ready);
+    await expect(lstat(claim)).resolves.toMatchObject({});
+  });
+
+  it("reports a conflicting ready entry observed behind another publisher's claim", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    await promoteValid(root);
+    const claim = `${cache.entryPath(key)}.publishing`;
+    await mkdir(claim);
+    const staging = await createStaging(root);
+    await writeFile(path.join(staging, "CONTEXT.md"), "# Conflicting context\n", "utf8");
+
+    await expect(cache.promoteContext(staging, input())).rejects.toBeInstanceOf(ContextCacheConflictError);
+    await expect(lstat(claim)).resolves.toMatchObject({});
+  });
+
+  it("propagates claim-acquisition permission errors without publishing", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const staging = await createStaging(root);
+    const parent = path.dirname(cache.entryPath(key));
+    await mkdir(parent, { recursive: true });
+    await chmod(parent, 0o500);
+    try {
+      await expect(cache.promoteContext(staging, input())).rejects.toMatchObject({ code: "EACCES" });
+      await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+    } finally {
+      await chmod(parent, 0o700);
+    }
+  });
+
   it("preserves staging and propagates a non-collision rename failure", async () => {
     const root = await tempRoot();
     const staging = await createStaging(root);
@@ -688,6 +1101,7 @@ describe("ContextCache", () => {
     await expect(cache.promoteContext(staging, input())).rejects.toMatchObject({ code: "EXDEV" });
     await expect(readFile(path.join(staging, "manifest.json"), "utf8")).resolves.toContain('"status":"ready"');
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+    await expect(lstat(`${cache.entryPath(key)}.publishing`)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("computes a deterministic manifest hash independent of object and record order", async () => {

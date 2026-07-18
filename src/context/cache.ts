@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename as fsRename, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rename as fsRename, rmdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   ContextValidationError,
@@ -29,6 +29,13 @@ export class ContextCacheConflictError extends Error {
   }
 }
 
+export class ContextCachePublicationInProgressError extends Error {
+  constructor(destination: string) {
+    super(`Context cache publication is already in progress for ${destination}`);
+    this.name = "ContextCachePublicationInProgressError";
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -39,6 +46,10 @@ function isMissing(error: unknown): boolean {
 
 function isRenameCollision(error: unknown): boolean {
   return isRecord(error) && (error.code === "EEXIST" || error.code === "ENOTEMPTY");
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return isRecord(error) && error.code === "EEXIST";
 }
 
 function canonicalize(value: unknown): unknown {
@@ -299,39 +310,60 @@ export class ContextCache {
       input.documents ?? [],
     );
     const manifest = buildManifest(input, records);
-    const existing = await this.lookupContext(input.key);
-    if (existing !== undefined) {
-      if (existing.manifestHash === manifest.manifestHash) return existing;
-      throw new ContextCacheConflictError(destination);
-    }
+    const claimPath = `${destination}.publishing`;
     try {
-      await lstat(destination);
-      throw new ContextCacheConflictError(destination);
+      await mkdir(claimPath);
     } catch (error) {
-      if (!isMissing(error)) throw error;
+      if (!isAlreadyExists(error)) throw error;
+      const concurrentlyPublished = await this.lookupContext(input.key);
+      if (concurrentlyPublished?.manifestHash === manifest.manifestHash) return concurrentlyPublished;
+      if (concurrentlyPublished !== undefined) throw new ContextCacheConflictError(destination);
+      throw new ContextCachePublicationInProgressError(destination);
     }
 
-    const stagingManifestPath = path.join(stagingPath, "manifest.json");
     try {
-      const stagingManifestInfo = await lstat(stagingManifestPath);
-      if (stagingManifestInfo.isSymbolicLink()) {
-        throw new ContextValidationError("Staging manifest must not be a symbolic link");
+      const existing = await this.lookupContext(input.key);
+      if (existing !== undefined) {
+        if (existing.manifestHash === manifest.manifestHash) return existing;
+        throw new ContextCacheConflictError(destination);
       }
-      if (!stagingManifestInfo.isFile()) {
-        throw new ContextValidationError("Staging manifest must be a regular file when present");
+      try {
+        await lstat(destination);
+        throw new ContextCacheConflictError(destination);
+      } catch (error) {
+        if (!isMissing(error)) throw error;
       }
-    } catch (error) {
-      if (!isMissing(error)) throw error;
+
+      const stagingManifestPath = path.join(stagingPath, "manifest.json");
+      try {
+        const stagingManifestInfo = await lstat(stagingManifestPath);
+        if (stagingManifestInfo.isSymbolicLink()) {
+          throw new ContextValidationError("Staging manifest must not be a symbolic link");
+        }
+        if (!stagingManifestInfo.isFile()) {
+          throw new ContextValidationError("Staging manifest must be a regular file when present");
+        }
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+      }
+      await writeFile(stagingManifestPath, `${canonicalJson(manifest)}\n`, "utf8");
+      try {
+        // The exclusive claim prevents conforming publishers from entering this
+        // window together. Node has no portable no-replace directory rename, so
+        // an arbitrary non-cooperating process can still race in an empty target.
+        await this.#rename(stagingPath, destination);
+      } catch (error) {
+        if (!isRenameCollision(error)) throw error;
+        const raced = await this.lookupContext(input.key);
+        if (raced?.manifestHash === manifest.manifestHash) return raced;
+        throw new ContextCacheConflictError(destination);
+      }
+      return manifest;
+    } finally {
+      // An in-process success/failure releases its own empty claim. A process
+      // crash leaves the claim in place so a later publisher cannot guess that
+      // it is stale and overlap a potentially live publisher.
+      await rmdir(claimPath);
     }
-    await writeFile(stagingManifestPath, `${canonicalJson(manifest)}\n`, "utf8");
-    try {
-      await this.#rename(stagingPath, destination);
-    } catch (error) {
-      if (!isRenameCollision(error)) throw error;
-      const raced = await this.lookupContext(input.key);
-      if (raced?.manifestHash === manifest.manifestHash) return raced;
-      throw new ContextCacheConflictError(destination);
-    }
-    return manifest;
   }
 }
