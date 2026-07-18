@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { lstat, readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { lstat, readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type {
   ArtifactInput,
   ArtifactKind,
@@ -36,6 +38,8 @@ const DOMAIN_EDGE_TYPES = new Set(["contains_flow", "flow_step", "cross_domain"]
 const DIRECTIONS = new Set(["forward", "backward", "bidirectional"]);
 const COMPLEXITIES = new Set(["simple", "moderate", "complex"]);
 const ENTRY_TYPES = new Set(["http", "cli", "event", "cron", "manual"]);
+/** Caps any single parsed JSON artifact at 64 MiB to bound local CLI memory use. */
+const MAX_JSON_ARTIFACT_BYTES = 64 * 1024 * 1024;
 
 export class ContextValidationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -79,7 +83,10 @@ export function validateCacheRelativePath(relativePath: unknown): asserts relati
   }
 }
 
-async function readRegularFileWithin(basePath: string, relativePath: string): Promise<Buffer> {
+async function resolveRegularFileWithin(
+  basePath: string,
+  relativePath: string,
+): Promise<{ filePath: string; size: number }> {
   validateCacheRelativePath(relativePath);
   const resolvedBase = path.resolve(basePath);
   const candidate = path.resolve(resolvedBase, ...relativePath.split("/"));
@@ -98,11 +105,11 @@ async function readRegularFileWithin(basePath: string, relativePath: string): Pr
         throw new ContextValidationError(`Artifact path contains a symbolic link: ${relativePath}`);
       }
     }
-    const info = await lstat(candidate);
+    const info = await stat(candidate);
     if (!info.isFile()) {
       throw new ContextValidationError(`Artifact is not a regular file: ${relativePath}`);
     }
-    return await readFile(candidate);
+    return { filePath: candidate, size: info.size };
   } catch (error) {
     if (error instanceof ContextValidationError) throw error;
     if (isExpectedMissing(error)) {
@@ -110,6 +117,33 @@ async function readRegularFileWithin(basePath: string, relativePath: string): Pr
     }
     throw error;
   }
+}
+
+async function readJsonArtifactWithin(basePath: string, relativePath: string): Promise<Buffer> {
+  const resolved = await resolveRegularFileWithin(basePath, relativePath);
+  if (resolved.size > MAX_JSON_ARTIFACT_BYTES) {
+    throw new ContextValidationError(
+      `JSON artifact exceeds maximum safe size (${MAX_JSON_ARTIFACT_BYTES} bytes): ${relativePath}`,
+    );
+  }
+  return readFile(resolved.filePath);
+}
+
+async function streamDigestWithin(
+  basePath: string,
+  relativePath: string,
+  inspectText: boolean,
+): Promise<{ sha256: string; size: number; hasNonWhitespace: boolean }> {
+  const resolved = await resolveRegularFileWithin(basePath, relativePath);
+  const hash = createHash("sha256");
+  const decoder = inspectText ? new StringDecoder("utf8") : undefined;
+  let hasNonWhitespace = false;
+  for await (const chunk of createReadStream(resolved.filePath)) {
+    hash.update(chunk);
+    if (decoder !== undefined && /\S/u.test(decoder.write(chunk))) hasNonWhitespace = true;
+  }
+  if (decoder !== undefined && /\S/u.test(decoder.end())) hasNonWhitespace = true;
+  return { sha256: hash.digest("hex"), size: resolved.size, hasNonWhitespace };
 }
 
 function parseJsonObject(contents: Buffer, artifactPath: string): Record<string, unknown> {
@@ -128,6 +162,22 @@ function isStringArray(value: unknown): value is string[] {
 
 function isOptionalString(record: Record<string, unknown>, key: string): boolean {
   return record[key] === undefined || typeof record[key] === "string";
+}
+
+function isSafeRepositoryRelativePath(value: unknown): boolean {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.includes("\0") ||
+    path.posix.isAbsolute(value) ||
+    path.win32.isAbsolute(value) ||
+    /^[a-z]:/i.test(value)
+  ) {
+    return false;
+  }
+  return value.split(/[\\/]/).every(
+    (segment) => segment.trim().length > 0 && segment !== "." && segment !== "..",
+  );
 }
 
 function isProject(value: unknown): boolean {
@@ -165,7 +215,7 @@ function isGraphNode(value: unknown, domainOnly: boolean): boolean {
   return typeof value.id === "string" &&
     allowedTypes.has(value.type as string) &&
     typeof value.name === "string" &&
-    isOptionalString(value, "filePath") &&
+    (value.filePath === undefined || isSafeRepositoryRelativePath(value.filePath)) &&
     (value.lineRange === undefined ||
       (Array.isArray(value.lineRange) && value.lineRange.length === 2 &&
         value.lineRange.every((line) => typeof line === "number" && Number.isFinite(line)))) &&
@@ -211,7 +261,9 @@ function isTourStep(value: unknown): boolean {
 
 function validateGraph(parsed: Record<string, unknown>, artifactPath: string, domainOnly: boolean): void {
   const validKind = parsed.kind === undefined || parsed.kind === "codebase" || parsed.kind === "knowledge";
-  const validNodes = Array.isArray(parsed.nodes) && parsed.nodes.every((node) => isGraphNode(node, domainOnly));
+  const validNodes = Array.isArray(parsed.nodes) &&
+    parsed.nodes.length > 0 &&
+    parsed.nodes.every((node) => isGraphNode(node, domainOnly));
   const hasDomain = !domainOnly || (Array.isArray(parsed.nodes) && parsed.nodes.some(
     (node) => isRecord(node) && node.type === "domain",
   ));
@@ -232,28 +284,24 @@ function validateGraph(parsed: Record<string, unknown>, artifactPath: string, do
   }
 }
 
-function validateBusinessContents(contents: Buffer, documentPath: string): void {
-  if (contents.length === 0) {
+function validateBusinessSize(size: number, documentPath: string): void {
+  if (size === 0) {
     throw new ContextValidationError(`Business-reference document is empty: ${documentPath}`);
   }
 }
 
-function validateArtifactContents(
+function validateExpectedArtifactPath(kind: ArtifactKind, artifactPath: string): void {
+  if (artifactPath !== EXPECTED_PATHS[kind]) {
+    throw new ContextValidationError(`${kind} must use ${EXPECTED_PATHS[kind]}`);
+  }
+}
+
+function validateJsonArtifactContents(
   kind: ArtifactKind,
   artifactPath: string,
   contents: Buffer,
   key: ContextCacheKey,
 ): void {
-  if (artifactPath !== EXPECTED_PATHS[kind]) {
-    throw new ContextValidationError(`${kind} must use ${EXPECTED_PATHS[kind]}`);
-  }
-  if (kind === "context") {
-    if (contents.toString("utf8").trim().length === 0) {
-      throw new ContextValidationError("CONTEXT.md must be non-empty");
-    }
-    return;
-  }
-
   const parsed = parseJsonObject(contents, artifactPath);
   if (kind === "knowledge-graph" || kind === "domain-graph") {
     validateGraph(parsed, artifactPath, kind === "domain-graph");
@@ -343,20 +391,25 @@ export async function digestArtifactInputs(
   if (!Array.isArray(documents)) throw new ContextValidationError("Documents must be an array");
   validateRecordSets(artifacts, documents);
   await rejectUndeclaredDomainAlternative(basePath, artifacts);
-  const artifactRecords = await Promise.all(
-    artifacts.map(async (artifact): Promise<ArtifactRecord> => {
-      const contents = await readRegularFileWithin(basePath, artifact.path);
-      validateArtifactContents(artifact.kind, artifact.path, contents, key);
-      return { ...artifact, sha256: digest(contents) };
-    }),
-  );
-  const documentRecords = await Promise.all(
-    documents.map(async (document): Promise<DocumentRecord> => {
-      const contents = await readRegularFileWithin(basePath, document.path);
-      validateBusinessContents(contents, document.path);
-      return { ...document, sha256: digest(contents) };
-    }),
-  );
+  const artifactRecords: ArtifactRecord[] = [];
+  for (const artifact of artifacts) {
+    validateExpectedArtifactPath(artifact.kind, artifact.path);
+    if (artifact.kind === "context") {
+      const streamed = await streamDigestWithin(basePath, artifact.path, true);
+      if (!streamed.hasNonWhitespace) throw new ContextValidationError("CONTEXT.md must be non-empty");
+      artifactRecords.push({ ...artifact, sha256: streamed.sha256 });
+      continue;
+    }
+    const contents = await readJsonArtifactWithin(basePath, artifact.path);
+    validateJsonArtifactContents(artifact.kind, artifact.path, contents, key);
+    artifactRecords.push({ ...artifact, sha256: digest(contents) });
+  }
+  const documentRecords: DocumentRecord[] = [];
+  for (const document of documents) {
+    const streamed = await streamDigestWithin(basePath, document.path, false);
+    validateBusinessSize(streamed.size, document.path);
+    documentRecords.push({ ...document, sha256: streamed.sha256 });
+  }
   return {
     artifacts: artifactRecords.sort((left, right) => left.path.localeCompare(right.path)),
     documents: documentRecords.sort((left, right) => left.path.localeCompare(right.path)),

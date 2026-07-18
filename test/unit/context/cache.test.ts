@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -396,6 +396,106 @@ describe("ContextCache", () => {
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
   });
 
+  it("rejects an otherwise schema-valid knowledge graph with zero nodes", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const emptyGraph = { ...knowledgeGraph(), nodes: [], edges: [], layers: [], tour: [] };
+    await writeFile(
+      path.join(staging, ".understand-anything/knowledge-graph.json"),
+      JSON.stringify(emptyGraph),
+      "utf8",
+    );
+    await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+
+    const hitRoot = await tempRoot();
+    const hitCache = new ContextCache(hitRoot);
+    await promoteValid(hitRoot);
+    await replaceStoredArtifact(hitRoot, ".understand-anything/knowledge-graph.json", emptyGraph);
+    await expect(hitCache.lookupContext(key)).resolves.toBeUndefined();
+  });
+
+  it.each([
+    "",
+    "   ",
+    "nul\0path.ts",
+    "/absolute/path.ts",
+    ".",
+    "..",
+    "src/../secret.ts",
+    "src\\..\\secret.ts",
+    "src/\\../secret.ts",
+    "C:/absolute.ts",
+    "C:\\absolute.ts",
+    "C:drive-relative.ts",
+    "\\\\server\\share\\file.ts",
+    "\\\\?\\C:\\device.ts",
+    "src//empty-segment.ts",
+    "src\\\\empty-segment.ts",
+  ])("rejects unsafe graph-node filePath provenance %j", async (filePath) => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const graph = knowledgeGraph();
+    (graph.nodes as Record<string, unknown>[])[0]!.filePath = filePath;
+    await writeFile(
+      path.join(staging, ".understand-anything/knowledge-graph.json"),
+      JSON.stringify(graph),
+      "utf8",
+    );
+
+    await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+  });
+
+  it("applies safe filePath provenance to domain nodes and accepts both normal separators", async () => {
+    const invalidRoot = await tempRoot();
+    const invalidStaging = await createStaging(invalidRoot);
+    const invalidDomain = domainGraph();
+    (invalidDomain.nodes as Record<string, unknown>[])[2]!.filePath = "src\\..\\escape.ts";
+    await writeFile(
+      path.join(invalidStaging, ".understand-anything/domain-graph.json"),
+      JSON.stringify(invalidDomain),
+      "utf8",
+    );
+    await expect(new ContextCache(invalidRoot).promoteContext(invalidStaging, input())).rejects.toThrow(
+      /graph schema/i,
+    );
+
+    for (const filePath of ["src/context/cache.ts", "src\\context\\cache.ts"]) {
+      const root = await tempRoot();
+      const staging = await createStaging(root);
+      const graph = domainGraph();
+      (graph.nodes as Record<string, unknown>[])[2]!.filePath = filePath;
+      await writeFile(
+        path.join(staging, ".understand-anything/domain-graph.json"),
+        JSON.stringify(graph),
+        "utf8",
+      );
+      await expect(new ContextCache(root).promoteContext(staging, input())).resolves.toMatchObject({
+        status: "ready",
+      });
+    }
+  });
+
+  it("rejects oversized sparse JSON graphs before reading or parsing them", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const staging = await createStaging(root);
+    const graphPath = path.join(staging, ".understand-anything/knowledge-graph.json");
+    await truncate(graphPath, 64 * 1024 * 1024 + 1);
+    await chmod(graphPath, 0o000);
+    try {
+      await expect(cache.promoteContext(staging, input())).rejects.toThrow(/maximum.*size/i);
+    } finally {
+      await chmod(graphPath, 0o600);
+    }
+    await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+
+    const hitRoot = await tempRoot();
+    const hitCache = new ContextCache(hitRoot);
+    await promoteValid(hitRoot);
+    await truncate(path.join(hitCache.entryPath(key), ".understand-anything/knowledge-graph.json"), 64 * 1024 * 1024 + 1);
+    await expect(hitCache.lookupContext(key)).resolves.toBeUndefined();
+  });
+
   it("rejects malformed optional node metadata and non-object graph entries", async () => {
     const base = knowledgeGraph();
     const validNode = (base.nodes as Record<string, unknown>[])[0]!;
@@ -524,6 +624,50 @@ describe("ContextCache", () => {
 
     await writeFile(path.join(cache.entryPath(key), "business/ticket.md"), "changed", "utf8");
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+  });
+
+  it("streams optional business documents and computes a correct multi-chunk digest", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const staging = await createStaging(root);
+    const contents = Buffer.alloc(256 * 1024 + 17);
+    for (let index = 0; index < contents.length; index += 1) contents[index] = index % 251;
+    await writeFile(path.join(staging, "business.bin"), contents);
+
+    const promoted = await cache.promoteContext(
+      staging,
+      input({ documents: [{ kind: "business-reference", path: "business.bin" }] }),
+    );
+
+    expect(promoted.documents[0]?.sha256).toBe(createHash("sha256").update(contents).digest("hex"));
+    await expect(cache.lookupContext(key)).resolves.toEqual(promoted);
+  });
+
+  it("propagates document path I/O faults before opening a stream", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const businessDirectory = path.join(staging, "business");
+    await mkdir(businessDirectory);
+    await writeFile(path.join(businessDirectory, "ticket.md"), "ticket", "utf8");
+    await chmod(businessDirectory, 0o000);
+    try {
+      await expect(
+        new ContextCache(root).promoteContext(
+          staging,
+          input({ documents: [{ kind: "business-reference", path: "business/ticket.md" }] }),
+        ),
+      ).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      await chmod(businessDirectory, 0o700);
+    }
+  });
+
+  it("preserves streamed text semantics when the decoder flushes a final replacement character", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    await writeFile(path.join(staging, "CONTEXT.md"), Buffer.from([0x20, 0xe2]));
+
+    await expect(new ContextCache(root).promoteContext(staging, input())).resolves.toMatchObject({ status: "ready" });
   });
 
   it.each([
