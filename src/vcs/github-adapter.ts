@@ -1,6 +1,15 @@
 import { execFile } from "node:child_process";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
-import type { BotComment, InlineReviewComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "./adapter.js";
+import type {
+  BotComment,
+  InlineReviewComment,
+  PullRequestInfo,
+  PullRequestSnapshot,
+  RepositoryRef,
+  RepositoryScopedVcsAdapter,
+  RuleFileContent,
+  VcsAdapter,
+} from "./adapter.js";
 
 /**
  * Seam for shelling out to the `gh` CLI. GitHubAdapter accepts an ExecGh
@@ -68,6 +77,8 @@ const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40})(?: cfg=([0-9a-
 interface GhPrViewJson {
   headRefOid: string;
   baseRefOid: string;
+  headRefName?: string;
+  baseRefName?: string;
   title: string;
   body: string;
   url?: string;
@@ -154,16 +165,45 @@ function isNotFoundError(err: unknown): boolean {
   return err instanceof Error && /HTTP 404/.test(err.message);
 }
 
+function isRepositoryRef(value: string | RepositoryRef): value is RepositoryRef {
+  return typeof value !== "string";
+}
+
+function resolvePullLocator(
+  repoOrId: string | RepositoryRef,
+  number?: number,
+): { repo?: RepositoryRef; id: string } {
+  if (isRepositoryRef(repoOrId)) {
+    if (!Number.isSafeInteger(number) || (number ?? 0) <= 0) {
+      throw new Error("A positive pull-request number is required with an explicit repository");
+    }
+    return { repo: repoOrId, id: String(number) };
+  }
+  return { id: repoOrId };
+}
+
+function repoFlag(repo?: RepositoryRef): string[] {
+  // `gh pr` documents `--repo [HOST/]OWNER/REPO` as the explicit selector:
+  // https://cli.github.com/manual/gh_pr_view
+  return repo ? ["--repo", `${repo.owner}/${repo.repo}`] : [];
+}
+
+function apiRepo(repo?: RepositoryRef): string {
+  // `gh api` documents that {owner}/{repo} placeholders use ambient context;
+  // canonical-URL runs therefore render the REST path explicitly instead:
+  // https://cli.github.com/manual/gh_api
+  return repo ? `repos/${repo.owner}/${repo.repo}` : "repos/{owner}/{repo}";
+}
+
 /**
  * GitHubAdapter: VcsAdapter implementation backed by the `gh` CLI.
  *
- * Owner/repo resolution: every `gh pr ...` / `gh api repos/{owner}/{repo}/...`
- * invocation relies on `gh`'s own repo-context inference (current git
- * remote, or `GH_REPO`/`GITHUB_REPOSITORY` env vars in CI) rather than a
- * hardcoded `--repo owner/repo` flag, per TASKS.md Task 2's "Owner/repo
- * resolution" note.
+ * Canonical-URL calls accept a RepositoryRef and use `--repo owner/repo`,
+ * explicit REST paths, and explicit GraphQL variables. Legacy one-argument
+ * calls retain ambient gh context for backward compatibility until their
+ * documented migration path is retired.
  */
-export class GitHubAdapter implements VcsAdapter {
+export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
   constructor(private readonly execGh: ExecGh = realExecGh) {}
 
   // Caches the resolved bot login (the currently-authenticated `gh` identity)
@@ -197,15 +237,40 @@ export class GitHubAdapter implements VcsAdapter {
    * owner/repo `gh` actually resolved from its ambient context — review() logs
    * it so a mis-inferred repo target is visible, not silent.
    */
-  async getPullRequest(id: string): Promise<PullRequestInfo> {
+  async getPullRequest(id: string): Promise<PullRequestInfo>;
+  async getPullRequest(repo: RepositoryRef, number: number): Promise<PullRequestSnapshot>;
+  async getPullRequest(
+    repoOrId: string | RepositoryRef,
+    number?: number,
+  ): Promise<PullRequestInfo | PullRequestSnapshot> {
+    const { repo, id } = resolvePullLocator(repoOrId, number);
+    const fields = repo
+      ? "headRefOid,baseRefOid,headRefName,baseRefName,title,body,url"
+      : "headRefOid,baseRefOid,title,body,url";
     const out = await this.execGh([
       "pr",
       "view",
       id,
+      ...repoFlag(repo),
       "--json",
-      "headRefOid,baseRefOid,title,body,url",
+      fields,
     ]);
     const parsed = JSON.parse(out) as GhPrViewJson;
+    if (repo) {
+      if (typeof parsed.headRefName !== "string" || typeof parsed.baseRefName !== "string") {
+        throw new Error("invalid response from gh pr view: missing base/head ref names");
+      }
+      return {
+        number: Number(id),
+        headSha: parsed.headRefOid,
+        baseSha: parsed.baseRefOid,
+        headRef: parsed.headRefName,
+        baseRef: parsed.baseRefName,
+        title: parsed.title,
+        description: parsed.body,
+        url: parsed.url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${id}`,
+      };
+    }
     return {
       id,
       headSha: parsed.headRefOid,
@@ -216,8 +281,11 @@ export class GitHubAdapter implements VcsAdapter {
     };
   }
 
-  async getDiff(id: string): Promise<string> {
-    return this.execGh(["pr", "diff", id]);
+  async getDiff(id: string): Promise<string>;
+  async getDiff(repo: RepositoryRef, number: number): Promise<string>;
+  async getDiff(repoOrId: string | RepositoryRef, number?: number): Promise<string> {
+    const { repo, id } = resolvePullLocator(repoOrId, number);
+    return this.execGh(["pr", "diff", id, ...repoFlag(repo)]);
   }
 
   /**
@@ -265,7 +333,13 @@ export class GitHubAdapter implements VcsAdapter {
    * `null` here would cause upsertComment to CREATE a second comment
    * instead of editing the existing (malformed) one.
    */
-  async findBotComment(id: string): Promise<BotComment | null> {
+  async findBotComment(id: string): Promise<BotComment | null>;
+  async findBotComment(repo: RepositoryRef, number: number): Promise<BotComment | null>;
+  async findBotComment(
+    repoOrId: string | RepositoryRef,
+    number?: number,
+  ): Promise<BotComment | null> {
+    const { repo, id } = resolvePullLocator(repoOrId, number);
     const botLogin = await this.getBotLogin();
     const out = await this.execGh([
       "api",
@@ -274,7 +348,7 @@ export class GitHubAdapter implements VcsAdapter {
       "--paginate",
       "-f",
       "per_page=100",
-      `repos/{owner}/{repo}/issues/${id}/comments`,
+      `${apiRepo(repo)}/issues/${id}/comments`,
     ]);
     const comments = JSON.parse(out) as GhIssueComment[];
     for (const comment of comments) {
@@ -301,12 +375,31 @@ export class GitHubAdapter implements VcsAdapter {
    * and never relies on `--edit-last` (which could target a human's comment
    * posted after the bot's).
    */
-  async upsertComment(id: string, body: string, existing: BotComment | null): Promise<void> {
+  async upsertComment(id: string, body: string, existing: BotComment | null): Promise<void>;
+  async upsertComment(
+    repo: RepositoryRef,
+    number: number,
+    body: string,
+    existing: BotComment | null,
+  ): Promise<void>;
+  async upsertComment(
+    repoOrId: string | RepositoryRef,
+    numberOrBody: number | string,
+    bodyOrExisting: string | BotComment | null,
+    maybeExisting?: BotComment | null,
+  ): Promise<void> {
+    const explicit = isRepositoryRef(repoOrId);
+    const { repo, id } = resolvePullLocator(
+      repoOrId,
+      explicit ? (numberOrBody as number) : undefined,
+    );
+    const body = explicit ? (bodyOrExisting as string) : (numberOrBody as string);
+    const existing = explicit ? (maybeExisting ?? null) : (bodyOrExisting as BotComment | null);
     if (existing === null) {
-      await this.execGh(["pr", "comment", id, "--body-file", "-"], body);
+      await this.execGh(["pr", "comment", id, ...repoFlag(repo), "--body-file", "-"], body);
     } else {
       await this.execGh(
-        ["api", `repos/{owner}/{repo}/issues/comments/${existing.id}`, "-X", "PATCH", "--input", "-"],
+        ["api", `${apiRepo(repo)}/issues/comments/${existing.id}`, "-X", "PATCH", "--input", "-"],
         JSON.stringify({ body }),
       );
     }
@@ -334,7 +427,28 @@ export class GitHubAdapter implements VcsAdapter {
     id: string,
     headSha: string,
     comments: InlineReviewComment[],
+  ): Promise<void>;
+  async createInlineReview(
+    repo: RepositoryRef,
+    number: number,
+    headSha: string,
+    comments: InlineReviewComment[],
+  ): Promise<void>;
+  async createInlineReview(
+    repoOrId: string | RepositoryRef,
+    numberOrHeadSha: number | string,
+    headShaOrComments: string | InlineReviewComment[],
+    maybeComments?: InlineReviewComment[],
   ): Promise<void> {
+    const explicit = isRepositoryRef(repoOrId);
+    const { repo, id } = resolvePullLocator(
+      repoOrId,
+      explicit ? (numberOrHeadSha as number) : undefined,
+    );
+    const headSha = explicit ? (headShaOrComments as string) : (numberOrHeadSha as string);
+    const comments = explicit
+      ? (maybeComments ?? [])
+      : (headShaOrComments as InlineReviewComment[]);
     if (comments.length === 0) return;
 
     const payload = {
@@ -354,7 +468,7 @@ export class GitHubAdapter implements VcsAdapter {
     };
 
     await this.execGh(
-      ["api", `repos/{owner}/{repo}/pulls/${id}/reviews`, "-X", "POST", "--input", "-"],
+      ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, "-X", "POST", "--input", "-"],
       JSON.stringify(payload),
     );
   }
@@ -405,10 +519,18 @@ export class GitHubAdapter implements VcsAdapter {
    * discipline findBotComment uses. Mutations run sequentially — resolving is
    * cosmetic cleanup, so gentle pacing beats hammering the API concurrently.
    */
-  async resolveStaleReviewThreads(id: string): Promise<number> {
+  async resolveStaleReviewThreads(id: string): Promise<number>;
+  async resolveStaleReviewThreads(repo: RepositoryRef, number: number): Promise<number>;
+  async resolveStaleReviewThreads(
+    repoOrId: string | RepositoryRef,
+    number?: number,
+  ): Promise<number> {
+    const { repo, id } = resolvePullLocator(repoOrId, number);
     const [botLogin, { owner, name }] = await Promise.all([
       this.getBotLogin(),
-      this.getRepoOwnerAndName(),
+      repo
+        ? Promise.resolve({ owner: repo.owner, name: repo.repo })
+        : this.getRepoOwnerAndName(),
     ]);
 
     const staleThreadIds: string[] = [];
@@ -506,10 +628,24 @@ export class GitHubAdapter implements VcsAdapter {
    * one extra `gh api` round trip per nested directory; neither is
    * necessary for v1's flat `.tgd-review/rules/*.md` layout.
    */
-  async getRuleFilesFromBase(baseSha: string, rulesDir: string): Promise<RuleFileContent[]> {
+  async getRuleFilesFromBase(baseSha: string, rulesDir: string): Promise<RuleFileContent[]>;
+  async getRuleFilesFromBase(
+    repo: RepositoryRef,
+    baseSha: string,
+    rulesDir: string,
+  ): Promise<RuleFileContent[]>;
+  async getRuleFilesFromBase(
+    repoOrBaseSha: RepositoryRef | string,
+    baseShaOrRulesDir: string,
+    maybeRulesDir?: string,
+  ): Promise<RuleFileContent[]> {
+    const explicit = isRepositoryRef(repoOrBaseSha);
+    const repo = explicit ? repoOrBaseSha : undefined;
+    const baseSha = explicit ? baseShaOrRulesDir : repoOrBaseSha;
+    const rulesDir = explicit ? (maybeRulesDir as string) : baseShaOrRulesDir;
     let entries: GhContentsEntry[];
     try {
-      const out = await this.execGh(["api", `repos/{owner}/{repo}/contents/${rulesDir}?ref=${baseSha}`]);
+      const out = await this.execGh(["api", `${apiRepo(repo)}/contents/${rulesDir}?ref=${baseSha}`]);
       const parsed = JSON.parse(out) as unknown;
       // The Contents API returns a single object (not an array) when the
       // given path resolves to a FILE rather than a directory. rulesDir is
@@ -529,7 +665,7 @@ export class GitHubAdapter implements VcsAdapter {
     // first genuine rejection, per this method's error-handling contract.
     return Promise.all(
       mdFileEntries.map(async (entry) => {
-        const out = await this.execGh(["api", `repos/{owner}/{repo}/contents/${entry.path}?ref=${baseSha}`]);
+        const out = await this.execGh(["api", `${apiRepo(repo)}/contents/${entry.path}?ref=${baseSha}`]);
         const parsed = JSON.parse(out) as GhContentsFileResponse;
         return { path: entry.name, content: Buffer.from(parsed.content, "base64").toString("utf-8") };
       }),

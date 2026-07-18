@@ -71,6 +71,48 @@ export interface VcsAdapter {
   getRuleFilesFromBase(baseSha: string, rulesDir: string): Promise<RuleFileContent[]>;
 }
 
+export interface RepositoryRef {
+  host: "github.com";
+  owner: string;
+  repo: string;
+}
+
+export interface PullRequestSnapshot {
+  number: number;
+  headSha: string;
+  baseSha: string;
+  headRef: string;
+  baseRef: string;
+  title: string;
+  description: string;
+  url: string;
+}
+
+/** Location-independent VCS operations used by canonical-URL review runs. */
+export interface RepositoryScopedVcsAdapter {
+  getPullRequest(repo: RepositoryRef, number: number): Promise<PullRequestSnapshot>;
+  getDiff(repo: RepositoryRef, number: number): Promise<string>;
+  findBotComment(repo: RepositoryRef, number: number): Promise<BotComment | null>;
+  upsertComment(
+    repo: RepositoryRef,
+    number: number,
+    body: string,
+    existing: BotComment | null,
+  ): Promise<void>;
+  createInlineReview(
+    repo: RepositoryRef,
+    number: number,
+    headSha: string,
+    comments: InlineReviewComment[],
+  ): Promise<void>;
+  resolveStaleReviewThreads(repo: RepositoryRef, number: number): Promise<number>;
+  getRuleFilesFromBase(
+    repo: RepositoryRef,
+    baseSha: string,
+    rulesDir: string,
+  ): Promise<RuleFileContent[]>;
+}
+
 export interface InlineReviewComment {
   /** Repo-relative path on the NEW side of the diff. */
   path: string;

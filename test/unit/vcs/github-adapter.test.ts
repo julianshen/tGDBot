@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
 import { INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
-import type { BotComment } from "../../../src/vcs/adapter.js";
+import type { BotComment, RepositoryRef } from "../../../src/vcs/adapter.js";
 
 const fixturePath = (name: string): string =>
   fileURLToPath(new URL(`../../fixtures/${name}`, import.meta.url));
@@ -31,6 +31,153 @@ const mockExecGhWithIdentity = (userFixture: string, commentsFixture: string) =>
   });
 
 describe("GitHubAdapter", () => {
+  const explicitRepo: RepositoryRef = {
+    host: "github.com",
+    owner: "octo-org",
+    repo: "octo-repo",
+  };
+
+  it("AC-2.1: scopes PR metadata and diff calls to the explicit repository", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "view") {
+        return JSON.stringify({
+          headRefOid: "abc123",
+          baseRefOid: "def456",
+          headRefName: "feature/topic",
+          baseRefName: "main",
+          title: "Explicit target",
+          body: "Body",
+          url: "https://github.com/octo-org/octo-repo/pull/42",
+        });
+      }
+      return "diff --git a/a.ts b/a.ts";
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    const pr = await adapter.getPullRequest(explicitRepo, 42);
+    const diff = await adapter.getDiff(explicitRepo, 42);
+
+    expect(pr).toEqual({
+      number: 42,
+      headSha: "abc123",
+      baseSha: "def456",
+      headRef: "feature/topic",
+      baseRef: "main",
+      title: "Explicit target",
+      description: "Body",
+      url: "https://github.com/octo-org/octo-repo/pull/42",
+    });
+    expect(diff).toBe("diff --git a/a.ts b/a.ts");
+    expect(execGh).toHaveBeenNthCalledWith(1, [
+      "pr",
+      "view",
+      "42",
+      "--repo",
+      "octo-org/octo-repo",
+      "--json",
+      "headRefOid,baseRefOid,headRefName,baseRefName,title,body,url",
+    ]);
+    expect(execGh).toHaveBeenNthCalledWith(2, [
+      "pr",
+      "diff",
+      "42",
+      "--repo",
+      "octo-org/octo-repo",
+    ]);
+  });
+
+  it("AC-2.2: scopes summary, inline, and trusted-rule operations to the explicit repository", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args.includes("repos/octo-org/octo-repo/issues/42/comments")) {
+        return readFixture("gh-comments.json");
+      }
+      if (args.includes("repos/octo-org/octo-repo/contents/.tgd-review/rules?ref=def456")) {
+        return "[]";
+      }
+      return "{}";
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.findBotComment(explicitRepo, 42);
+    await adapter.upsertComment(explicitRepo, 42, "summary", null);
+    await adapter.upsertComment(explicitRepo, 42, "updated", {
+      id: "99",
+      body: "old",
+      lastReviewedSha: "abc1234",
+      reviewedConfig: "cfg",
+    });
+    await adapter.createInlineReview(explicitRepo, 42, "abc123", [
+      { path: "src/a.ts", line: 7, body: "finding" },
+    ]);
+    await adapter.getRuleFilesFromBase(explicitRepo, "def456", ".tgd-review/rules");
+
+    const calls = execGh.mock.calls.map(([args]) => args as string[]);
+    expect(calls).toContainEqual([
+      ...PAGINATED_COMMENTS_ARGS_PREFIX,
+      "repos/octo-org/octo-repo/issues/42/comments",
+    ]);
+    expect(calls).toContainEqual([
+      "pr",
+      "comment",
+      "42",
+      "--repo",
+      "octo-org/octo-repo",
+      "--body-file",
+      "-",
+    ]);
+    expect(calls).toContainEqual([
+      "api",
+      "repos/octo-org/octo-repo/issues/comments/99",
+      "-X",
+      "PATCH",
+      "--input",
+      "-",
+    ]);
+    expect(calls).toContainEqual([
+      "api",
+      "repos/octo-org/octo-repo/pulls/42/reviews",
+      "-X",
+      "POST",
+      "--input",
+      "-",
+    ]);
+    expect(calls).toContainEqual([
+      "api",
+      "repos/octo-org/octo-repo/contents/.tgd-review/rules?ref=def456",
+    ]);
+    expect(calls.some((args) => args.join(" ").includes("{owner}"))).toBe(false);
+  });
+
+  it("AC-2.2: resolves stale threads with explicit GraphQL owner/name and no ambient repo lookup", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      if (args[0] === "api" && args[1] === "graphql") {
+        return JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] },
+              },
+            },
+          },
+        });
+      }
+      throw new Error(`unexpected ambient command: ${args.join(" ")}`);
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.resolveStaleReviewThreads(explicitRepo, 42)).resolves.toBe(0);
+
+    expect(execGh.mock.calls.some(([args]) => (args as string[])[0] === "repo")).toBe(false);
+    const graphQlArgs = execGh.mock.calls
+      .map(([args]) => args as string[])
+      .find((args) => args[0] === "api" && args[1] === "graphql");
+    expect(graphQlArgs).toContain("owner=octo-org");
+    expect(graphQlArgs).toContain("name=octo-repo");
+    expect(graphQlArgs).toContain("number=42");
+  });
+
   // AC-2.1: Given a mocked `gh pr view` response for PR 42, When
   // getPullRequest("42") is called, Then it returns a PullRequestInfo with
   // the correct headSha, baseSha, title, description parsed from that JSON.
