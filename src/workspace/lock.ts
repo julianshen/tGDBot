@@ -1,4 +1,5 @@
 import { hostname } from "node:os";
+import { performance } from "node:perf_hooks";
 import { lstat, mkdir, open, readFile, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
@@ -213,10 +214,14 @@ export async function withRepositoryLock<T>(
 
   const metadata = buildMetadata(options.owner);
   const contents = `${JSON.stringify(metadata)}\n`;
-  const deadline = Date.now() + options.timeoutMs;
+  const deadline = performance.now() + options.timeoutMs;
 
   await mkdir(path.dirname(options.lockPath), { recursive: true });
+  let isInitialAttempt = true;
   while (true) {
+    if (!isInitialAttempt && performance.now() >= deadline) {
+      throw await timeoutError(options.lockPath, options.timeoutMs);
+    }
     const acquiredLock = await tryAcquireLock(options.lockPath, contents);
     if (acquiredLock !== null) {
       const workResult = await Promise.resolve().then(work).then(
@@ -240,7 +245,9 @@ export async function withRepositoryLock<T>(
         }
       }
     }
-    if (Date.now() >= deadline) throw await timeoutError(options.lockPath, options.timeoutMs);
-    await delay(Math.min(pollMs, deadline - Date.now()));
+    isInitialAttempt = false;
+    const remainingMs = deadline - performance.now();
+    if (remainingMs <= 0) throw await timeoutError(options.lockPath, options.timeoutMs);
+    await delay(Math.min(pollMs, remainingMs));
   }
 }

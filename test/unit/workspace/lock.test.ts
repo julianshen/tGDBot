@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,13 +6,24 @@ import { withRepositoryLock } from "../../../src/workspace/lock.js";
 
 const mockedFs = vi.hoisted(() => ({
   open: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
+  unlink: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
 }));
+const mockedClock = vi.hoisted(() => ({ now: undefined as undefined | (() => number) }));
 
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
     open: (...args: unknown[]) => mockedFs.open === undefined ? actual.open(...args as Parameters<typeof actual.open>) : mockedFs.open(...args),
+    unlink: (...args: unknown[]) => mockedFs.unlink === undefined ? actual.unlink(...args as Parameters<typeof actual.unlink>) : mockedFs.unlink(...args),
+  };
+});
+
+vi.mock("node:perf_hooks", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:perf_hooks")>();
+  return {
+    ...actual,
+    performance: { now: () => mockedClock.now === undefined ? actual.performance.now() : mockedClock.now() },
   };
 });
 
@@ -35,6 +46,8 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   mockedFs.open = undefined;
+  mockedFs.unlink = undefined;
+  mockedClock.now = undefined;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -58,6 +71,7 @@ describe("withRepositoryLock", () => {
 
   it("AC-4.1: serializes callers using the same repository lock path", async () => {
     vi.useFakeTimers();
+    mockedClock.now = () => Date.now();
     const lockPath = await tempLockPath();
     const firstEntered = deferred();
     const releaseFirst = deferred();
@@ -79,6 +93,44 @@ describe("withRepositoryLock", () => {
     await vi.advanceTimersByTimeAsync(1);
     await expect(second).resolves.toBe("second");
     expect(secondWork).toHaveBeenCalledOnce();
+  });
+
+  it("times out before a delayed retry can acquire a released lock", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    mockedClock.now = () => now;
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const lockPath = await tempLockPath();
+    await writeFile(lockPath, "contended", "utf8");
+    const work = vi.fn(async () => "must not run");
+    const firstContention = deferred();
+    const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
+    mockedFs.open = async (...args) => {
+      try {
+        return await realOpen(...args);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") firstContention.resolve();
+        throw error;
+      }
+    };
+
+    const waiting = withRepositoryLock({ lockPath, timeoutMs: 20, pollMs: 5, owner }, work);
+    await firstContention.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    now = 60;
+    await rm(lockPath);
+    const rejection = expect(waiting).rejects.toThrow(/Timed out acquiring repository lock/);
+    await vi.advanceTimersByTimeAsync(5);
+
+    await rejection;
+    expect(work).not.toHaveBeenCalled();
+  });
+
+  it("allows the immediate acquisition attempt when timeout is zero", async () => {
+    const lockPath = await tempLockPath();
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 0, owner }, async () => "acquired"))
+      .resolves.toBe("acquired");
   });
 
   it("records non-secret owner metadata while the lock is held and releases after success", async () => {
@@ -267,19 +319,10 @@ describe("withRepositoryLock", () => {
 
   it("reports an unlink failure instead of silently claiming release", async () => {
     const lockPath = await tempLockPath();
-    let releaseError: unknown;
-    try {
-      await withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => {
-        await chmod(path.dirname(lockPath), 0o500);
-      });
-    } catch (error) {
-      releaseError = error;
-    } finally {
-      await chmod(path.dirname(lockPath), 0o700);
-    }
+    mockedFs.unlink = async () => { throw new Error("permission denied"); };
 
-    expect(releaseError).toBeInstanceOf(Error);
-    expect((releaseError as Error).message).toMatch(/Failed to release repository lock/);
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => undefined))
+      .rejects.toThrow(/Failed to release repository lock/);
     await expect(readFile(lockPath, "utf8")).resolves.toContain(owner.runId);
   });
 
@@ -303,6 +346,7 @@ describe("withRepositoryLock", () => {
 
   it("times out deterministically, reports safe existing-owner metadata, and never deletes it", async () => {
     vi.useFakeTimers();
+    mockedClock.now = () => Date.now();
     const lockPath = await tempLockPath();
     await writeFile(lockPath, JSON.stringify({
       version: 1,
@@ -329,6 +373,7 @@ describe("withRepositoryLock", () => {
 
   it("does not echo malformed existing lock contents in timeout diagnostics", async () => {
     vi.useFakeTimers();
+    mockedClock.now = () => Date.now();
     const lockPath = await tempLockPath();
     await writeFile(lockPath, "sensitive malformed lock contents");
 
