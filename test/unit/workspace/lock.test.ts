@@ -118,6 +118,16 @@ describe("withRepositoryLock", () => {
     await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("releases its owned lock when work throws an undefined value", async () => {
+    const lockPath = await tempLockPath();
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => {
+      throw undefined;
+    })).rejects.toBeUndefined();
+
+    await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("propagates an EEXIST error from work unchanged without retrying work", async () => {
     const lockPath = await tempLockPath();
     const workError = Object.assign(new Error("work EEXIST"), { code: "EEXIST" });
@@ -306,7 +316,8 @@ describe("withRepositoryLock", () => {
 
     const waiting = withRepositoryLock({ lockPath, timeoutMs: 25, pollMs: 5, owner }, work);
     const rejection = expect(waiting).rejects.toThrow(/Timed out acquiring repository lock/);
-    await vi.advanceTimersByTimeAsync(25);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(24);
     await rejection;
 
     await expect(waiting).rejects.toThrow(/other-run/);
@@ -327,5 +338,68 @@ describe("withRepositoryLock", () => {
     await expect(waiting).rejects.toThrow(/metadata is unavailable/i);
     await expect(waiting).rejects.not.toThrow(/sensitive malformed/i);
     await expect(readFile(lockPath, "utf8")).resolves.toBe("sensitive malformed lock contents");
+  });
+
+  it.each(["null", JSON.stringify({ version: 1 })])("reports invalid parsed owner metadata safely: %s", async (contents) => {
+    const lockPath = await tempLockPath();
+    await writeFile(lockPath, contents, "utf8");
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 0, owner }, async () => "unreachable"))
+      .rejects.toThrow(/metadata is unavailable or invalid/i);
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(contents);
+  });
+
+  it("propagates a non-contention acquisition error without running work", async () => {
+    const lockPath = await tempLockPath();
+    const acquisitionError = Object.assign(new Error("read-only filesystem"), { code: "EACCES" });
+    mockedFs.open = async () => { throw acquisitionError; };
+    const work = vi.fn(async () => "unreachable");
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, work)).rejects.toBe(acquisitionError);
+    expect(work).not.toHaveBeenCalled();
+  });
+
+  it("leaves the lock in place when identity capture fails after exclusive open", async () => {
+    const lockPath = await tempLockPath();
+    const identityFailure = new Error("fstat failed");
+    const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
+    mockedFs.open = async (...args) => {
+      const handle = await realOpen(...args);
+      return Object.assign(Object.create(handle), {
+        stat: async () => { throw identityFailure; },
+      });
+    };
+
+    const result = await withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => "unreachable")
+      .catch((error: unknown) => error);
+
+    expect(result).toBeInstanceOf(AggregateError);
+    expect((result as AggregateError).errors[0]).toBe(identityFailure);
+    await expect(readFile(lockPath, "utf8")).resolves.toBe("");
+  });
+
+  it("aggregates close and cleanup failures after successful metadata creation", async () => {
+    const lockPath = await tempLockPath();
+    const closeFailure = new Error("close failed");
+    const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
+    mockedFs.open = async (...args) => {
+      const handle = await realOpen(...args);
+      return Object.assign(Object.create(handle), {
+        close: async () => {
+          await handle.close();
+          await rm(lockPath);
+          await writeFile(lockPath, "replacement", "utf8");
+          throw closeFailure;
+        },
+      });
+    };
+    const work = vi.fn(async () => "unreachable");
+
+    const result = await withRepositoryLock({ lockPath, timeoutMs: 100, owner }, work).catch((error: unknown) => error);
+
+    expect(result).toBeInstanceOf(AggregateError);
+    expect((result as AggregateError).errors[0]).toBe(closeFailure);
+    expect(work).not.toHaveBeenCalled();
+    await expect(readFile(lockPath, "utf8")).resolves.toBe("replacement");
   });
 });

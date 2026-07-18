@@ -167,8 +167,7 @@ async function tryAcquireLock(lockPath: string, contents: string): Promise<Acqui
   }
 
   if (!hasPrimaryFailure && closeFailure === undefined) {
-    if (identity === undefined) throw new Error(`Failed to acquire repository lock at ${lockPath}: missing file identity`);
-    return { identity };
+    return { identity: identity as LockFileIdentity };
   }
 
   const cleanupFailures: unknown[] = [];
@@ -220,21 +219,20 @@ export async function withRepositoryLock<T>(
   while (true) {
     const acquiredLock = await tryAcquireLock(options.lockPath, contents);
     if (acquiredLock !== null) {
-      let workFailed = false;
-      let workError: unknown;
+      const workResult = await Promise.resolve().then(work).then(
+        (value) => ({ succeeded: true as const, value }),
+        (error: unknown) => ({ succeeded: false as const, error }),
+      );
       try {
-        return await work();
-      } catch (error) {
-        workFailed = true;
-        workError = error;
-        throw error;
+        if (workResult.succeeded) return workResult.value;
+        throw workResult.error;
       } finally {
         try {
           await releaseOwnedLock(options.lockPath, acquiredLock.identity);
         } catch (releaseError) {
-          if (workFailed) {
+          if (!workResult.succeeded) {
             throw new AggregateError(
-              [workError, releaseError],
+              [workResult.error, releaseError],
               `Repository lock work failed and lock release also failed at ${options.lockPath}`,
             );
           }
