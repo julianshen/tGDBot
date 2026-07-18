@@ -207,6 +207,22 @@ describe("GitHubAdapter", () => {
     ]);
   });
 
+  it("normalizes a null PR body to an empty description for both locator forms", async () => {
+    const execGh = vi.fn(async (args: string[]) => JSON.stringify({
+      headRefOid: "abc123",
+      baseRefOid: "def456",
+      headRefName: args.includes("--repo") ? "feature/topic" : undefined,
+      baseRefName: args.includes("--repo") ? "main" : undefined,
+      title: "No description",
+      body: null,
+      url: "https://github.com/octo-org/octo-repo/pull/42",
+    }));
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getPullRequest(explicitRepo, 42)).resolves.toMatchObject({ description: "" });
+    await expect(adapter.getPullRequest("42")).resolves.toMatchObject({ description: "" });
+  });
+
   // AC-2.2: Given a mocked comment list containing one comment authored by
   // the bot's own identity with body `<!-- tgd-review-agent:sha=abc123... -->`,
   // When findBotComment("42") is called, Then it returns that comment with

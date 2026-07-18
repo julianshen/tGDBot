@@ -28,8 +28,20 @@ async function exists(path: string): Promise<boolean> {
 }
 
 function isExpectedOrigin(origin: string, owner: string, repo: string): boolean {
-  const normalized = origin.trim().replace(/\.git$/i, "").toLowerCase();
   const slug = `${owner}/${repo}`.toLowerCase();
+  const normalized = origin.trim().replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+  try {
+    const parsed = new URL(normalized);
+    if (
+      parsed.protocol === "https:" &&
+      parsed.hostname === "github.com" &&
+      parsed.pathname.replace(/^\//, "") === slug
+    ) {
+      return true;
+    }
+  } catch {
+    // SCP-style Git origins are not valid URLs and are checked below.
+  }
   return normalized === `https://github.com/${slug}` ||
     normalized === `git@github.com:${slug}` ||
     normalized === `ssh://git@github.com/${slug}`;
@@ -53,7 +65,11 @@ export async function prepareWorkspace(
   if (await exists(paths.baseWorktreePath)) {
     let marker: typeof expectedMarker;
     try {
-      marker = JSON.parse(await readFile(paths.ownerMarkerPath, "utf8")) as typeof expectedMarker;
+      const parsed: unknown = JSON.parse(await readFile(paths.ownerMarkerPath, "utf8"));
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("invalid ownership marker");
+      }
+      marker = parsed as typeof expectedMarker;
     } catch {
       throw new Error(`Refusing unmanaged worktree collision at ${paths.baseWorktreePath}`);
     }
@@ -61,7 +77,7 @@ export async function prepareWorkspace(
       throw new Error(`Refusing unmanaged worktree ownership mismatch at ${paths.baseWorktreePath}`);
     }
     const actualHead = (await dependencies.exec("git", ["-C", paths.baseWorktreePath, "rev-parse", "HEAD"])).trim();
-    if (actualHead.toLowerCase() !== expectedMarker.baseSha) {
+    if (!actualHead.toLowerCase().startsWith(expectedMarker.baseSha)) {
       throw new Error(`Managed worktree HEAD does not match requested base SHA at ${paths.baseWorktreePath}`);
     }
     return { ...paths, baseSha: expectedMarker.baseSha };

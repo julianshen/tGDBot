@@ -80,7 +80,7 @@ interface GhPrViewJson {
   headRefName?: string;
   baseRefName?: string;
   title: string;
-  body: string;
+  body?: string | null;
   url?: string;
 }
 
@@ -267,7 +267,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
         headRef: parsed.headRefName,
         baseRef: parsed.baseRefName,
         title: parsed.title,
-        description: parsed.body,
+        description: parsed.body ?? "",
         url: parsed.url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${id}`,
       };
     }
@@ -276,7 +276,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
       headSha: parsed.headRefOid,
       baseSha: parsed.baseRefOid,
       title: parsed.title,
-      description: parsed.body,
+      description: parsed.body ?? "",
       url: parsed.url,
     };
   }
