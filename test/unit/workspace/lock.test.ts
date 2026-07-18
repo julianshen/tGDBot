@@ -4,6 +4,18 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { withRepositoryLock } from "../../../src/workspace/lock.js";
 
+const mockedFs = vi.hoisted(() => ({
+  open: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
+}));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...actual,
+    open: (...args: unknown[]) => mockedFs.open === undefined ? actual.open(...args as Parameters<typeof actual.open>) : mockedFs.open(...args),
+  };
+});
+
 const roots: string[] = [];
 const owner = { runId: "run-123" };
 
@@ -22,6 +34,7 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => voi
 afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  mockedFs.open = undefined;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -105,15 +118,40 @@ describe("withRepositoryLock", () => {
     await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("propagates an EEXIST error from work unchanged without retrying work", async () => {
+    const lockPath = await tempLockPath();
+    const workError = Object.assign(new Error("work EEXIST"), { code: "EEXIST" });
+    const work = vi.fn(async () => {
+      if (work.mock.calls.length === 1) throw workError;
+      return "must not run again";
+    });
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, work)).rejects.toBe(workError);
+    expect(work).toHaveBeenCalledOnce();
+  });
+
   it("leaves a replacement lock in place and surfaces the release failure", async () => {
     const lockPath = await tempLockPath();
     const replacement = "a lock created by another owner\n";
 
     await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => {
+      await rm(lockPath);
       await writeFile(lockPath, replacement, "utf8");
     })).rejects.toThrow(/Failed to release repository lock/);
 
     await expect(readFile(lockPath, "utf8")).resolves.toBe(replacement);
+  });
+
+  it("does not unlink an identical-content replacement lock", async () => {
+    const lockPath = await tempLockPath();
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => {
+      const contents = await readFile(lockPath, "utf8");
+      await rm(lockPath);
+      await writeFile(lockPath, contents, "utf8");
+    })).rejects.toThrow(/Failed to release repository lock/);
+
+    await expect(readFile(lockPath, "utf8")).resolves.toContain(owner.runId);
   });
 
   it("preserves the work failure when releasing the owned lock also fails", async () => {
@@ -121,6 +159,7 @@ describe("withRepositoryLock", () => {
     const workError = new Error("review failed");
 
     const result = await withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => {
+      await rm(lockPath);
       await writeFile(lockPath, "replacement lock\n", "utf8");
       throw workError;
     }).catch((error: unknown) => error);
@@ -148,6 +187,72 @@ describe("withRepositoryLock", () => {
     await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => "unreachable"))
       .rejects.toThrow("disk full");
     await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("leaves an empty replacement lock in place when metadata writing fails", async () => {
+    const lockPath = await tempLockPath();
+    const reference = await open(path.join(path.dirname(lockPath), "reference"), "w");
+    const fileHandlePrototype = Object.getPrototypeOf(reference) as { writeFile: (value: string) => Promise<void> };
+    await reference.close();
+    vi.spyOn(fileHandlePrototype, "writeFile").mockImplementationOnce(async () => {
+      await rm(lockPath);
+      await writeFile(lockPath, "", "utf8");
+      throw new Error("disk full");
+    });
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => "unreachable"))
+      .rejects.toThrow(/Failed to initialize repository lock/);
+    await expect(readFile(lockPath, "utf8")).resolves.toBe("");
+  });
+
+  it("releases its lock when closing after metadata creation fails", async () => {
+    const lockPath = await tempLockPath();
+    const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
+    mockedFs.open = async (...args) => {
+      const handle = await realOpen(...args);
+      return Object.assign(Object.create(handle), {
+        close: async () => {
+          await handle.close();
+          throw new Error("close failed");
+        },
+      });
+    };
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => "must not run"))
+      .rejects.toThrow("close failed");
+    await expect(readFile(lockPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("keeps metadata-write failure primary when closing and cleanup also fail", async () => {
+    const lockPath = await tempLockPath();
+    const writeFailure = new Error("disk full");
+    const closeFailure = new Error("close failed");
+    const reference = await open(path.join(path.dirname(lockPath), "reference"), "w");
+    const fileHandlePrototype = Object.getPrototypeOf(reference) as { writeFile: (value: string) => Promise<void> };
+    await reference.close();
+    vi.spyOn(fileHandlePrototype, "writeFile").mockImplementationOnce(async () => {
+      await rm(lockPath);
+      await writeFile(lockPath, "", "utf8");
+      throw writeFailure;
+    });
+    const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
+    mockedFs.open = async (...args) => {
+      const handle = await realOpen(...args);
+      return Object.assign(Object.create(handle), {
+        close: async () => {
+          await handle.close();
+          throw closeFailure;
+        },
+      });
+    };
+
+    const result = await withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => "must not run")
+      .catch((error: unknown) => error);
+
+    expect(result).toBeInstanceOf(AggregateError);
+    expect((result as AggregateError).errors[0]).toBe(writeFailure);
+    expect((result as AggregateError).errors[1]).toBe(closeFailure);
+    await expect(readFile(lockPath, "utf8")).resolves.toBe("");
   });
 
   it("reports an unlink failure instead of silently claiming release", async () => {

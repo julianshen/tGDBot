@@ -1,5 +1,6 @@
 import { hostname } from "node:os";
-import { mkdir, open, readFile, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, unlink } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 const LOCK_SCHEMA_VERSION = 1;
@@ -24,6 +25,15 @@ interface LockMetadata {
   hostname: string;
   runId: string;
   createdAt: string;
+}
+
+interface LockFileIdentity {
+  dev: number;
+  ino: number;
+}
+
+interface AcquiredLock {
+  identity: LockFileIdentity;
 }
 
 function isErrno(error: unknown, code: string): boolean {
@@ -104,15 +114,23 @@ async function timeoutError(lockPath: string, timeoutMs: number): Promise<Error>
   );
 }
 
-async function releaseOwnedLock(lockPath: string, expectedContents: string): Promise<void> {
-  let actualContents: string;
+function identityOf(stats: { dev: number; ino: number }): LockFileIdentity {
+  return { dev: stats.dev, ino: stats.ino };
+}
+
+function hasSameIdentity(left: LockFileIdentity, right: LockFileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+async function releaseOwnedLock(lockPath: string, expectedIdentity: LockFileIdentity): Promise<void> {
+  let currentIdentity: LockFileIdentity;
   try {
-    actualContents = await readFile(lockPath, "utf8");
+    currentIdentity = identityOf(await lstat(lockPath));
   } catch (error) {
     throw new Error(`Failed to release repository lock at ${lockPath}: could not verify ownership`, { cause: error });
   }
-  if (actualContents !== expectedContents) {
-    throw new Error(`Failed to release repository lock at ${lockPath}: lock contents no longer match this owner`);
+  if (!hasSameIdentity(currentIdentity, expectedIdentity)) {
+    throw new Error(`Failed to release repository lock at ${lockPath}: lock file identity no longer matches this owner`);
   }
   try {
     await unlink(lockPath);
@@ -121,27 +139,71 @@ async function releaseOwnedLock(lockPath: string, expectedContents: string): Pro
   }
 }
 
-async function releaseUninitializedLock(lockPath: string, intendedContents: string): Promise<void> {
-  let actualContents: string;
+async function tryAcquireLock(lockPath: string, contents: string): Promise<AcquiredLock | null> {
+  let handle: FileHandle;
   try {
-    actualContents = await readFile(lockPath, "utf8");
+    handle = await open(lockPath, "wx", 0o600);
   } catch (error) {
-    throw new Error(`Failed to release uninitialized repository lock at ${lockPath}`, { cause: error });
+    if (isErrno(error, "EEXIST")) return null;
+    throw error;
   }
-  if (!intendedContents.startsWith(actualContents)) {
-    throw new Error(`Failed to release uninitialized repository lock at ${lockPath}: lock contents no longer match this owner`);
-  }
+
+  let identity: LockFileIdentity | undefined;
+  let primaryFailure: unknown;
+  let hasPrimaryFailure = false;
+  let closeFailure: unknown;
   try {
-    await unlink(lockPath);
+    identity = identityOf(await handle.stat());
+    await handle.writeFile(contents, "utf8");
   } catch (error) {
-    throw new Error(`Failed to release uninitialized repository lock at ${lockPath}`, { cause: error });
+    hasPrimaryFailure = true;
+    primaryFailure = error;
+  } finally {
+    try {
+      await handle.close();
+    } catch (error) {
+      closeFailure = error;
+    }
   }
+
+  if (!hasPrimaryFailure && closeFailure === undefined) {
+    if (identity === undefined) throw new Error(`Failed to acquire repository lock at ${lockPath}: missing file identity`);
+    return { identity };
+  }
+
+  const cleanupFailures: unknown[] = [];
+  if (identity === undefined) {
+    cleanupFailures.push(new Error(`Failed to release repository lock at ${lockPath}: could not verify acquired file identity`));
+  } else {
+    try {
+      await releaseOwnedLock(lockPath, identity);
+    } catch (error) {
+      cleanupFailures.push(error);
+    }
+  }
+  if (hasPrimaryFailure) {
+    if (closeFailure !== undefined) cleanupFailures.unshift(closeFailure);
+    if (cleanupFailures.length > 0) {
+      throw new AggregateError(
+        [primaryFailure, ...cleanupFailures],
+        `Failed to initialize repository lock at ${lockPath}`,
+      );
+    }
+    throw primaryFailure;
+  }
+  if (cleanupFailures.length > 0) {
+    throw new AggregateError(
+      [closeFailure, ...cleanupFailures],
+      `Failed to close and release repository lock at ${lockPath}`,
+    );
+  }
+  throw closeFailure;
 }
 
 /**
  * Runs work while exclusively owning a repository-specific lock file. The lock
- * is never treated as stale or removed unless its exact metadata was created by
- * this invocation.
+ * is never treated as stale and is removed only when its filesystem identity
+ * still matches the file exclusively created by this invocation.
  */
 export async function withRepositoryLock<T>(
   options: RepositoryLockOptions,
@@ -156,21 +218,8 @@ export async function withRepositoryLock<T>(
 
   await mkdir(path.dirname(options.lockPath), { recursive: true });
   while (true) {
-    try {
-      const handle = await open(options.lockPath, "wx", 0o600);
-      try {
-        await handle.writeFile(contents, "utf8");
-      } catch (error) {
-        await handle.close();
-        try {
-          await releaseUninitializedLock(options.lockPath, contents);
-        } catch (releaseError) {
-          throw new AggregateError([error, releaseError], `Failed to initialize repository lock at ${options.lockPath}`);
-        }
-        throw error;
-      }
-      await handle.close();
-
+    const acquiredLock = await tryAcquireLock(options.lockPath, contents);
+    if (acquiredLock !== null) {
       let workFailed = false;
       let workError: unknown;
       try {
@@ -181,7 +230,7 @@ export async function withRepositoryLock<T>(
         throw error;
       } finally {
         try {
-          await releaseOwnedLock(options.lockPath, contents);
+          await releaseOwnedLock(options.lockPath, acquiredLock.identity);
         } catch (releaseError) {
           if (workFailed) {
             throw new AggregateError(
@@ -192,10 +241,8 @@ export async function withRepositoryLock<T>(
           throw releaseError;
         }
       }
-    } catch (error) {
-      if (!isErrno(error, "EEXIST")) throw error;
-      if (Date.now() >= deadline) throw await timeoutError(options.lockPath, options.timeoutMs);
-      await delay(Math.min(pollMs, deadline - Date.now()));
     }
+    if (Date.now() >= deadline) throw await timeoutError(options.lockPath, options.timeoutMs);
+    await delay(Math.min(pollMs, deadline - Date.now()));
   }
 }
