@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, rename as fsRename, rmdir } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename as fsRename, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   ContextValidationError,
@@ -20,11 +20,13 @@ const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_READY_MANIFEST_BYTES = 1024 * 1024;
 type Rename = (source: string, destination: string) => Promise<void>;
 type Open = typeof open;
+type BeforeManifestReplace = (manifestPath: string, temporaryPath: string) => Promise<void>;
 
 export interface ContextCacheDependencies {
   rename?: Rename;
   claimRename?: Rename;
   lookupOpen?: Open;
+  beforeManifestReplace?: BeforeManifestReplace;
 }
 
 export class ContextCacheConflictError extends Error {
@@ -228,27 +230,34 @@ function physicallyBeneath(base: string, candidate: string): boolean {
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
-async function writeReadyManifest(manifestPath: string, contents: string): Promise<void> {
-  let handle;
+async function writeReadyManifest(
+  manifestPath: string,
+  contents: string,
+  beforeReplace: BeforeManifestReplace,
+): Promise<void> {
+  const temporaryPath = `${manifestPath}.ready-${process.pid}-${randomUUID()}`;
+  let replaced = false;
   try {
-    handle = await open(manifestPath, constants.O_WRONLY | constants.O_NOFOLLOW);
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-    handle = await open(
-      manifestPath,
+    const handle = await open(
+      temporaryPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o600,
     );
-  }
-  try {
-    const info = await handle.stat();
-    if (!info.isFile() || info.nlink !== 1) {
-      throw new ContextValidationError("Staging manifest must be a single-link regular file");
+    try {
+      await handle.writeFile(contents, "utf8");
+    } finally {
+      await handle.close();
     }
-    await handle.truncate(0);
-    await handle.writeFile(contents, "utf8");
+
+    await beforeReplace(manifestPath, temporaryPath);
+    await fsRename(temporaryPath, manifestPath);
+    replaced = true;
   } finally {
-    await handle.close();
+    if (!replaced) {
+      await unlink(temporaryPath).catch((error: unknown) => {
+        if (!isMissing(error)) throw error;
+      });
+    }
   }
 }
 
@@ -257,6 +266,7 @@ export class ContextCache {
   readonly #rename: Rename;
   readonly #claimRename: Rename;
   readonly #lookupOpen: Open;
+  readonly #beforeManifestReplace: BeforeManifestReplace;
 
   constructor(root: string, dependencies: ContextCacheDependencies = {}) {
     if (!path.isAbsolute(root) || root.includes("\0")) {
@@ -266,6 +276,7 @@ export class ContextCache {
     this.#rename = dependencies.rename ?? fsRename;
     this.#claimRename = dependencies.claimRename ?? fsRename;
     this.#lookupOpen = dependencies.lookupOpen ?? open;
+    this.#beforeManifestReplace = dependencies.beforeManifestReplace ?? (async () => undefined);
   }
 
   entryPath(key: ContextCacheKey): string {
@@ -436,7 +447,11 @@ export class ContextCache {
       } catch (error) {
         if (!isMissing(error)) throw error;
       }
-      await writeReadyManifest(stagingManifestPath, `${canonicalJson(manifest)}\n`);
+      await writeReadyManifest(
+        stagingManifestPath,
+        `${canonicalJson(manifest)}\n`,
+        this.#beforeManifestReplace,
+      );
       try {
         // The exclusive claim prevents conforming publishers from entering this
         // window together. Node has no portable no-replace directory rename, so

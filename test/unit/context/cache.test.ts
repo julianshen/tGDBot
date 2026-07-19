@@ -1250,6 +1250,22 @@ describe("ContextCache", () => {
     await expect(readFile(sentinel, "utf8")).resolves.toBe("keep\n");
   });
 
+  it("atomically replaces a manifest that gains a hard link after validation", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const sentinel = path.join(root, "late-hard-link.txt");
+    const diagnostic = "{\"status\":\"preparing\"}\n";
+    await writeFile(path.join(staging, "manifest.json"), diagnostic, "utf8");
+    const dependencies = {
+      beforeManifestReplace: async (manifestPath: string) => link(manifestPath, sentinel),
+    } satisfies ContextCacheDependencies;
+
+    await expect(new ContextCache(root, dependencies).promoteContext(staging, input())).resolves.toMatchObject({
+      status: "ready",
+    });
+    await expect(readFile(sentinel, "utf8")).resolves.toBe(diagnostic);
+  });
+
   it("conflicts with an existing corrupt destination", async () => {
     const root = await tempRoot();
     const cache = new ContextCache(root);

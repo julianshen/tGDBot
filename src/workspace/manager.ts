@@ -24,11 +24,26 @@ const GIT_PATH_OVERRIDE_VARIABLES = [
   "GIT_REPLACE_REF_BASE",
   "GIT_SHALLOW_FILE",
   "GIT_QUARANTINE_PATH",
+  "GIT_SSH",
+  "GIT_SSH_COMMAND",
+  "GIT_CONFIG",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_NOSYSTEM",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_EXEC_PATH",
+  "GIT_TEMPLATE_DIR",
+  "GIT_EXTERNAL_DIFF",
+  "GIT_DIFF_OPTS",
 ] as const;
 
 function workspaceCommandEnvironment(): NodeJS.ProcessEnv {
   const env = { ...process.env };
   for (const name of GIT_PATH_OVERRIDE_VARIABLES) delete env[name];
+  for (const name of Object.keys(env)) {
+    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(name)) delete env[name];
+  }
   env.GH_PROMPT_DISABLED = "1";
   env.GIT_TERMINAL_PROMPT = "0";
   return env;

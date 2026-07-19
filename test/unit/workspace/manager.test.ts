@@ -44,7 +44,7 @@ describe("prepareWorkspace", () => {
     const fakeGit = path.join(bin, "git");
     await writeFile(
       fakeGit,
-      "#!/bin/sh\nprintf '%s' \"${GIT_DIR-unset}:${GIT_WORK_TREE-unset}:${GIT_COMMON_DIR-unset}:${GIT_OBJECT_DIRECTORY-unset}:${GIT_INDEX_FILE-unset}\"\n",
+      "#!/bin/sh\nprintf '%s' \"${GIT_DIR-unset}:${GIT_WORK_TREE-unset}:${GIT_COMMON_DIR-unset}:${GIT_OBJECT_DIRECTORY-unset}:${GIT_INDEX_FILE-unset}:${GIT_SSH_COMMAND-unset}:${GIT_CONFIG_COUNT-unset}:${GIT_CONFIG_KEY_0-unset}:${GIT_CONFIG_VALUE_0-unset}\"\n",
       "utf8",
     );
     await chmod(fakeGit, 0o700);
@@ -55,8 +55,14 @@ describe("prepareWorkspace", () => {
     process.env.GIT_COMMON_DIR = "/tmp/attacker-common";
     process.env.GIT_OBJECT_DIRECTORY = "/tmp/attacker-objects";
     process.env.GIT_INDEX_FILE = "/tmp/attacker-index";
+    process.env.GIT_SSH_COMMAND = "/tmp/attacker-ssh";
+    process.env.GIT_CONFIG_COUNT = "1";
+    process.env.GIT_CONFIG_KEY_0 = "core.hooksPath";
+    process.env.GIT_CONFIG_VALUE_0 = "/tmp/attacker-hooks";
     try {
-      await expect(realExecWorkspaceCommand("git", [])).resolves.toBe("unset:unset:unset:unset:unset");
+      await expect(realExecWorkspaceCommand("git", [])).resolves.toBe(
+        "unset:unset:unset:unset:unset:unset:unset:unset:unset",
+      );
     } finally {
       process.env = previous;
     }
