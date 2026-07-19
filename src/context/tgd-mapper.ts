@@ -7,7 +7,7 @@ import {
   readFile,
   readdir,
   realpath,
-  unlink,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
@@ -94,6 +94,24 @@ async function assertNonEmptyContext(outputRoot: string): Promise<void> {
   }
 }
 
+async function ensureSafeGraphRoot(outputRoot: string): Promise<void> {
+  const graphRoot = path.join(outputRoot, GRAPH_ROOT);
+  let info;
+  try {
+    info = await lstat(graphRoot);
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+    await mkdir(graphRoot);
+    info = await lstat(graphRoot);
+  }
+  if (info.isSymbolicLink()) throw new Error("Mapping graph root must not be a symbolic link");
+  if (!info.isDirectory()) throw new Error("Mapping graph root must be a real directory");
+  const [physicalOutput, physicalGraphRoot] = await Promise.all([realpath(outputRoot), realpath(graphRoot)]);
+  if (!physicallyBeneath(physicalOutput, physicalGraphRoot)) {
+    throw new Error("Mapping graph root escaped the staging directory");
+  }
+}
+
 async function copyMappedGraphsFromTgdLayout(sourceRoot: string, outputRoot: string): Promise<void> {
   if (await regularFileExists(path.join(outputRoot, KNOWLEDGE_PATH))) return;
   const scansRoot = path.join(outputRoot, ".scans");
@@ -165,6 +183,14 @@ function mappingArtifacts(hasDomainGraph: boolean): ArtifactInput[] {
       : { kind: "zero-domains", path: ZERO_DOMAINS_PATH },
     { kind: "mapping-metadata", path: METADATA_PATH },
   ];
+}
+
+async function cleanupStagedArtifacts(outputRoot: string): Promise<unknown[]> {
+  const results = await Promise.allSettled([
+    rm(path.join(outputRoot, GRAPH_ROOT), { recursive: true, force: true }),
+    rm(path.join(outputRoot, CONTEXT_PATH), { force: true }),
+  ]);
+  return results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
 }
 
 async function createRealMappingSession(request: MappingSessionRequest): Promise<MappingSession> {
@@ -267,7 +293,7 @@ export class TgdPiMapper implements ContextMapper {
     try {
       await copyMappedGraphsFromTgdLayout(sourceRoot, outputRoot);
       await assertNonEmptyContext(outputRoot);
-      await mkdir(path.dirname(manifestPath), { recursive: true });
+      await ensureSafeGraphRoot(outputRoot);
       await writeFile(
         manifestPath,
         `${JSON.stringify({ version: 1, status: "complete", baseSha: request.baseSha })}\n`,
@@ -310,11 +336,12 @@ export class TgdPiMapper implements ContextMapper {
         degradedReasons: [],
       };
     } catch (error) {
-      await unlink(manifestPath).catch((unlinkError: unknown) => {
-        if (!isMissing(unlinkError)) throw unlinkError;
-      });
+      const cleanupErrors = await cleanupStagedArtifacts(outputRoot);
       this.#onProgress({ stage: "validation", status: "failed" });
-      return failed("invalid-artifacts", errorMessage(error));
+      const cleanupSuffix = cleanupErrors.length === 0
+        ? ""
+        : ` (cleanup failed: ${cleanupErrors.map(errorMessage).join("; ")})`;
+      return failed("invalid-artifacts", `${errorMessage(error)}${cleanupSuffix}`);
     }
   }
 }

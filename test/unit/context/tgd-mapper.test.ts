@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -203,7 +203,7 @@ describe("TgdPiMapper", () => {
       .resolves.toContain(baseSha);
   });
 
-  it("AC-6.2: rejects graph provenance for a different base SHA and removes completion metadata", async () => {
+  it("AC-6.2: rejects graph provenance and removes staged artifacts that could poison a retry", async () => {
     const sourceRoot = await tempRoot("tgd-mapper-source-");
     const outputRoot = await tempRoot("tgd-mapper-output-");
     const createSession = vi.fn(async () => session(async () => {
@@ -217,8 +217,36 @@ describe("TgdPiMapper", () => {
     });
 
     expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-artifacts" } });
-    await expect(readFile(path.join(outputRoot, ".understand-anything/mapping-metadata.json"), "utf8"))
-      .rejects.toMatchObject({ code: "ENOENT" });
+    await Promise.all([
+      readFile(path.join(outputRoot, "CONTEXT.md"), "utf8"),
+      readFile(path.join(outputRoot, ".understand-anything/knowledge-graph.json"), "utf8"),
+      readFile(path.join(outputRoot, ".understand-anything/mapping-metadata.json"), "utf8"),
+    ].map(async (read) => expect(read).rejects.toMatchObject({ code: "ENOENT" })));
+  });
+
+  it("AC-6.2: returns a structured failure when validation cleanup cannot remove artifacts", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const createSession = vi.fn(async () => session(async () => {
+      await writeReadyArtifacts(outputRoot);
+      await chmod(outputRoot, 0o500);
+    }));
+
+    try {
+      const result = await new TgdPiMapper({ createSession }).map({
+        sourceRoot,
+        outputRoot,
+        baseSha: "abc4567890abc4567890abc4567890abc4567890",
+      });
+
+      expect(result).toMatchObject({
+        status: "failed",
+        artifactPaths: [],
+        failure: { code: "invalid-artifacts", message: expect.stringMatching(/cleanup failed/i) },
+      });
+    } finally {
+      await chmod(outputRoot, 0o700);
+    }
   });
 
   it("AC-6.2: ignores success prose and fails when the knowledge graph is missing", async () => {
