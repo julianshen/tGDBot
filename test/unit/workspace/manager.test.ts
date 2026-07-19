@@ -37,6 +37,31 @@ describe("prepareWorkspace", () => {
     }
   });
 
+  it.skipIf(process.platform === "win32")("removes Git repository-location overrides from command environments", async () => {
+    const root = await tempRoot();
+    const bin = path.join(root, "bin");
+    await mkdir(bin);
+    const fakeGit = path.join(bin, "git");
+    await writeFile(
+      fakeGit,
+      "#!/bin/sh\nprintf '%s' \"${GIT_DIR-unset}:${GIT_WORK_TREE-unset}:${GIT_COMMON_DIR-unset}:${GIT_OBJECT_DIRECTORY-unset}:${GIT_INDEX_FILE-unset}\"\n",
+      "utf8",
+    );
+    await chmod(fakeGit, 0o700);
+    const previous = { ...process.env };
+    process.env.PATH = `${bin}${path.delimiter}${process.env.PATH ?? ""}`;
+    process.env.GIT_DIR = "/tmp/attacker.git";
+    process.env.GIT_WORK_TREE = "/tmp/attacker-tree";
+    process.env.GIT_COMMON_DIR = "/tmp/attacker-common";
+    process.env.GIT_OBJECT_DIRECTORY = "/tmp/attacker-objects";
+    process.env.GIT_INDEX_FILE = "/tmp/attacker-index";
+    try {
+      await expect(realExecWorkspaceCommand("git", [])).resolves.toBe("unset:unset:unset:unset:unset");
+    } finally {
+      process.env = previous;
+    }
+  });
+
   it.skipIf(process.platform === "win32")("terminates a workspace command after its configured timeout", async () => {
     const root = await tempRoot();
     const bin = path.join(root, "bin");
@@ -240,6 +265,42 @@ describe("prepareWorkspace", () => {
     releaseClone();
     await expect(Promise.all([first, second])).resolves.toHaveLength(2);
     expect(exec.mock.calls.filter(([tool]) => tool === "gh")).toHaveLength(1);
+  });
+
+  it("does not serialize distinct repositories whose hyphenated components flatten identically", async () => {
+    const root = await tempRoot();
+    let releaseFirst!: () => void;
+    const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstEntered!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { firstEntered = resolve; });
+    let secondEntered!: () => void;
+    const secondStarted = new Promise<void>((resolve) => { secondEntered = resolve; });
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "gh") {
+        const target = args[3]!;
+        await mkdir(target, { recursive: true });
+        if (args[2]?.includes("/a-b/c")) {
+          firstEntered();
+          await firstBlocked;
+        } else {
+          secondEntered();
+        }
+      }
+      if (tool === "git" && args.includes("add")) await mkdir(args.at(-2)!, { recursive: true });
+      return "";
+    });
+
+    const first = prepareWorkspace({ root, repo: { ...repo, owner: "a-b", repo: "c" }, baseSha }, { exec });
+    await firstStarted;
+    const second = prepareWorkspace({ root, repo: { ...repo, owner: "a", repo: "b-c" }, baseSha }, { exec });
+    const overlapped = await Promise.race([
+      secondStarted.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 30)),
+    ]);
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(overlapped).toBe(true);
   });
 
   it("rejects a symlinked managed-path ancestor before filesystem or Git mutation", async () => {

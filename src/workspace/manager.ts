@@ -13,11 +13,31 @@ import type {
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
+const GIT_PATH_OVERRIDE_VARIABLES = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_INDEX_FILE",
+  "GIT_GRAFT_FILE",
+  "GIT_REPLACE_REF_BASE",
+  "GIT_SHALLOW_FILE",
+  "GIT_QUARANTINE_PATH",
+] as const;
+
+function workspaceCommandEnvironment(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const name of GIT_PATH_OVERRIDE_VARIABLES) delete env[name];
+  env.GH_PROMPT_DISABLED = "1";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
+}
 
 export const realExecWorkspaceCommand: ExecWorkspaceCommand = (tool, args, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS) =>
   new Promise((resolve, reject) => {
     execFile(tool, args, {
-      env: { ...process.env, GH_PROMPT_DISABLED: "1", GIT_TERMINAL_PROMPT: "0" },
+      env: workspaceCommandEnvironment(),
       killSignal: "SIGKILL",
       maxBuffer: 10 * 1024 * 1024,
       timeout: timeoutMs,
@@ -220,7 +240,9 @@ export async function prepareWorkspace(
   const lockPath = path.join(
     paths.root,
     ".locks",
-    `${request.repo.host}-${request.repo.owner}-${request.repo.repo}.lock`,
+    request.repo.host,
+    request.repo.owner,
+    `${request.repo.repo}.lock`,
   );
   await assertNoSymlinkedAncestors(
     paths.root,
