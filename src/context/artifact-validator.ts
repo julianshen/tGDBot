@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
 import { constants } from "node:fs";
-import { lstat, open } from "node:fs/promises";
+import { lstat, open, realpath } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -118,6 +118,22 @@ async function resolveRegularFileWithin(
       await handle.close();
       handle = undefined;
       throw new ContextValidationError(`Artifact is not a regular file: ${relativePath}`);
+    }
+    const [physicalBase, physicalCandidate, currentInfo] = await Promise.all([
+      realpath(resolvedBase),
+      realpath(candidate),
+      lstat(candidate),
+    ]);
+    const physicalRelative = path.relative(physicalBase, physicalCandidate);
+    if (
+      physicalRelative === "" ||
+      physicalRelative === ".." ||
+      physicalRelative.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(physicalRelative) ||
+      currentInfo.dev !== info.dev ||
+      currentInfo.ino !== info.ino
+    ) {
+      throw new ContextValidationError(`Artifact path changed or escaped during open: ${relativePath}`);
     }
     return { size: info.size, handle };
   } catch (error) {

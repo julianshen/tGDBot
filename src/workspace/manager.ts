@@ -214,6 +214,7 @@ export async function prepareWorkspace(
   dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
 ): Promise<PreparedWorkspace> {
   const paths = deriveWorkspacePaths({ ...request, root: await physicalWorkspaceRoot(request.root) });
+  const normalizedRequest = { ...request, root: paths.root };
   await mkdir(paths.root, { recursive: true });
   const lockPath = path.join(
     paths.root,
@@ -233,6 +234,6 @@ export async function prepareWorkspace(
       paths.root,
       [paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
     );
-    return prepareWorkspaceUnlocked(request, dependencies);
+    return prepareWorkspaceUnlocked(normalizedRequest, dependencies);
   });
 }
