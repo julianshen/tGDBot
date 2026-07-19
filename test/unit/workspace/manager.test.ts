@@ -204,14 +204,17 @@ describe("prepareWorkspace", () => {
     const abbreviatedSha = baseSha.slice(0, 8);
     const worktreePath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "worktrees", abbreviatedSha);
     const markerPath = path.join(path.dirname(worktreePath), ".owners", `${abbreviatedSha}.json`);
+    const mirrorPath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "repository.git");
     await mkdir(worktreePath, { recursive: true });
+    await mkdir(mirrorPath, { recursive: true });
     await mkdir(path.dirname(markerPath), { recursive: true });
     await writeFile(markerPath, JSON.stringify({
       version: 1,
       repository: "github.com/octo-org/octo-repo",
       baseSha: abbreviatedSha,
     }));
-    const exec = vi.fn(async () => `${baseSha}\n`);
+    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
+      args.includes("--git-common-dir") ? `${mirrorPath}\n` : `${baseSha}\n`);
 
     await expect(prepareWorkspace({ root, repo, baseSha: abbreviatedSha }, { exec })).resolves.toMatchObject({
       baseSha: abbreviatedSha,
@@ -219,6 +222,27 @@ describe("prepareWorkspace", () => {
     });
     expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "reset", "--hard", "HEAD"]);
     expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "clean", "-ffdx"]);
+  });
+
+  it("rejects a forged marker for a checkout not registered to the managed mirror", async () => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    const foreignCommonDir = path.join(root, "foreign.git");
+    await mkdir(paths.baseWorktreePath, { recursive: true });
+    await mkdir(paths.mirrorPath, { recursive: true });
+    await mkdir(foreignCommonDir);
+    await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
+    await writeFile(paths.ownerMarkerPath, JSON.stringify({
+      version: 1,
+      repository: "github.com/octo-org/octo-repo",
+      baseSha,
+    }));
+    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
+      args.includes("--git-common-dir") ? `${foreignCommonDir}\n` : `${baseSha}\n`);
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/managed mirror/i);
+    expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["reset"]));
+    expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["clean"]));
   });
 
   it("rejects an unsupported managed-worktree marker version", async () => {
@@ -240,6 +264,7 @@ describe("prepareWorkspace", () => {
 
   it("serializes concurrent preparation of the same repository and base SHA", async () => {
     const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
     let releaseClone!: () => void;
     const cloneBlocked = new Promise<void>((resolve) => { releaseClone = resolve; });
     let cloneStarted!: () => void;
@@ -253,6 +278,7 @@ describe("prepareWorkspace", () => {
       if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2)!, { recursive: true });
       }
+      if (args.includes("--git-common-dir")) return `${paths.mirrorPath}\n`;
       if (args.includes("rev-parse")) return `${baseSha}\n`;
       return "";
     });
@@ -295,7 +321,7 @@ describe("prepareWorkspace", () => {
     const second = prepareWorkspace({ root, repo: { ...repo, owner: "a", repo: "b-c" }, baseSha }, { exec });
     const overlapped = await Promise.race([
       secondStarted.then(() => true),
-      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 30)),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
     ]);
     releaseFirst();
     await Promise.all([first, second]);

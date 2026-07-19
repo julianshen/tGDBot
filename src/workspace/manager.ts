@@ -168,6 +168,20 @@ async function prepareWorkspaceUnlocked(
     ) {
       throw new Error(`Refusing unmanaged worktree ownership mismatch at ${paths.baseWorktreePath}`);
     }
+    const commonDir = (await execWorkspace(dependencies, "git", [
+      "-C",
+      paths.baseWorktreePath,
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ])).trim();
+    const [actualCommonDir, expectedCommonDir] = await Promise.all([
+      realpath(commonDir),
+      realpath(paths.mirrorPath),
+    ]);
+    if (actualCommonDir !== expectedCommonDir) {
+      throw new Error(`Managed worktree is not registered to the expected managed mirror at ${paths.mirrorPath}`);
+    }
     const actualHead = (await execWorkspace(dependencies, "git", ["-C", paths.baseWorktreePath, "rev-parse", "HEAD"])).trim();
     if (!actualHead.toLowerCase().startsWith(expectedMarker.baseSha)) {
       throw new Error(`Managed worktree HEAD does not match requested base SHA at ${paths.baseWorktreePath}`);
