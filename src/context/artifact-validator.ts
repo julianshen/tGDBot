@@ -403,6 +403,7 @@ function validateJsonArtifactContents(
 function validateRecordSets(
   artifacts: readonly (ArtifactInput | ArtifactRecord)[],
   documents: readonly (DocumentInput | DocumentRecord)[],
+  mode: "ready" | "degraded" = "ready",
 ): void {
   const kinds = new Set<string>();
   const paths = new Set<string>();
@@ -425,8 +426,17 @@ function validateRecordSets(
     paths.add(document.path);
   }
 
-  for (const required of ["context", "knowledge-graph", "mapping-metadata"] as const) {
+  const requiredKinds = mode === "ready"
+    ? ["context", "knowledge-graph", "mapping-metadata"] as const
+    : ["context", "mapping-metadata"] as const;
+  for (const required of requiredKinds) {
     if (!kinds.has(required)) throw new ContextValidationError(`Missing required artifact kind: ${required}`);
+  }
+  if (mode === "degraded") {
+    if (kinds.size !== requiredKinds.length || documents.length !== 0) {
+      throw new ContextValidationError("Degraded context may contain only context and mapping metadata artifacts");
+    }
+    return;
   }
   const hasDomainGraph = kinds.has("domain-graph");
   const hasZeroDomains = kinds.has("zero-domains");
@@ -454,6 +464,37 @@ function digest(contents: Buffer): string {
   return createHash("sha256").update(contents).digest("hex");
 }
 
+async function digestArtifacts(
+  basePath: string,
+  key: ContextCacheKey,
+  artifacts: readonly ArtifactInput[],
+): Promise<ArtifactRecord[]> {
+  const records: ArtifactRecord[] = [];
+  for (const artifact of artifacts) {
+    validateExpectedArtifactPath(artifact.kind, artifact.path);
+    if (artifact.kind === "context") {
+      const streamed = await streamDigestWithin(basePath, artifact.path, true);
+      if (!streamed.hasNonWhitespace) throw new ContextValidationError("CONTEXT.md must be non-empty");
+      records.push({ ...artifact, sha256: streamed.sha256 });
+      continue;
+    }
+    const contents = await readJsonArtifactWithin(basePath, artifact.path);
+    validateJsonArtifactContents(artifact.kind, artifact.path, contents, key);
+    records.push({ ...artifact, sha256: digest(contents) });
+  }
+  return records.sort((left, right) => left.path.localeCompare(right.path));
+}
+
+export async function digestDegradedArtifactInputs(
+  basePath: string,
+  key: ContextCacheKey,
+  artifacts: readonly ArtifactInput[],
+): Promise<ArtifactRecord[]> {
+  if (!Array.isArray(artifacts)) throw new ContextValidationError("Artifacts must be an array");
+  validateRecordSets(artifacts, [], "degraded");
+  return digestArtifacts(basePath, key, artifacts);
+}
+
 export async function digestArtifactInputs(
   basePath: string,
   key: ContextCacheKey,
@@ -464,19 +505,7 @@ export async function digestArtifactInputs(
   if (!Array.isArray(documents)) throw new ContextValidationError("Documents must be an array");
   validateRecordSets(artifacts, documents);
   await rejectUndeclaredDomainAlternative(basePath, artifacts);
-  const artifactRecords: ArtifactRecord[] = [];
-  for (const artifact of artifacts) {
-    validateExpectedArtifactPath(artifact.kind, artifact.path);
-    if (artifact.kind === "context") {
-      const streamed = await streamDigestWithin(basePath, artifact.path, true);
-      if (!streamed.hasNonWhitespace) throw new ContextValidationError("CONTEXT.md must be non-empty");
-      artifactRecords.push({ ...artifact, sha256: streamed.sha256 });
-      continue;
-    }
-    const contents = await readJsonArtifactWithin(basePath, artifact.path);
-    validateJsonArtifactContents(artifact.kind, artifact.path, contents, key);
-    artifactRecords.push({ ...artifact, sha256: digest(contents) });
-  }
+  const artifactRecords = await digestArtifacts(basePath, key, artifacts);
   const documentRecords: DocumentRecord[] = [];
   for (const document of documents) {
     const streamed = await streamDigestWithin(basePath, document.path, false);
@@ -484,7 +513,7 @@ export async function digestArtifactInputs(
     documentRecords.push({ ...document, sha256: streamed.sha256 });
   }
   return {
-    artifacts: artifactRecords.sort((left, right) => left.path.localeCompare(right.path)),
+    artifacts: artifactRecords,
     documents: documentRecords.sort((left, right) => left.path.localeCompare(right.path)),
   };
 }

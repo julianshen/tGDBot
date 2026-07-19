@@ -18,7 +18,7 @@ import {
   getAgentDir,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { digestArtifactInputs } from "./artifact-validator.js";
+import { digestArtifactInputs, digestDegradedArtifactInputs } from "./artifact-validator.js";
 import type { ArtifactInput, ContextCacheKey } from "./types.js";
 import type { ContextMapper, ContextMapRequest, MappingResult } from "./mapper.js";
 
@@ -195,12 +195,18 @@ async function createRealMappingSession(request: MappingSessionRequest): Promise
   return session;
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
+class MappingTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`tGD mapping timed out after ${timeoutMs}ms`);
+    this.name = "MappingTimeoutError";
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
-      onTimeout();
-      reject(new Error(`tGD mapping timed out after ${timeoutMs}ms`));
+      reject(new MappingTimeoutError(timeoutMs));
     }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
@@ -245,9 +251,12 @@ export class TgdPiMapper implements ContextMapper {
       }
       this.#onProgress({ stage: "session", status: "started" });
       const session = await this.#createSession({ sourceRoot, outputRoot });
-      await withTimeout(session.prompt("/tgd-map"), this.#timeoutMs, () => {
-        void session.abort?.().catch(() => undefined);
-      });
+      try {
+        await withTimeout(session.prompt("/tgd-map"), this.#timeoutMs);
+      } catch (error) {
+        if (error instanceof MappingTimeoutError) await session.abort?.().catch(() => undefined);
+        throw error;
+      }
       this.#onProgress({ stage: "session", status: "completed" });
     } catch (error) {
       this.#onProgress({ stage: "session", status: "failed" });
@@ -275,6 +284,10 @@ export class TgdPiMapper implements ContextMapper {
             : "Mapping must produce exactly one domain graph or zero-domain marker");
         }
         const degradedReasons = [!hasKnowledge ? "knowledge-graph-unavailable" : "domain-context-unavailable"];
+        await digestDegradedArtifactInputs(outputRoot, validationKey(request.baseSha), [
+          { kind: "context", path: CONTEXT_PATH },
+          { kind: "mapping-metadata", path: METADATA_PATH },
+        ]);
         this.#onProgress({ stage: "validation", status: "completed" });
         return {
           status: "degraded",

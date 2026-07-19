@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -159,6 +159,36 @@ describe("TgdPiMapper", () => {
     expect(abort).toHaveBeenCalledOnce();
   });
 
+  it("AC-6.2: waits for asynchronous session abort cleanup before returning a timeout failure", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    let finishAbort: (() => void) | undefined;
+    const abort = vi.fn(() => new Promise<void>((resolve) => {
+      finishAbort = resolve;
+    }));
+    const createSession = vi.fn(async () => ({
+      prompt: async () => new Promise<void>(() => undefined),
+      getLastAssistantText: () => undefined,
+      abort,
+    }));
+
+    const mapping = new TgdPiMapper({ createSession, timeoutMs: 5 })
+      .map({ sourceRoot, outputRoot, baseSha });
+    let settled = false;
+    void mapping.finally(() => {
+      settled = true;
+    });
+    await vi.waitFor(() => expect(abort).toHaveBeenCalledOnce());
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(settled).toBe(false);
+    finishAbort?.();
+    await expect(mapping).resolves.toMatchObject({
+      status: "failed",
+      failure: { code: "pi-session-failed", message: expect.stringMatching(/timed out/i) },
+    });
+  });
+
   it("AC-6.1: normalizes the installed tGD scan layout into cache artifact paths", async () => {
     const sourceRoot = await tempRoot("tgd-mapper-source-");
     const outputRoot = await tempRoot("tgd-mapper-output-");
@@ -228,5 +258,30 @@ describe("TgdPiMapper", () => {
       analyzedFiles: 0,
       degradedReasons: ["knowledge-graph-unavailable"],
     });
+  });
+
+  it("AC-6.3: rejects degraded artifacts whose metadata parent escapes through a symlink", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const outsideRoot = await tempRoot("tgd-mapper-outside-");
+    const createSession = vi.fn(async () => session(async () => {
+      await writeFile(path.join(outputRoot, "CONTEXT.md"), "# Minimum trusted context\n", "utf8");
+      await symlink(outsideRoot, path.join(outputRoot, ".understand-anything"));
+    }));
+
+    const result = await new TgdPiMapper({ createSession }).map({
+      sourceRoot,
+      outputRoot,
+      baseSha,
+      allowDegradedContext: true,
+    });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      artifactPaths: [],
+      failure: { code: "invalid-artifacts", message: expect.stringMatching(/symbolic link/i) },
+    });
+    await expect(readFile(path.join(outsideRoot, "mapping-metadata.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 });
