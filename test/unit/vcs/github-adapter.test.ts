@@ -15,7 +15,7 @@ const readFixture = (name: string): string => readFileSync(fixturePath(name), "u
 // in src/vcs/github-adapter.ts for why `gh api` silently defaults to POST
 // once any `-f`/`-F` param is passed, and the real end-to-end 422 this
 // caused against `hmchangw/chat` PR #491.
-const PAGINATED_COMMENTS_ARGS_PREFIX = ["api", "-X", "GET", "--paginate", "-f", "per_page=100"];
+const PAGINATED_COMMENTS_ARGS_PREFIX = ["api", "-X", "GET", "--paginate", "--slurp", "-f", "per_page=100"];
 
 /**
  * Builds an execGh mock that dispatches based on the `gh` subcommand:
@@ -383,8 +383,28 @@ describe("GitHubAdapter", () => {
       "-X",
       "GET",
       "--paginate",
+      "--slurp",
       "-f",
       "per_page=100",
+      "repos/{owner}/{repo}/issues/42/comments",
+    ]);
+  });
+
+  it("parses slurped pagination pages and finds the bot marker after page one", async () => {
+    const markerComment = {
+      id: 222,
+      body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 -->",
+      user: { login: "tgd-review-agent[bot]" },
+    };
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      return JSON.stringify([[{ id: 111, body: "page one", user: { login: "someone" } }], [markerComment]]);
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.findBotComment("42")).resolves.toMatchObject({ id: "222", lastReviewedSha: "abc1234" });
+    expect(execGh).toHaveBeenCalledWith([
+      "api", "-X", "GET", "--paginate", "--slurp", "-f", "per_page=100",
       "repos/{owner}/{repo}/issues/42/comments",
     ]);
   });

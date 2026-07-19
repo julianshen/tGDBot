@@ -102,6 +102,7 @@ function isExpectedOrigin(origin: string, owner: string, repo: string): boolean 
     if (
       parsed.protocol === "https:" &&
       parsed.hostname === "github.com" &&
+      parsed.port === "" &&
       parsed.pathname.replace(/^\//, "") === slug
     ) {
       return true;

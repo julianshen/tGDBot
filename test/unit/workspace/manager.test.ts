@@ -337,4 +337,19 @@ describe("prepareWorkspace", () => {
       "Managed mirror origin does not match octo-org/octo-repo",
     );
   });
+
+  it("rejects a GitHub HTTPS mirror origin with a custom port", async () => {
+    const root = await tempRoot();
+    const mirrorPath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "repository.git");
+    await mkdir(mirrorPath, { recursive: true });
+    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) => {
+      if (args.includes("get-url")) return "https://github.com:444/octo-org/octo-repo.git\n";
+      return "";
+    });
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(
+      "Managed mirror origin does not match octo-org/octo-repo",
+    );
+    expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["fetch"]));
+  });
 });

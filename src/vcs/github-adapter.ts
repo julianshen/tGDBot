@@ -346,11 +346,13 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
       "-X",
       "GET",
       "--paginate",
+      "--slurp",
       "-f",
       "per_page=100",
       `${apiRepo(repo)}/issues/${id}/comments`,
     ]);
-    const comments = JSON.parse(out) as GhIssueComment[];
+    const parsed = JSON.parse(out) as GhIssueComment[] | GhIssueComment[][];
+    const comments = Array.isArray(parsed[0]) ? (parsed as GhIssueComment[][]).flat() : parsed as GhIssueComment[];
     for (const comment of comments) {
       if (comment.user?.login !== botLogin) continue;
       if (!BOT_MARKER_PREFIX_RE.test(comment.body)) continue;
