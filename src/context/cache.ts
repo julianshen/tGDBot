@@ -21,6 +21,7 @@ const MAX_READY_MANIFEST_BYTES = 1024 * 1024;
 type Rename = (source: string, destination: string) => Promise<void>;
 type Open = typeof open;
 type BeforeManifestReplace = (manifestPath: string, temporaryPath: string) => Promise<void>;
+type DirectoryIdentity = { dev: number; ino: number; realPath: string };
 
 export interface ContextCacheDependencies {
   rename?: Rename;
@@ -230,26 +231,55 @@ function physicallyBeneath(base: string, candidate: string): boolean {
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
+async function assertDirectoryIdentity(directoryPath: string, expected: DirectoryIdentity): Promise<void> {
+  const info = await lstat(directoryPath);
+  if (
+    !info.isDirectory() ||
+    info.isSymbolicLink() ||
+    info.dev !== expected.dev ||
+    info.ino !== expected.ino ||
+    await realpath(directoryPath) !== expected.realPath
+  ) {
+    throw new ContextValidationError("Promotion staging directory changed during publication");
+  }
+}
+
 async function writeReadyManifest(
   manifestPath: string,
   contents: string,
   beforeReplace: BeforeManifestReplace,
+  expectedDirectory: DirectoryIdentity,
 ): Promise<void> {
   const temporaryPath = `${manifestPath}.ready-${process.pid}-${randomUUID()}`;
   let replaced = false;
   try {
+    const manifestDirectory = path.dirname(manifestPath);
+    await assertDirectoryIdentity(manifestDirectory, expectedDirectory);
     const handle = await open(
       temporaryPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
       0o600,
     );
     try {
+      const [handleInfo, pathInfo, physicalTemporaryPath] = await Promise.all([
+        handle.stat(),
+        lstat(temporaryPath),
+        realpath(temporaryPath),
+      ]);
+      if (
+        !handleInfo.isFile() ||
+        !sameIdentity(handleInfo, pathInfo) ||
+        path.dirname(physicalTemporaryPath) !== expectedDirectory.realPath
+      ) {
+        throw new ContextValidationError("Ready manifest temporary file escaped staging");
+      }
       await handle.writeFile(contents, "utf8");
     } finally {
       await handle.close();
     }
 
     await beforeReplace(manifestPath, temporaryPath);
+    await assertDirectoryIdentity(manifestDirectory, expectedDirectory);
     await fsRename(temporaryPath, manifestPath);
     replaced = true;
   } finally {
@@ -413,12 +443,19 @@ export class ContextCache {
       if (!physicallyBeneath(realRoot, realClaimedStaging)) {
         throw new ContextValidationError("Promotion staging directory escaped the configured cache root after claiming");
       }
+      const claimedStagingIdentity: DirectoryIdentity = {
+        dev: claimedStagingInfo.dev,
+        ino: claimedStagingInfo.ino,
+        realPath: realClaimedStaging,
+      };
+      await assertDirectoryIdentity(claimedStagingPath, claimedStagingIdentity);
       const records = await digestArtifactInputs(
         claimedStagingPath,
         input.key,
         input.artifacts,
         input.documents ?? [],
       );
+      await assertDirectoryIdentity(claimedStagingPath, claimedStagingIdentity);
       const manifest = buildManifest(input, records);
       const existing = await this.lookupContext(input.key);
       if (existing !== undefined) {
@@ -433,6 +470,7 @@ export class ContextCache {
       }
 
       const stagingManifestPath = path.join(claimedStagingPath, "manifest.json");
+      await assertDirectoryIdentity(claimedStagingPath, claimedStagingIdentity);
       try {
         const stagingManifestInfo = await lstat(stagingManifestPath);
         if (stagingManifestInfo.isSymbolicLink()) {
@@ -451,6 +489,7 @@ export class ContextCache {
         stagingManifestPath,
         `${canonicalJson(manifest)}\n`,
         this.#beforeManifestReplace,
+        claimedStagingIdentity,
       );
       try {
         // The exclusive claim prevents conforming publishers from entering this

@@ -1266,6 +1266,27 @@ describe("ContextCache", () => {
     await expect(readFile(sentinel, "utf8")).resolves.toBe(diagnostic);
   });
 
+  it("rejects a claimed staging-path swap before replacing its manifest", async () => {
+    const root = await tempRoot();
+    const outside = await tempRoot();
+    const staging = await createStaging(root);
+    const outsideManifest = path.join(outside, "manifest.json");
+    const parked = path.join(root, "parked-entry");
+    await writeFile(outsideManifest, "outside sentinel\n", "utf8");
+    const dependencies = {
+      beforeManifestReplace: async (manifestPath: string) => {
+        const claimedStaging = path.dirname(manifestPath);
+        await rename(claimedStaging, parked);
+        await symlink(outside, claimedStaging);
+      },
+    } satisfies ContextCacheDependencies;
+
+    await expect(new ContextCache(root, dependencies).promoteContext(staging, input())).rejects.toThrow(
+      /staging directory changed/i,
+    );
+    await expect(readFile(outsideManifest, "utf8")).resolves.toBe("outside sentinel\n");
+  });
+
   it("conflicts with an existing corrupt destination", async () => {
     const root = await tempRoot();
     const cache = new ContextCache(root);
