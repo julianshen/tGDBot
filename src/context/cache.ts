@@ -21,6 +21,7 @@ type Rename = (source: string, destination: string) => Promise<void>;
 
 export interface ContextCacheDependencies {
   rename?: Rename;
+  claimRename?: Rename;
 }
 
 export class ContextCacheConflictError extends Error {
@@ -219,6 +220,7 @@ function physicallyBeneath(base: string, candidate: string): boolean {
 export class ContextCache {
   readonly root: string;
   readonly #rename: Rename;
+  readonly #claimRename: Rename;
 
   constructor(root: string, dependencies: ContextCacheDependencies = {}) {
     if (!path.isAbsolute(root) || root.includes("\0")) {
@@ -226,6 +228,7 @@ export class ContextCache {
     }
     this.root = path.resolve(root);
     this.#rename = dependencies.rename ?? fsRename;
+    this.#claimRename = dependencies.claimRename ?? fsRename;
   }
 
   entryPath(key: ContextCacheKey): string {
@@ -338,7 +341,15 @@ export class ContextCache {
     const claimedStagingPath = path.join(claimPath, "entry");
     let published = false;
     const publicationResult = await (async () => {
-      await fsRename(stagingPath, claimedStagingPath);
+      await this.#claimRename(stagingPath, claimedStagingPath);
+      const claimedStagingInfo = await lstat(claimedStagingPath);
+      if (!claimedStagingInfo.isDirectory() || claimedStagingInfo.isSymbolicLink()) {
+        throw new ContextValidationError("Promotion staging path must remain a real directory after claiming");
+      }
+      const realClaimedStaging = await realpath(claimedStagingPath);
+      if (!physicallyBeneath(realRoot, realClaimedStaging)) {
+        throw new ContextValidationError("Promotion staging directory escaped the configured cache root after claiming");
+      }
       const records = await digestArtifactInputs(
         claimedStagingPath,
         input.key,

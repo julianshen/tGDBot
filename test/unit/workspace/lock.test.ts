@@ -6,6 +6,7 @@ import { withRepositoryLock } from "../../../src/workspace/lock.js";
 
 const mockedFs = vi.hoisted(() => ({
   open: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
+  rename: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
   unlink: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
 }));
 const mockedClock = vi.hoisted(() => ({ now: undefined as undefined | (() => number) }));
@@ -15,6 +16,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   return {
     ...actual,
     open: (...args: unknown[]) => mockedFs.open === undefined ? actual.open(...args as Parameters<typeof actual.open>) : mockedFs.open(...args),
+    rename: (...args: unknown[]) => mockedFs.rename === undefined ? actual.rename(...args as Parameters<typeof actual.rename>) : mockedFs.rename(...args),
     unlink: (...args: unknown[]) => mockedFs.unlink === undefined ? actual.unlink(...args as Parameters<typeof actual.unlink>) : mockedFs.unlink(...args),
   };
 });
@@ -46,6 +48,7 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
   mockedFs.open = undefined;
+  mockedFs.rename = undefined;
   mockedFs.unlink = undefined;
   mockedClock.now = undefined;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -214,6 +217,21 @@ describe("withRepositoryLock", () => {
     })).rejects.toThrow(/Failed to release repository lock/);
 
     await expect(readFile(lockPath, "utf8")).resolves.toContain(owner.runId);
+  });
+
+  it("does not remove a replacement lock created after atomically retiring the owned lock", async () => {
+    const lockPath = await tempLockPath();
+    const replacement = "new owner lock\n";
+    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    mockedFs.rename = async (...args) => {
+      const [source] = args as [string, string];
+      await actual.rename(...args as Parameters<typeof actual.rename>);
+      if (source === lockPath) await writeFile(lockPath, replacement, "utf8");
+    };
+
+    await expect(withRepositoryLock({ lockPath, timeoutMs: 100, owner }, async () => "done"))
+      .resolves.toBe("done");
+    await expect(readFile(lockPath, "utf8")).resolves.toBe(replacement);
   });
 
   it("preserves the work failure when releasing the owned lock also fails", async () => {

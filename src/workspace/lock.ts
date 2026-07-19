@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { performance } from "node:perf_hooks";
-import { lstat, mkdir, open, readFile, unlink } from "node:fs/promises";
+import { link, lstat, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
@@ -124,19 +125,50 @@ function hasSameIdentity(left: LockFileIdentity, right: LockFileIdentity): boole
 }
 
 async function releaseOwnedLock(lockPath: string, expectedIdentity: LockFileIdentity): Promise<void> {
-  let currentIdentity: LockFileIdentity;
+  const retirementPath = `${lockPath}.releasing-${process.pid}-${randomUUID()}`;
   try {
-    currentIdentity = identityOf(await lstat(lockPath));
+    await rename(lockPath, retirementPath);
   } catch (error) {
     throw new Error(`Failed to release repository lock at ${lockPath}: could not verify ownership`, { cause: error });
   }
-  if (!hasSameIdentity(currentIdentity, expectedIdentity)) {
+
+  let retiredIdentity: LockFileIdentity;
+  try {
+    retiredIdentity = identityOf(await lstat(retirementPath));
+  } catch (error) {
+    throw new Error(
+      `Failed to release repository lock at ${lockPath}: could not verify the atomically retired lock`,
+      { cause: error },
+    );
+  }
+
+  if (!hasSameIdentity(retiredIdentity, expectedIdentity)) {
+    try {
+      await link(retirementPath, lockPath);
+      await unlink(retirementPath);
+    } catch (error) {
+      throw new Error(
+        `Failed to release repository lock at ${lockPath}: lock file identity no longer matches this owner; ` +
+        `the replacement was preserved at ${retirementPath}`,
+        { cause: error },
+      );
+    }
     throw new Error(`Failed to release repository lock at ${lockPath}: lock file identity no longer matches this owner`);
   }
+
   try {
-    await unlink(lockPath);
+    await unlink(retirementPath);
   } catch (error) {
-    throw new Error(`Failed to release repository lock at ${lockPath}`, { cause: error });
+    try {
+      await link(retirementPath, lockPath);
+    } catch {
+      // A new owner may already hold the fixed lock path. The retired owned
+      // inode remains isolated for manual cleanup and that new lock is untouched.
+    }
+    throw new Error(
+      `Failed to release repository lock at ${lockPath}; the retired lock remains at ${retirementPath}`,
+      { cause: error },
+    );
   }
 }
 

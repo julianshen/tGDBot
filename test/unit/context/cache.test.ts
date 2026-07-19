@@ -8,6 +8,7 @@ import {
   ContextCacheConflictError,
   computeManifestHash,
 } from "../../../src/context/cache.js";
+import type { ContextCacheDependencies } from "../../../src/context/cache.js";
 import { ContextValidationError, digestArtifactInputs } from "../../../src/context/artifact-validator.js";
 import type {
   ContextCacheKey,
@@ -1153,6 +1154,26 @@ describe("ContextCache", () => {
     const escapedStage = await createStaging(root);
     await symlink(outside, path.join(root, "contexts"));
     await expect(cache.promoteContext(escapedStage, input())).rejects.toThrow(/destination escapes/i);
+  });
+
+  it("rejects a staging directory replaced by a symlink while it is moved under the publication claim", async () => {
+    const root = await tempRoot();
+    const outside = await tempRoot();
+    const staging = await createStaging(root);
+    const outsideManifest = path.join(outside, "manifest.json");
+    await writeFile(outsideManifest, "outside sentinel\n", "utf8");
+    const dependencies = {
+      claimRename: async (source: string, destination: string) => {
+        await rm(source, { recursive: true, force: true });
+        await symlink(outside, source);
+        await rename(source, destination);
+      },
+    } satisfies ContextCacheDependencies;
+
+    await expect(new ContextCache(root, dependencies).promoteContext(staging, input())).rejects.toThrow(
+      /staging.*real directory/i,
+    );
+    await expect(readFile(outsideManifest, "utf8")).resolves.toBe("outside sentinel\n");
   });
 
   it("rejects a staging manifest symlink without writing outside staging", async () => {
