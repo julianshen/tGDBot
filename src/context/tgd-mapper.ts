@@ -144,10 +144,16 @@ function validationKey(baseSha: string): ContextCacheKey {
 }
 
 async function countAnalyzedFiles(outputRoot: string): Promise<number> {
-  const parsed = JSON.parse(await readFile(path.join(outputRoot, KNOWLEDGE_PATH), "utf8")) as {
-    nodes?: Array<{ type?: unknown }>;
-  };
-  return Array.isArray(parsed.nodes) ? parsed.nodes.filter((node) => node.type === "file").length : 0;
+  const parsed: unknown = JSON.parse(await readFile(path.join(outputRoot, KNOWLEDGE_PATH), "utf8"));
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return 0;
+
+  const nodes = (parsed as Record<string, unknown>).nodes;
+  return Array.isArray(nodes)
+    ? nodes.filter((node) =>
+      typeof node === "object" && node !== null && !Array.isArray(node) &&
+      (node as Record<string, unknown>).type === "file"
+    ).length
+    : 0;
 }
 
 function mappingArtifacts(hasDomainGraph: boolean): ArtifactInput[] {
