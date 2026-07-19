@@ -95,6 +95,23 @@ afterEach(async () => {
 });
 
 describe("TgdPiMapper", () => {
+  it("AC-6.1: rejects an output root physically nested under source through a symlinked parent", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const aliasRoot = await tempRoot("tgd-mapper-alias-");
+    await mkdir(path.join(sourceRoot, "mapping-output"));
+    await symlink(sourceRoot, path.join(aliasRoot, "source-link"));
+    const outputRoot = path.join(aliasRoot, "source-link", "mapping-output");
+    const createSession = vi.fn(async () => session(async () => undefined));
+
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      failure: { code: "invalid-request", message: expect.stringMatching(/detached source worktree/i) },
+    });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("AC-6.1: maps only the detached base worktree and validates ready staging artifacts", async () => {
     const sourceRoot = await tempRoot("tgd-mapper-source-");
     const outputRoot = await tempRoot("tgd-mapper-output-");
@@ -203,6 +220,25 @@ describe("TgdPiMapper", () => {
       .resolves.toContain(baseSha);
   });
 
+  it("AC-6.2: validates the graph target before copying scan-layout artifacts", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const outsideRoot = await tempRoot("tgd-mapper-outside-");
+    const createSession = vi.fn(async () => session(async () => {
+      await symlink(outsideRoot, path.join(outputRoot, ".understand-anything"));
+      await writeTgdLayoutArtifacts(sourceRoot, outputRoot);
+    }));
+
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      failure: { code: "invalid-artifacts", message: expect.stringMatching(/symbolic link/i) },
+    });
+    await expect(readFile(path.join(outsideRoot, "knowledge-graph.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("AC-6.2: rejects graph provenance and removes staged artifacts that could poison a retry", async () => {
     const sourceRoot = await tempRoot("tgd-mapper-source-");
     const outputRoot = await tempRoot("tgd-mapper-output-");
@@ -222,6 +258,26 @@ describe("TgdPiMapper", () => {
       readFile(path.join(outputRoot, ".understand-anything/knowledge-graph.json"), "utf8"),
       readFile(path.join(outputRoot, ".understand-anything/mapping-metadata.json"), "utf8"),
     ].map(async (read) => expect(read).rejects.toMatchObject({ code: "ENOENT" })));
+  });
+
+  it("AC-6.2: removes stale scan-layout artifacts after validation failure", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const createSession = vi.fn(async () => session(async () => {
+      await writeTgdLayoutArtifacts(sourceRoot, outputRoot);
+    }));
+
+    const result = await new TgdPiMapper({ createSession }).map({
+      sourceRoot,
+      outputRoot,
+      baseSha: "abc4567890abc4567890abc4567890abc4567890",
+    });
+
+    expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-artifacts" } });
+    await expect(readFile(
+      path.join(outputRoot, ".scans", path.basename(sourceRoot), ".understand-anything/knowledge-graph.json"),
+      "utf8",
+    )).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("AC-6.2: returns a structured failure when validation cleanup cannot remove artifacts", async () => {
@@ -292,6 +348,7 @@ describe("TgdPiMapper", () => {
     const sourceRoot = await tempRoot("tgd-mapper-source-");
     const outputRoot = await tempRoot("tgd-mapper-output-");
     const outsideRoot = await tempRoot("tgd-mapper-outside-");
+    await writeFile(path.join(outsideRoot, "mapping-metadata.json"), "external metadata\n", "utf8");
     const createSession = vi.fn(async () => session(async () => {
       await writeFile(path.join(outputRoot, "CONTEXT.md"), "# Minimum trusted context\n", "utf8");
       await symlink(outsideRoot, path.join(outputRoot, ".understand-anything"));
@@ -310,6 +367,6 @@ describe("TgdPiMapper", () => {
       failure: { code: "invalid-artifacts", message: expect.stringMatching(/symbolic link/i) },
     });
     await expect(readFile(path.join(outsideRoot, "mapping-metadata.json"), "utf8"))
-      .rejects.toMatchObject({ code: "ENOENT" });
+      .resolves.toBe("external metadata\n");
   });
 });

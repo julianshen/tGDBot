@@ -188,6 +188,7 @@ function mappingArtifacts(hasDomainGraph: boolean): ArtifactInput[] {
 async function cleanupStagedArtifacts(outputRoot: string): Promise<unknown[]> {
   const results = await Promise.allSettled([
     rm(path.join(outputRoot, GRAPH_ROOT), { recursive: true, force: true }),
+    rm(path.join(outputRoot, ".scans"), { recursive: true, force: true }),
     rm(path.join(outputRoot, CONTEXT_PATH), { force: true }),
   ]);
   return results.flatMap((result) => result.status === "rejected" ? [result.reason] : []);
@@ -275,6 +276,10 @@ export class TgdPiMapper implements ContextMapper {
       if (!sourceInfo.isDirectory() || sourceInfo.isSymbolicLink() || !outputInfo.isDirectory() || outputInfo.isSymbolicLink()) {
         return failed("invalid-request", "Mapping roots must be real directories");
       }
+      const [physicalSourceRoot, physicalOutputRoot] = await Promise.all([realpath(sourceRoot), realpath(outputRoot)]);
+      if (physicalSourceRoot === physicalOutputRoot || physicallyBeneath(physicalSourceRoot, physicalOutputRoot)) {
+        return failed("invalid-request", "Mapping output must be outside the detached source worktree");
+      }
       this.#onProgress({ stage: "session", status: "started" });
       const session = await this.#createSession({ sourceRoot, outputRoot });
       try {
@@ -291,9 +296,9 @@ export class TgdPiMapper implements ContextMapper {
 
     this.#onProgress({ stage: "validation", status: "started" });
     try {
+      await ensureSafeGraphRoot(outputRoot);
       await copyMappedGraphsFromTgdLayout(sourceRoot, outputRoot);
       await assertNonEmptyContext(outputRoot);
-      await ensureSafeGraphRoot(outputRoot);
       await writeFile(
         manifestPath,
         `${JSON.stringify({ version: 1, status: "complete", baseSha: request.baseSha })}\n`,
