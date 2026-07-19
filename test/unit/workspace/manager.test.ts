@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepositoryRef } from "../../../src/vcs/adapter.js";
 import { prepareWorkspace, realExecWorkspaceCommand } from "../../../src/workspace/manager.js";
+import { deriveWorkspacePaths } from "../../../src/workspace/paths.js";
 
 const repo: RepositoryRef = { host: "github.com", owner: "octo-org", repo: "octo-repo" };
 const baseSha = "def4567890def4567890def4567890def4567890";
@@ -252,6 +253,21 @@ describe("prepareWorkspace", () => {
     await expect(readFile(path.join(outside, "github.com", "octo-org", "octo-repo", "repository.git")))
       .rejects.toMatchObject({ code: "ENOENT" });
   });
+
+  it.each(["mirrorPath", "ownerMarkerPath"] as const)(
+    "rejects a symlink at the managed %s before filesystem or Git mutation",
+    async (candidateName) => {
+      const root = await tempRoot();
+      const outside = await tempRoot();
+      const paths = deriveWorkspacePaths({ root, repo, baseSha });
+      await mkdir(path.dirname(paths[candidateName]), { recursive: true });
+      await symlink(outside, paths[candidateName]);
+      const exec = vi.fn(async () => "");
+
+      await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/symbolic link/i);
+      expect(exec).not.toHaveBeenCalled();
+    },
+  );
 
   it.each([
     "https://x-access-token:example-token@github.com/octo-org/octo-repo.git",

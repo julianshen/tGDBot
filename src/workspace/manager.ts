@@ -187,13 +187,19 @@ export async function prepareWorkspace(
     ".locks",
     `${request.repo.host}-${request.repo.owner}-${request.repo.repo}.lock`,
   );
-  await assertNoSymlinkedAncestors(paths.root, [lockPath, paths.repositoryRoot, paths.baseWorktreePath]);
+  await assertNoSymlinkedAncestors(
+    paths.root,
+    [lockPath, paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
+  );
   return withRepositoryLock({
     lockPath,
     timeoutMs: dependencies.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
     owner: { runId: randomUUID() },
   }, async () => {
-    await assertNoSymlinkedAncestors(paths.root, [paths.repositoryRoot, paths.baseWorktreePath]);
+    await assertNoSymlinkedAncestors(
+      paths.root,
+      [paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
+    );
     return prepareWorkspaceUnlocked(request, dependencies);
   });
 }

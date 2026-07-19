@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
-import { chmod, lstat, mkdtemp, mkdir, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, lstat, mkdtemp, mkdir, open, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
+import { promisify } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ContextCache,
@@ -28,6 +31,7 @@ const key: ContextCacheKey = {
 };
 const createdAt = "2026-07-18T08:00:00.000Z";
 const roots: string[] = [];
+const execFileAsync = promisify(execFile);
 
 function knowledgeGraph(): Record<string, unknown> {
   return {
@@ -874,6 +878,29 @@ describe("ContextCache", () => {
         input({ documents: [{ kind: "business-reference", path: "business/ticket.md" }] }),
       ),
     ).rejects.toThrow(/symbolic link/i);
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a FIFO artifact without blocking for a writer", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const staging = await createStaging(root);
+    const fifoPath = path.join(staging, "CONTEXT.md");
+    const claimedFifoPath = path.join(`${cache.entryPath(key)}.publishing`, "entry", "CONTEXT.md");
+    await rm(fifoPath);
+    await execFileAsync("mkfifo", [fifoPath]);
+
+    let writer: Promise<void> | undefined;
+    const writerTimer = setTimeout(() => {
+      writer = open(claimedFifoPath, "w").then(async (handle) => handle.close());
+    }, 200);
+    const startedAt = performance.now();
+    try {
+      await expect(cache.promoteContext(staging, input())).rejects.toThrow(/regular file/i);
+      expect(performance.now() - startedAt).toBeLessThan(100);
+    } finally {
+      clearTimeout(writerTimer);
+      await writer;
+    }
   });
 
   it("rejects promotion staging outside the configured cache scope", async () => {

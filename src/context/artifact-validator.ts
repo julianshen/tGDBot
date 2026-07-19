@@ -112,7 +112,7 @@ async function resolveRegularFileWithin(
     if (maxBytes !== undefined && (pathInfo?.size ?? 0) > maxBytes) {
       throw new ContextValidationError(`JSON artifact exceeds maximum safe size (${maxBytes} bytes): ${relativePath}`);
     }
-    handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     const info = await handle.stat();
     if (!info.isFile()) {
       await handle.close();
