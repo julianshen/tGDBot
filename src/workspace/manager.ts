@@ -130,7 +130,7 @@ async function prepareWorkspaceUnlocked(
       throw new Error(`Managed worktree HEAD does not match requested base SHA at ${paths.baseWorktreePath}`);
     }
     await execWorkspace(dependencies, "git", ["-C", paths.baseWorktreePath, "reset", "--hard", "HEAD"]);
-    await execWorkspace(dependencies, "git", ["-C", paths.baseWorktreePath, "clean", "-ffd"]);
+    await execWorkspace(dependencies, "git", ["-C", paths.baseWorktreePath, "clean", "-ffdx"]);
     return { ...paths, baseSha: expectedMarker.baseSha };
   }
 
@@ -145,7 +145,7 @@ async function prepareWorkspaceUnlocked(
     await execWorkspace(dependencies, "gh", [
       "repo",
       "clone",
-      `${request.repo.owner}/${request.repo.repo}`,
+      `https://${request.repo.host}/${request.repo.owner}/${request.repo.repo}`,
       paths.mirrorPath,
       "--",
       "--mirror",

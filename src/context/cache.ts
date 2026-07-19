@@ -337,7 +337,7 @@ export class ContextCache {
 
     const claimedStagingPath = path.join(claimPath, "entry");
     let published = false;
-    try {
+    const publicationResult = await (async () => {
       await fsRename(stagingPath, claimedStagingPath);
       const records = await digestArtifactInputs(
         claimedStagingPath,
@@ -384,25 +384,59 @@ export class ContextCache {
         throw new ContextCacheConflictError(destination);
       }
       return manifest;
-    } finally {
-      if (!published) {
+    })().then(
+      (value) => ({ succeeded: true as const, value }),
+      (error: unknown) => ({ succeeded: false as const, error }),
+    );
+
+    const cleanupErrors: unknown[] = [];
+    let claimCanBeRemoved = true;
+    if (!published) {
+      try {
+        await lstat(claimedStagingPath);
+        let stagingWasReplaced = false;
         try {
-          await lstat(claimedStagingPath);
-          try {
-            await lstat(stagingPath);
-            throw new ContextValidationError("Promotion staging path was replaced while publication was in progress");
-          } catch (error) {
-            if (!isMissing(error)) throw error;
-          }
-          await fsRename(claimedStagingPath, stagingPath);
+          await lstat(stagingPath);
+          stagingWasReplaced = true;
         } catch (error) {
           if (!isMissing(error)) throw error;
         }
+        if (stagingWasReplaced) {
+          claimCanBeRemoved = false;
+          cleanupErrors.push(
+            new ContextValidationError("Promotion staging path was replaced while publication was in progress"),
+          );
+        } else {
+          await fsRename(claimedStagingPath, stagingPath);
+        }
+      } catch (error) {
+        if (!isMissing(error)) cleanupErrors.push(error);
       }
+    }
+    if (claimCanBeRemoved) {
       // An in-process success/failure releases its own empty claim. A process
       // crash leaves the claim in place so a later publisher cannot guess that
       // it is stale and overlap a potentially live publisher.
-      await rmdir(claimPath);
+      try {
+        await rmdir(claimPath);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
     }
+
+    if (cleanupErrors.length > 0) {
+      const cleanupError = cleanupErrors.length === 1
+        ? cleanupErrors[0]
+        : new AggregateError(cleanupErrors, `Context cache publication cleanup failed for ${destination}`);
+      if (!publicationResult.succeeded) {
+        throw new AggregateError(
+          [publicationResult.error, cleanupError],
+          `Context cache publication and cleanup both failed for ${destination}`,
+        );
+      }
+      throw cleanupError;
+    }
+    if (!publicationResult.succeeded) throw publicationResult.error;
+    return publicationResult.value;
   }
 }

@@ -311,12 +311,16 @@ function validateGraph(
   const nodeIds = validNodes
     ? new Set((parsed.nodes as Record<string, unknown>[]).map((node) => node.id as string))
     : new Set<string>();
-  const referencesAreValid = validNodes && nodeIds.size === (parsed.nodes as unknown[]).length &&
-    (parsed.edges as unknown[] | undefined)?.every((edge) => isRecord(edge) &&
+  const referencesAreValid = validNodes &&
+    Array.isArray(parsed.edges) &&
+    Array.isArray(parsed.layers) &&
+    Array.isArray(parsed.tour) &&
+    nodeIds.size === (parsed.nodes as unknown[]).length &&
+    parsed.edges.every((edge) => isRecord(edge) &&
       nodeIds.has(edge.source as string) && nodeIds.has(edge.target as string)) === true &&
-    (parsed.layers as unknown[] | undefined)?.every((layer) => isRecord(layer) &&
+    parsed.layers.every((layer) => isRecord(layer) &&
       isStringArray(layer.nodeIds) && layer.nodeIds.every((id) => nodeIds.has(id))) === true &&
-    (parsed.tour as unknown[] | undefined)?.every((step) => isRecord(step) &&
+    parsed.tour.every((step) => isRecord(step) &&
       isStringArray(step.nodeIds) && step.nodeIds.every((id) => nodeIds.has(id))) === true;
   if (
     typeof parsed.version !== "string" ||

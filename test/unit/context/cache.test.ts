@@ -8,7 +8,7 @@ import {
   ContextCacheConflictError,
   computeManifestHash,
 } from "../../../src/context/cache.js";
-import { digestArtifactInputs } from "../../../src/context/artifact-validator.js";
+import { ContextValidationError, digestArtifactInputs } from "../../../src/context/artifact-validator.js";
 import type {
   ContextCacheKey,
   ContextManifest,
@@ -451,6 +451,19 @@ describe("ContextCache", () => {
     const staging = await createStaging(root);
     const graph = knowledgeGraph();
     mutate(graph);
+    await writeFile(
+      path.join(staging, ".understand-anything/knowledge-graph.json"),
+      JSON.stringify(graph),
+      "utf8",
+    );
+
+    await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+  });
+
+  it.each(["edges", "layers", "tour"])("rejects a non-array graph %s field with a validation error", async (field) => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const graph = { ...knowledgeGraph(), [field]: {} };
     await writeFile(
       path.join(staging, ".understand-anything/knowledge-graph.json"),
       JSON.stringify(graph),
@@ -1305,6 +1318,25 @@ describe("ContextCache", () => {
     await expect(readFile(path.join(staging, "manifest.json"), "utf8")).resolves.toContain('"status":"ready"');
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
     await expect(lstat(`${cache.entryPath(key)}.publishing`)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("preserves the publication failure when cleanup also finds a replaced staging path", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const publicationError = Object.assign(new Error("cross-device"), { code: "EXDEV" });
+    const cache = new ContextCache(root, {
+      rename: async () => {
+        await mkdir(staging);
+        throw publicationError;
+      },
+    });
+
+    const result = await cache.promoteContext(staging, input()).catch((error: unknown) => error);
+
+    expect(result).toBeInstanceOf(AggregateError);
+    expect((result as AggregateError).errors[0]).toBe(publicationError);
+    expect((result as AggregateError).errors[1]).toBeInstanceOf(ContextValidationError);
+    expect(((result as AggregateError).errors[1] as Error).message).toMatch(/replaced/i);
   });
 
   it("computes a deterministic manifest hash independent of object and record order", async () => {

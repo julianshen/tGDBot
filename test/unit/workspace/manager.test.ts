@@ -73,7 +73,14 @@ describe("prepareWorkspace", () => {
     expect(result.baseWorktreePath.startsWith(root + path.sep)).toBe(true);
     expect(commands).toContainEqual({
       tool: "gh",
-      args: ["repo", "clone", "octo-org/octo-repo", result.mirrorPath, "--", "--mirror"],
+      args: [
+        "repo",
+        "clone",
+        "https://github.com/octo-org/octo-repo",
+        result.mirrorPath,
+        "--",
+        "--mirror",
+      ],
     });
     expect(commands).toContainEqual({
       tool: "git",
@@ -185,7 +192,7 @@ describe("prepareWorkspace", () => {
       baseWorktreePath: worktreePath,
     });
     expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "reset", "--hard", "HEAD"]);
-    expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "clean", "-ffd"]);
+    expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "clean", "-ffdx"]);
   });
 
   it("rejects an unsupported managed-worktree marker version", async () => {
