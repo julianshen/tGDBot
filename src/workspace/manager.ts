@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withRepositoryLock } from "./lock.js";
 import { deriveWorkspacePaths } from "./paths.js";
@@ -68,6 +68,28 @@ async function assertNoSymlinkedAncestors(root: string, candidates: readonly str
         if (isMissing(error)) break;
         throw error;
       }
+    }
+  }
+}
+
+async function physicalWorkspaceRoot(requestedRoot: string): Promise<string> {
+  let existing = path.resolve(requestedRoot);
+  try {
+    await lstat(existing);
+    return existing;
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+  }
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      return path.join(await realpath(existing), ...suffix.reverse());
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+      const parent = path.dirname(existing);
+      if (parent === existing) throw error;
+      suffix.push(path.basename(existing));
+      existing = parent;
     }
   }
 }
@@ -168,10 +190,21 @@ async function prepareWorkspaceUnlocked(
     paths.baseWorktreePath,
     request.baseSha,
   ]);
-  await writeFile(paths.ownerMarkerPath, `${JSON.stringify(expectedMarker, null, 2)}\n`, {
-    encoding: "utf8",
-    flag: "wx",
-  });
+  try {
+    await writeFile(paths.ownerMarkerPath, `${JSON.stringify(expectedMarker, null, 2)}\n`, {
+      encoding: "utf8",
+      flag: "wx",
+    });
+  } catch (error) {
+    try {
+      await execWorkspace(dependencies, "git", [
+        "-C", paths.mirrorPath, "worktree", "remove", "--force", paths.baseWorktreePath,
+      ]);
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], `Failed to create ownership marker and clean up worktree`);
+    }
+    throw error;
+  }
 
   return { ...paths, baseSha: expectedMarker.baseSha };
 }
@@ -180,7 +213,7 @@ export async function prepareWorkspace(
   request: WorkspaceRequest,
   dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
 ): Promise<PreparedWorkspace> {
-  const paths = deriveWorkspacePaths(request);
+  const paths = deriveWorkspacePaths({ ...request, root: await physicalWorkspaceRoot(request.root) });
   await mkdir(paths.root, { recursive: true });
   const lockPath = path.join(
     paths.root,

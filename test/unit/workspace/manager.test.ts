@@ -1,4 +1,4 @@
-import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -252,6 +252,43 @@ describe("prepareWorkspace", () => {
     expect(exec).not.toHaveBeenCalled();
     await expect(readFile(path.join(outside, "github.com", "octo-org", "octo-repo", "repository.git")))
       .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("canonicalizes a symlinked ancestor above the configured workspace root", async () => {
+    const parent = await tempRoot();
+    const outside = await tempRoot();
+    const linkedParent = path.join(parent, "linked");
+    await symlink(outside, linkedParent);
+    const root = path.join(linkedParent, "workspace");
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "gh") await mkdir(args[3]!, { recursive: true });
+      if (args.includes("add")) await mkdir(args.at(-2)!, { recursive: true });
+      return "";
+    });
+
+    const result = await prepareWorkspace({ root, repo, baseSha }, { exec });
+    expect(await realpath(result.root)).toBe(await realpath(path.join(outside, "workspace")));
+    expect(result.repositoryRoot.startsWith(`${result.root}${path.sep}`)).toBe(true);
+  });
+
+  it("removes a newly-created worktree when ownership-marker creation fails", async () => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "gh") await mkdir(paths.mirrorPath, { recursive: true });
+      if (args.includes("add")) {
+        await mkdir(paths.baseWorktreePath, { recursive: true });
+        await mkdir(paths.ownerMarkerPath);
+      }
+      if (args.includes("remove")) await rm(paths.baseWorktreePath, { recursive: true, force: true });
+      return "";
+    });
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow();
+    expect(exec).toHaveBeenCalledWith("git", [
+      "-C", paths.mirrorPath, "worktree", "remove", "--force", paths.baseWorktreePath,
+    ]);
+    await expect(lstat(paths.baseWorktreePath)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it.each(["mirrorPath", "ownerMarkerPath"] as const)(

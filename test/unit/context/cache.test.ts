@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, lstat, mkdtemp, mkdir, open, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, mkdir, open, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -1214,6 +1214,17 @@ describe("ContextCache", () => {
     await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/manifest.*symbolic link/i);
     await expect(readFile(outsideFile, "utf8")).resolves.toBe("keep");
     await expect(new ContextCache(root).lookupContext(key)).resolves.toBeUndefined();
+  });
+
+  it("rejects a hard-linked staging manifest without overwriting its other name", async () => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const sentinel = path.join(root, "sentinel.txt");
+    await writeFile(sentinel, "keep\n", "utf8");
+    await link(sentinel, path.join(staging, "manifest.json"));
+
+    await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/hard links/i);
+    await expect(readFile(sentinel, "utf8")).resolves.toBe("keep\n");
   });
 
   it("conflicts with an existing corrupt destination", async () => {

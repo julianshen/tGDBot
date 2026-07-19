@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, open, realpath, rename as fsRename, rmdir, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, realpath, rename as fsRename, rmdir } from "node:fs/promises";
 import path from "node:path";
 import {
   ContextValidationError,
@@ -217,6 +218,30 @@ function physicallyBeneath(base: string, candidate: string): boolean {
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
+async function writeReadyManifest(manifestPath: string, contents: string): Promise<void> {
+  let handle;
+  try {
+    handle = await open(manifestPath, constants.O_WRONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (!isMissing(error)) throw error;
+    handle = await open(
+      manifestPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.nlink !== 1) {
+      throw new ContextValidationError("Staging manifest must be a single-link regular file");
+    }
+    await handle.truncate(0);
+    await handle.writeFile(contents, "utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
 export class ContextCache {
   readonly root: string;
   readonly #rename: Rename;
@@ -378,10 +403,13 @@ export class ContextCache {
         if (!stagingManifestInfo.isFile()) {
           throw new ContextValidationError("Staging manifest must be a regular file when present");
         }
+        if (stagingManifestInfo.nlink !== 1) {
+          throw new ContextValidationError("Staging manifest must not have multiple hard links");
+        }
       } catch (error) {
         if (!isMissing(error)) throw error;
       }
-      await writeFile(stagingManifestPath, `${canonicalJson(manifest)}\n`, "utf8");
+      await writeReadyManifest(stagingManifestPath, `${canonicalJson(manifest)}\n`);
       try {
         // The exclusive claim prevents conforming publishers from entering this
         // window together. Node has no portable no-replace directory rename, so
