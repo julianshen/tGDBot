@@ -20,7 +20,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { digestArtifactInputs, digestDegradedArtifactInputs } from "./artifact-validator.js";
 import type { ArtifactInput, ContextCacheKey } from "./types.js";
-import type { ContextMapper, ContextMapRequest, MappingResult } from "./mapper.js";
+import type {
+  ContextMapper,
+  ContextMapRequest,
+  DegradedReason,
+  MappingFailureCode,
+  MappingResult,
+} from "./mapper.js";
 
 const CONTEXT_PATH = "CONTEXT.md";
 const GRAPH_ROOT = ".understand-anything";
@@ -252,7 +258,11 @@ export class TgdPiMapper implements ContextMapper {
 
   async map(request: ContextMapRequest): Promise<MappingResult> {
     const manifestPath = path.join(request.outputRoot, METADATA_PATH);
-    const failed = (code: string, message: string, degradedReasons: string[] = []): MappingResult => ({
+    const failed = (
+      code: MappingFailureCode,
+      message: string,
+      degradedReasons: DegradedReason[] = [],
+    ): MappingResult => ({
       status: "failed",
       manifestPath,
       artifactPaths: [],
@@ -270,8 +280,8 @@ export class TgdPiMapper implements ContextMapper {
       return failed("invalid-request", "Mapping output must be outside the detached source worktree");
     }
 
-    await mkdir(outputRoot, { recursive: true });
     try {
+      await mkdir(outputRoot, { recursive: true });
       const [sourceInfo, outputInfo] = await Promise.all([lstat(sourceRoot), lstat(outputRoot)]);
       if (!sourceInfo.isDirectory() || sourceInfo.isSymbolicLink() || !outputInfo.isDirectory() || outputInfo.isSymbolicLink()) {
         return failed("invalid-request", "Mapping roots must be real directories");
@@ -280,6 +290,11 @@ export class TgdPiMapper implements ContextMapper {
       if (physicalSourceRoot === physicalOutputRoot || physicallyBeneath(physicalSourceRoot, physicalOutputRoot)) {
         return failed("invalid-request", "Mapping output must be outside the detached source worktree");
       }
+    } catch (error) {
+      return failed("invalid-request", errorMessage(error));
+    }
+
+    try {
       this.#onProgress({ stage: "session", status: "started" });
       const session = await this.#createSession({ sourceRoot, outputRoot });
       try {
@@ -314,7 +329,9 @@ export class TgdPiMapper implements ContextMapper {
             ? "Required knowledge graph is missing"
             : "Mapping must produce exactly one domain graph or zero-domain marker");
         }
-        const degradedReasons = [!hasKnowledge ? "knowledge-graph-unavailable" : "domain-context-unavailable"];
+        const degradedReasons: DegradedReason[] = [
+          !hasKnowledge ? "knowledge-graph-unavailable" : "domain-context-unavailable",
+        ];
         await digestDegradedArtifactInputs(outputRoot, validationKey(request.baseSha), [
           { kind: "context", path: CONTEXT_PATH },
           { kind: "mapping-metadata", path: METADATA_PATH },

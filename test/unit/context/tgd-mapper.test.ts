@@ -95,6 +95,64 @@ afterEach(async () => {
 });
 
 describe("TgdPiMapper", () => {
+  it.each([
+    { name: "relative source", sourceRoot: "relative-source", outputRoot: "/tmp/output" },
+    { name: "relative output", sourceRoot: "/tmp/source", outputRoot: "relative-output" },
+  ])("AC-6.1: rejects $name roots before creating a session", async ({ sourceRoot, outputRoot }) => {
+    const createSession = vi.fn(async () => session(async () => undefined));
+
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+
+    expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("AC-6.1: rejects an output root lexically nested under source", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = path.join(sourceRoot, "mapping-output");
+    const createSession = vi.fn(async () => session(async () => undefined));
+
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+
+    expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "output"])("AC-6.1: rejects a non-directory %s root", async (name) => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const fileRoot = path.join(await tempRoot("tgd-mapper-file-"), "root.txt");
+    await writeFile(fileRoot, "not a directory\n", "utf8");
+    const createSession = vi.fn(async () => session(async () => undefined));
+
+    const result = await new TgdPiMapper({ createSession }).map({
+      sourceRoot: name === "source" ? fileRoot : sourceRoot,
+      outputRoot: name === "output" ? fileRoot : outputRoot,
+      baseSha,
+    });
+
+    expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it.each(["source", "output"])("AC-6.1: rejects a symlinked %s root", async (name) => {
+    const realSourceRoot = await tempRoot("tgd-mapper-source-");
+    const realOutputRoot = await tempRoot("tgd-mapper-output-");
+    const linkParent = await tempRoot("tgd-mapper-link-");
+    const linkedRoot = path.join(linkParent, "root-link");
+    await symlink(name === "source" ? realSourceRoot : realOutputRoot, linkedRoot);
+    const createSession = vi.fn(async () => session(async () => undefined));
+
+    const result = await new TgdPiMapper({ createSession }).map({
+      sourceRoot: name === "source" ? linkedRoot : realSourceRoot,
+      outputRoot: name === "output" ? linkedRoot : realOutputRoot,
+      baseSha,
+    });
+
+    expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("AC-6.1: rejects an output root physically nested under source through a symlinked parent", async () => {
     const sourceRoot = await tempRoot("tgd-mapper-source-");
     const aliasRoot = await tempRoot("tgd-mapper-alias-");

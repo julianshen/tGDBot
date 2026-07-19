@@ -5,9 +5,12 @@ export interface ContextMapRequest {
   allowDegradedContext?: boolean;
 }
 
+export type MappingFailureCode = "invalid-request" | "pi-session-failed" | "invalid-artifacts";
+export type DegradedReason = "knowledge-graph-unavailable" | "domain-context-unavailable";
+
 export interface MappingFailure {
   stage: "context-map";
-  code: string;
+  code: MappingFailureCode;
   message: string;
 }
 
@@ -16,7 +19,7 @@ export interface MappingResult {
   manifestPath: string;
   artifactPaths: string[];
   analyzedFiles: number;
-  degradedReasons: string[];
+  degradedReasons: DegradedReason[];
   failure?: MappingFailure;
 }
 
