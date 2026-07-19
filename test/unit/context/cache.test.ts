@@ -1154,6 +1154,29 @@ describe("ContextCache", () => {
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
   });
 
+  it("misses when the manifest is replaced by a symlink at the lookup open boundary", async () => {
+    const root = await tempRoot();
+    await promoteValid(root);
+    const file = await manifestPath(root);
+    const outside = await tempRoot();
+    const outsideManifest = path.join(outside, "manifest.json");
+    await writeFile(outsideManifest, await readFile(file));
+    const actualOpen = open;
+    let replaced = false;
+    const dependencies = {
+      lookupOpen: async (...args: Parameters<typeof open>) => {
+        if (!replaced) {
+          replaced = true;
+          await rm(file);
+          await symlink(outsideManifest, file);
+        }
+        return actualOpen(...args);
+      },
+    } satisfies ContextCacheDependencies;
+
+    await expect(new ContextCache(root, dependencies).lookupContext(key)).resolves.toBeUndefined();
+  });
+
   it("misses when an entry escapes through a symlinked cache parent", async () => {
     const root = await tempRoot();
     const outside = await tempRoot();

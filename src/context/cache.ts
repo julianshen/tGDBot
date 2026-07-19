@@ -19,10 +19,12 @@ import type {
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_READY_MANIFEST_BYTES = 1024 * 1024;
 type Rename = (source: string, destination: string) => Promise<void>;
+type Open = typeof open;
 
 export interface ContextCacheDependencies {
   rename?: Rename;
   claimRename?: Rename;
+  lookupOpen?: Open;
 }
 
 export class ContextCacheConflictError extends Error {
@@ -45,6 +47,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isMissing(error: unknown): boolean {
   return isRecord(error) && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
+function isUnsafeLookupPath(error: unknown): boolean {
+  return isMissing(error) || (isRecord(error) && error.code === "ELOOP");
+}
+
+function sameIdentity(left: { dev: number; ino: number }, right: { dev: number; ino: number }): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function isRenameCollision(error: unknown): boolean {
@@ -246,6 +256,7 @@ export class ContextCache {
   readonly root: string;
   readonly #rename: Rename;
   readonly #claimRename: Rename;
+  readonly #lookupOpen: Open;
 
   constructor(root: string, dependencies: ContextCacheDependencies = {}) {
     if (!path.isAbsolute(root) || root.includes("\0")) {
@@ -254,6 +265,7 @@ export class ContextCache {
     this.root = path.resolve(root);
     this.#rename = dependencies.rename ?? fsRename;
     this.#claimRename = dependencies.claimRename ?? fsRename;
+    this.#lookupOpen = dependencies.lookupOpen ?? open;
   }
 
   entryPath(key: ContextCacheKey): string {
@@ -285,10 +297,25 @@ export class ContextCache {
       if (manifestInfo.size > MAX_READY_MANIFEST_BYTES) return undefined;
       let parsedJson: unknown;
       try {
-        const handle = await open(manifestPath, "r");
+        const handle = await this.#lookupOpen(
+          manifestPath,
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
         try {
           const currentInfo = await handle.stat();
-          if (!currentInfo.isFile() || currentInfo.size > MAX_READY_MANIFEST_BYTES) return undefined;
+          const [currentEntryInfo, currentParentInfo] = await Promise.all([
+            lstat(entry),
+            lstat(path.dirname(entry)),
+          ]);
+          if (
+            !currentInfo.isFile() ||
+            currentInfo.size > MAX_READY_MANIFEST_BYTES ||
+            !sameIdentity(currentInfo, manifestInfo) ||
+            !sameIdentity(currentEntryInfo, entryInfo) ||
+            !sameIdentity(currentParentInfo, parentInfo) ||
+            currentEntryInfo.isSymbolicLink() ||
+            currentParentInfo.isSymbolicLink()
+          ) return undefined;
           const contents = Buffer.alloc(currentInfo.size);
           const { bytesRead } = await handle.read(contents, 0, contents.length, 0);
           const probe = Buffer.allocUnsafe(1);
@@ -308,7 +335,7 @@ export class ContextCache {
       await validateArtifactRecords(entry, key, manifest.artifacts, manifest.documents);
       return manifest;
     } catch (error) {
-      if (error instanceof ContextValidationError || isMissing(error)) return undefined;
+      if (error instanceof ContextValidationError || isUnsafeLookupPath(error)) return undefined;
       throw error;
     }
   }
