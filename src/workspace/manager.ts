@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withRepositoryLock } from "./lock.js";
 import { deriveWorkspacePaths } from "./paths.js";
@@ -126,6 +126,43 @@ async function physicalWorkspaceRoot(requestedRoot: string): Promise<string> {
       suffix.push(path.basename(existing));
       existing = parent;
     }
+  }
+}
+
+async function protectWorkspaceRoot(root: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const initial = await lstat(root);
+  if (!initial.isDirectory() || initial.isSymbolicLink()) {
+    throw new Error(`Managed workspace root must be a real directory: ${root}`);
+  }
+  const currentUid = process.getuid?.();
+  if (currentUid !== undefined && initial.uid !== currentUid) {
+    throw new Error(`Managed workspace root must be owned by the current user: ${root}`);
+  }
+
+  let ancestor = path.dirname(root);
+  while (true) {
+    const info = await stat(ancestor);
+    const writableByOthers = (info.mode & 0o022) !== 0;
+    const sticky = (info.mode & 0o1000) !== 0;
+    if (writableByOthers && !sticky) {
+      throw new Error(`Managed workspace parent can be replaced by another user: ${ancestor}`);
+    }
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+  }
+
+  await chmod(root, 0o700);
+  const secured = await lstat(root);
+  if (
+    secured.isSymbolicLink() ||
+    !secured.isDirectory() ||
+    secured.dev !== initial.dev ||
+    secured.ino !== initial.ino ||
+    (secured.mode & 0o077) !== 0
+  ) {
+    throw new Error(`Managed workspace root changed while it was being protected: ${root}`);
   }
 }
 
@@ -273,6 +310,7 @@ export async function prepareWorkspace(
   const paths = deriveWorkspacePaths({ ...request, root: await physicalWorkspaceRoot(request.root) });
   const normalizedRequest = { ...request, root: paths.root };
   await mkdir(paths.root, { recursive: true });
+  await protectWorkspaceRoot(paths.root);
   const lockPath = path.join(
     paths.root,
     ".locks",

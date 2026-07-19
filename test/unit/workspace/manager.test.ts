@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -21,6 +21,33 @@ afterEach(async () => {
 });
 
 describe("prepareWorkspace", () => {
+  it.skipIf(process.platform === "win32")("protects the managed root from other operating-system users", async () => {
+    const root = await tempRoot();
+    await chmod(root, 0o777);
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "gh" && args[0] === "repo" && args[1] === "clone") await mkdir(args[3], { recursive: true });
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2) as string, { recursive: true });
+      }
+      return "";
+    });
+
+    await prepareWorkspace({ root, repo, baseSha }, { exec });
+
+    expect((await stat(root)).mode & 0o777).toBe(0o700);
+  });
+
+  it.skipIf(process.platform === "win32")("rejects a root whose parent can be replaced by another user", async () => {
+    const parent = await tempRoot();
+    const root = path.join(parent, "workspace");
+    await mkdir(root);
+    await chmod(parent, 0o777);
+    const exec = vi.fn(async () => "");
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/parent.*another user/i);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it.skipIf(process.platform === "win32")("runs real workspace commands non-interactively", async () => {
     const root = await tempRoot();
     const bin = path.join(root, "bin");
