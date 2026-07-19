@@ -75,6 +75,14 @@ async function writeReadyArtifacts(outputRoot: string): Promise<void> {
   await writeFile(path.join(graphRoot, "domain-graph.json"), JSON.stringify(domainGraph()), "utf8");
 }
 
+async function writeTgdLayoutArtifacts(sourceRoot: string, outputRoot: string): Promise<void> {
+  const graphRoot = path.join(outputRoot, ".scans", path.basename(sourceRoot), ".understand-anything");
+  await mkdir(graphRoot, { recursive: true });
+  await writeFile(path.join(outputRoot, "CONTEXT.md"), "# Trusted base context\n", "utf8");
+  await writeFile(path.join(graphRoot, "knowledge-graph.json"), JSON.stringify(knowledgeGraph()), "utf8");
+  await writeFile(path.join(graphRoot, "domain-graph.json"), JSON.stringify(domainGraph()), "utf8");
+}
+
 function session(onPrompt: (prompt: string) => Promise<void>): MappingSession {
   return {
     prompt: onPrompt,
@@ -130,6 +138,57 @@ describe("TgdPiMapper", () => {
       artifactPaths: [],
       failure: { stage: "context-map", code: "pi-session-failed", message: "provider unavailable" },
     });
+  });
+
+  it("AC-6.2: aborts a timed-out pi session before returning the structured failure", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const abort = vi.fn(async () => undefined);
+    const createSession = vi.fn(async () => ({
+      prompt: async () => new Promise<void>(() => undefined),
+      getLastAssistantText: () => undefined,
+      abort,
+    }));
+
+    const result = await new TgdPiMapper({ createSession, timeoutMs: 5 }).map({ sourceRoot, outputRoot, baseSha });
+
+    expect(result).toMatchObject({
+      status: "failed",
+      failure: { code: "pi-session-failed", message: expect.stringMatching(/timed out/i) },
+    });
+    expect(abort).toHaveBeenCalledOnce();
+  });
+
+  it("AC-6.1: normalizes the installed tGD scan layout into cache artifact paths", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const createSession = vi.fn(async () => session(async () => {
+      await writeTgdLayoutArtifacts(sourceRoot, outputRoot);
+    }));
+
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+
+    expect(result.status).toBe("ready");
+    await expect(readFile(path.join(outputRoot, ".understand-anything/knowledge-graph.json"), "utf8"))
+      .resolves.toContain(baseSha);
+  });
+
+  it("AC-6.2: rejects graph provenance for a different base SHA and removes completion metadata", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const createSession = vi.fn(async () => session(async () => {
+      await writeReadyArtifacts(outputRoot);
+    }));
+
+    const result = await new TgdPiMapper({ createSession }).map({
+      sourceRoot,
+      outputRoot,
+      baseSha: "abc4567890abc4567890abc4567890abc4567890",
+    });
+
+    expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-artifacts" } });
+    await expect(readFile(path.join(outputRoot, ".understand-anything/mapping-metadata.json"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it("AC-6.2: ignores success prose and fails when the knowledge graph is missing", async () => {

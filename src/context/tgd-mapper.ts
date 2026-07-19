@@ -41,6 +41,7 @@ const EMBEDDED_MAPPING_CONTRACT = [
 export interface MappingSession {
   prompt(text: string): Promise<void>;
   getLastAssistantText(): string | undefined;
+  abort?(): Promise<void>;
 }
 
 export interface MappingSessionRequest {
@@ -188,10 +189,13 @@ async function createRealMappingSession(request: MappingSessionRequest): Promise
   return session;
 }
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout: () => void): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`tGD mapping timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => {
+      onTimeout();
+      reject(new Error(`tGD mapping timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
@@ -235,7 +239,9 @@ export class TgdPiMapper implements ContextMapper {
       }
       this.#onProgress({ stage: "session", status: "started" });
       const session = await this.#createSession({ sourceRoot, outputRoot });
-      await withTimeout(session.prompt("/tgd-map"), this.#timeoutMs);
+      await withTimeout(session.prompt("/tgd-map"), this.#timeoutMs, () => {
+        void session.abort?.().catch(() => undefined);
+      });
       this.#onProgress({ stage: "session", status: "completed" });
     } catch (error) {
       this.#onProgress({ stage: "session", status: "failed" });
@@ -293,4 +299,3 @@ export class TgdPiMapper implements ContextMapper {
     }
   }
 }
-

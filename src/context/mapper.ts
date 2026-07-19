@@ -23,4 +23,3 @@ export interface MappingResult {
 export interface ContextMapper {
   map(request: ContextMapRequest): Promise<MappingResult>;
 }
-
