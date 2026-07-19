@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { realExecWorkspaceCommand } from "../workspace/manager.js";
 
@@ -30,12 +30,20 @@ export interface BusinessReferenceResult {
 
 export interface BusinessReferenceDependencies {
   listTrackedFiles?: (sourceRoot: string) => Promise<string[]>;
+  now?: () => Date;
 }
 
 interface TrustedDocument {
   relativePath: string;
   absolutePath: string;
   contents: string;
+}
+
+interface DomainGraphSource {
+  projectName: string;
+  baseSha: string;
+  sha256: string;
+  nodes: Array<{ id: string; type: "domain" | "flow" | "step"; name: string; summary: string }>;
 }
 
 function isBeneath(base: string, candidate: string): boolean {
@@ -49,6 +57,15 @@ function toPosix(relativePath: string): string {
 
 function emptyDigest(): string {
   return createHash("sha256").update("").digest("hex");
+}
+
+function isMissing(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error &&
+    ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function digestDocuments(documents: readonly TrustedDocument[]): string {
@@ -124,6 +141,144 @@ async function resolveTrustedDocuments(sourceRoot: string, candidates: readonly 
   })));
 }
 
+async function validateGenerationRoot(sourceRoot: string, generatedPath: string): Promise<{
+  generatedPath: string;
+  generationRoot: string;
+  physicalGenerationRoot: string;
+}> {
+  if (!path.isAbsolute(generatedPath) || path.basename(generatedPath) !== "BUSINESS-CONTEXT.md") {
+    throw new Error("Generated business reference must use an absolute BUSINESS-CONTEXT.md path");
+  }
+  const resolvedSource = path.resolve(sourceRoot);
+  const resolvedGenerated = path.resolve(generatedPath);
+  if (resolvedGenerated === resolvedSource || isBeneath(resolvedSource, resolvedGenerated)) {
+    throw new Error("Generated business reference must be outside the trusted source repository");
+  }
+  const generationRoot = path.dirname(resolvedGenerated);
+  const rootInfo = await lstat(generationRoot);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    throw new Error("Generated business reference root must be a real cache directory");
+  }
+  const [physicalSource, physicalGenerationRoot] = await Promise.all([
+    realpath(resolvedSource),
+    realpath(generationRoot),
+  ]);
+  if (physicalGenerationRoot === physicalSource || isBeneath(physicalSource, physicalGenerationRoot)) {
+    throw new Error("Generated business reference cache resolves inside the trusted source repository");
+  }
+  return { generatedPath: resolvedGenerated, generationRoot, physicalGenerationRoot };
+}
+
+async function readDomainGraph(
+  generationRoot: string,
+  physicalGenerationRoot: string,
+): Promise<DomainGraphSource | undefined> {
+  const graphPath = path.join(generationRoot, ".understand-anything", "domain-graph.json");
+  let info;
+  try {
+    info = await lstat(graphPath);
+  } catch (error) {
+    if (isMissing(error)) return;
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("Domain graph must be a real cache file");
+  const physicalGraph = await realpath(graphPath);
+  if (!isBeneath(physicalGenerationRoot, physicalGraph)) {
+    throw new Error("Domain graph escaped the business-reference cache root");
+  }
+  const raw = await readFile(graphPath, "utf8");
+  const parsed: unknown = JSON.parse(raw);
+  if (!isRecord(parsed) || !isRecord(parsed.project) || !Array.isArray(parsed.nodes) ||
+    typeof parsed.project.name !== "string" || typeof parsed.project.gitCommitHash !== "string") {
+    throw new Error("Domain graph is missing business-reference provenance");
+  }
+  const nodes = parsed.nodes.flatMap((node) => {
+    if (!isRecord(node) || (node.type !== "domain" && node.type !== "flow" && node.type !== "step") ||
+      typeof node.id !== "string" || typeof node.name !== "string" || typeof node.summary !== "string") {
+      return [];
+    }
+    const type: "domain" | "flow" | "step" = node.type;
+    return [{ id: node.id, type, name: node.name, summary: node.summary }];
+  }).sort((left, right) => {
+    const typeOrder = { domain: 0, flow: 1, step: 2 } as const;
+    return typeOrder[left.type] - typeOrder[right.type] || left.id.localeCompare(right.id);
+  });
+  if (nodes.length === 0) throw new Error("Domain graph has no domain or flow context to generate");
+  return {
+    projectName: parsed.project.name,
+    baseSha: parsed.project.gitCommitHash,
+    sha256: createHash("sha256").update(raw).digest("hex"),
+    nodes,
+  };
+}
+
+function safeScalar(value: string): string {
+  return /^[a-zA-Z0-9._:/-]+$/u.test(value) ? value : JSON.stringify(value);
+}
+
+function singleLine(value: string): string {
+  return value.replaceAll(/[\r\n]+/gu, " ").trim();
+}
+
+function generateBusinessContext(source: DomainGraphSource, generatedAt: Date): string {
+  const sections = source.nodes.map((node) => {
+    const citationId = /^[a-zA-Z0-9:_-]+$/u.test(node.id) ? node.id : encodeURIComponent(node.id);
+    return [
+      `## ${node.type[0]!.toUpperCase()}${node.type.slice(1)}: ${singleLine(node.name)}`,
+      "",
+      singleLine(node.summary),
+      "",
+      `Source: \`.understand-anything/domain-graph.json#${citationId}\``,
+    ].join("\n");
+  });
+  return [
+    "---",
+    "generated: true",
+    "provider: github",
+    `repository: ${safeScalar(source.projectName)}`,
+    `base_sha: ${safeScalar(source.baseSha)}`,
+    "source: .understand-anything/domain-graph.json",
+    `source_sha256: ${source.sha256}`,
+    `generated_at: ${generatedAt.toISOString()}`,
+    "---",
+    "",
+    "# Business Context",
+    "",
+    "Generated solely from the validated trusted-base domain graph.",
+    "",
+    ...sections,
+    "",
+  ].join("\n");
+}
+
+async function readReusableGenerated(generatedPath: string, source: DomainGraphSource): Promise<string | undefined> {
+  let info;
+  try {
+    info = await lstat(generatedPath);
+  } catch (error) {
+    if (isMissing(error)) return;
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink()) throw new Error("Generated business reference must be a real file");
+  const contents = await readFile(generatedPath, "utf8");
+  return contents.includes(`source_sha256: ${source.sha256}`) && contents.includes(`base_sha: ${safeScalar(source.baseSha)}`)
+    ? contents
+    : undefined;
+}
+
+async function writeGenerated(generatedPath: string, contents: string): Promise<void> {
+  const temporaryPath = path.join(path.dirname(generatedPath), `.BUSINESS-CONTEXT.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporaryPath, contents, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    await rename(temporaryPath, generatedPath);
+  } catch (error) {
+    await unlink(temporaryPath).catch((cleanupError: unknown) => {
+      if (!isMissing(cleanupError)) throw cleanupError;
+    });
+    throw error;
+  }
+}
+
 export async function selectBusinessReference(
   input: BusinessReferenceInput,
   dependencies: BusinessReferenceDependencies = {},
@@ -154,10 +309,23 @@ export async function selectBusinessReference(
     .map((candidate) => candidate.relativePath);
   const documents = (await resolveTrustedDocuments(path.resolve(input.sourceRoot), ranked)).filter((document) =>
     isAdequate(document.contents));
-  if (documents.length === 0) return { kind: "none", paths: [], digest: emptyDigest() };
+  if (documents.length > 0) {
+    return {
+      kind: "existing",
+      paths: documents.map((document) => document.relativePath),
+      digest: digestDocuments(documents),
+    };
+  }
+
+  const destination = await validateGenerationRoot(path.resolve(input.sourceRoot), input.generatedPath);
+  const domainGraph = await readDomainGraph(destination.generationRoot, destination.physicalGenerationRoot);
+  if (domainGraph === undefined) return { kind: "none", paths: [], digest: emptyDigest() };
+  const existing = await readReusableGenerated(destination.generatedPath, domainGraph);
+  const contents = existing ?? generateBusinessContext(domainGraph, (dependencies.now ?? (() => new Date()))());
+  if (existing === undefined) await writeGenerated(destination.generatedPath, contents);
   return {
-    kind: "existing",
-    paths: documents.map((document) => document.relativePath),
-    digest: digestDocuments(documents),
+    kind: "generated",
+    paths: [path.basename(destination.generatedPath)],
+    digest: createHash("sha256").update(contents).digest("hex"),
   };
 }

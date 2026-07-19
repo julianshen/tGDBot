@@ -23,6 +23,31 @@ function adequateDoc(title = "Domain", secondHeading = "Workflow"): string {
     "The workflow coordinates customer requests with fulfillment outcomes.\n";
 }
 
+function domainGraph(): Record<string, unknown> {
+  return {
+    version: "1.0.0",
+    project: {
+      name: "octo-repo",
+      gitCommitHash: "def4567890def4567890def4567890def4567890",
+    },
+    nodes: [
+      {
+        id: "domain:orders",
+        type: "domain",
+        name: "Orders",
+        summary: "Owns order placement and lifecycle invariants.",
+      },
+      {
+        id: "flow:checkout",
+        type: "flow",
+        name: "Checkout",
+        summary: "Validates a cart before creating an order.",
+      },
+    ],
+    edges: [],
+  };
+}
+
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
@@ -101,5 +126,66 @@ describe("selectBusinessReference", () => {
       explicitPaths: ["business.md"],
       generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
     })).rejects.toThrow(/symbolic link|outside.*trusted source|escape/i);
+  });
+
+  it("AC-7.2: generates a cited cache-local reference from the domain graph and leaves source unchanged", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
+    await write(sourceRoot, "README.md", "# Project\n\nShort setup notes only.\n");
+    await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
+    const originalReadme = await readFile(path.join(sourceRoot, "README.md"), "utf8");
+
+    const result = await selectBusinessReference({
+      sourceRoot,
+      explicitPaths: [],
+      generatedPath,
+    }, {
+      listTrackedFiles: async () => ["README.md"],
+      now: () => new Date("2026-07-20T00:00:00.000Z"),
+    });
+
+    expect(result).toMatchObject({ kind: "generated", paths: ["BUSINESS-CONTEXT.md"] });
+    expect(result.digest).toMatch(/^[a-f0-9]{64}$/);
+    const generated = await readFile(generatedPath, "utf8");
+    expect(generated).toContain("generated: true");
+    expect(generated).toContain("provider: github");
+    expect(generated).toContain("repository: octo-repo");
+    expect(generated).toContain("base_sha: def4567890def4567890def4567890def4567890");
+    expect(generated).toMatch(/source_sha256: [a-f0-9]{64}/);
+    expect(generated).toContain("generated_at: 2026-07-20T00:00:00.000Z");
+    expect(generated).toContain(".understand-anything/domain-graph.json#domain:orders");
+    expect(generated).toContain(".understand-anything/domain-graph.json#flow:checkout");
+    await expect(readFile(path.join(sourceRoot, "README.md"), "utf8")).resolves.toBe(originalReadme);
+    await expect(readFile(path.join(sourceRoot, "BUSINESS-CONTEXT.md"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("AC-7.2: returns none without creating a document when no adequate docs or domain graph exist", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
+
+    const result = await selectBusinessReference({
+      sourceRoot,
+      explicitPaths: [],
+      generatedPath,
+    }, { listTrackedFiles: async () => [] });
+
+    expect(result).toMatchObject({ kind: "none", paths: [] });
+    await expect(readFile(generatedPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("AC-7.2: refuses to generate BUSINESS-CONTEXT.md inside the trusted repository", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    await write(sourceRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
+
+    await expect(selectBusinessReference({
+      sourceRoot,
+      explicitPaths: [],
+      generatedPath: path.join(sourceRoot, "BUSINESS-CONTEXT.md"),
+    }, { listTrackedFiles: async () => [] })).rejects.toThrow(/generated.*outside|repository|trusted source/i);
+    await expect(readFile(path.join(sourceRoot, "BUSINESS-CONTEXT.md"), "utf8"))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 });
