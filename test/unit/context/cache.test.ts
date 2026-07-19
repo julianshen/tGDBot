@@ -306,6 +306,21 @@ describe("ContextCache", () => {
     await expect(new ContextCache(root).lookupContext(key)).resolves.toBeUndefined();
   });
 
+  it("treats an oversized unreadable ready manifest as a bounded cache miss", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const file = await manifestPath(root);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, "{}");
+    await truncate(file, 1024 * 1024 + 1);
+    await chmod(file, 0o000);
+    try {
+      await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+    } finally {
+      await chmod(file, 0o600);
+    }
+  });
+
   it("rejects a manifest whose embedded key does not exactly match", async () => {
     const root = await tempRoot();
     const cache = new ContextCache(root);
@@ -413,6 +428,50 @@ describe("ContextCache", () => {
     await replaceStoredArtifact(hitRoot, ".understand-anything/knowledge-graph.json", emptyGraph);
     await expect(hitCache.lookupContext(key)).resolves.toBeUndefined();
   });
+
+  it.each([
+    ["duplicate node IDs", (graph: Record<string, unknown>) => {
+      const nodes = graph.nodes as Record<string, unknown>[];
+      nodes[1] = { ...nodes[1], id: nodes[0]?.id };
+    }],
+    ["a dangling edge source", (graph: Record<string, unknown>) => {
+      (graph.edges as Record<string, unknown>[])[0]!.source = "file:missing.ts";
+    }],
+    ["a dangling edge target", (graph: Record<string, unknown>) => {
+      (graph.edges as Record<string, unknown>[])[0]!.target = "function:missing";
+    }],
+    ["a dangling layer reference", (graph: Record<string, unknown>) => {
+      (graph.layers as Record<string, unknown>[])[0]!.nodeIds = ["file:missing.ts"];
+    }],
+    ["a dangling tour reference", (graph: Record<string, unknown>) => {
+      (graph.tour as Record<string, unknown>[])[0]!.nodeIds = ["file:missing.ts"];
+    }],
+  ])("rejects %s", async (_label, mutate) => {
+    const root = await tempRoot();
+    const staging = await createStaging(root);
+    const graph = knowledgeGraph();
+    mutate(graph);
+    await writeFile(
+      path.join(staging, ".understand-anything/knowledge-graph.json"),
+      JSON.stringify(graph),
+      "utf8",
+    );
+
+    await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+  });
+
+  it.each(["knowledge-graph.json", "domain-graph.json"])(
+    "rejects %s when its project commit differs from the cache key",
+    async (filename) => {
+      const root = await tempRoot();
+      const staging = await createStaging(root);
+      const graph = filename === "knowledge-graph.json" ? knowledgeGraph() : domainGraph();
+      (graph.project as Record<string, unknown>).gitCommitHash = "a".repeat(40);
+      await writeFile(path.join(staging, ".understand-anything", filename), JSON.stringify(graph), "utf8");
+
+      await expect(new ContextCache(root).promoteContext(staging, input())).rejects.toThrow(/graph schema/i);
+    },
+  );
 
   it.each([
     "",
@@ -1320,7 +1379,9 @@ describe("ContextCache", () => {
 
     const promoted = await cache.promoteContext(staging, input());
 
-    expect(calls).toEqual([`rename:${staging}:${cache.entryPath(key)}`]);
+    expect(calls).toEqual([
+      `rename:${cache.entryPath(key)}.publishing${path.sep}entry:${cache.entryPath(key)}`,
+    ]);
     await expect(cache.lookupContext(key)).resolves.toEqual(promoted);
   });
 

@@ -228,22 +228,21 @@ export async function withRepositoryLock<T>(
         (value) => ({ succeeded: true as const, value }),
         (error: unknown) => ({ succeeded: false as const, error }),
       );
+      let releaseError: unknown;
       try {
-        if (workResult.succeeded) return workResult.value;
-        throw workResult.error;
-      } finally {
-        try {
-          await releaseOwnedLock(options.lockPath, acquiredLock.identity);
-        } catch (releaseError) {
-          if (!workResult.succeeded) {
-            throw new AggregateError(
-              [workResult.error, releaseError],
-              `Repository lock work failed and lock release also failed at ${options.lockPath}`,
-            );
-          }
-          throw releaseError;
-        }
+        await releaseOwnedLock(options.lockPath, acquiredLock.identity);
+      } catch (error) {
+        releaseError = error;
       }
+      if (releaseError !== undefined && !workResult.succeeded) {
+        throw new AggregateError(
+          [workResult.error, releaseError],
+          `Repository lock work failed and lock release also failed at ${options.lockPath}`,
+        );
+      }
+      if (releaseError !== undefined) throw releaseError;
+      if (!workResult.succeeded) throw workResult.error;
+      return workResult.value;
     }
     isInitialAttempt = false;
     const remainingMs = deadline - performance.now();

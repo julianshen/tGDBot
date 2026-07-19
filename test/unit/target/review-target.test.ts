@@ -26,6 +26,10 @@ describe("parseReviewTarget", () => {
     ["a query", "https://github.com/acme/widget/pull/42?repo=other"],
     ["a fragment", "https://github.com/acme/widget/pull/42#discussion"],
     ["encoded path data", "https://github.com/acme%2Fadmin/widget/pull/42"],
+    ["an encoded dot segment", "https://github.com/acme/%2e%2e/widget/pull/42"],
+    ["a backslash path separator", "https://github.com/acme\\widget/pull/42"],
+    ["an ASCII tab", "https://github.com/acme/wi\tdget/pull/42"],
+    ["an ASCII newline", "https://github.com/acme/widget/pull/4\n2"],
   ])("AC-1.2: rejects %s with an actionable validation error", (_case, input) => {
     expect(() => parseReviewTarget(input)).toThrow(/GitHub PR URL/);
   });

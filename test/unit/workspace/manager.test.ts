@@ -1,9 +1,9 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepositoryRef } from "../../../src/vcs/adapter.js";
-import { prepareWorkspace } from "../../../src/workspace/manager.js";
+import { prepareWorkspace, realExecWorkspaceCommand } from "../../../src/workspace/manager.js";
 
 const repo: RepositoryRef = { host: "github.com", owner: "octo-org", repo: "octo-repo" };
 const baseSha = "def4567890def4567890def4567890def4567890";
@@ -20,6 +20,38 @@ afterEach(async () => {
 });
 
 describe("prepareWorkspace", () => {
+  it.skipIf(process.platform === "win32")("runs real workspace commands non-interactively", async () => {
+    const root = await tempRoot();
+    const bin = path.join(root, "bin");
+    await mkdir(bin);
+    const fakeGit = path.join(bin, "git");
+    await writeFile(fakeGit, "#!/bin/sh\nprintf '%s' \"$GIT_TERMINAL_PROMPT:$GH_PROMPT_DISABLED\"\n", "utf8");
+    await chmod(fakeGit, 0o700);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ""}`;
+    try {
+      await expect(realExecWorkspaceCommand("git", [])).resolves.toBe("0:1");
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it.skipIf(process.platform === "win32")("terminates a workspace command after its configured timeout", async () => {
+    const root = await tempRoot();
+    const bin = path.join(root, "bin");
+    await mkdir(bin);
+    const fakeGit = path.join(bin, "git");
+    await writeFile(fakeGit, "#!/bin/sh\nsleep 1\n", "utf8");
+    await chmod(fakeGit, 0o700);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ""}`;
+    try {
+      await expect(realExecWorkspaceCommand("git", [], 10)).rejects.toMatchObject({ killed: true });
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
   it("AC-3.1: creates a managed mirror and detached base-SHA worktree on a cold root", async () => {
     const root = await tempRoot();
     const commands: { tool: "gh" | "git"; args: string[] }[] = [];
@@ -152,6 +184,66 @@ describe("prepareWorkspace", () => {
       baseSha: abbreviatedSha,
       baseWorktreePath: worktreePath,
     });
+    expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "reset", "--hard", "HEAD"]);
+    expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "clean", "-ffd"]);
+  });
+
+  it("rejects an unsupported managed-worktree marker version", async () => {
+    const root = await tempRoot();
+    const worktreePath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "worktrees", baseSha);
+    const markerPath = path.join(path.dirname(worktreePath), ".owners", `${baseSha}.json`);
+    await mkdir(worktreePath, { recursive: true });
+    await mkdir(path.dirname(markerPath), { recursive: true });
+    await writeFile(markerPath, JSON.stringify({
+      version: 2,
+      repository: "github.com/octo-org/octo-repo",
+      baseSha,
+    }));
+    const exec = vi.fn(async () => `${baseSha}\n`);
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/ownership mismatch/i);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it("serializes concurrent preparation of the same repository and base SHA", async () => {
+    const root = await tempRoot();
+    let releaseClone!: () => void;
+    const cloneBlocked = new Promise<void>((resolve) => { releaseClone = resolve; });
+    let cloneStarted!: () => void;
+    const cloneEntered = new Promise<void>((resolve) => { cloneStarted = resolve; });
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "gh") {
+        cloneStarted();
+        await cloneBlocked;
+        await mkdir(args[3]!, { recursive: true });
+      }
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2)!, { recursive: true });
+      }
+      if (args.includes("rev-parse")) return `${baseSha}\n`;
+      return "";
+    });
+
+    const first = prepareWorkspace({ root, repo, baseSha }, { exec });
+    await cloneEntered;
+    const second = prepareWorkspace({ root, repo, baseSha }, { exec });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(exec.mock.calls.filter(([tool]) => tool === "gh")).toHaveLength(1);
+    releaseClone();
+    await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+    expect(exec.mock.calls.filter(([tool]) => tool === "gh")).toHaveLength(1);
+  });
+
+  it("rejects a symlinked managed-path ancestor before filesystem or Git mutation", async () => {
+    const root = await tempRoot();
+    const outside = await tempRoot();
+    await symlink(outside, path.join(root, "repos"));
+    const exec = vi.fn(async () => "");
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/symbolic link/i);
+    expect(exec).not.toHaveBeenCalled();
+    await expect(readFile(path.join(outside, "github.com", "octo-org", "octo-repo", "repository.git")))
+      .rejects.toMatchObject({ code: "ENOENT" });
   });
 
   it.each([

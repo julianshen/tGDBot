@@ -16,6 +16,12 @@ export function parseReviewTarget(input: string): ReviewTarget {
   if (input.trim() !== input) {
     throw invalidTarget("leading or trailing whitespace is not allowed");
   }
+  if (/[\\\u0000-\u001f\u007f]/u.test(input)) {
+    throw invalidTarget("backslashes and ASCII control characters are not allowed");
+  }
+  if (/%[0-9a-f]{2}/i.test(input)) {
+    throw invalidTarget("percent-encoded path data is not allowed");
+  }
 
   let parsed: URL;
   try {
@@ -36,10 +42,6 @@ export function parseReviewTarget(input: string): ReviewTarget {
   if (parsed.search !== "" || parsed.hash !== "") {
     throw invalidTarget("queries and fragments are not allowed");
   }
-  if (/%[0-9a-f]{2}/i.test(parsed.pathname)) {
-    throw invalidTarget("percent-encoded path data is not allowed");
-  }
-
   const pathname = parsed.pathname.endsWith("/")
     ? parsed.pathname.slice(0, -1)
     : parsed.pathname;

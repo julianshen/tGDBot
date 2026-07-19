@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { lstat, mkdir, readFile, realpath, rename as fsRename, rmdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename as fsRename, rmdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   ContextValidationError,
@@ -16,6 +16,7 @@ import type {
 } from "./types.js";
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
+const MAX_READY_MANIFEST_BYTES = 1024 * 1024;
 type Rename = (source: string, destination: string) => Promise<void>;
 
 export interface ContextCacheDependencies {
@@ -253,9 +254,22 @@ export class ContextCache {
       const manifestPath = path.join(entry, "manifest.json");
       const manifestInfo = await lstat(manifestPath);
       if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink()) return undefined;
+      if (manifestInfo.size > MAX_READY_MANIFEST_BYTES) return undefined;
       let parsedJson: unknown;
       try {
-        parsedJson = JSON.parse(await readFile(manifestPath, "utf8"));
+        const handle = await open(manifestPath, "r");
+        try {
+          const currentInfo = await handle.stat();
+          if (!currentInfo.isFile() || currentInfo.size > MAX_READY_MANIFEST_BYTES) return undefined;
+          const contents = Buffer.alloc(currentInfo.size);
+          const { bytesRead } = await handle.read(contents, 0, contents.length, 0);
+          const probe = Buffer.allocUnsafe(1);
+          const trailing = await handle.read(probe, 0, 1, currentInfo.size);
+          if (bytesRead !== currentInfo.size || trailing.bytesRead !== 0) return undefined;
+          parsedJson = JSON.parse(contents.toString("utf8"));
+        } finally {
+          await handle.close();
+        }
       } catch (error) {
         if (error instanceof SyntaxError) return undefined;
         throw error;
@@ -303,25 +317,35 @@ export class ContextCache {
       throw new ContextValidationError("Ready destination escapes the configured cache root");
     }
 
-    const records = await digestArtifactInputs(
-      stagingPath,
-      input.key,
-      input.artifacts,
-      input.documents ?? [],
-    );
-    const manifest = buildManifest(input, records);
     const claimPath = `${destination}.publishing`;
     try {
       await mkdir(claimPath);
     } catch (error) {
       if (!isAlreadyExists(error)) throw error;
+      const records = await digestArtifactInputs(
+        stagingPath,
+        input.key,
+        input.artifacts,
+        input.documents ?? [],
+      );
+      const manifest = buildManifest(input, records);
       const concurrentlyPublished = await this.lookupContext(input.key);
       if (concurrentlyPublished?.manifestHash === manifest.manifestHash) return concurrentlyPublished;
       if (concurrentlyPublished !== undefined) throw new ContextCacheConflictError(destination);
       throw new ContextCachePublicationInProgressError(destination);
     }
 
+    const claimedStagingPath = path.join(claimPath, "entry");
+    let published = false;
     try {
+      await fsRename(stagingPath, claimedStagingPath);
+      const records = await digestArtifactInputs(
+        claimedStagingPath,
+        input.key,
+        input.artifacts,
+        input.documents ?? [],
+      );
+      const manifest = buildManifest(input, records);
       const existing = await this.lookupContext(input.key);
       if (existing !== undefined) {
         if (existing.manifestHash === manifest.manifestHash) return existing;
@@ -334,7 +358,7 @@ export class ContextCache {
         if (!isMissing(error)) throw error;
       }
 
-      const stagingManifestPath = path.join(stagingPath, "manifest.json");
+      const stagingManifestPath = path.join(claimedStagingPath, "manifest.json");
       try {
         const stagingManifestInfo = await lstat(stagingManifestPath);
         if (stagingManifestInfo.isSymbolicLink()) {
@@ -351,7 +375,8 @@ export class ContextCache {
         // The exclusive claim prevents conforming publishers from entering this
         // window together. Node has no portable no-replace directory rename, so
         // an arbitrary non-cooperating process can still race in an empty target.
-        await this.#rename(stagingPath, destination);
+        await this.#rename(claimedStagingPath, destination);
+        published = true;
       } catch (error) {
         if (!isRenameCollision(error)) throw error;
         const raced = await this.lookupContext(input.key);
@@ -360,6 +385,20 @@ export class ContextCache {
       }
       return manifest;
     } finally {
+      if (!published) {
+        try {
+          await lstat(claimedStagingPath);
+          try {
+            await lstat(stagingPath);
+            throw new ContextValidationError("Promotion staging path was replaced while publication was in progress");
+          } catch (error) {
+            if (!isMissing(error)) throw error;
+          }
+          await fsRename(claimedStagingPath, stagingPath);
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
+      }
       // An in-process success/failure releases its own empty claim. A process
       // crash leaves the claim in place so a later publisher cannot guess that
       // it is stale and overlap a potentially live publisher.

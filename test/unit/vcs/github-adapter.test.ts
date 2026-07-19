@@ -73,7 +73,7 @@ describe("GitHubAdapter", () => {
       "view",
       "42",
       "--repo",
-      "octo-org/octo-repo",
+      "github.com/octo-org/octo-repo",
       "--json",
       "headRefOid,baseRefOid,headRefName,baseRefName,title,body,url",
     ]);
@@ -82,7 +82,7 @@ describe("GitHubAdapter", () => {
       "diff",
       "42",
       "--repo",
-      "octo-org/octo-repo",
+      "github.com/octo-org/octo-repo",
     ]);
   });
 
@@ -122,7 +122,7 @@ describe("GitHubAdapter", () => {
       "comment",
       "42",
       "--repo",
-      "octo-org/octo-repo",
+      "github.com/octo-org/octo-repo",
       "--body-file",
       "-",
     ]);

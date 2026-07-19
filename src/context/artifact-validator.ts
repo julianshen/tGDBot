@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import assert from "node:assert/strict";
-import { createReadStream } from "node:fs";
-import { lstat, readFile, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type {
@@ -86,7 +87,8 @@ export function validateCacheRelativePath(relativePath: unknown): asserts relati
 async function resolveRegularFileWithin(
   basePath: string,
   relativePath: string,
-): Promise<{ filePath: string; size: number }> {
+  maxBytes?: number,
+): Promise<{ size: number; handle: FileHandle }> {
   validateCacheRelativePath(relativePath);
   const resolvedBase = path.resolve(basePath);
   const candidate = path.resolve(resolvedBase, ...relativePath.split("/"));
@@ -97,20 +99,29 @@ async function resolveRegularFileWithin(
   );
 
   let current = resolvedBase;
+  let handle: FileHandle | undefined;
   try {
+    let pathInfo: Awaited<ReturnType<typeof lstat>> | undefined;
     for (const segment of relativePath.split("/")) {
       current = path.join(current, segment);
-      const info = await lstat(current);
-      if (info.isSymbolicLink()) {
+      pathInfo = await lstat(current);
+      if (pathInfo.isSymbolicLink()) {
         throw new ContextValidationError(`Artifact path contains a symbolic link: ${relativePath}`);
       }
     }
-    const info = await stat(candidate);
+    if (maxBytes !== undefined && (pathInfo?.size ?? 0) > maxBytes) {
+      throw new ContextValidationError(`JSON artifact exceeds maximum safe size (${maxBytes} bytes): ${relativePath}`);
+    }
+    handle = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const info = await handle.stat();
     if (!info.isFile()) {
+      await handle.close();
+      handle = undefined;
       throw new ContextValidationError(`Artifact is not a regular file: ${relativePath}`);
     }
-    return { filePath: candidate, size: info.size };
+    return { size: info.size, handle };
   } catch (error) {
+    if (handle !== undefined) await handle.close().catch(() => undefined);
     if (error instanceof ContextValidationError) throw error;
     if (isExpectedMissing(error)) {
       throw new ContextValidationError(`Missing artifact: ${relativePath}`, { cause: error });
@@ -120,13 +131,24 @@ async function resolveRegularFileWithin(
 }
 
 async function readJsonArtifactWithin(basePath: string, relativePath: string): Promise<Buffer> {
-  const resolved = await resolveRegularFileWithin(basePath, relativePath);
-  if (resolved.size > MAX_JSON_ARTIFACT_BYTES) {
-    throw new ContextValidationError(
-      `JSON artifact exceeds maximum safe size (${MAX_JSON_ARTIFACT_BYTES} bytes): ${relativePath}`,
-    );
+  const resolved = await resolveRegularFileWithin(basePath, relativePath, MAX_JSON_ARTIFACT_BYTES);
+  try {
+    if (resolved.size > MAX_JSON_ARTIFACT_BYTES) {
+      throw new ContextValidationError(
+        `JSON artifact exceeds maximum safe size (${MAX_JSON_ARTIFACT_BYTES} bytes): ${relativePath}`,
+      );
+    }
+    const contents = Buffer.alloc(resolved.size);
+    const { bytesRead } = await resolved.handle.read(contents, 0, contents.length, 0);
+    const probe = Buffer.allocUnsafe(1);
+    const trailing = await resolved.handle.read(probe, 0, 1, resolved.size);
+    if (bytesRead !== resolved.size || trailing.bytesRead !== 0) {
+      throw new ContextValidationError(`Artifact changed while being read: ${relativePath}`);
+    }
+    return contents;
+  } finally {
+    await resolved.handle.close();
   }
-  return readFile(resolved.filePath);
 }
 
 async function streamDigestWithin(
@@ -138,10 +160,24 @@ async function streamDigestWithin(
   const hash = createHash("sha256");
   const decoder = inspectText ? new StringDecoder("utf8") : undefined;
   let hasNonWhitespace = false;
-  for await (const chunk of createReadStream(resolved.filePath)) {
-    hash.update(chunk);
-    if (decoder !== undefined && /\S/u.test(decoder.write(chunk))) hasNonWhitespace = true;
+  let offset = 0;
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  try {
+    while (offset < resolved.size) {
+      const length = Math.min(buffer.length, resolved.size - offset);
+      const { bytesRead } = await resolved.handle.read(buffer, 0, length, offset);
+      if (bytesRead === 0) break;
+      const chunk = buffer.subarray(0, bytesRead);
+      hash.update(chunk);
+      if (decoder !== undefined && /\S/u.test(decoder.write(chunk))) hasNonWhitespace = true;
+      offset += bytesRead;
+    }
+    const trailing = await resolved.handle.read(buffer, 0, 1, resolved.size);
+    if (trailing.bytesRead !== 0) offset += trailing.bytesRead;
+  } finally {
+    await resolved.handle.close();
   }
+  if (offset !== resolved.size) throw new ContextValidationError(`Artifact changed while being read: ${relativePath}`);
   if (decoder !== undefined && /\S/u.test(decoder.end())) hasNonWhitespace = true;
   return { sha256: hash.digest("hex"), size: resolved.size, hasNonWhitespace };
 }
@@ -259,7 +295,12 @@ function isTourStep(value: unknown): boolean {
     isOptionalString(value, "languageLesson");
 }
 
-function validateGraph(parsed: Record<string, unknown>, artifactPath: string, domainOnly: boolean): void {
+function validateGraph(
+  parsed: Record<string, unknown>,
+  artifactPath: string,
+  domainOnly: boolean,
+  expectedBaseSha: string,
+): void {
   const validKind = parsed.kind === undefined || parsed.kind === "codebase" || parsed.kind === "knowledge";
   const validNodes = Array.isArray(parsed.nodes) &&
     parsed.nodes.length > 0 &&
@@ -267,10 +308,21 @@ function validateGraph(parsed: Record<string, unknown>, artifactPath: string, do
   const hasDomain = !domainOnly || (Array.isArray(parsed.nodes) && parsed.nodes.some(
     (node) => isRecord(node) && node.type === "domain",
   ));
+  const nodeIds = validNodes
+    ? new Set((parsed.nodes as Record<string, unknown>[]).map((node) => node.id as string))
+    : new Set<string>();
+  const referencesAreValid = validNodes && nodeIds.size === (parsed.nodes as unknown[]).length &&
+    (parsed.edges as unknown[] | undefined)?.every((edge) => isRecord(edge) &&
+      nodeIds.has(edge.source as string) && nodeIds.has(edge.target as string)) === true &&
+    (parsed.layers as unknown[] | undefined)?.every((layer) => isRecord(layer) &&
+      isStringArray(layer.nodeIds) && layer.nodeIds.every((id) => nodeIds.has(id))) === true &&
+    (parsed.tour as unknown[] | undefined)?.every((step) => isRecord(step) &&
+      isStringArray(step.nodeIds) && step.nodeIds.every((id) => nodeIds.has(id))) === true;
   if (
     typeof parsed.version !== "string" ||
     !validKind ||
     !isProject(parsed.project) ||
+    (parsed.project as Record<string, unknown> | undefined)?.gitCommitHash !== expectedBaseSha ||
     !validNodes ||
     !hasDomain ||
     !Array.isArray(parsed.edges) ||
@@ -279,6 +331,7 @@ function validateGraph(parsed: Record<string, unknown>, artifactPath: string, do
     !parsed.layers.every(isLayer) ||
     !Array.isArray(parsed.tour) ||
     !parsed.tour.every(isTourStep)
+    || !referencesAreValid
   ) {
     throw new ContextValidationError(`Invalid Understand Anything graph schema: ${artifactPath}`);
   }
@@ -304,7 +357,7 @@ function validateJsonArtifactContents(
 ): void {
   const parsed = parseJsonObject(contents, artifactPath);
   if (kind === "knowledge-graph" || kind === "domain-graph") {
-    validateGraph(parsed, artifactPath, kind === "domain-graph");
+    validateGraph(parsed, artifactPath, kind === "domain-graph", key.baseSha);
   }
   if (kind === "mapping-metadata") {
     if (

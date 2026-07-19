@@ -185,7 +185,7 @@ function resolvePullLocator(
 function repoFlag(repo?: RepositoryRef): string[] {
   // `gh pr` documents `--repo [HOST/]OWNER/REPO` as the explicit selector:
   // https://cli.github.com/manual/gh_pr_view
-  return repo ? ["--repo", `${repo.owner}/${repo.repo}`] : [];
+  return repo ? ["--repo", `${repo.host}/${repo.owner}/${repo.repo}`] : [];
 }
 
 function apiRepo(repo?: RepositoryRef): string {
@@ -198,7 +198,7 @@ function apiRepo(repo?: RepositoryRef): string {
 /**
  * GitHubAdapter: VcsAdapter implementation backed by the `gh` CLI.
  *
- * Canonical-URL calls accept a RepositoryRef and use `--repo owner/repo`,
+ * Canonical-URL calls accept a RepositoryRef and use `--repo host/owner/repo`,
  * explicit REST paths, and explicit GraphQL variables. Legacy one-argument
  * calls retain ambient gh context for backward compatibility until their
  * documented migration path is retired.
