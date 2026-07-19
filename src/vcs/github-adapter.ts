@@ -195,6 +195,10 @@ function apiRepo(repo?: RepositoryRef): string {
   return repo ? `repos/${repo.owner}/${repo.repo}` : "repos/{owner}/{repo}";
 }
 
+function apiHost(repo?: RepositoryRef): string[] {
+  return repo ? ["--hostname", repo.host] : [];
+}
+
 /**
  * GitHubAdapter: VcsAdapter implementation backed by the `gh` CLI.
  *
@@ -211,7 +215,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
   // invoked once per process — not once per comment-list fetch. Caching the
   // in-flight Promise (not just the resolved value) also collapses
   // concurrent callers onto a single `gh api user` invocation.
-  private botLoginPromise: Promise<string> | null = null;
+  private readonly botLoginPromises = new Map<string, Promise<string>>();
 
   /**
    * Resolves the identity `gh` is currently authenticated as, via
@@ -220,14 +224,17 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
    * user` resolves that user's login — the identity findBotComment matches
    * against so a spoofed marker from another author can't trick dedup.
    */
-  private getBotLogin(): Promise<string> {
-    if (!this.botLoginPromise) {
-      this.botLoginPromise = this.execGh(["api", "user"]).then((out) => {
+  private getBotLogin(repo?: RepositoryRef): Promise<string> {
+    const cacheKey = repo?.host ?? "";
+    let promise = this.botLoginPromises.get(cacheKey);
+    if (!promise) {
+      promise = this.execGh(["api", "user", ...apiHost(repo)]).then((out) => {
         const parsed = JSON.parse(out) as GhUser;
         return parsed.login;
       });
+      this.botLoginPromises.set(cacheKey, promise);
     }
-    return this.botLoginPromise;
+    return promise;
   }
 
   /**
@@ -340,7 +347,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
     number?: number,
   ): Promise<BotComment | null> {
     const { repo, id } = resolvePullLocator(repoOrId, number);
-    const botLogin = await this.getBotLogin();
+    const botLogin = await this.getBotLogin(repo);
     const out = await this.execGh([
       "api",
       "-X",
@@ -350,6 +357,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
       "-f",
       "per_page=100",
       `${apiRepo(repo)}/issues/${id}/comments`,
+      ...apiHost(repo),
     ]);
     const parsed = JSON.parse(out) as GhIssueComment[] | GhIssueComment[][];
     const comments = Array.isArray(parsed[0]) ? (parsed as GhIssueComment[][]).flat() : parsed as GhIssueComment[];
@@ -401,7 +409,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
       await this.execGh(["pr", "comment", id, ...repoFlag(repo), "--body-file", "-"], body);
     } else {
       await this.execGh(
-        ["api", `${apiRepo(repo)}/issues/comments/${existing.id}`, "-X", "PATCH", "--input", "-"],
+        ["api", `${apiRepo(repo)}/issues/comments/${existing.id}`, ...apiHost(repo), "-X", "PATCH", "--input", "-"],
         JSON.stringify({ body }),
       );
     }
@@ -470,7 +478,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
     };
 
     await this.execGh(
-      ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, "-X", "POST", "--input", "-"],
+      ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"],
       JSON.stringify(payload),
     );
   }
@@ -529,7 +537,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
   ): Promise<number> {
     const { repo, id } = resolvePullLocator(repoOrId, number);
     const [botLogin, { owner, name }] = await Promise.all([
-      this.getBotLogin(),
+      this.getBotLogin(repo),
       repo
         ? Promise.resolve({ owner: repo.owner, name: repo.repo })
         : this.getRepoOwnerAndName(),
@@ -550,6 +558,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
         "-F",
         `number=${id}`,
         ...(cursor !== null ? ["-f", `cursor=${cursor}`] : []),
+        ...apiHost(repo),
       ];
       const out = await this.execGh(args);
       const parsed = JSON.parse(out) as GhReviewThreadsResponse;
@@ -595,6 +604,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
           `query=${RESOLVE_THREAD_MUTATION}`,
           "-f",
           `threadId=${threadId}`,
+          ...apiHost(repo),
         ]);
         resolved += 1;
       } catch (err) {
@@ -647,7 +657,9 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
     const rulesDir = explicit ? (maybeRulesDir as string) : baseShaOrRulesDir;
     let entries: GhContentsEntry[];
     try {
-      const out = await this.execGh(["api", `${apiRepo(repo)}/contents/${rulesDir}?ref=${baseSha}`]);
+      const out = await this.execGh([
+        "api", `${apiRepo(repo)}/contents/${rulesDir}?ref=${baseSha}`, ...apiHost(repo),
+      ]);
       const parsed = JSON.parse(out) as unknown;
       // The Contents API returns a single object (not an array) when the
       // given path resolves to a FILE rather than a directory. rulesDir is
@@ -667,7 +679,9 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
     // first genuine rejection, per this method's error-handling contract.
     return Promise.all(
       mdFileEntries.map(async (entry) => {
-        const out = await this.execGh(["api", `${apiRepo(repo)}/contents/${entry.path}?ref=${baseSha}`]);
+        const out = await this.execGh([
+          "api", `${apiRepo(repo)}/contents/${entry.path}?ref=${baseSha}`, ...apiHost(repo),
+        ]);
         const parsed = JSON.parse(out) as GhContentsFileResponse;
         return { path: entry.name, content: Buffer.from(parsed.content, "base64").toString("utf-8") };
       }),

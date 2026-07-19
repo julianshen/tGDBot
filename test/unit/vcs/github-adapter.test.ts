@@ -116,6 +116,8 @@ describe("GitHubAdapter", () => {
     expect(calls).toContainEqual([
       ...PAGINATED_COMMENTS_ARGS_PREFIX,
       "repos/octo-org/octo-repo/issues/42/comments",
+      "--hostname",
+      "github.com",
     ]);
     expect(calls).toContainEqual([
       "pr",
@@ -129,6 +131,8 @@ describe("GitHubAdapter", () => {
     expect(calls).toContainEqual([
       "api",
       "repos/octo-org/octo-repo/issues/comments/99",
+      "--hostname",
+      "github.com",
       "-X",
       "PATCH",
       "--input",
@@ -137,6 +141,8 @@ describe("GitHubAdapter", () => {
     expect(calls).toContainEqual([
       "api",
       "repos/octo-org/octo-repo/pulls/42/reviews",
+      "--hostname",
+      "github.com",
       "-X",
       "POST",
       "--input",
@@ -145,8 +151,14 @@ describe("GitHubAdapter", () => {
     expect(calls).toContainEqual([
       "api",
       "repos/octo-org/octo-repo/contents/.tgd-review/rules?ref=def456",
+      "--hostname",
+      "github.com",
     ]);
     expect(calls.some((args) => args.join(" ").includes("{owner}"))).toBe(false);
+    for (const args of calls.filter((args) => args[0] === "api")) {
+      expect(args).toContain("--hostname");
+      expect(args[args.indexOf("--hostname") + 1]).toBe("github.com");
+    }
   });
 
   it("AC-2.2: resolves stale threads with explicit GraphQL owner/name and no ambient repo lookup", async () => {
@@ -176,6 +188,8 @@ describe("GitHubAdapter", () => {
     expect(graphQlArgs).toContain("owner=octo-org");
     expect(graphQlArgs).toContain("name=octo-repo");
     expect(graphQlArgs).toContain("number=42");
+    expect(graphQlArgs).toContain("--hostname");
+    expect(graphQlArgs?.[graphQlArgs.indexOf("--hostname") + 1]).toBe("github.com");
   });
 
   // AC-2.1: Given a mocked `gh pr view` response for PR 42, When
