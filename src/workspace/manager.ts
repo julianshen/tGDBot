@@ -144,6 +144,13 @@ async function prepareWorkspaceUnlocked(
   dependencies: WorkspaceDependencies,
 ): Promise<PreparedWorkspace> {
   const paths = deriveWorkspacePaths(request);
+  const execManaged = async (tool: "gh" | "git", args: string[]): Promise<string> => {
+    await assertNoSymlinkedAncestors(
+      paths.root,
+      [paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
+    );
+    return execWorkspace(dependencies, tool, args);
+  };
   const expectedMarker = {
     version: 1,
     repository: `${request.repo.host}/${request.repo.owner}/${request.repo.repo}`,
@@ -168,7 +175,7 @@ async function prepareWorkspaceUnlocked(
     ) {
       throw new Error(`Refusing unmanaged worktree ownership mismatch at ${paths.baseWorktreePath}`);
     }
-    const commonDir = (await execWorkspace(dependencies, "git", [
+    const commonDir = (await execManaged("git", [
       "-C",
       paths.baseWorktreePath,
       "rev-parse",
@@ -182,12 +189,12 @@ async function prepareWorkspaceUnlocked(
     if (actualCommonDir !== expectedCommonDir) {
       throw new Error(`Managed worktree is not registered to the expected managed mirror at ${paths.mirrorPath}`);
     }
-    const actualHead = (await execWorkspace(dependencies, "git", ["-C", paths.baseWorktreePath, "rev-parse", "HEAD"])).trim();
+    const actualHead = (await execManaged("git", ["-C", paths.baseWorktreePath, "rev-parse", "HEAD"])).trim();
     if (!actualHead.toLowerCase().startsWith(expectedMarker.baseSha)) {
       throw new Error(`Managed worktree HEAD does not match requested base SHA at ${paths.baseWorktreePath}`);
     }
-    await execWorkspace(dependencies, "git", ["-C", paths.baseWorktreePath, "reset", "--hard", "HEAD"]);
-    await execWorkspace(dependencies, "git", ["-C", paths.baseWorktreePath, "clean", "-ffdx"]);
+    await execManaged("git", ["-C", paths.baseWorktreePath, "reset", "--hard", "HEAD"]);
+    await execManaged("git", ["-C", paths.baseWorktreePath, "clean", "-ffdx"]);
     return { ...paths, baseSha: expectedMarker.baseSha };
   }
 
@@ -199,7 +206,7 @@ async function prepareWorkspaceUnlocked(
   await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
 
   if (!(await exists(paths.mirrorPath))) {
-    await execWorkspace(dependencies, "gh", [
+    await execManaged("gh", [
       "repo",
       "clone",
       `https://${request.repo.host}/${request.repo.owner}/${request.repo.repo}`,
@@ -208,15 +215,15 @@ async function prepareWorkspaceUnlocked(
       "--mirror",
     ]);
   } else {
-    const origin = await execWorkspace(dependencies, "git", ["-C", paths.mirrorPath, "remote", "get-url", "origin"]);
+    const origin = await execManaged("git", ["-C", paths.mirrorPath, "remote", "get-url", "origin"]);
     if (!isExpectedOrigin(origin, request.repo.owner, request.repo.repo)) {
       throw new Error(`Managed mirror origin does not match ${request.repo.owner}/${request.repo.repo}`);
     }
-    await execWorkspace(dependencies, "git", ["-C", paths.mirrorPath, "fetch", "--prune", "origin"]);
+    await execManaged("git", ["-C", paths.mirrorPath, "fetch", "--prune", "origin"]);
   }
 
-  await execWorkspace(dependencies, "git", ["-C", paths.mirrorPath, "cat-file", "-e", `${request.baseSha}^{commit}`]);
-  await execWorkspace(dependencies, "git", [
+  await execManaged("git", ["-C", paths.mirrorPath, "cat-file", "-e", `${request.baseSha}^{commit}`]);
+  await execManaged("git", [
     "-C",
     paths.mirrorPath,
     "worktree",
@@ -232,7 +239,7 @@ async function prepareWorkspaceUnlocked(
     });
   } catch (error) {
     try {
-      await execWorkspace(dependencies, "git", [
+      await execManaged("git", [
         "-C", paths.mirrorPath, "worktree", "remove", "--force", paths.baseWorktreePath,
       ]);
     } catch (cleanupError) {

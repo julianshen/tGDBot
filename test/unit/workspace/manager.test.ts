@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -241,6 +241,33 @@ describe("prepareWorkspace", () => {
       args.includes("--git-common-dir") ? `${foreignCommonDir}\n` : `${baseSha}\n`);
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/managed mirror/i);
+    expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["reset"]));
+    expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["clean"]));
+  });
+
+  it("rejects a worktree replaced by a symlink between managed Git command boundaries", async () => {
+    const root = await tempRoot();
+    const outside = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    const parkedWorktree = `${paths.baseWorktreePath}.parked`;
+    await mkdir(paths.baseWorktreePath, { recursive: true });
+    await mkdir(paths.mirrorPath, { recursive: true });
+    await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
+    await writeFile(paths.ownerMarkerPath, JSON.stringify({
+      version: 1,
+      repository: "github.com/octo-org/octo-repo",
+      baseSha,
+    }));
+    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) => {
+      if (args.includes("--git-common-dir")) {
+        await rename(paths.baseWorktreePath, parkedWorktree);
+        await symlink(outside, paths.baseWorktreePath);
+        return `${paths.mirrorPath}\n`;
+      }
+      return `${baseSha}\n`;
+    });
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/symbolic link/i);
     expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["reset"]));
     expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["clean"]));
   });
