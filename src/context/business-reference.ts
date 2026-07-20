@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, open, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { link, lstat, open, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
 import { realExecWorkspaceCommand } from "../workspace/manager.js";
 
@@ -47,6 +47,18 @@ interface DomainGraphSource {
   nodes: Array<{ id: string; type: "domain" | "flow" | "step"; name: string; summary: string }>;
 }
 
+interface DirectoryIdentity {
+  dev: number;
+  ino: number;
+  realPath: string;
+}
+
+interface GenerationDestination {
+  generatedPath: string;
+  generationRoot: string;
+  identity: DirectoryIdentity;
+}
+
 function isBeneath(base: string, candidate: string): boolean {
   const relative = path.relative(base, candidate);
   return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
@@ -63,6 +75,15 @@ function emptyDigest(): string {
 function isMissing(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error &&
     ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ENOTDIR");
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error &&
+    (error as NodeJS.ErrnoException).code === "EEXIST";
+}
+
+function sameIdentity(left: { dev: number; ino: number }, right: { dev: number; ino: number }): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -146,11 +167,7 @@ async function resolveTrustedDocuments(sourceRoot: string, candidates: readonly 
   })));
 }
 
-async function validateGenerationRoot(sourceRoot: string, generatedPath: string): Promise<{
-  generatedPath: string;
-  generationRoot: string;
-  physicalGenerationRoot: string;
-}> {
+async function validateGenerationRoot(sourceRoot: string, generatedPath: string): Promise<GenerationDestination> {
   if (!path.isAbsolute(generatedPath) || path.basename(generatedPath) !== "BUSINESS-CONTEXT.md") {
     throw new Error("Generated business reference must use an absolute BUSINESS-CONTEXT.md path");
   }
@@ -176,7 +193,24 @@ async function validateGenerationRoot(sourceRoot: string, generatedPath: string)
   if (physicalGenerationRoot === physicalSource || isBeneath(physicalSource, physicalGenerationRoot)) {
     throw new Error("Generated business reference cache resolves inside the trusted source repository");
   }
-  return { generatedPath: resolvedGenerated, generationRoot, physicalGenerationRoot };
+  return {
+    generatedPath: resolvedGenerated,
+    generationRoot,
+    identity: { dev: rootInfo.dev, ino: rootInfo.ino, realPath: physicalGenerationRoot },
+  };
+}
+
+async function assertGenerationRootIdentity(destination: GenerationDestination): Promise<void> {
+  let info;
+  try {
+    info = await lstat(destination.generationRoot);
+  } catch {
+    throw new Error("Business-reference cache directory changed during generation");
+  }
+  if (!info.isDirectory() || info.isSymbolicLink() || !sameIdentity(info, destination.identity) ||
+    await realpath(destination.generationRoot) !== destination.identity.realPath) {
+    throw new Error("Business-reference cache directory changed during generation");
+  }
 }
 
 async function readRegularFileNoFollow(filePath: string, invalidMessage: string): Promise<string> {
@@ -219,7 +253,8 @@ async function readDomainGraph(
   const raw = await readRegularFileNoFollow(graphPath, "Domain graph must be a real cache file");
   const parsed: unknown = JSON.parse(raw);
   if (!isRecord(parsed) || !isRecord(parsed.project) || !Array.isArray(parsed.nodes) ||
-    typeof parsed.project.name !== "string" || typeof parsed.project.gitCommitHash !== "string") {
+    typeof parsed.project.name !== "string" || typeof parsed.project.gitCommitHash !== "string" ||
+    !/^[a-fA-F0-9]{7,64}$/u.test(parsed.project.gitCommitHash)) {
     throw new Error("Domain graph is missing business-reference provenance");
   }
   const nodes = parsed.nodes.flatMap((node) => {
@@ -285,38 +320,111 @@ function generateBusinessContext(source: DomainGraphSource, generatedAt: Date): 
   ].join("\n");
 }
 
-async function readReusableGenerated(generatedPath: string, source: DomainGraphSource): Promise<string | undefined> {
+async function readReusableGenerated(
+  destination: GenerationDestination,
+  source: DomainGraphSource,
+): Promise<string | undefined> {
+  await assertGenerationRootIdentity(destination);
   let info;
   try {
-    info = await lstat(generatedPath);
+    info = await lstat(destination.generatedPath);
   } catch (error) {
     if (isMissing(error)) return;
     throw error;
   }
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("Generated business reference must be a real file");
+  const physicalGeneratedPath = await realpath(destination.generatedPath);
+  if (path.dirname(physicalGeneratedPath) !== destination.identity.realPath) {
+    throw new Error("Generated business reference escaped the cache directory");
+  }
   const contents = await readRegularFileNoFollow(
-    generatedPath,
+    destination.generatedPath,
     "Generated business reference must be a real file",
   );
-  const baseShaMatch = contents.match(/^base_sha:\s*["']?([^\s"']+)["']?\s*$/mu);
-  const fileBaseSha = baseShaMatch?.[1]?.toLowerCase();
+  await assertGenerationRootIdentity(destination);
+  const baseShaMatch = contents.match(/^base_sha:\s*["']?([a-fA-F0-9]{7,64})["']?\s*$/mu);
+  const fileBaseSha = baseShaMatch?.[1];
   const sourceBaseSha = source.baseSha.toLowerCase();
-  const shaMatches = fileBaseSha !== undefined && fileBaseSha.length > 0 && sourceBaseSha.length > 0 &&
-    (fileBaseSha.startsWith(sourceBaseSha) || sourceBaseSha.startsWith(fileBaseSha));
-  return contents.includes(`source_sha256: ${source.sha256}`) && shaMatches ? contents : undefined;
+  const shaMatches = fileBaseSha !== undefined &&
+    (fileBaseSha.toLowerCase().startsWith(sourceBaseSha) || sourceBaseSha.startsWith(fileBaseSha.toLowerCase()));
+  const sourceDigestMatch = contents.match(/^source_sha256:\s*([a-f0-9]{64})\s*$/mu);
+  const generatedAtMatch = contents.match(/^generated_at:\s*(\S+)\s*$/mu);
+  if (!shaMatches || sourceDigestMatch?.[1] !== source.sha256 || generatedAtMatch?.[1] === undefined) return;
+  const generatedAt = new Date(generatedAtMatch[1]);
+  if (!Number.isFinite(generatedAt.getTime()) || generatedAt.toISOString() !== generatedAtMatch[1]) return;
+  const expected = generateBusinessContext({ ...source, baseSha: fileBaseSha }, generatedAt);
+  return contents === expected ? contents : undefined;
 }
 
-async function writeGenerated(generatedPath: string, contents: string): Promise<void> {
-  const temporaryPath = path.join(path.dirname(generatedPath), `.BUSINESS-CONTEXT.${randomUUID()}.tmp`);
+async function removeInvalidGenerated(destination: GenerationDestination): Promise<void> {
+  await assertGenerationRootIdentity(destination);
   try {
-    await writeFile(temporaryPath, contents, { encoding: "utf8", flag: "wx", mode: 0o600 });
-    await rename(temporaryPath, generatedPath);
+    const initialInfo = await lstat(destination.generatedPath);
+    if (!initialInfo.isFile() || initialInfo.isSymbolicLink()) {
+      throw new Error("Generated business reference must be a real file");
+    }
+    await assertGenerationRootIdentity(destination);
+    const currentInfo = await lstat(destination.generatedPath);
+    if (!sameIdentity(initialInfo, currentInfo)) return;
+    await unlink(destination.generatedPath);
+    await assertGenerationRootIdentity(destination);
   } catch (error) {
-    await unlink(temporaryPath).catch((cleanupError: unknown) => {
-      if (!isMissing(cleanupError)) throw cleanupError;
-    });
-    throw error;
+    if (!isMissing(error)) throw error;
   }
+}
+
+async function writeGenerated(destination: GenerationDestination, contents: string): Promise<void> {
+  const temporaryPath = path.join(destination.generationRoot, `.BUSINESS-CONTEXT.${randomUUID()}.tmp`);
+  let outcome: "published" | "exists" | undefined;
+  let primaryError: unknown;
+  try {
+    await assertGenerationRootIdentity(destination);
+    const handle = await open(
+      temporaryPath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      const [handleInfo, pathInfo, physicalTemporaryPath] = await Promise.all([
+        handle.stat(),
+        lstat(temporaryPath),
+        realpath(temporaryPath),
+      ]);
+      if (!handleInfo.isFile() || !sameIdentity(handleInfo, pathInfo) ||
+        path.dirname(physicalTemporaryPath) !== destination.identity.realPath) {
+        throw new Error("Generated business reference temporary file escaped the cache directory");
+      }
+      await handle.writeFile(contents, "utf8");
+    } finally {
+      await handle.close();
+    }
+    await assertGenerationRootIdentity(destination);
+    try {
+      await link(temporaryPath, destination.generatedPath);
+      outcome = "published";
+    } catch (error) {
+      if (isAlreadyExists(error)) outcome = "exists";
+      else throw error;
+    }
+    await assertGenerationRootIdentity(destination);
+  } catch (error) {
+    primaryError = error;
+  }
+
+  let cleanupError: unknown;
+  try {
+    await unlink(temporaryPath);
+  } catch (error) {
+    if (!isMissing(error)) cleanupError = error;
+  }
+  if (primaryError !== undefined) {
+    if (cleanupError !== undefined) {
+      throw new AggregateError([primaryError, cleanupError], "Business-reference publication and cleanup failed");
+    }
+    throw primaryError;
+  }
+  if (cleanupError !== undefined) throw cleanupError;
+  if (outcome === undefined) throw new Error("Business-reference publication produced no outcome");
 }
 
 export async function selectBusinessReference(
@@ -328,7 +436,8 @@ export async function selectBusinessReference(
 
   if (input.explicitPaths.length > 0) {
     const candidates = [...new Set(input.explicitPaths)].sort((left, right) => left.localeCompare(right));
-    const documents = await resolveTrustedDocuments(path.resolve(input.sourceRoot), candidates);
+    const documents = (await resolveTrustedDocuments(path.resolve(input.sourceRoot), candidates))
+      .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
     if (documents.some((document) => document.contents.trim().length === 0)) {
       throw new Error("Explicit business documents must be non-empty");
     }
@@ -358,11 +467,18 @@ export async function selectBusinessReference(
   }
 
   const destination = await validateGenerationRoot(path.resolve(input.sourceRoot), input.generatedPath);
-  const domainGraph = await readDomainGraph(destination.generationRoot, destination.physicalGenerationRoot);
+  const domainGraph = await readDomainGraph(destination.generationRoot, destination.identity.realPath);
   if (domainGraph === undefined) return { kind: "none", paths: [], digest: emptyDigest() };
-  const existing = await readReusableGenerated(destination.generatedPath, domainGraph);
-  const contents = existing ?? generateBusinessContext(domainGraph, (dependencies.now ?? (() => new Date()))());
-  if (existing === undefined) await writeGenerated(destination.generatedPath, contents);
+  let contents = await readReusableGenerated(destination, domainGraph);
+  if (contents === undefined) {
+    await removeInvalidGenerated(destination);
+    const candidate = generateBusinessContext(domainGraph, (dependencies.now ?? (() => new Date()))());
+    await writeGenerated(destination, candidate);
+    contents = await readReusableGenerated(destination, domainGraph);
+    if (contents === undefined) {
+      throw new Error("Concurrent business-reference publication produced incompatible content");
+    }
+  }
   return {
     kind: "generated",
     paths: [path.basename(destination.generatedPath)],
