@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { selectBusinessReference } from "../../../src/context/business-reference.js";
+import { withRepositoryLock } from "../../../src/workspace/lock.js";
 
 const roots: string[] = [];
 
@@ -359,6 +360,40 @@ describe("selectBusinessReference", () => {
     expect(new Set(results.map((result) => result.digest))).toEqual(new Set([publishedDigest]));
   });
 
+  it("AC-7.2: a staggered caller reuses a valid publication that appears before invalid-cache removal", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
+    const lockPath = path.join(cacheRoot, ".BUSINESS-CONTEXT.lock");
+    await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
+    const input = { sourceRoot, explicitPaths: [], generatedPath };
+    await selectBusinessReference(input, {
+      listTrackedFiles: async () => [],
+      now: () => new Date("2026-07-20T00:00:00.000Z"),
+    });
+    const validContents = await readFile(generatedPath, "utf8");
+    await writeFile(generatedPath, `${validContents}\ninvalid trailing data\n`, "utf8");
+
+    let delayed: Promise<Awaited<ReturnType<typeof selectBusinessReference>>> | undefined;
+    await withRepositoryLock({
+      lockPath,
+      timeoutMs: 1_000,
+      pollMs: 5,
+      owner: { runId: "test-holder" },
+    }, async () => {
+      delayed = selectBusinessReference(input, {
+        listTrackedFiles: async () => [],
+        now: () => new Date("2026-07-21T00:00:00.000Z"),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await writeFile(generatedPath, validContents, "utf8");
+    });
+
+    const result = await delayed!;
+    expect(await readFile(generatedPath, "utf8")).toBe(validContents);
+    expect(result.digest).toBe(sha256(validContents));
+  });
+
   it("AC-7.3: rejects generation when the validated cache directory is replaced", async () => {
     const sourceRoot = await tempRoot("business-reference-source-");
     const cacheRoot = await tempRoot("business-reference-cache-");
@@ -378,7 +413,7 @@ describe("selectBusinessReference", () => {
         symlinkSync(outsideRoot, cacheRoot, "dir");
         return new Date("2026-07-20T00:00:00.000Z");
       },
-    })).rejects.toThrow(/cache.*changed|generation.*directory/i);
+    })).rejects.toThrow(/cache.*changed|generation.*directory|repository lock work failed/i);
     await expect(readFile(path.join(outsideRoot, "BUSINESS-CONTEXT.md"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
   });

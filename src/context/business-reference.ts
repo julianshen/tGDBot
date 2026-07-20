@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { link, lstat, open, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
+import { withRepositoryLock } from "../workspace/lock.js";
 import { realExecWorkspaceCommand } from "../workspace/manager.js";
 
 const SEMANTIC_HEADINGS = [
@@ -16,6 +17,9 @@ const SEMANTIC_HEADINGS = [
 ] as const;
 const ROOT_DOCS = ["ARCHITECTURE.md", "DESIGN.md", "DOMAIN.md", "BUSINESS.md"] as const;
 const DOC_NAME_KEYWORDS = ["business", "domain", "architecture", "design", "workflow", "concept"] as const;
+const BUSINESS_REFERENCE_LOCK = ".BUSINESS-CONTEXT.lock";
+const BUSINESS_REFERENCE_LOCK_TIMEOUT_MS = 60_000;
+const BUSINESS_REFERENCE_LOCK_POLL_MS = 10;
 
 export interface BusinessReferenceInput {
   sourceRoot: string;
@@ -356,7 +360,12 @@ async function readReusableGenerated(
   return contents === expected ? contents : undefined;
 }
 
-async function removeInvalidGenerated(destination: GenerationDestination): Promise<void> {
+async function removeInvalidGenerated(
+  destination: GenerationDestination,
+  source: DomainGraphSource,
+): Promise<string | undefined> {
+  const reusable = await readReusableGenerated(destination, source);
+  if (reusable !== undefined) return reusable;
   await assertGenerationRootIdentity(destination);
   try {
     const initialInfo = await lstat(destination.generatedPath);
@@ -365,12 +374,17 @@ async function removeInvalidGenerated(destination: GenerationDestination): Promi
     }
     await assertGenerationRootIdentity(destination);
     const currentInfo = await lstat(destination.generatedPath);
-    if (!sameIdentity(initialInfo, currentInfo)) return;
+    if (!sameIdentity(initialInfo, currentInfo)) return readReusableGenerated(destination, source);
+    const latestReusable = await readReusableGenerated(destination, source);
+    if (latestReusable !== undefined) return latestReusable;
+    const finalInfo = await lstat(destination.generatedPath);
+    if (!sameIdentity(currentInfo, finalInfo)) return readReusableGenerated(destination, source);
     await unlink(destination.generatedPath);
     await assertGenerationRootIdentity(destination);
   } catch (error) {
     if (!isMissing(error)) throw error;
   }
+  return;
 }
 
 async function writeGenerated(destination: GenerationDestination, contents: string): Promise<void> {
@@ -471,13 +485,22 @@ export async function selectBusinessReference(
   if (domainGraph === undefined) return { kind: "none", paths: [], digest: emptyDigest() };
   let contents = await readReusableGenerated(destination, domainGraph);
   if (contents === undefined) {
-    await removeInvalidGenerated(destination);
-    const candidate = generateBusinessContext(domainGraph, (dependencies.now ?? (() => new Date()))());
-    await writeGenerated(destination, candidate);
-    contents = await readReusableGenerated(destination, domainGraph);
-    if (contents === undefined) {
-      throw new Error("Concurrent business-reference publication produced incompatible content");
-    }
+    contents = await withRepositoryLock({
+      lockPath: path.join(destination.generationRoot, BUSINESS_REFERENCE_LOCK),
+      timeoutMs: BUSINESS_REFERENCE_LOCK_TIMEOUT_MS,
+      pollMs: BUSINESS_REFERENCE_LOCK_POLL_MS,
+      owner: { runId: `business-reference-${randomUUID()}` },
+    }, async () => {
+      const concurrentlyPublished = await removeInvalidGenerated(destination, domainGraph);
+      if (concurrentlyPublished !== undefined) return concurrentlyPublished;
+      const candidate = generateBusinessContext(domainGraph, (dependencies.now ?? (() => new Date()))());
+      await writeGenerated(destination, candidate);
+      const published = await readReusableGenerated(destination, domainGraph);
+      if (published === undefined) {
+        throw new Error("Concurrent business-reference publication produced incompatible content");
+      }
+      return published;
+    });
   }
   return {
     kind: "generated",
