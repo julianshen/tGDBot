@@ -78,6 +78,24 @@ describe("selectBusinessReference", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("AC-7.1: deduplicates equivalent explicit document paths after resolution", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    await write(sourceRoot, "notes/product.md", "Authoritative product behavior.\n");
+
+    const result = await selectBusinessReference({
+      sourceRoot,
+      explicitPaths: [
+        "notes/product.md",
+        "./notes/product.md",
+        path.join(sourceRoot, "notes/product.md"),
+      ],
+      generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
+    });
+
+    expect(result).toMatchObject({ kind: "existing", paths: ["notes/product.md"] });
+  });
+
   it("AC-7.1: deterministically selects adequate tracked docs from the fixed allowlist", async () => {
     const sourceRoot = await tempRoot("business-reference-source-");
     const cacheRoot = await tempRoot("business-reference-cache-");
@@ -128,6 +146,21 @@ describe("selectBusinessReference", () => {
     })).rejects.toThrow(/symbolic link|outside.*trusted source|escape/i);
   });
 
+  it.each(["vendor/lib/.git/config.md", "vendor/lib/.GIT/config.md"])(
+    "AC-7.3: rejects repository metadata at %s",
+    async (relativePath) => {
+      const sourceRoot = await tempRoot("business-reference-source-");
+      const cacheRoot = await tempRoot("business-reference-cache-");
+      await write(sourceRoot, relativePath, "credential-bearing repository metadata\n");
+
+      await expect(selectBusinessReference({
+        sourceRoot,
+        explicitPaths: [relativePath],
+        generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
+      })).rejects.toThrow(/repository metadata/i);
+    },
+  );
+
   it("AC-7.2: generates a cited cache-local reference from the domain graph and leaves source unchanged", async () => {
     const sourceRoot = await tempRoot("business-reference-source-");
     const cacheRoot = await tempRoot("business-reference-cache-");
@@ -161,6 +194,53 @@ describe("selectBusinessReference", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("AC-7.2: reuses generated context when graph provenance and abbreviated base SHA match", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
+    await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
+    const input = { sourceRoot, explicitPaths: [], generatedPath };
+
+    await selectBusinessReference(input, {
+      listTrackedFiles: async () => [],
+      now: () => new Date("2026-07-20T00:00:00.000Z"),
+    });
+    const firstContents = (await readFile(generatedPath, "utf8"))
+      .replace("base_sha: def4567890def4567890def4567890def4567890", "base_sha: DEF4567890DE");
+    await writeFile(generatedPath, firstContents, "utf8");
+
+    const second = await selectBusinessReference(input, {
+      listTrackedFiles: async () => [],
+      now: () => new Date("2027-01-01T00:00:00.000Z"),
+    });
+
+    expect(second).toMatchObject({ kind: "generated", paths: ["BUSINESS-CONTEXT.md"] });
+    expect(await readFile(generatedPath, "utf8")).toBe(firstContents);
+    expect(firstContents).toMatch(/source_sha256: [a-f0-9]{64}/u);
+    expect(firstContents).toContain("base_sha: DEF4567890DE");
+    expect(firstContents).not.toContain("2027-01-01T00:00:00.000Z");
+  });
+
+  it("AC-7.2: escapes domain graph text that could alter generated Markdown structure", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    const graph = domainGraph();
+    const nodes = graph.nodes as Array<Record<string, unknown>>;
+    nodes[0]!.name = "# Orders [admin](https://example.test)";
+    nodes[0]!.summary = "Use `unsafe` *formatting* and [links](https://example.test).";
+    await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(graph));
+    const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
+
+    await selectBusinessReference({ sourceRoot, explicitPaths: [], generatedPath }, {
+      listTrackedFiles: async () => [],
+      now: () => new Date("2026-07-20T00:00:00.000Z"),
+    });
+
+    const generated = await readFile(generatedPath, "utf8");
+    expect(generated).toContain("Domain: \\# Orders \\[admin\\]\\(https://example\\.test\\)");
+    expect(generated).toContain("Use \\`unsafe\\` \\*formatting\\* and \\[links\\]\\(https://example\\.test\\)\\.");
+  });
+
   it("AC-7.2: returns none without creating a document when no adequate docs or domain graph exist", async () => {
     const sourceRoot = await tempRoot("business-reference-source-");
     const cacheRoot = await tempRoot("business-reference-cache-");
@@ -187,5 +267,19 @@ describe("selectBusinessReference", () => {
     }, { listTrackedFiles: async () => [] })).rejects.toThrow(/generated.*outside|repository|trusted source/i);
     await expect(readFile(path.join(sourceRoot, "BUSINESS-CONTEXT.md"), "utf8"))
       .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("AC-7.2: reports a descriptive error when the generation root is missing", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    const missingRoot = path.join(cacheRoot, "missing");
+
+    await expect(selectBusinessReference({
+      sourceRoot,
+      explicitPaths: [],
+      generatedPath: path.join(missingRoot, "BUSINESS-CONTEXT.md"),
+    }, { listTrackedFiles: async () => [] })).rejects.toThrow(
+      `Generated business reference root directory does not exist or is inaccessible: ${missingRoot}`,
+    );
   });
 });

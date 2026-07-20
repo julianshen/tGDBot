@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { realExecWorkspaceCommand } from "../workspace/manager.js";
 
@@ -123,7 +124,7 @@ async function resolveTrustedDocuments(sourceRoot: string, candidates: readonly 
       throw new Error(`Business document path is outside the trusted source: ${candidate}`);
     }
     const relativePath = toPosix(path.relative(sourceRoot, absolutePath));
-    if (relativePath === ".git" || relativePath.startsWith(".git/")) {
+    if (relativePath.toLowerCase().split("/").includes(".git")) {
       throw new Error(`Business document path escapes into repository metadata: ${candidate}`);
     }
     const info = await lstat(absolutePath);
@@ -135,9 +136,13 @@ async function resolveTrustedDocuments(sourceRoot: string, candidates: readonly 
     }
     return { relativePath, absolutePath };
   }));
-  return Promise.all(resolved.map(async (document) => ({
+  const uniqueResolved = [...new Map(resolved.map((document) => [document.relativePath, document])).values()];
+  return Promise.all(uniqueResolved.map(async (document) => ({
     ...document,
-    contents: await readFile(document.absolutePath, "utf8"),
+    contents: await readRegularFileNoFollow(
+      document.absolutePath,
+      `Business document path is not a real regular file: ${document.relativePath}`,
+    ),
   })));
 }
 
@@ -155,7 +160,12 @@ async function validateGenerationRoot(sourceRoot: string, generatedPath: string)
     throw new Error("Generated business reference must be outside the trusted source repository");
   }
   const generationRoot = path.dirname(resolvedGenerated);
-  const rootInfo = await lstat(generationRoot);
+  let rootInfo;
+  try {
+    rootInfo = await lstat(generationRoot);
+  } catch {
+    throw new Error(`Generated business reference root directory does not exist or is inaccessible: ${generationRoot}`);
+  }
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
     throw new Error("Generated business reference root must be a real cache directory");
   }
@@ -167,6 +177,26 @@ async function validateGenerationRoot(sourceRoot: string, generatedPath: string)
     throw new Error("Generated business reference cache resolves inside the trusted source repository");
   }
   return { generatedPath: resolvedGenerated, generationRoot, physicalGenerationRoot };
+}
+
+async function readRegularFileNoFollow(filePath: string, invalidMessage: string): Promise<string> {
+  let handle;
+  try {
+    handle = await open(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error &&
+      (error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error(invalidMessage);
+    }
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error(invalidMessage);
+    return await handle.readFile("utf8");
+  } finally {
+    await handle.close();
+  }
 }
 
 async function readDomainGraph(
@@ -186,7 +216,7 @@ async function readDomainGraph(
   if (!isBeneath(physicalGenerationRoot, physicalGraph)) {
     throw new Error("Domain graph escaped the business-reference cache root");
   }
-  const raw = await readFile(graphPath, "utf8");
+  const raw = await readRegularFileNoFollow(graphPath, "Domain graph must be a real cache file");
   const parsed: unknown = JSON.parse(raw);
   if (!isRecord(parsed) || !isRecord(parsed.project) || !Array.isArray(parsed.nodes) ||
     typeof parsed.project.name !== "string" || typeof parsed.project.gitCommitHash !== "string") {
@@ -220,13 +250,17 @@ function singleLine(value: string): string {
   return value.replaceAll(/[\r\n]+/gu, " ").trim();
 }
 
+function markdownSingleLine(value: string): string {
+  return singleLine(value).replaceAll(/[\\`*_[\]{}()<>#+.!|-]/gu, "\\$&");
+}
+
 function generateBusinessContext(source: DomainGraphSource, generatedAt: Date): string {
   const sections = source.nodes.map((node) => {
     const citationId = /^[a-zA-Z0-9:_-]+$/u.test(node.id) ? node.id : encodeURIComponent(node.id);
     return [
-      `## ${node.type[0]!.toUpperCase()}${node.type.slice(1)}: ${singleLine(node.name)}`,
+      `## ${node.type[0]!.toUpperCase()}${node.type.slice(1)}: ${markdownSingleLine(node.name)}`,
       "",
-      singleLine(node.summary),
+      markdownSingleLine(node.summary),
       "",
       `Source: \`.understand-anything/domain-graph.json#${citationId}\``,
     ].join("\n");
@@ -260,10 +294,16 @@ async function readReusableGenerated(generatedPath: string, source: DomainGraphS
     throw error;
   }
   if (!info.isFile() || info.isSymbolicLink()) throw new Error("Generated business reference must be a real file");
-  const contents = await readFile(generatedPath, "utf8");
-  return contents.includes(`source_sha256: ${source.sha256}`) && contents.includes(`base_sha: ${safeScalar(source.baseSha)}`)
-    ? contents
-    : undefined;
+  const contents = await readRegularFileNoFollow(
+    generatedPath,
+    "Generated business reference must be a real file",
+  );
+  const baseShaMatch = contents.match(/^base_sha:\s*["']?([^\s"']+)["']?\s*$/mu);
+  const fileBaseSha = baseShaMatch?.[1]?.toLowerCase();
+  const sourceBaseSha = source.baseSha.toLowerCase();
+  const shaMatches = fileBaseSha !== undefined && fileBaseSha.length > 0 && sourceBaseSha.length > 0 &&
+    (fileBaseSha.startsWith(sourceBaseSha) || sourceBaseSha.startsWith(fileBaseSha));
+  return contents.includes(`source_sha256: ${source.sha256}`) && shaMatches ? contents : undefined;
 }
 
 async function writeGenerated(generatedPath: string, contents: string): Promise<void> {
