@@ -110,14 +110,16 @@ function domainGraph(): Record<string, unknown> {
   };
 }
 
-function manifestInput(): ContextManifestInput {
+function manifestInput(zeroDomains = false): ContextManifestInput {
   return {
     key,
     createdAt,
     artifacts: [
       { kind: "context", path: "CONTEXT.md" },
       { kind: "knowledge-graph", path: ".understand-anything/knowledge-graph.json" },
-      { kind: "domain-graph", path: ".understand-anything/domain-graph.json" },
+      zeroDomains
+        ? { kind: "zero-domains", path: ".understand-anything/zero-domains.json" }
+        : { kind: "domain-graph", path: ".understand-anything/domain-graph.json" },
       { kind: "mapping-metadata", path: ".understand-anything/mapping-metadata.json" },
     ],
     documents: [],
@@ -125,7 +127,13 @@ function manifestInput(): ContextManifestInput {
   };
 }
 
-async function createEntry(): Promise<{ contextRoot: string; manifest: ContextManifest }> {
+interface EntryOptions {
+  knowledge?: Record<string, unknown>;
+  domain?: Record<string, unknown>;
+  zeroDomains?: boolean;
+}
+
+async function createEntry(options: EntryOptions = {}): Promise<{ contextRoot: string; manifest: ContextManifest }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "context-pack-test-"));
   roots.push(root);
   const staging = await mkdtemp(path.join(root, "staging-"));
@@ -134,12 +142,19 @@ async function createEntry(): Promise<{ contextRoot: string; manifest: ContextMa
     writeFile(path.join(staging, "CONTEXT.md"), "# Trusted context\n", "utf8"),
     writeFile(
       path.join(staging, ".understand-anything/knowledge-graph.json"),
-      JSON.stringify(knowledgeGraph()),
+      JSON.stringify(options.knowledge ?? knowledgeGraph()),
       "utf8",
     ),
     writeFile(
-      path.join(staging, ".understand-anything/domain-graph.json"),
-      JSON.stringify(domainGraph()),
+      path.join(
+        staging,
+        options.zeroDomains
+          ? ".understand-anything/zero-domains.json"
+          : ".understand-anything/domain-graph.json",
+      ),
+      JSON.stringify(options.zeroDomains
+        ? { version: 1, status: "zero-domains" }
+        : options.domain ?? domainGraph()),
       "utf8",
     ),
     writeFile(
@@ -149,7 +164,7 @@ async function createEntry(): Promise<{ contextRoot: string; manifest: ContextMa
     ),
   ]);
   const cache = new ContextCache(root);
-  const manifest = await cache.promoteContext(staging, manifestInput());
+  const manifest = await cache.promoteContext(staging, manifestInput(options.zeroDomains));
   return { contextRoot: cache.entryPath(key), manifest };
 }
 
@@ -221,6 +236,129 @@ describe("buildContextPack", () => {
       changedFiles,
     })).rejects.toBeInstanceOf(ContextValidationError);
     expect(manifest).toEqual(beforeManifest);
+    expect(changedFiles).toEqual(beforeChangedFiles);
+  });
+
+  it("AC-2.1: ranks exact changed-file seeds before one-hop neighbors and excludes unrelated nodes", async () => {
+    const nodes = [
+      {
+        id: "file:src/unrelated.ts", type: "file", name: "unrelated.ts", filePath: "src/unrelated.ts",
+        summary: "Must not be emitted", tags: ["unrelated"], complexity: "simple",
+      },
+      {
+        id: "module:z-neighbor", type: "module", name: "Z Neighbor",
+        summary: "Neighbor of B", tags: ["neighbor"], complexity: "simple",
+      },
+      {
+        id: "file:src/b.ts", type: "file", name: "b.ts", filePath: "src/b.ts",
+        summary: "Changed file B", tags: ["changed"], complexity: "simple",
+      },
+      {
+        id: "function:a-handler", type: "function", name: "A Handler", filePath: "src/a.ts",
+        summary: "Changed handler A", tags: ["changed"], complexity: "moderate",
+      },
+      {
+        id: "file:src/a.ts", type: "file", name: "a.ts", filePath: "src/a.ts",
+        summary: "Changed file A", tags: ["changed"], complexity: "simple",
+      },
+      {
+        id: "module:a-neighbor", type: "module", name: "A Neighbor",
+        summary: "Neighbor of A", tags: ["neighbor"], complexity: "simple",
+      },
+    ];
+    const knowledge = {
+      ...knowledgeGraph(),
+      nodes,
+      edges: [
+        { source: "file:src/b.ts", target: "module:z-neighbor", type: "imports", direction: "forward", weight: 0.7 },
+        { source: "module:a-neighbor", target: "file:src/a.ts", type: "imports", direction: "forward", weight: 0.7 },
+      ],
+    };
+    const { contextRoot, manifest } = await createEntry({ knowledge });
+
+    const result = await buildContextPack({
+      contextRoot,
+      manifest,
+      ruleName: "tgd-review",
+      changedFiles: ["src/b.ts", "./src/a.ts", "src/a.ts"],
+    });
+
+    const orderedIds = [
+      "file:src/a.ts",
+      "function:a-handler",
+      "file:src/b.ts",
+      "module:a-neighbor",
+      "module:z-neighbor",
+    ];
+    for (let index = 1; index < orderedIds.length; index += 1) {
+      expect(result.text.indexOf(orderedIds[index - 1]!)).toBeLessThan(result.text.indexOf(orderedIds[index]!));
+    }
+    expect(result.text).not.toContain("file:src/unrelated.ts");
+    expect(result.sources.find((source) => source.kind === "knowledge-graph")).toMatchObject({
+      includedItems: 5,
+      omittedItems: 0,
+    });
+  });
+
+  it("AC-2.2: renders only connected domain hierarchies and explicit zero-domain or no-match states", async () => {
+    const relevant = await createEntry();
+    const relevantPack = await buildContextPack({
+      ...relevant,
+      ruleName: "tgd-review",
+      changedFiles: ["src/index.ts"],
+    });
+    expect(relevantPack.text).toContain("domain:reviews");
+    expect(relevantPack.text).toContain("flow:review-pr");
+    expect(relevantPack.text).toContain("step:load-context");
+
+    const noMatchPack = await buildContextPack({
+      ...relevant,
+      ruleName: "tgd-review",
+      changedFiles: ["src/other.ts"],
+    });
+    expect(noMatchPack.text).toContain("No domain flows matched the changed files.");
+
+    const zero = await createEntry({ zeroDomains: true });
+    const zeroPack = await buildContextPack({
+      ...zero,
+      ruleName: "tgd-review",
+      changedFiles: ["src/index.ts"],
+    });
+    expect(zeroPack.text).toContain("No domain graph was produced for the trusted base.");
+    expect(zeroPack.sources.find((source) => source.kind === "zero-domains")).toMatchObject({
+      includedItems: 0,
+      omittedItems: 0,
+    });
+  });
+
+  it("AC-2.3: produces identical output for normalized input permutations over identical artifact bytes", async () => {
+    const { contextRoot, manifest } = await createEntry();
+    const changedFiles = ["src/other.ts", "src/index.ts", "./src/index.ts"];
+    const permutedManifest: ContextManifest = {
+      ...manifest,
+      artifacts: [...manifest.artifacts].reverse(),
+      documents: [...manifest.documents].reverse(),
+      degradedReasons: [...manifest.degradedReasons].reverse(),
+    };
+    const beforeManifest = structuredClone(permutedManifest);
+    const beforeChangedFiles = [...changedFiles];
+
+    const first = await buildContextPack({
+      contextRoot,
+      manifest,
+      ruleName: "tgd-review",
+      changedFiles: [...changedFiles].reverse(),
+    });
+    const second = await buildContextPack({
+      contextRoot,
+      manifest: permutedManifest,
+      ruleName: "tgd-review",
+      changedFiles,
+    });
+
+    expect(first.text).toContain("file:src/index.ts");
+    expect(second).toEqual(first);
+    expect(permutedManifest).toEqual(beforeManifest);
     expect(changedFiles).toEqual(beforeChangedFiles);
   });
 });
