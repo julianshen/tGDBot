@@ -1,3 +1,6 @@
+import type { ContextPackResult } from "../context/context-pack.js";
+import type { RuleDefinition } from "../rules/types.js";
+
 // Finding/DispatchResult: the shape produced by dispatching every loaded rule
 // through the orchestrating AgentSession's `subagent` tool call and parsing
 // its final JSON message. See SPEC.md "Data Models" and TASKS.md Task 5.
@@ -66,4 +69,18 @@ export interface DispatchResult {
    * absent per-rule for rules that succeeded.
    */
   ruleFailureReasons?: Record<string, string>;
+
+  /** Present only when every dispatched rule used a pack from one validated manifest. */
+  contextManifestHash?: string;
+}
+
+export type RuleContextPacks = Readonly<Record<string, ContextPackResult>>;
+
+/** Runtime dispatch data shared by the direct and legacy engines. */
+export interface ReviewDispatchInput {
+  rules: RuleDefinition[];
+  diff: string;
+  useAdvisor: boolean;
+  contextPacks?: RuleContextPacks;
+  orchestratorModel?: string;
 }
