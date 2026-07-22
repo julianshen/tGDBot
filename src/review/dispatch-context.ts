@@ -64,10 +64,18 @@ export function validateDispatchContext(
     }
 
     const candidate = pack as Record<string, unknown>;
-    if (typeof candidate.text !== "string" || candidate.text.trim().length === 0) {
+    if (
+      !Object.hasOwn(candidate, "text") ||
+      typeof candidate.text !== "string" ||
+      candidate.text.trim().length === 0
+    ) {
       return invalid(`context pack for ${JSON.stringify(rule.name)} must contain non-empty text`);
     }
-    if (typeof candidate.manifestHash !== "string" || !MANIFEST_HASH_RE.test(candidate.manifestHash)) {
+    if (
+      !Object.hasOwn(candidate, "manifestHash") ||
+      typeof candidate.manifestHash !== "string" ||
+      !MANIFEST_HASH_RE.test(candidate.manifestHash)
+    ) {
       return invalid(
         `context pack for ${JSON.stringify(rule.name)} must contain a lowercase SHA-256 manifest hash`,
       );

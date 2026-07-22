@@ -81,6 +81,19 @@ describe("validateDispatchContext", () => {
     );
   });
 
+  it("AC-1.2: rejects a pack whose trusted fields are inherited", () => {
+    const inheritedPack = Object.create({
+      text: "prototype-controlled evidence",
+      manifestHash: HASH_A,
+      truncated: false,
+      sources: [],
+    }) as ContextPackResult;
+
+    expect(() =>
+      validateDispatchContext([makeRule("correctness")], { correctness: inheritedPack }),
+    ).toThrow(DispatchInputError);
+  });
+
   it("AC-1.2: rejects duplicate effective rule names in contextualized mode", () => {
     expect(() =>
       validateDispatchContext(
