@@ -134,8 +134,8 @@ function normalizeRuleName(ruleName: unknown): string {
 }
 
 function normalizeChangedFile(changedFile: unknown): string {
-  if (typeof changedFile !== "string" || changedFile.includes("\0")) {
-    return invalid("Changed file must be a NUL-free string");
+  if (typeof changedFile !== "string" || /[\u0000-\u001f\u007f]/u.test(changedFile)) {
+    return invalid("Changed file must be a string containing no control characters");
   }
   const normalized = changedFile.replaceAll("\\", "/").replace(/^\.\//u, "");
   if (
@@ -316,28 +316,46 @@ async function readDeclaredArtifact(
   }
 }
 
+function* sourceLines(contents: string): Generator<{ text: string; lineNumber: number }> {
+  let start = 0;
+  let lineNumber = 1;
+  while (start <= contents.length) {
+    const newline = contents.indexOf("\n", start);
+    const end = newline === -1 ? contents.length : newline;
+    const carriageReturn = end > start && contents.charCodeAt(end - 1) === 13;
+    yield { text: contents.slice(start, carriageReturn ? end - 1 : end), lineNumber };
+    if (newline === -1) return;
+    start = newline + 1;
+    lineNumber += 1;
+  }
+}
+
 function isGeneratedBusinessReference(contents: string): boolean {
-  const lines = contents.split(/\r?\n/u);
-  if (lines[0]?.trim() !== "---") return false;
-  for (let index = 1; index < lines.length; index += 1) {
-    const line = lines[index]!.trim();
+  for (const { text, lineNumber } of sourceLines(contents)) {
+    const line = text.trim();
+    if (lineNumber === 1) {
+      if (line !== "---") return false;
+      continue;
+    }
     if (line === "---") return false;
     if (/^generated\s*:\s*true\s*$/iu.test(line)) return true;
   }
   return false;
 }
 
-function redactBusinessLines(contents: string): { lines: string[]; redactedItems: number } {
-  const lines: string[] = [];
+function redactBusinessLines(
+  contents: string,
+): { lines: Array<{ text: string; lineNumber: number }>; redactedItems: number } {
+  const lines: Array<{ text: string; lineNumber: number }> = [];
   let redactedItems = 0;
   let inPrivateKey = false;
-  for (const rawLine of contents.split(/\r?\n/u)) {
-    const line = rawLine.trim();
+  for (const { text, lineNumber } of sourceLines(contents)) {
+    const line = text.trim();
     if (line.length === 0) continue;
     if (/^-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----$/u.test(line)) {
       inPrivateKey = true;
       redactedItems += 1;
-      lines.push("[REDACTED: potential secret]");
+      lines.push({ text: "[REDACTED: potential secret]", lineNumber });
       continue;
     }
     if (inPrivateKey) {
@@ -349,9 +367,9 @@ function redactBusinessLines(contents: string): { lines: string[]; redactedItems
     const awsAccessKey = /\bAKIA[A-Z0-9]{16}\b/u;
     if (credentialAssignment.test(line) || githubToken.test(line) || awsAccessKey.test(line)) {
       redactedItems += 1;
-      lines.push("[REDACTED: potential secret]");
+      lines.push({ text: "[REDACTED: potential secret]", lineNumber });
     } else {
-      lines.push(line);
+      lines.push({ text: line, lineNumber });
     }
   }
   return { lines, redactedItems };
@@ -373,13 +391,13 @@ async function businessEvidence(
     const redacted = redactBusinessLines(contents);
     source.redactedItems = redacted.redactedItems;
     const generated = isGeneratedBusinessReference(contents);
-    redacted.lines.forEach((line, index) => {
+    redacted.lines.forEach((line) => {
       entries.push({
         section: "business",
         source,
         text: [
-          `- Source \`${document.path}\` (SHA-256: ${document.sha256}, Generated: ${String(generated)}, line ${index + 1})`,
-          `  > ${line}`,
+          `- Source \`${document.path}\` (SHA-256: ${document.sha256}, Generated: ${String(generated)}, line ${line.lineNumber})`,
+          `  > ${line.text}`,
         ].join("\n"),
       });
     });
