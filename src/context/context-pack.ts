@@ -220,6 +220,14 @@ function validateManifestIdentity(manifest: unknown): asserts manifest is Contex
   if (computed !== candidate.manifestHash) return invalid("Context manifest hash does not match its contents");
 }
 
+function validateRenderedPaths(manifest: ContextManifest): void {
+  for (const document of manifest.documents) {
+    if (/[\u0000-\u001f\u007f]/u.test(document.path)) {
+      return invalid("Business-reference path contains control characters");
+    }
+  }
+}
+
 function sourceRefs(manifest: ContextManifest): SourceRef[] {
   const artifacts = manifest.artifacts.flatMap((record): SourceRef[] => {
     if (
@@ -362,7 +370,7 @@ function redactBusinessLines(
       if (/^-----END [A-Z0-9 ]*PRIVATE KEY-----$/u.test(line)) inPrivateKey = false;
       continue;
     }
-    const credentialAssignment = /^\s*(?:password|passwd|secret|token|api[_-]?key|apikey|authorization|aws_access_key_id)\s*[:=]/iu;
+    const credentialAssignment = /^\s*[a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|apikey|authorization|private[_-]?key|aws_access_key_id)[a-z0-9_.-]*\s*[:=]/iu;
     const githubToken = /(?:\bgh[pousr]_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b)/u;
     const awsAccessKey = /\bAKIA[A-Z0-9]{16}\b/u;
     if (credentialAssignment.test(line) || githubToken.test(line) || awsAccessKey.test(line)) {
@@ -642,13 +650,14 @@ function allocateEvidence(
   const mandatory = renderPack(ruleName, manifest, selected, eligible, zeroDomains, footerReservation);
   if (mandatory.length > maxChars) return invalid("Mandatory context pack content exceeds maxChars");
 
+  let selectedLength = mandatory.length;
   for (const entry of entries) {
-    selected[entry.section].push(entry.text);
-    const candidate = renderPack(ruleName, manifest, selected, eligible, zeroDomains, footerReservation);
-    if (candidate.length <= maxChars) {
+    const entryLength = entry.text.length + 1;
+    if (selectedLength + entryLength <= maxChars) {
+      selected[entry.section].push(entry.text);
+      selectedLength += entryLength;
       accountEntry(entry, "includedItems");
     } else {
-      selected[entry.section].pop();
       accountEntry(entry, "omittedItems");
     }
   }
@@ -671,6 +680,7 @@ export async function buildContextPack(input: BuildContextPackInput): Promise<Co
   const changedFiles = normalizeChangedFiles(input.changedFiles);
   const maxChars = resolveMaxChars(input.maxChars);
   validateManifestIdentity(input.manifest);
+  validateRenderedPaths(input.manifest);
   await validateArtifactRecords(
     contextRoot,
     input.manifest.key,
