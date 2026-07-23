@@ -10,13 +10,15 @@ describe("parseArgs", () => {
     expect(result).toEqual({
       pr: "42",
       vcs: "github",
-      rulesDir: ".tgd-review/rules",
+      rulesDir: ".review/rules",
       disableBuiltinRule: false,
       advisor: "on",
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
       dispatch: "direct",
+      maxDiffChars: undefined,
+      model: undefined,
     });
   });
 

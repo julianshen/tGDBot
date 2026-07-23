@@ -16,6 +16,8 @@ export interface RuleDefinition {
    */
   provider?: string;
   model?: string;
+  dependsOn: readonly string[];
+  parallelGroup?: string;
   body: string;
   sourcePath: string;
 }

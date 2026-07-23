@@ -43,7 +43,7 @@ See ADR-006. This is enforced by `test/unit/review/comment-format.test.ts` and
 recorded in `REGRESSION-CATALOG.md`.
 
 One related attack vector **is** fully closed, natively by the CLI itself:
-rule files (`.tgd-review/rules/*.md`) are loaded from the PR's **base**
+rule files (`.review/rules/*.md`) are loaded from the PR's **base**
 branch via the VCS provider's API, never from the PR's own checkout — see
 "Rule files are sourced from the base branch" below. Before that fix, a PR
 could simply add its own rule file and get attacker-authored instructions
@@ -123,7 +123,7 @@ The real flags, as parsed by `src/cli.ts`:
 tgd-review-agent review \
   --pr <number>                  # required: PR number
   --vcs github|gitlab            # default: github (gitlab adapter is Phase 2, not yet implemented)
-  --rules-dir <path>             # default: .tgd-review/rules — a REPO-RELATIVE path looked up on
+  --rules-dir <path>             # default: .review/rules — a REPO-RELATIVE path looked up on
                                   # the PR's BASE branch via the VCS provider's API (not a local
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
@@ -271,10 +271,10 @@ node dist/cli.js review --pr 42 --dry-run
 
 ### Zero-config smoke test (AC-9.2)
 
-Proves the "works with zero user configuration" claim: no `.tgd-review/rules/`
+Proves the "works with zero user configuration" claim: no `.review/rules/`
 directory, only the vendored built-in `tgd-review` rule.
 
-1. Clone the repo fresh and confirm there is no `.tgd-review/rules/`
+1. Clone the repo fresh and confirm there is no `.review/rules/`
    directory (nothing to author, nothing to configure).
 2. `npm ci && npm run build`.
 3. Export ANY one provider API key (e.g. `ANTHROPIC_API_KEY` or
@@ -293,17 +293,22 @@ directory, only the vendored built-in `tgd-review` rule.
 
 ### Authoring a rule file
 
-Rule files live under `.tgd-review/rules/*.md` (configurable via
+Rule files live under `.review/rules/*.md` (configurable via
 `--rules-dir`) and supplement (not replace) the built-in `tgd-review` rule
 unless `--disable-builtin-rule` is passed. Each file is Markdown with YAML
 frontmatter, parsed by `src/rules/loader.ts` (`gray-matter`) into the
 `RuleDefinition` shape defined in `src/rules/types.ts`:
 
+Repositories using the former layout can opt in explicitly with
+`--rules-dir .tgd-review/rules`; the CLI never fetches or merges both paths.
+
 ```typescript
 export interface RuleDefinition {
   name: string;
-  provider: string;
-  model: string;
+  provider?: string;
+  model?: string;
+  dependsOn: readonly string[];
+  parallelGroup?: string;
   body: string;
   sourcePath: string;
 }
@@ -320,6 +325,12 @@ log/comment) rather than failing the whole run. Everything after the closing
 `---` becomes the rule's Markdown `body`, which is sent verbatim as the
 dispatched subagent's task prompt (with a fixed JSON-output contract appended
 automatically — you don't need to ask for JSON yourself).
+
+`depends_on` is an optional unique array of rule names and defaults to `[]`.
+Dependencies establish ordering, not success gating. `parallel_group` is an
+optional lowercase slug (`[a-z0-9][a-z0-9._-]{0,63}`); currently-ready rules
+sharing the same explicit group may run in one wave. Ungrouped rules each form
+their own sequential wave.
 
 ```markdown
 ---
@@ -339,6 +350,9 @@ model for a narrow style rule, or a specific provider's strengths):
 name: deep-security-review
 provider: anthropic
 model: claude-opus-4-5
+depends_on:
+  - security-review
+parallel_group: deep-analysis
 ---
 ...
 ```
@@ -367,7 +381,7 @@ filesystem at all — instead it:
 3. Writes the fetched files into a fresh, isolated temp directory and points
    `loadRules()` at that directory (cleaned up afterward).
 
-`--rules-dir`'s default value (`.tgd-review/rules`) is therefore a
+`--rules-dir`'s default value (`.review/rules`) is therefore a
 **repo-relative lookup key**, not a local filesystem path, in this default
 mode — see "CLI flags" above.
 
@@ -375,14 +389,14 @@ This is deliberate, not an oversight. `dispatchRules` sends every rule
 file's `body` verbatim as a **trusted** agent-instruction prompt, with an
 attacker-chosen `provider`/`model` if the rule file itself is
 attacker-controlled. Without this indirection, a PR author could add
-`.tgd-review/rules/evil.md` to their own PR and have its contents executed
+`.review/rules/evil.md` to their own PR and have its contents executed
 as a trusted instruction by a subagent with real tool access on the CI
 runner — no prompt-injection cleverness required, just adding a file.
 Sourcing rules from the base branch instead means:
 
 - **A PR cannot introduce or modify a rule that affects its own review.**
   Rule changes only take effect once merged into the base branch.
-- If the base branch has no `.tgd-review/rules/` directory at all,
+- If the base branch has no `.review/rules/` directory at all,
   `getRuleFilesFromBase` returns zero files (a 404 from the Contents API is
   treated as "no rules," not an error) — same "directory doesn't exist"
   handling `loadRules()` already has for the local-filesystem case.
@@ -501,12 +515,12 @@ provider name works, not just `hermes`; pick something that matches the
 `provider` field you'll write in your rule files.)
 
 **2. Create a custom rule file that uses it.** Rule files live at
-`.tgd-review/rules/*.md` in your repo (the default `--rules-dir`; see
+`.review/rules/*.md` in your repo (the default `--rules-dir`; see
 "Authoring a rule file" above for the full frontmatter reference). Create
 one — the filename doesn't matter, only the `name` in the frontmatter does —
 referencing your new provider exactly like a built-in one:
 
-`.tgd-review/rules/hermes-readability-review.md`:
+`.review/rules/hermes-readability-review.md`:
 ```markdown
 ---
 name: hermes-readability-review

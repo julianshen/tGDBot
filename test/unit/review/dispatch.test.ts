@@ -125,6 +125,7 @@ function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
     name: "rule-a",
     provider: "anthropic",
     model: "claude-opus-4-5",
+    dependsOn: [],
     body: "Check for bugs.",
     sourcePath: "/rules/rule-a.md",
     ...overrides,
@@ -1963,7 +1964,7 @@ describe("ADR-007: a committable suggestion must be traceable to a real reviewer
 // ANY model fails with a clear reason, before any session is created.
 describe("dispatchRules with unpinned rules (design-review #6)", () => {
   const unpinnedRule = (name = "unpinned-rule"): RuleDefinition =>
-    ({ name, body: "Review the diff.", sourcePath: `/rules/${name}.md` }) as RuleDefinition;
+    ({ name, dependsOn: [], body: "Review the diff.", sourcePath: `/rules/${name}.md` }) as RuleDefinition;
 
   it("fills an unpinned rule from a credentialed --model and dispatches it on that model", async () => {
     const stub = createPiSessionStub(

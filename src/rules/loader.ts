@@ -32,6 +32,8 @@ function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+const PARALLEL_GROUP_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
 // Wraps `matter(raw)` in try/catch: malformed YAML frontmatter (bad
 // indentation, unclosed brackets, etc.) makes gray-matter throw a
 // `YAMLException` rather than returning a parse-error value. Left
@@ -70,10 +72,38 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
     };
   }
 
+  const dependsOnValue = data.depends_on;
+  if (dependsOnValue !== undefined && !Array.isArray(dependsOnValue)) {
+    return { error: `frontmatter field "depends_on" must be an array of non-empty strings` };
+  }
+  const dependsOn = dependsOnValue ?? [];
+  if (!(dependsOn as unknown[]).every(isNonEmptyString)) {
+    return { error: `frontmatter field "depends_on" must be an array of non-empty strings` };
+  }
+  if (new Set(dependsOn as string[]).size !== (dependsOn as string[]).length) {
+    return { error: `frontmatter field "depends_on" contains a duplicate dependency` };
+  }
+
+  const parallelGroupValue = data.parallel_group;
+  if (
+    parallelGroupValue !== undefined &&
+    (!isNonEmptyString(parallelGroupValue) || !PARALLEL_GROUP_PATTERN.test(parallelGroupValue))
+  ) {
+    return {
+      error:
+        `frontmatter field "parallel_group" must match ` +
+        `"^[a-z0-9][a-z0-9._-]{0,63}$"`,
+    };
+  }
+
   return {
     rule: {
       name: data.name,
       ...(hasProvider ? { provider: data.provider as string, model: data.model as string } : {}),
+      dependsOn: Object.freeze([...(dependsOn as string[])]),
+      ...(parallelGroupValue === undefined
+        ? {}
+        : { parallelGroup: parallelGroupValue as string }),
       body: parsed.content.trim(),
       sourcePath,
     },
