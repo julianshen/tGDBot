@@ -327,10 +327,16 @@ dispatched subagent's task prompt (with a fixed JSON-output contract appended
 automatically — you don't need to ask for JSON yourself).
 
 `depends_on` is an optional unique array of rule names and defaults to `[]`.
-Dependencies establish ordering, not success gating. `parallel_group` is an
-optional lowercase slug (`[a-z0-9][a-z0-9._-]{0,63}`); currently-ready rules
-sharing the same explicit group may run in one wave. Ungrouped rules each form
-their own sequential wave.
+`parallel_group` is an optional lowercase slug
+(`[a-z0-9][a-z0-9._-]{0,63}`). The loader validates and snapshots this
+metadata, and `planReviewWorkflow()` compiles it into deterministic waves:
+dependencies establish order rather than success gating, currently-ready rules
+sharing an explicit group may share a wave, and ungrouped rules receive
+individual waves.
+
+This release exposes and tests the planning contract only. The current dispatch
+engines do not yet consume the compiled waves, so these fields do not change
+runtime reviewer scheduling until the follow-up scheduler integration lands.
 
 ```markdown
 ---
