@@ -62,7 +62,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
   return {
     pr: "42",
     vcs: "github",
-    rulesDir: ".tgd-review/rules",
+    rulesDir: ".review/rules",
     disableBuiltinRule: false,
     advisor: "on",
     dryRun: false,
@@ -92,6 +92,7 @@ describe("review — default dependency wiring", () => {
           name: "rule-a",
           provider: "anthropic",
           model: "claude-opus-4-5",
+          dependsOn: [],
           body: "Check for bugs.",
           sourcePath: "/rules/rule-a.md",
         },
@@ -133,7 +134,7 @@ describe("review — default dependency wiring", () => {
 
     // ADR-002 CLI-native fix: rules are now sourced from the PR's base
     // branch via getRuleFilesFromBase, not the literal --rules-dir path.
-    expect(hoisted.getRuleFilesFromBase).toHaveBeenCalledWith("base0000", ".tgd-review/rules");
+    expect(hoisted.getRuleFilesFromBase).toHaveBeenCalledWith("base0000", ".review/rules");
 
     // The real loadRulesReal/dispatchRulesReal/orchestrateReal references
     // were actually invoked (not silently skipped by a typo'd default) —
@@ -142,7 +143,7 @@ describe("review — default dependency wiring", () => {
     // lookup key for the base-branch fetch above).
     expect(loadRules).toHaveBeenCalledTimes(1);
     const [loadedDir, includeBuiltin] = vi.mocked(loadRules).mock.calls[0];
-    expect(loadedDir).not.toBe(".tgd-review/rules");
+    expect(loadedDir).not.toBe(".review/rules");
     expect(includeBuiltin).toBe(true);
     // Design-review P0: the DEFAULT engine is the direct one. Its adapter
     // keeps the deps bag in slot 4 ({} → real factories) and the default

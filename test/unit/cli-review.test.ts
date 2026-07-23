@@ -23,7 +23,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
   return {
     pr: "42",
     vcs: "github",
-    rulesDir: ".tgd-review/rules",
+    rulesDir: ".review/rules",
     disableBuiltinRule: false,
     advisor: "on",
     suggestions: "on",
@@ -50,6 +50,7 @@ function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
     name: "rule-a",
     provider: "anthropic",
     model: "claude-opus-4-5",
+    dependsOn: [],
     body: "Check for bugs.",
     sourcePath: "/rules/rule-a.md",
     ...overrides,
@@ -630,7 +631,7 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
 
     await review(h.args, depsFrom(h));
 
-    expect(h.vcsAdapter.getRuleFilesFromBase).toHaveBeenCalledWith("based00d", ".tgd-review/rules");
+    expect(h.vcsAdapter.getRuleFilesFromBase).toHaveBeenCalledWith("based00d", ".review/rules");
 
     vi.restoreAllMocks();
   });
@@ -661,7 +662,7 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
     await review(h.args, depsFrom(h));
 
     expect(h.loadRules).toHaveBeenCalledTimes(1);
-    expect(seenDir).not.toBe(".tgd-review/rules");
+    expect(seenDir).not.toBe(".review/rules");
     expect(path.isAbsolute(seenDir as string)).toBe(true);
     expect(seenIncludeBuiltin).toBe(true);
 
@@ -672,6 +673,23 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
 
     // ...and was removed afterward.
     expect(existsSync(seenDir as string)).toBe(false);
+
+    vi.restoreAllMocks();
+  });
+
+  it("preserves the legacy directory when it is supplied explicitly", async () => {
+    const h = makeHarness({
+      args: makeArgs({ rulesDir: ".tgd-review/rules" }),
+      pr: makePr({ baseSha: "based00d" }),
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.getRuleFilesFromBase).toHaveBeenCalledWith(
+      "based00d",
+      ".tgd-review/rules",
+    );
 
     vi.restoreAllMocks();
   });

@@ -47,6 +47,69 @@ const duplicateBuiltinDir = fileURLToPath(
 );
 
 describe("loadRules", () => {
+  it("loads depends_on and parallel_group as snapshotted workflow metadata", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-workflow-rule-"));
+    await writeFile(
+      path.join(dir, "workflow.md"),
+      [
+        "---",
+        "name: workflow-rule",
+        "depends_on:",
+        "  - prerequisite-a",
+        "  - prerequisite-b",
+        "parallel_group: security",
+        "---",
+        "",
+        "Review the diff.",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    try {
+      const result = await loadRules(dir, false);
+
+      expect(result.errors).toEqual([]);
+      expect(result.rules[0]).toMatchObject({
+        name: "workflow-rule",
+        dependsOn: ["prerequisite-a", "prerequisite-b"],
+        parallelGroup: "security",
+      });
+      expect(Object.isFrozen(result.rules[0]?.dependsOn)).toBe(true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a scalar dependency", "depends_on: prerequisite", "depends_on"],
+    ["a blank dependency", "depends_on:\n  - \"\"", "depends_on"],
+    ["duplicate dependencies", "depends_on:\n  - prerequisite\n  - prerequisite", "duplicate"],
+    ["a blank group", "parallel_group: \"\"", "parallel_group"],
+    ["an invalid group", "parallel_group: Not Valid!", "parallel_group"],
+  ])("records %s as a per-file load error while loading a valid sibling", async (_label, metadata, errorText) => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-invalid-workflow-"));
+    await writeFile(
+      path.join(dir, "bad.md"),
+      `---\nname: bad-rule\n${metadata}\n---\n\nBad.\n`,
+      "utf-8",
+    );
+    await writeFile(
+      path.join(dir, "good.md"),
+      "---\nname: good-rule\n---\n\nGood.\n",
+      "utf-8",
+    );
+
+    try {
+      const result = await loadRules(dir, false);
+
+      expect(result.rules.map((rule) => rule.name)).toEqual(["good-rule"]);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]?.message).toContain(errorText);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   // AC-4.1: Given a valid rule file with name/provider/model set, When
   // loadRules runs, Then the returned rules array contains a matching
   // RuleDefinition with those exact fields and body equal to the file's
@@ -59,6 +122,7 @@ describe("loadRules", () => {
       name: "valid-rule",
       provider: "anthropic",
       model: "claude-opus-4-5",
+      dependsOn: [],
       body: "Review this diff for correctness and note any test gaps.",
       sourcePath: path.join(fixturesDir, "valid-rule.md"),
     });

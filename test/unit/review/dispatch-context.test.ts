@@ -14,6 +14,7 @@ function makeRule(name: string): EffectiveRule {
     name,
     provider: "openai",
     model: "gpt-5.6-terra",
+    dependsOn: [],
     body: `Review ${name}.`,
     sourcePath: `/rules/${name}.md`,
   };

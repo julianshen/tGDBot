@@ -11,6 +11,7 @@ function makeRule(body = "  Check correctness.  "): EffectiveRule {
     name: "correctness",
     provider: "openai",
     model: "gpt-5.6-terra",
+    dependsOn: [],
     body,
     sourcePath: "/rules/correctness.md",
   };

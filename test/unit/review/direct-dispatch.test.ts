@@ -60,6 +60,7 @@ function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
     name: "rule-a",
     provider: "anthropic",
     model: "claude-opus-4-5",
+    dependsOn: [],
     body: "Check for bugs.",
     sourcePath: "/rules/rule-a.md",
     ...overrides,

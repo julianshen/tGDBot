@@ -9,7 +9,7 @@ const repoRoot = path.resolve(
 );
 const readme = readFileSync(path.join(repoRoot, "README.md"), "utf8");
 
-// AC-9.2: Given a fresh clone of the repo with no `.tgd-review/rules/`
+// AC-9.2: Given a fresh clone of the repo with no `.review/rules/`
 // directory, When the workflow runs `review` on a real PR, Then the
 // built-in rule alone produces a posted comment.
 //
@@ -41,7 +41,7 @@ describe("AC-9.2: README documents the zero-config smoke test procedure", () => 
     // Substantive-content checks: these fail if the walkthrough's actual
     // steps are stripped out even though the heading remains.
     expect(sectionBody).toMatch(/clone the repo fresh/i);
-    expect(sectionBody).toContain(".tgd-review/rules/");
+    expect(sectionBody).toContain(".review/rules/");
     expect(sectionBody).toContain("--dry-run");
     expect(sectionBody).toMatch(/no custom rule files were loaded/i);
     // A real numbered walkthrough, not just a one-line pointer.

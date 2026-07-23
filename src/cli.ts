@@ -70,7 +70,7 @@ export interface CliArgs {
 
 const DEFAULTS = {
   vcs: "github" as const,
-  rulesDir: ".tgd-review/rules",
+  rulesDir: ".review/rules",
   disableBuiltinRule: false,
   advisor: "on" as const,
   suggestions: "on" as const,
@@ -86,7 +86,7 @@ const DEFAULTS = {
  * AC-1.2: a missing `--pr` throws an Error naming `--pr` as required, which
  * `main()` translates into exit code 1 with a human-readable message.
  *
- * `--rules-dir <path>` (default `.tgd-review/rules`): a REPO-RELATIVE path,
+ * `--rules-dir <path>` (default `.review/rules`): a REPO-RELATIVE path,
  * NOT a local filesystem path by default. `review()` passes it to
  * `vcsAdapter.getRuleFilesFromBase(pr.baseSha, rulesDir)`, which fetches
  * `<rulesDir>/*.md` as it exists on the PR's BASE branch via the VCS
