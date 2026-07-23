@@ -262,7 +262,10 @@ export async function dispatchRulesDirect(
   // reject rather than degrading into an all-failed provider result.
   const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
   const validatedContext = validateDispatchContext(effective, contextPacks);
-  const workflow = planReviewWorkflow(effective);
+  // Plan the complete loaded graph, including rules that could not be given a
+  // model. Those rules remain ordered workflow nodes and are reported failed,
+  // but they do not suppress dependent rules in later waves.
+  const workflow = planReviewWorkflow(rules);
   const effectiveByName = new Map(effective.map((rule) => [rule.name, rule]));
 
   let cwd: string | undefined;
@@ -347,7 +350,10 @@ export async function dispatchRulesDirect(
     // multi-rule wave, and preserves that wave's planned input order.
     const outcomes: RuleOutcome[] = [];
     for (const wave of workflow.waves) {
-      const waveRules = wave.ruleNames.map((name) => effectiveByName.get(name) as EffectiveRule);
+      const waveRules = wave.ruleNames.flatMap((name) => {
+        const rule = effectiveByName.get(name);
+        return rule === undefined ? [] : [rule];
+      });
       outcomes.push(...(await Promise.all(waveRules.map(runRule))));
     }
 

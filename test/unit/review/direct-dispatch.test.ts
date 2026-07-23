@@ -156,6 +156,38 @@ describe("dispatchRulesDirect", () => {
     expect(createAdvisorSession).not.toHaveBeenCalled();
   });
 
+  it("keeps an unresolved prerequisite as a skipped workflow node and still runs its dependent", async () => {
+    const createSession = vi.fn<DirectSessionFactory>(async () => ({
+      async prompt() {},
+      getLastAssistantText: () => "[]",
+    }));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRulesDirect(
+      [
+        makeRule({
+          name: "prerequisite",
+          provider: undefined,
+          model: undefined,
+        }),
+        makeRule({
+          name: "dependent",
+          dependsOn: ["prerequisite"],
+        }),
+      ],
+      "diff",
+      false,
+      { createSession },
+    );
+
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(createSession.mock.calls[0]?.[0].name).toBe("dependent");
+    expect(result.rulesFailed).toEqual(["prerequisite"]);
+    expect(result.rulesRun).toEqual(["dependent"]);
+    expect(result.ruleFailureReasons?.prerequisite).toContain("no default model");
+    vi.restoreAllMocks();
+  });
+
   it("runs ungrouped rules in non-overlapping sequential waves", async () => {
     let active = 0;
     let maxActive = 0;
