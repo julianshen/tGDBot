@@ -12,8 +12,8 @@
 //   - each rule gets its OWN session — the vendored read-only reviewer system
 //     prompt (the same reviewer.md, ADR-003), the rule's task text (the same
 //     buildTaskText, diff embedded), the rule's resolved model;
-//   - sessions run concurrently (Promise.all); each rule's outcome depends
-//     only on its own session — one failure never takes down the others;
+//   - sessions run in precompiled workflow waves; only an explicit parallel
+//     group shares a Promise.all, and one failure never takes down later waves;
 //   - each session's final text is parsed with the same never-throws
 //     extractors the legacy recovery path already used, stamped with the
 //     rule's name, and concatenated. Attribution is by construction, so
@@ -47,7 +47,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import matter from "gray-matter";
-import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
+import type { EffectiveRule } from "../rules/types.js";
 import { buildTaskText } from "./dispatch-prompt.js";
 import {
   classifyTaskFailure,
@@ -63,6 +63,9 @@ import {
 } from "./orchestrator-model.js";
 import { VENDORED_REVIEWER_AGENT_PATH } from "./session-hermetics.js";
 import type { DispatchResult, Finding } from "./types.js";
+import type { ReviewDispatchInput } from "./types.js";
+import { validateDispatchContext } from "./dispatch-context.js";
+import { planReviewWorkflow } from "./workflow.js";
 
 /** Creates one rule's review session. Tests inject stubs; the real factory below is the only SDK toucher. */
 export type DirectSessionFactory = (rule: EffectiveRule, cwd: string) => Promise<DispatchSession>;
@@ -241,19 +244,26 @@ export function parseAdvisorDropList(text: string | undefined): number[] | undef
 }
 
 /**
- * The direct counterpart of dispatchRules — same inputs, same DispatchResult,
- * same never-throws boundary — selected via `--dispatch direct` (the default).
+ * The direct counterpart of dispatchRules, selected via `--dispatch direct`
+ * (the default). Invalid workflow/context input rejects before any factory runs;
+ * provider/session failures remain isolated into a DispatchResult.
  */
 export async function dispatchRulesDirect(
-  rules: RuleDefinition[],
-  diff: string,
-  useAdvisor: boolean,
+  input: ReviewDispatchInput,
   deps: DirectDispatchDeps = {},
-  defaultModel?: string,
 ): Promise<DispatchResult> {
+  const { rules, diff, useAdvisor, contextPacks, orchestratorModel } = input;
   const createSession = deps.createSession ?? createRealDirectSession;
   const ruleTimeoutMs = deps.ruleTimeoutMs ?? RULE_PROMPT_TIMEOUT_MS;
   const advisorTimeoutMs = deps.advisorTimeoutMs ?? ADVISOR_PROMPT_TIMEOUT_MS;
+
+  // Compile the complete trusted plan before creating a reviewer/advisor
+  // session. These validation errors are caller errors and intentionally
+  // reject rather than degrading into an all-failed provider result.
+  const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
+  const validatedContext = validateDispatchContext(effective, contextPacks);
+  const workflow = planReviewWorkflow(effective);
+  const effectiveByName = new Map(effective.map((rule) => [rule.name, rule]));
 
   let cwd: string | undefined;
   try {
@@ -263,74 +273,110 @@ export async function dispatchRulesDirect(
     // seeding (direct sessions do no agent discovery at all).
     cwd = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-direct-"));
 
-    const { effective, unresolved } = resolveEffectiveRules(rules, defaultModel);
     const unresolvedNames = Object.keys(unresolved);
     for (const name of unresolvedNames) {
       console.warn(`dispatchRulesDirect: rule "${name}" not dispatched: ${unresolved[name]}`);
     }
 
-    const rulesRun: string[] = [];
-    const rulesFailed: string[] = [...unresolvedNames];
     const ruleFailureReasons: Record<string, string> = Object.create(null) as Record<
       string,
       string
     >;
     for (const name of unresolvedNames) ruleFailureReasons[name] = unresolved[name];
 
-    // One independent session per rule. Every branch below records its
-    // outcome and returns findings — nothing rejects, so Promise.all is safe.
-    const perRule = await Promise.all(
-      effective.map(async (rule): Promise<Finding[]> => {
-        try {
-          const session = await createSession(rule, cwd as string);
-          await withTimeout(
-            session.prompt(buildTaskText(rule, diff)),
-            ruleTimeoutMs,
-            `rule "${rule.name}" timed out after ${ruleTimeoutMs}ms`,
-          );
-          const text = session.getLastAssistantText();
-          // extractFindingsArray distinguishes "no parseable findings array"
-          // (undefined — the rule FAILED to follow its output contract) from
-          // a genuinely empty review ([] — a SUCCESS).
-          if (text === undefined || extractFindingsArray(text) === undefined) {
-            rulesFailed.push(rule.name);
-            ruleFailureReasons[rule.name] =
-              "the reviewer returned no parseable findings array (see the CI logs)";
-            console.warn(
-              `dispatchRulesDirect: rule "${rule.name}" produced no parseable findings array`,
-            );
-            return [];
-          }
-          rulesRun.push(rule.name);
-          return parseFindingsFromFinalOutput(text, rule.name);
-        } catch (err) {
-          const timedOut = err instanceof PromptTimeoutError;
-          const message = (err as Error).message;
-          rulesFailed.push(rule.name);
-          // Same publish-safe classification the legacy path uses; the RAW
-          // error goes to the logs only. A timeout is classified distinctly
-          // ("timed out") rather than as a generic error.
-          ruleFailureReasons[rule.name] = classifyTaskFailure(
-            timedOut ? { timedOut: true } : { error: message },
-            rule,
-          );
+    interface RuleOutcome {
+      readonly ruleName: string;
+      readonly succeeded: boolean;
+      readonly findings: readonly Finding[];
+      readonly failureReason?: string;
+    }
+
+    const runRule = async (rule: EffectiveRule): Promise<RuleOutcome> => {
+      let session: DispatchSession | undefined;
+      try {
+        session = await createSession(rule, cwd as string);
+        await withTimeout(
+          session.prompt(
+            buildTaskText(rule, diff, validatedContext.packsByRule?.get(rule.name)),
+          ),
+          ruleTimeoutMs,
+          `rule "${rule.name}" timed out after ${ruleTimeoutMs}ms`,
+        );
+        const text = session.getLastAssistantText();
+        // extractFindingsArray distinguishes "no parseable findings array"
+        // (undefined — the rule FAILED to follow its output contract) from
+        // a genuinely empty review ([] — a SUCCESS).
+        if (text === undefined || extractFindingsArray(text) === undefined) {
+          const failureReason =
+            "the reviewer returned no parseable findings array (see the CI logs)";
           console.warn(
-            `dispatchRulesDirect: rule "${rule.name}" (${rule.provider}/${rule.model}) failed: ${message}`,
+            `dispatchRulesDirect: rule "${rule.name}" produced no parseable findings array`,
           );
-          return [];
+          return { ruleName: rule.name, succeeded: false, findings: [], failureReason };
         }
-      }),
-    );
+        return {
+          ruleName: rule.name,
+          succeeded: true,
+          findings: parseFindingsFromFinalOutput(text, rule.name),
+        };
+      } catch (err) {
+        const timedOut = err instanceof PromptTimeoutError;
+        const message = (err as Error).message;
+        if (session?.abort) {
+          try {
+            await session.abort();
+          } catch (abortError) {
+            console.warn(
+              `dispatchRulesDirect: failed to abort rule "${rule.name}" session ` +
+                `(${(abortError as Error).message})`,
+            );
+          }
+        }
+        const failureReason = classifyTaskFailure(
+          timedOut ? { timedOut: true } : { error: message },
+          rule,
+        );
+        console.warn(
+          `dispatchRulesDirect: rule "${rule.name}" (${rule.provider}/${rule.model}) failed: ${message}`,
+        );
+        return { ruleName: rule.name, succeeded: false, findings: [], failureReason };
+      }
+    };
+
+    // Waves are sequential. Promise.all is used only inside one explicit
+    // multi-rule wave, and preserves that wave's planned input order.
+    const outcomes: RuleOutcome[] = [];
+    for (const wave of workflow.waves) {
+      const waveRules = wave.ruleNames.map((name) => effectiveByName.get(name) as EffectiveRule);
+      outcomes.push(...(await Promise.all(waveRules.map(runRule))));
+    }
+
+    const outcomeByName = new Map(outcomes.map((outcome) => [outcome.ruleName, outcome]));
+    const rulesRun: string[] = [];
+    const rulesFailed: string[] = [];
+    for (const rule of rules) {
+      const outcome = outcomeByName.get(rule.name);
+      if (outcome?.succeeded) {
+        rulesRun.push(rule.name);
+      } else {
+        rulesFailed.push(rule.name);
+        if (outcome?.failureReason !== undefined) {
+          ruleFailureReasons[rule.name] = outcome.failureReason;
+        }
+      }
+    }
+
     // Order-stable merge; every finding is already stamped with its own
     // rule's name by construction.
-    let findings = perRule.flat();
+    let findings = outcomes.flatMap((outcome) => outcome.findings);
 
     // Advisor pass: filters the COMPLETE merged set (so, unlike the legacy
     // path, advisor-on can never mask a dropped rule). Best-effort by
     // design — any failure keeps every finding and says so.
     if (useAdvisor && findings.length > 0) {
       const createAdvisorSession =
-        deps.createAdvisorSession ?? makeRealAdvisorSessionFactory(defaultModel, effective);
+        deps.createAdvisorSession ??
+        makeRealAdvisorSessionFactory(orchestratorModel, effective);
       try {
         const advisor = await createAdvisorSession(cwd);
         await withTimeout(
@@ -354,10 +400,18 @@ export async function dispatchRulesDirect(
       }
     }
 
-    return { findings, rulesRun, rulesFailed, ruleFailureReasons };
+    return {
+      findings,
+      rulesRun,
+      rulesFailed,
+      ruleFailureReasons,
+      ...(validatedContext.manifestHash === undefined
+        ? {}
+        : { contextManifestHash: validatedContext.manifestHash }),
+    };
   } catch (err) {
-    // Setup failure (mkdtemp, resolveEffectiveRules). Same never-throws
-    // contract as dispatchRules.
+    // Runtime setup failure (for example mkdtemp). Provider/session failures
+    // are isolated above; invalid workflow/context rejects before this block.
     console.warn(`dispatchRulesDirect: setup failed (${(err as Error).message})`);
     const ruleFailureReasons: Record<string, string> = Object.create(null) as Record<
       string,

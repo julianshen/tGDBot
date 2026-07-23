@@ -283,6 +283,12 @@ describe("review", () => {
 
     expect(exitCode).toBe(0);
     expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    expect(h.dispatchRules).toHaveBeenCalledWith({
+      rules: expect.arrayContaining([expect.objectContaining({ name: "rule-a" })]),
+      diff: "diff --git a/x b/x",
+      useAdvisor: true,
+      orchestratorModel: undefined,
+    });
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
 
     vi.restoreAllMocks();
@@ -850,12 +856,8 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
   });
 });
 
-// Issue #1 (round 2): the `--model` flag must reach dispatchRules as the
-// ORCHESTRATOR MODEL, not as its injectable session factory. dispatchRules'
-// 4th positional param is `createSession`; `orchestratorModel` is only the 5th,
-// so wiring dispatchRulesReal straight in would silently pass the model string
-// into the factory slot — a bug TypeScript would happily accept at the call
-// site. Pin the contract at the boundary.
+// Task 3 migrates the CLI seam to ReviewDispatchInput, eliminating the former
+// positional-slot ambiguity around --model.
 describe("issue #1 (round 2): --model reaches dispatchRules as the orchestrator model", () => {
   it("parses --model and forwards it as the orchestratorModel argument", async () => {
     const args = parseArgs(["review", "--pr", "42", "--model", "openai-codex/gpt-5.6-terra", "--dry-run"]);
@@ -864,9 +866,13 @@ describe("issue #1 (round 2): --model reaches dispatchRules as the orchestrator 
     const h = makeHarness({ args });
     await review(args, depsFrom(h));
 
-    // 4th positional arg of ReviewDependencies["dispatchRules"] = orchestratorModel.
     expect(h.dispatchRules).toHaveBeenCalledTimes(1);
-    expect(h.dispatchRules.mock.calls[0]?.[3]).toBe("openai-codex/gpt-5.6-terra");
+    expect(h.dispatchRules.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({
+        orchestratorModel: "openai-codex/gpt-5.6-terra",
+      }),
+    );
+    expect(h.dispatchRules.mock.calls[0]?.[0]).not.toHaveProperty("contextPacks");
   });
 
   // Review fix: `??` is nullish-only, so `--model ""` would otherwise slip past
@@ -891,7 +897,10 @@ describe("issue #1 (round 2): --model reaches dispatchRules as the orchestrator 
     const h = makeHarness({ args });
     await review(args, depsFrom(h));
 
-    expect(h.dispatchRules.mock.calls[0]?.[3]).toBeUndefined();
+    expect(h.dispatchRules.mock.calls[0]?.[0]).toEqual(
+      expect.objectContaining({ orchestratorModel: undefined }),
+    );
+    expect(h.dispatchRules.mock.calls[0]?.[0]).not.toHaveProperty("contextPacks");
   });
 });
 

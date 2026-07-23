@@ -145,15 +145,17 @@ describe("review — default dependency wiring", () => {
     const [loadedDir, includeBuiltin] = vi.mocked(loadRules).mock.calls[0];
     expect(loadedDir).not.toBe(".review/rules");
     expect(includeBuiltin).toBe(true);
-    // Design-review P0: the DEFAULT engine is the direct one. Its adapter
-    // keeps the deps bag in slot 4 ({} → real factories) and the default
-    // model in slot 5 — asserting both catches a slot swap.
+    // Task 3: the DEFAULT engine receives one shared object-shaped input.
+    // contextPacks is intentionally absent until the later context-integration
+    // task; direct-only dependencies remain the second argument.
     expect(dispatchRulesDirect).toHaveBeenCalledWith(
-      expect.arrayContaining([expect.objectContaining({ name: "rule-a" })]),
-      "diff --git a/x b/x",
-      true,
-      {}, // deps bag → real factories (NOT the model string)
-      undefined, // default model → none given
+      {
+        rules: expect.arrayContaining([expect.objectContaining({ name: "rule-a" })]),
+        diff: "diff --git a/x b/x",
+        useAdvisor: true,
+        orchestratorModel: undefined,
+      },
+      {},
     );
     expect(dispatchRules).not.toHaveBeenCalled(); // legacy engine untouched
     expect(orchestrate).toHaveBeenCalledTimes(1);
@@ -167,11 +169,7 @@ describe("review — default dependency wiring", () => {
     );
   });
 
-  // Slot-pinning with a REAL model: with --model absent, slots 4 and 5 are both
-  // `undefined`, so the assertion above cannot tell them apart. Setting a model
-  // makes it behavioral — a slot swap (the model string landing in the
-  // session-factory slot) fails loudly here.
-  it("passes --model into the default-model slot (5th), never the deps slot (4th)", async () => {
+  it("passes --model in the object input, never in the direct deps argument", async () => {
     vi.mocked(dispatchRulesDirect).mockClear();
     vi.mocked(dispatchRulesDirect).mockResolvedValue({
       findings: [],
@@ -183,18 +181,13 @@ describe("review — default dependency wiring", () => {
     await review(makeArgs({ model: "x/y" }));
 
     expect(dispatchRulesDirect).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.any(String),
-      true,
-      {}, // deps bag → real factories
-      "x/y", // default model
+      expect.objectContaining({ orchestratorModel: "x/y" }),
+      {},
     );
     logSpy.mockRestore();
   });
 
-  // Design-review P0: --dispatch legacy selects the previous LLM-orchestrated
-  // engine, with its own slot layout (4th = session factory, 5th = model).
-  it("--dispatch legacy wires the legacy engine with --model in ITS 5th slot", async () => {
+  it("--dispatch legacy adapts the same object input to the legacy positional API", async () => {
     vi.mocked(dispatchRules).mockClear();
     vi.mocked(dispatchRulesDirect).mockClear();
     vi.mocked(dispatchRules).mockResolvedValue({

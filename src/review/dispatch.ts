@@ -61,6 +61,8 @@ export { buildDispatchPrompt } from "./dispatch-prompt.js";
 export interface DispatchSession {
   prompt(text: string): Promise<void>;
   getLastAssistantText(): string | undefined;
+  /** Stops an in-flight prompt after timeout/failure before a later workflow wave starts. */
+  abort?(): Promise<void>;
   // Optional. The real pi AgentSession exposes subscribe(); dispatchRules uses
   // it (when present) to capture the `subagent` tool's structured
   // `result.details.results` — one entry per dispatched task, in dispatch

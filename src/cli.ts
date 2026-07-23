@@ -10,10 +10,9 @@ import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
-import type { DispatchResult } from "./review/types.js";
+import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
-import type { RuleDefinition } from "./rules/types.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
 
 /**
@@ -223,12 +222,7 @@ export function parseArgs(argv: string[]): CliArgs {
 export interface ReviewDependencies {
   resolveConfig: (args: CliArgs) => ResolvedConfig;
   loadRules: (rulesDir: string, includeBuiltin: boolean) => Promise<LoadResult>;
-  dispatchRules: (
-    rules: RuleDefinition[],
-    diff: string,
-    useAdvisor: boolean,
-    orchestratorModel?: string,
-  ) => Promise<DispatchResult>;
+  dispatchRules: (input: ReviewDispatchInput) => Promise<DispatchResult>;
   orchestrate: (
     dispatchResult: DispatchResult,
     diff?: string,
@@ -406,23 +400,20 @@ export async function review(
 ): Promise<number> {
   const resolveConfigFn = deps.resolveConfig ?? resolveConfigReal;
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
-  // Design-review P0: `--dispatch` selects the engine. "direct" (default) is
-  // the deterministic one-session-per-rule path; "legacy" is the previous
-  // LLM-orchestrated pi-subagents fan-out, kept as the escape hatch. Both
-  // adapters exist because each real function's 4th positional param is its
-  // injectable session-factory/deps bag (with `orchestratorModel`/default
-  // model only 5th), which is not assignable to
-  // ReviewDependencies["dispatchRules"], whose 4th param IS the model. tsc
-  // rejects both the direct assignment and the slot-swapped call, so this is
-  // a plain shape mismatch, not a silent landmine — the tests pin the exact
-  // argument positions.
+  // Task 3: both engines share one object-shaped CLI seam. The legacy adapter
+  // remains positional internally until Task 4 migrates its orchestration.
   const dispatchRulesFn =
     deps.dispatchRules ??
     (args.dispatch === "legacy"
-      ? (rules: RuleDefinition[], diff: string, useAdvisor: boolean, orchestratorModel?: string) =>
-          dispatchRulesReal(rules, diff, useAdvisor, undefined, orchestratorModel)
-      : (rules: RuleDefinition[], diff: string, useAdvisor: boolean, orchestratorModel?: string) =>
-          dispatchRulesDirectReal(rules, diff, useAdvisor, {}, orchestratorModel));
+      ? (input: ReviewDispatchInput) =>
+          dispatchRulesReal(
+            input.rules,
+            input.diff,
+            input.useAdvisor,
+            undefined,
+            input.orchestratorModel,
+          )
+      : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
 
   const config = resolveConfigFn(args);
@@ -522,7 +513,12 @@ export async function review(
     return EXIT_FATAL;
   }
 
-  const dispatchResult = await dispatchRulesFn(rules, diff, config.advisor === "on", config.model);
+  const dispatchResult = await dispatchRulesFn({
+    rules,
+    diff,
+    useAdvisor: config.advisor === "on",
+    orchestratorModel: config.model,
+  });
 
   // Findings are anchored to the diff and posted as INLINE review comments; only
   // what can't be anchored (no line number, or a line outside this PR's hunks)
