@@ -5,11 +5,20 @@
 // factory's hermeticity (below) IS unit tested against a mocked SDK, the same
 // stance dispatch.test.ts takes for the legacy engine's real factory.
 import { describe, expect, it, vi } from "vitest";
-import { dispatchRulesDirect, parseAdvisorDropList } from "../../../src/review/direct-dispatch.js";
-import type { DirectSessionFactory } from "../../../src/review/direct-dispatch.js";
+import {
+  dispatchRulesDirect as dispatchRulesDirectObject,
+  parseAdvisorDropList,
+} from "../../../src/review/direct-dispatch.js";
+import type {
+  DirectDispatchDeps,
+  DirectSessionFactory,
+} from "../../../src/review/direct-dispatch.js";
+import { DispatchInputError } from "../../../src/review/dispatch-context.js";
 import type { DispatchSession } from "../../../src/review/dispatch.js";
 import { resolveRpivAdvisorExtensionPath } from "../../../src/review/extensions.js";
+import { ReviewWorkflowError } from "../../../src/review/workflow.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
+import type { RuleContextPacks } from "../../../src/review/types.js";
 
 // Hoisted so the SDK mock below can reference it before direct-dispatch.ts is
 // imported (vi.mock is hoisted to the top of the module by vitest).
@@ -67,6 +76,26 @@ function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
   };
 }
 
+function dispatchRulesDirect(
+  rules: RuleDefinition[],
+  diff: string,
+  useAdvisor: boolean,
+  deps: DirectDispatchDeps = {},
+  orchestratorModel?: string,
+  contextPacks?: RuleContextPacks,
+) {
+  return dispatchRulesDirectObject(
+    {
+      rules,
+      diff,
+      useAdvisor,
+      ...(orchestratorModel === undefined ? {} : { orchestratorModel }),
+      ...(contextPacks === undefined ? {} : { contextPacks }),
+    },
+    deps,
+  );
+}
+
 const finding = (file: string, message: string) => ({
   file,
   line: 1,
@@ -96,6 +125,230 @@ function makeFactory(outputs: Record<string, string | Error>): {
 }
 
 describe("dispatchRulesDirect", () => {
+  it("rejects invalid workflow and context input before reviewer or advisor factories run", async () => {
+    const createSession = vi.fn();
+    const createAdvisorSession = vi.fn();
+
+    await expect(
+      dispatchRulesDirect(
+        [
+          makeRule({ name: "rule-a", dependsOn: ["rule-b"] }),
+          makeRule({ name: "rule-b", dependsOn: ["rule-a"] }),
+        ],
+        "diff",
+        true,
+        { createSession, createAdvisorSession },
+      ),
+    ).rejects.toThrow(ReviewWorkflowError);
+
+    await expect(
+      dispatchRulesDirect(
+        [makeRule()],
+        "diff",
+        true,
+        { createSession, createAdvisorSession },
+        undefined,
+        {},
+      ),
+    ).rejects.toThrow(DispatchInputError);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(createAdvisorSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unresolved prerequisite as a skipped workflow node and still runs its dependent", async () => {
+    const prompts: string[] = [];
+    const createSession = vi.fn<DirectSessionFactory>(async () => ({
+      async prompt(text: string) {
+        prompts.push(text);
+      },
+      getLastAssistantText: () => "[]",
+    }));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const manifestHash = "a".repeat(64);
+
+    const result = await dispatchRulesDirect(
+      [
+        makeRule({
+          name: "prerequisite",
+          provider: undefined,
+          model: undefined,
+        }),
+        makeRule({
+          name: "dependent",
+          dependsOn: ["prerequisite"],
+        }),
+      ],
+      "diff",
+      false,
+      { createSession },
+      undefined,
+      {
+        prerequisite: {
+          text: "unresolved prerequisite context",
+          manifestHash,
+          truncated: false,
+          sources: [],
+        },
+        dependent: {
+          text: "dependent context",
+          manifestHash,
+          truncated: false,
+          sources: [],
+        },
+      },
+    );
+
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(createSession.mock.calls[0]?.[0].name).toBe("dependent");
+    expect(prompts[0]).toContain("dependent context");
+    expect(prompts[0]).not.toContain("unresolved prerequisite context");
+    expect(result.rulesFailed).toEqual(["prerequisite"]);
+    expect(result.rulesRun).toEqual(["dependent"]);
+    expect(result.ruleFailureReasons?.prerequisite).toContain("no default model");
+    expect(result.contextManifestHash).toBe(manifestHash);
+    vi.restoreAllMocks();
+  });
+
+  it("degrades model-registry setup failures to an all-failed dispatch result", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    hoisted.modelRegistryCreate.mockImplementationOnce(() => {
+      throw new Error("agent config unreadable");
+    });
+    try {
+      const result = await dispatchRulesDirect(
+        [makeRule({ provider: undefined, model: undefined })],
+        "diff",
+        false,
+      );
+
+      expect(result.rulesRun).toEqual([]);
+      expect(result.rulesFailed).toEqual(["rule-a"]);
+      expect(result.ruleFailureReasons?.["rule-a"]).toContain("dispatcher did not complete");
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("runs ungrouped rules in non-overlapping sequential waves", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const events: string[] = [];
+    const createSession: DirectSessionFactory = async (rule) => ({
+      async prompt() {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        events.push(`start:${rule.name}`);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        events.push(`end:${rule.name}`);
+        active -= 1;
+      },
+      getLastAssistantText: () => "[]",
+    });
+
+    await dispatchRulesDirect(
+      [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" }), makeRule({ name: "rule-c" })],
+      "diff",
+      false,
+      { createSession },
+    );
+
+    expect(maxActive).toBe(1);
+    expect(events).toEqual([
+      "start:rule-a",
+      "end:rule-a",
+      "start:rule-b",
+      "end:rule-b",
+      "start:rule-c",
+      "end:rule-c",
+    ]);
+  });
+
+  it("overlaps only an explicit parallel wave and waits for it before the next wave", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const events: string[] = [];
+    const createSession: DirectSessionFactory = async (rule) => ({
+      async prompt() {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        events.push(`start:${rule.name}`);
+        await new Promise((resolve) => setTimeout(resolve, rule.name === "rule-a" ? 10 : 5));
+        events.push(`end:${rule.name}`);
+        active -= 1;
+      },
+      getLastAssistantText: () =>
+        JSON.stringify([finding(`${rule.name}.ts`, `finding from ${rule.name}`)]),
+    });
+    const createAdvisorSession = vi.fn(async (): Promise<DispatchSession> => ({
+      async prompt() {
+        events.push("start:advisor");
+      },
+      getLastAssistantText: () => '{"drop": []}',
+    }));
+
+    await dispatchRulesDirect(
+      [
+        makeRule({ name: "rule-a", parallelGroup: "checks" }),
+        makeRule({ name: "rule-b", parallelGroup: "checks" }),
+        makeRule({ name: "rule-c" }),
+      ],
+      "diff",
+      true,
+      { createSession, createAdvisorSession },
+    );
+
+    expect(maxActive).toBe(2);
+    expect(events.slice(0, 2)).toEqual(["start:rule-a", "start:rule-b"]);
+    expect(events.indexOf("start:rule-c")).toBeGreaterThan(events.indexOf("end:rule-a"));
+    expect(events.indexOf("start:rule-c")).toBeGreaterThan(events.indexOf("end:rule-b"));
+    expect(events.indexOf("start:advisor")).toBeGreaterThan(events.indexOf("end:rule-c"));
+    expect(createAdvisorSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps findings and accounting in planned order under inverse completion and retains context identity", async () => {
+    const manifestHash = "a".repeat(64);
+    const contextPacks = {
+      "rule-a": { text: "context a", manifestHash, truncated: false, sources: [] },
+      "rule-b": { text: "context b", manifestHash, truncated: false, sources: [] },
+      "rule-c": { text: "context c", manifestHash, truncated: false, sources: [] },
+    };
+    const prompts: Record<string, string> = {};
+    const createSession: DirectSessionFactory = async (rule) => {
+      if (rule.name === "rule-c") throw new Error("provider unavailable");
+      return {
+        async prompt(text: string) {
+          prompts[rule.name] = text;
+          await new Promise((resolve) => setTimeout(resolve, rule.name === "rule-a" ? 10 : 1));
+        },
+        getLastAssistantText: () =>
+          JSON.stringify([finding(`${rule.name}.ts`, `finding from ${rule.name}`)]),
+      };
+    };
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRulesDirect(
+      [
+        makeRule({ name: "rule-a", parallelGroup: "checks" }),
+        makeRule({ name: "rule-b", parallelGroup: "checks" }),
+        makeRule({ name: "rule-c", dependsOn: ["rule-a"] }),
+      ],
+      "diff",
+      false,
+      { createSession },
+      undefined,
+      contextPacks,
+    );
+
+    expect(result.findings.map((item) => item.ruleName)).toEqual(["rule-a", "rule-b"]);
+    expect(result.rulesRun).toEqual(["rule-a", "rule-b"]);
+    expect(result.rulesFailed).toEqual(["rule-c"]);
+    expect(result.contextManifestHash).toBe(manifestHash);
+    expect(prompts["rule-a"]).toContain("context a");
+    expect(prompts["rule-b"]).toContain("context b");
+    vi.restoreAllMocks();
+  });
+
   it("runs one session per rule and merges findings deterministically, stamped by construction", async () => {
     const { factory, prompts } = makeFactory({
       "rule-a": JSON.stringify([finding("a.ts", "bug in a")]),
@@ -266,20 +519,57 @@ describe("dispatchRulesDirect", () => {
     });
   });
 
-  // CodeRabbit review (PR #7): a hung provider call must not block the whole
-  // run indefinitely — each session's prompt() is wrapped in a bounded
-  // timeout (overridable via deps for tests).
-  describe("prompt timeouts", () => {
+  // A hung provider call must not block the whole run indefinitely — both
+  // session construction and prompt() are bounded (overridable for tests).
+  describe("rule timeouts", () => {
+    it("a rule whose session creation never resolves times out and does not block later waves", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const { factory } = makeFactory({ "rule-b": "[]" });
+        const createSession: DirectSessionFactory = (rule, cwd) =>
+          rule.name === "rule-a" ? new Promise(() => {}) : factory(rule, cwd);
+
+        const result = await dispatchRulesDirect(
+          [
+            makeRule({ name: "rule-a" }),
+            makeRule({ name: "rule-b", provider: "xai", model: "grok-4.5" }),
+          ],
+          "diff",
+          false,
+          { createSession, ruleTimeoutMs: 20 },
+        );
+
+        expect(result.rulesFailed).toEqual(["rule-a"]);
+        expect(result.rulesRun).toEqual(["rule-b"]);
+        expect(result.ruleFailureReasons?.["rule-a"]).toContain("timed out");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it("a rule whose session never resolves times out, is classified 'timed out', and never blocks the others", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
+        const events: string[] = [];
         const hangingSession: DispatchSession = {
           prompt: () => new Promise(() => {}), // never resolves
           getLastAssistantText: () => undefined,
+          async abort() {
+            events.push("abort:rule-a");
+          },
         };
         const { factory } = makeFactory({ "rule-b": JSON.stringify([finding("b.ts", "ok")]) });
-        const combinedFactory: DirectSessionFactory = async (rule, cwd) =>
-          rule.name === "rule-a" ? hangingSession : factory(rule, cwd);
+        const combinedFactory: DirectSessionFactory = async (rule, cwd) => {
+          if (rule.name === "rule-a") return hangingSession;
+          const session = await factory(rule, cwd);
+          return {
+            ...session,
+            async prompt(text: string) {
+              events.push("start:rule-b");
+              await session.prompt(text);
+            },
+          };
+        };
 
         const result = await dispatchRulesDirect(
           [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b", provider: "xai", model: "grok-4.5" })],
@@ -290,6 +580,7 @@ describe("dispatchRulesDirect", () => {
 
         expect(result.rulesFailed).toEqual(["rule-a"]);
         expect(result.rulesRun).toEqual(["rule-b"]); // the hung rule never blocks this one
+        expect(events).toEqual(["abort:rule-a", "start:rule-b"]);
         expect(result.ruleFailureReasons?.["rule-a"]).toContain("timed out");
         const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
         expect(warned).toContain("timed out");

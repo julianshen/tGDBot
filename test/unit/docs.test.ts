@@ -49,3 +49,11 @@ describe("AC-9.2: README documents the zero-config smoke test procedure", () => 
     expect(numberedSteps.length).toBeGreaterThanOrEqual(4);
   });
 });
+
+describe("direct workflow scheduling documentation", () => {
+  it("states that direct dispatch consumes sequential waves and legacy does not yet", () => {
+    expect(readme).toMatch(/default `direct` dispatch engine consumes these waves/i);
+    expect(readme).toMatch(/waves run\s+sequentially/i);
+    expect(readme).toMatch(/`legacy` engine does not consume this plan yet/i);
+  });
+});

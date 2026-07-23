@@ -334,9 +334,11 @@ dependencies establish order rather than success gating, currently-ready rules
 sharing an explicit group may share a wave, and ungrouped rules receive
 individual waves.
 
-This release exposes and tests the planning contract only. The current dispatch
-engines do not yet consume the compiled waves, so these fields do not change
-runtime reviewer scheduling until the follow-up scheduler integration lands.
+The default `direct` dispatch engine consumes these waves: waves run
+sequentially, while rules inside one explicit parallel wave may overlap. A
+failed prerequisite establishes order but does not suppress later waves. The
+temporary `legacy` engine does not consume this plan yet; its migration is a
+separate compatibility step.
 
 ```markdown
 ---

@@ -1,5 +1,5 @@
 import type { ContextPackResult } from "../context/context-pack.js";
-import type { EffectiveRule } from "../rules/types.js";
+import type { RuleDefinition } from "../rules/types.js";
 import type { RuleContextPacks } from "./types.js";
 
 const MANIFEST_HASH_RE = /^[a-f0-9]{64}$/;
@@ -21,7 +21,7 @@ function invalid(message: string): never {
 }
 
 export function validateDispatchContext(
-  rules: EffectiveRule[],
+  rules: RuleDefinition[],
   contextPacks: RuleContextPacks | undefined,
 ): ValidatedDispatchContext {
   if (contextPacks === undefined) return {};
