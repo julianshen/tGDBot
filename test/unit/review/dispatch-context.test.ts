@@ -34,8 +34,10 @@ describe("validateDispatchContext", () => {
     const result = validateDispatchContext(rules, packs);
 
     expect(result.manifestHash).toBe(HASH_A);
-    expect(result.packsByRule?.get("correctness")).toBe(correctness);
-    expect(result.packsByRule?.get("security")).toBe(security);
+    expect(result.packsByRule?.get("correctness")).toEqual(correctness);
+    expect(result.packsByRule?.get("correctness")).not.toBe(correctness);
+    expect(result.packsByRule?.get("security")).toEqual(security);
+    expect(result.packsByRule?.get("security")).not.toBe(security);
     expect(JSON.stringify(packs)).toBe(before);
   });
 
@@ -92,6 +94,49 @@ describe("validateDispatchContext", () => {
     expect(() =>
       validateDispatchContext([makeRule("correctness")], { correctness: inheritedPack }),
     ).toThrow(DispatchInputError);
+  });
+
+  it("AC-1.2: snapshots getter-backed trusted fields exactly once", () => {
+    let textReads = 0;
+    let hashReads = 0;
+    const getterPack = {
+      get text() {
+        textReads += 1;
+        return textReads === 1 ? "validated evidence" : "changed evidence";
+      },
+      get manifestHash() {
+        hashReads += 1;
+        return hashReads === 1 ? HASH_A : HASH_B;
+      },
+      truncated: false,
+      sources: [],
+    } as ContextPackResult;
+
+    const result = validateDispatchContext([makeRule("correctness")], {
+      correctness: getterPack,
+    });
+    const validated = result.packsByRule?.get("correctness");
+
+    expect(textReads).toBe(1);
+    expect(hashReads).toBe(1);
+    expect(validated?.text).toBe("validated evidence");
+    expect(validated?.manifestHash).toBe(HASH_A);
+    expect(Object.isFrozen(validated)).toBe(true);
+  });
+
+  it("AC-1.2: isolates validated trusted fields from later caller mutation", () => {
+    const original = makePack("validated evidence");
+    const result = validateDispatchContext([makeRule("correctness")], {
+      correctness: original,
+    });
+    const validated = result.packsByRule?.get("correctness");
+
+    original.text = "mutated evidence";
+    original.manifestHash = HASH_B;
+
+    expect(validated?.text).toBe("validated evidence");
+    expect(validated?.manifestHash).toBe(HASH_A);
+    expect(validated).not.toBe(original);
   });
 
   it("AC-1.2: rejects duplicate effective rule names in contextualized mode", () => {

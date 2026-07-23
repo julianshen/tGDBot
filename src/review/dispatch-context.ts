@@ -64,28 +64,43 @@ export function validateDispatchContext(
     }
 
     const candidate = pack as Record<string, unknown>;
-    if (
-      !Object.hasOwn(candidate, "text") ||
-      typeof candidate.text !== "string" ||
-      candidate.text.trim().length === 0
-    ) {
+    if (!Object.hasOwn(candidate, "text")) {
       return invalid(`context pack for ${JSON.stringify(rule.name)} must contain non-empty text`);
     }
-    if (
-      !Object.hasOwn(candidate, "manifestHash") ||
-      typeof candidate.manifestHash !== "string" ||
-      !MANIFEST_HASH_RE.test(candidate.manifestHash)
-    ) {
+    if (!Object.hasOwn(candidate, "manifestHash")) {
       return invalid(
         `context pack for ${JSON.stringify(rule.name)} must contain a lowercase SHA-256 manifest hash`,
       );
     }
-    if (manifestHash !== undefined && candidate.manifestHash !== manifestHash) {
+
+    const text = candidate.text;
+    const packManifestHash = candidate.manifestHash;
+    const truncated = candidate.truncated;
+    const sources = candidate.sources;
+    if (typeof text !== "string" || text.trim().length === 0) {
+      return invalid(`context pack for ${JSON.stringify(rule.name)} must contain non-empty text`);
+    }
+    if (typeof packManifestHash !== "string" || !MANIFEST_HASH_RE.test(packManifestHash)) {
+      return invalid(
+        `context pack for ${JSON.stringify(rule.name)} must contain a lowercase SHA-256 manifest hash`,
+      );
+    }
+    if (manifestHash !== undefined && packManifestHash !== manifestHash) {
       return invalid("contextPacks must all use the same manifest hash");
     }
 
-    manifestHash = candidate.manifestHash;
-    packsByRule.set(rule.name, pack as ContextPackResult);
+    manifestHash = packManifestHash;
+    packsByRule.set(
+      rule.name,
+      Object.freeze({
+        text,
+        manifestHash: packManifestHash,
+        truncated: truncated === true,
+        sources: Array.isArray(sources)
+          ? ([...sources] as ContextPackResult["sources"])
+          : [],
+      }),
+    );
   }
 
   return { packsByRule, manifestHash };
