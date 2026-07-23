@@ -257,19 +257,27 @@ export async function dispatchRulesDirect(
   const ruleTimeoutMs = deps.ruleTimeoutMs ?? RULE_PROMPT_TIMEOUT_MS;
   const advisorTimeoutMs = deps.advisorTimeoutMs ?? ADVISOR_PROMPT_TIMEOUT_MS;
 
-  // Compile the complete trusted plan before creating a reviewer/advisor
-  // session. These validation errors are caller errors and intentionally
-  // reject rather than degrading into an all-failed provider result.
-  const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
-  const validatedContext = validateDispatchContext(effective, contextPacks);
+  // Compile the complete trusted plan and validate the caller-owned context
+  // before creating a reviewer/advisor session. Context packs describe the
+  // loaded rule set, including a rule whose runtime model may prove
+  // unavailable; only effective rules consume their corresponding packs.
+  // These validation errors are caller errors and intentionally reject rather
+  // than degrading into an all-failed provider result.
+  const validatedContext = validateDispatchContext(rules, contextPacks);
   // Plan the complete loaded graph, including rules that could not be given a
   // model. Those rules remain ordered workflow nodes and are reported failed,
   // but they do not suppress dependent rules in later waves.
   const workflow = planReviewWorkflow(rules);
-  const effectiveByName = new Map(effective.map((rule) => [rule.name, rule]));
 
   let cwd: string | undefined;
   try {
+    // Model resolution reads ambient registry/settings state and can fail for
+    // operational reasons (for example an unreadable agent configuration).
+    // Keep it inside the runtime fallback boundary so such failures retain
+    // dispatchRulesDirect's never-throws provider/setup contract.
+    const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
+    const effectiveByName = new Map(effective.map((rule) => [rule.name, rule]));
+
     // An empty temp cwd for every session: nothing project-local to discover,
     // nothing of the target repo reachable by relative path — same isolation
     // stance as the legacy path's createIsolatedSessionCwd, without the agent
@@ -297,7 +305,11 @@ export async function dispatchRulesDirect(
     const runRule = async (rule: EffectiveRule): Promise<RuleOutcome> => {
       let session: DispatchSession | undefined;
       try {
-        session = await createSession(rule, cwd as string);
+        session = await withTimeout(
+          createSession(rule, cwd as string),
+          ruleTimeoutMs,
+          `rule "${rule.name}" session creation timed out after ${ruleTimeoutMs}ms`,
+        );
         await withTimeout(
           session.prompt(
             buildTaskText(rule, diff, validatedContext.packsByRule?.get(rule.name)),

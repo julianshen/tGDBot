@@ -157,11 +157,15 @@ describe("dispatchRulesDirect", () => {
   });
 
   it("keeps an unresolved prerequisite as a skipped workflow node and still runs its dependent", async () => {
+    const prompts: string[] = [];
     const createSession = vi.fn<DirectSessionFactory>(async () => ({
-      async prompt() {},
+      async prompt(text: string) {
+        prompts.push(text);
+      },
       getLastAssistantText: () => "[]",
     }));
     vi.spyOn(console, "warn").mockImplementation(() => {});
+    const manifestHash = "a".repeat(64);
 
     const result = await dispatchRulesDirect(
       [
@@ -178,14 +182,52 @@ describe("dispatchRulesDirect", () => {
       "diff",
       false,
       { createSession },
+      undefined,
+      {
+        prerequisite: {
+          text: "unresolved prerequisite context",
+          manifestHash,
+          truncated: false,
+          sources: [],
+        },
+        dependent: {
+          text: "dependent context",
+          manifestHash,
+          truncated: false,
+          sources: [],
+        },
+      },
     );
 
     expect(createSession).toHaveBeenCalledTimes(1);
     expect(createSession.mock.calls[0]?.[0].name).toBe("dependent");
+    expect(prompts[0]).toContain("dependent context");
+    expect(prompts[0]).not.toContain("unresolved prerequisite context");
     expect(result.rulesFailed).toEqual(["prerequisite"]);
     expect(result.rulesRun).toEqual(["dependent"]);
     expect(result.ruleFailureReasons?.prerequisite).toContain("no default model");
+    expect(result.contextManifestHash).toBe(manifestHash);
     vi.restoreAllMocks();
+  });
+
+  it("degrades model-registry setup failures to an all-failed dispatch result", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    hoisted.modelRegistryCreate.mockImplementationOnce(() => {
+      throw new Error("agent config unreadable");
+    });
+    try {
+      const result = await dispatchRulesDirect(
+        [makeRule({ provider: undefined, model: undefined })],
+        "diff",
+        false,
+      );
+
+      expect(result.rulesRun).toEqual([]);
+      expect(result.rulesFailed).toEqual(["rule-a"]);
+      expect(result.ruleFailureReasons?.["rule-a"]).toContain("dispatcher did not complete");
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it("runs ungrouped rules in non-overlapping sequential waves", async () => {
@@ -477,10 +519,34 @@ describe("dispatchRulesDirect", () => {
     });
   });
 
-  // CodeRabbit review (PR #7): a hung provider call must not block the whole
-  // run indefinitely — each session's prompt() is wrapped in a bounded
-  // timeout (overridable via deps for tests).
-  describe("prompt timeouts", () => {
+  // A hung provider call must not block the whole run indefinitely — both
+  // session construction and prompt() are bounded (overridable for tests).
+  describe("rule timeouts", () => {
+    it("a rule whose session creation never resolves times out and does not block later waves", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const { factory } = makeFactory({ "rule-b": "[]" });
+        const createSession: DirectSessionFactory = (rule, cwd) =>
+          rule.name === "rule-a" ? new Promise(() => {}) : factory(rule, cwd);
+
+        const result = await dispatchRulesDirect(
+          [
+            makeRule({ name: "rule-a" }),
+            makeRule({ name: "rule-b", provider: "xai", model: "grok-4.5" }),
+          ],
+          "diff",
+          false,
+          { createSession, ruleTimeoutMs: 20 },
+        );
+
+        expect(result.rulesFailed).toEqual(["rule-a"]);
+        expect(result.rulesRun).toEqual(["rule-b"]);
+        expect(result.ruleFailureReasons?.["rule-a"]).toContain("timed out");
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
     it("a rule whose session never resolves times out, is classified 'timed out', and never blocks the others", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
