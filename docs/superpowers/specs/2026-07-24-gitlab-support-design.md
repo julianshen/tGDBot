@@ -77,6 +77,14 @@ Target URLs must:
 - contain no encoded separators, dot segments, backslashes, or control
   characters.
 
+Self-managed HTTPS URLs may contain an explicit port. The normalized repository
+identity and canonical URL retain that port, so `gitlab.example.com:8443` and
+`gitlab.example.com` cannot share a cache or workspace. `glab --repo` receives
+the full canonical project URL. `glab api --hostname` and auth checks receive
+the hostname without the port; users whose API is exposed on a custom port must
+configure that mapping with `glab auth login --hostname <host> --api-host
+<host>:<port>`. HTTP-only GitLab installations are out of scope.
+
 ### Provider-neutral model
 
 `RepositoryRef` and `ReviewTarget` become discriminated provider-neutral
@@ -92,10 +100,33 @@ GitHub retains its owner/repository constraints. GitLab allows nested namespace
 segments. Helpers produce provider-specific CLI locator values and canonical
 URLs; callers do not concatenate repository paths themselves.
 
+### Definitive review locator contract
+
+The current ambient `VcsAdapter` and overloaded `RepositoryScopedVcsAdapter`
+interfaces will be replaced by one locator-based contract:
+
+```text
+ReviewLocator =
+  | { kind: "ambient"; provider: "github"; number: number }
+  | { kind: "repository"; repo: RepositoryRef; number: number }
+```
+
+`ResolvedConfig` carries both a `ReviewLocator` and the selected `VcsAdapter`.
+Every adapter method accepts the locator as its first argument. `review()` never
+passes a bare PR/MR string and never performs provider-specific routing.
+
+The ambient variant exists only for the existing GitHub numeric invocation
+without `--repo`. GitLab numeric input always resolves to the repository
+variant, and both GitHub and GitLab full URLs or explicit `--repo` values use
+the repository variant. `GitHubAdapter` preserves its current ambient command
+behavior for the ambient variant and uses explicit repository flags for the
+repository variant. This removes the two competing adapter interfaces while
+keeping the existing GitHub command usable.
+
 ## Adapter Architecture
 
-`GitLabAdapter` implements the same repository-scoped VCS boundary as
-`GitHubAdapter`. It accepts an injectable `ExecGlab`:
+`GitLabAdapter` implements the locator-based VCS boundary. It accepts an
+injectable `ExecGlab`:
 
 ```text
 ExecGlab(args: readonly string[], stdin?: string): Promise<string>
@@ -130,10 +161,18 @@ All required fields are shape-validated. Missing or malformed diff refs fail
 before review dispatch because inline positions cannot be safely constructed
 without them.
 
+When the versions endpoint returns multiple entries, the adapter uses the first
+entry in the API's newest-first response and verifies that its head SHA equals
+both MR metadata `diff_refs.head_sha` and the head SHA reviewed by the caller.
+An empty list or mismatch is a stale/incomplete snapshot error before the first
+inline write.
+
 ### Diff
 
 The adapter obtains the unified MR diff through `glab mr diff` with an explicit
-repository. Existing diff-size limits and anchor parsing remain unchanged.
+repository. Existing diff-size limits remain unchanged. Anchor parsing is
+extended to retain the old/new path and line metadata required for GitLab
+positions while preserving its current GitHub eligibility decisions.
 
 ### Trusted base-branch rules
 
@@ -172,8 +211,31 @@ the adapter obtains the latest MR diff version and uses its exact:
 - `start_commit_sha`;
 - `head_commit_sha`.
 
-Each provider-neutral inline comment becomes a GitLab text position with old
-and new paths, a new-side line, and a line range when supported by the finding.
+The diff-anchor parser will retain provider-neutral per-line position metadata,
+not only the new-side line number:
+
+- old and new paths from the unified diff headers, including renames;
+- old and new line numbers when present;
+- whether a line is added or context;
+- start and end endpoints for an accepted range.
+
+Every inline candidate remains anchored to the new file. For an added line, the
+GitLab position sends `new_line` only and uses range endpoint type `new`. For a
+context line, it sends both `old_line` and `new_line` and uses endpoint type
+`old`, as required by GitLab. Removed-line findings remain summary-only because
+the current finding contract identifies new-side lines.
+
+A single-line discussion sends `old_path`, `new_path`, `new_line`, and
+`old_line` when it exists. A multi-line discussion sends
+`position[line_range][start]` and `[end]`; each endpoint contains its type,
+available old/new line numbers, and a line code of
+`<sha1(path)>_<old-or-empty>_<new-or-empty>`. The path used for a new-side
+endpoint is the normalized new path. A range is eligible only when both
+endpoints are in the same file and diff hunk and every replaced line is
+new-side addressable. Otherwise the candidate is not posted inline: its
+finding, including any suggestion, falls back to the summary as a plain
+non-committable code block.
+
 The reviewed head SHA must equal the latest diff version head SHA; otherwise
 the adapter fails before posting any comment so the caller can retry against a
 fresh MR snapshot.
@@ -188,15 +250,29 @@ GitHub can submit inline comments atomically in one review. GitLab discussions
 are separate writes, so the current all-or-nothing `createInlineReview`
 contract is insufficient.
 
-The provider-neutral contract will return a result for each requested comment:
+Each orchestrated inline comment receives a unique, stable `clientId`.
+`createInlineReview` returns exactly one outcome for every input:
 
-- posted;
-- failed with a publish-safe reason.
+- `{ clientId, status: "posted" }`;
+- `{ clientId, status: "failed", reason }`.
 
 GitHub reports all posted after its atomic request succeeds and all failed when
-it rejects. GitLab posts sequentially or with conservative bounded concurrency
-and records each result. The CLI moves only failed findings into the summary.
+it rejects. GitLab posts sequentially in input order and records each result.
+Missing, duplicate, or unknown IDs in an adapter result are treated as a batch
+contract failure.
+
+Orchestration retains a provider-neutral presentation record mapping every
+`clientId` to its normalized finding. A pure rendering helper accepts the set
+of failed IDs and re-renders the summary from that existing record; it does not
+redispatch rules or rerun an LLM. The first summary contains normal non-inline
+findings. After a partial publish, only failed inline findings are added.
 Already-posted findings are not duplicated, and no finding is lost.
+
+Failures before the first write, including metadata/diff-version preflight,
+reject the batch and cause every inline candidate to fall back to summary. Once
+posting starts, individual write failures are returned as outcomes rather than
+throwing. A process-level failure that makes remaining writes impossible marks
+each unattempted input failed before returning.
 
 Dry-run performs no note or discussion writes.
 
@@ -317,4 +393,3 @@ Implementation will be one pull request organized into reviewable commits:
 
 Each commit must keep the relevant unit tests green. The final gate is the full
 unit suite, type tests, lint, and build.
-
