@@ -10,6 +10,7 @@ import type {
 } from "./adapter.js";
 
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+const RULE_FILE_FETCH_CONCURRENCY = 4;
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const HTTP_DIAGNOSTIC_RE = /(?:^|\n)HTTP ([1-5]\d{2})\r?\n?$/;
 
@@ -426,20 +427,32 @@ export class GitLabAdapter implements VcsAdapter {
       })
       .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
 
-    const files: RuleFileContent[] = [];
-    for (const entry of selected) {
-      const content = await this.execGlab([
-        "api",
-        "--method",
-        "GET",
-        "--hostname",
-        repo.host,
-        projectEndpoint(repo, `repository/files/${encodeURIComponent(entry.path)}/raw`),
-        "--raw-field",
-        `ref=${baseSha}`,
-      ]);
-      files.push({ path: entry.path.slice(prefix.length), content });
-    }
+    const files = new Array<RuleFileContent>(selected.length);
+    let nextIndex = 0;
+    const fetchNext = async (): Promise<void> => {
+      while (nextIndex < selected.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        const entry = selected[index]!;
+        const content = await this.execGlab([
+          "api",
+          "--method",
+          "GET",
+          "--hostname",
+          repo.host,
+          projectEndpoint(repo, `repository/files/${encodeURIComponent(entry.path)}/raw`),
+          "--raw-field",
+          `ref=${baseSha}`,
+        ]);
+        files[index] = { path: entry.path.slice(prefix.length), content };
+      }
+    };
+    await Promise.all(
+      Array.from(
+        { length: Math.min(RULE_FILE_FETCH_CONCURRENCY, selected.length) },
+        fetchNext,
+      ),
+    );
     return files;
   }
 }

@@ -218,6 +218,59 @@ describe("GitLabAdapter trusted base-branch rules", () => {
     ]);
   });
 
+  it("fetches files concurrently with a small cap while preserving sorted result order", async () => {
+    const paths = ["f.md", "e.md", "d.md", "c.md", "b.md", "a.md"];
+    let active = 0;
+    let maximumActive = 0;
+    const releases: Array<() => void> = [];
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      if (args.includes("--paginate")) {
+        return paths
+          .map((name, index) =>
+            JSON.stringify({
+              id: String(index),
+              name,
+              type: "blob",
+              path: `.review/rules/${name}`,
+              mode: "100644",
+            }),
+          )
+          .join("\n");
+      }
+
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => releases.push(resolve));
+      active -= 1;
+      const endpoint = args.find((arg) => arg.includes("/repository/files/"))!;
+      const encodedPath = endpoint.match(/repository\/files\/(.+)\/raw$/u)![1]!;
+      return `content:${decodeURIComponent(encodedPath)}`;
+    });
+
+    const pending = new GitLabAdapter(execGlab).getRuleFilesFromBase(
+      locator(),
+      "1111111111111111111111111111111111111111",
+      ".review/rules",
+    );
+    await vi.waitFor(() => expect(maximumActive).toBeGreaterThan(1));
+    expect(maximumActive).toBeLessThanOrEqual(4);
+
+    await vi.waitFor(() => expect(releases).toHaveLength(4));
+    releases.pop()!();
+    await vi.waitFor(() => expect(releases).toHaveLength(4));
+    releases.shift()!();
+    await vi.waitFor(() => expect(releases).toHaveLength(4));
+    releases.splice(0).reverse().forEach((release) => release());
+
+    await expect(pending).resolves.toEqual(
+      ["a.md", "b.md", "c.md", "d.md", "e.md", "f.md"].map((path) => ({
+        path,
+        content: `content:.review/rules/${path}`,
+      })),
+    );
+    expect(maximumActive).toBe(4);
+  });
+
   it("returns no rules only when the initial tree listing is missing", async () => {
     const missing = new GlabCommandError("missing", { httpStatus: 404 });
     const execGlab = vi.fn<ExecGlab>().mockRejectedValue(missing);
