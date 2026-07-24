@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
+import { parseBotMarker } from "../review/comment-marker.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -47,31 +48,6 @@ export const realExecGh: ExecGh = (args, stdin) =>
       child.stdin?.end(stdin);
     }
   });
-
-// Detects the *presence* of our marker prefix, regardless of whether the SHA
-// that follows is well-formed. Used to distinguish "the bot posted a marker
-// comment (possibly with a malformed SHA)" from "this isn't our comment at
-// all" — see findBotComment.
-const BOT_MARKER_PREFIX_RE = /<!-- tgd-review-agent:sha=/;
-
-// Matches the bot's own HTML marker comment, e.g.
-// `<!-- tgd-review-agent:sha=abc1234 -->` or, since config-aware dedup,
-// `<!-- tgd-review-agent:sha=abc1234 cfg=1a2b3c4d5e6f -->`. Capture group 1 is
-// lastReviewedSha; group 2 (optional) is the review-config hash, absent on a
-// legacy marker. A comment can match BOT_MARKER_PREFIX_RE without matching this
-// (malformed SHA) — that's still treated as "the bot's marker comment", just
-// with an empty lastReviewedSha/reviewedConfig (see findBotComment).
-//
-// The `\s*$` anchor is load-bearing (hardening, CodeRabbit review): buildBody
-// (cli.ts) always appends this marker as the LAST thing in the comment body, so
-// the AUTHORITATIVE marker is the trailing one. Without the anchor, `exec`
-// returns the FIRST marker-shaped match anywhere in the body — so a review
-// finding that quoted a marker-shaped string earlier in the comment could be
-// parsed as the reviewed SHA/config, causing an incorrect skip. (Finding text
-// is already sanitized to defang `<!--`/`-->`, so this is defense-in-depth on
-// top of that — but anchoring makes the parse correct by construction rather
-// than resting on the sanitizer.)
-const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40})(?: cfg=([0-9a-z]+))? -->\s*$/;
 
 interface GhPrViewJson {
   headRefOid: string;
@@ -346,13 +322,12 @@ export class GitHubAdapter implements VcsAdapter {
     const comments = Array.isArray(parsed[0]) ? (parsed as GhIssueComment[][]).flat() : parsed as GhIssueComment[];
     for (const comment of comments) {
       if (comment.user?.login !== botLogin) continue;
-      if (!BOT_MARKER_PREFIX_RE.test(comment.body)) continue;
-      const match = BOT_MARKER_RE.exec(comment.body);
+      const marker = parseBotMarker(comment.body);
+      if (marker === null) continue;
       return {
         id: String(comment.id),
         body: comment.body,
-        lastReviewedSha: match?.[1] ?? "",
-        reviewedConfig: match?.[2] ?? "",
+        ...marker,
       };
     }
     return null;

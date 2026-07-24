@@ -243,6 +243,31 @@ describe("review", () => {
     logSpy.mockRestore();
   });
 
+  it("applies head/config dedup to an explicit GitLab merge request", async () => {
+    const args = makeArgs({
+      pr: "https://gitlab.example.com/group/project/-/merge_requests/42",
+      vcs: "gitlab",
+    });
+    const cfg = computeReviewConfigHash(args);
+    const botComment: BotComment = {
+      id: "303",
+      body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
+      lastReviewedSha: "cafef00d",
+      reviewedConfig: cfg,
+    };
+    const unchanged = makeHarness({ args, botComment });
+    const changedArgs = { ...args, advisor: "off" as const };
+    const changed = makeHarness({ args: changedArgs, botComment });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(unchanged.args, depsFrom(unchanged))).resolves.toBe(0);
+    expect(unchanged.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+
+    await expect(review(changed.args, depsFrom(changed))).resolves.toBe(0);
+    expect(changed.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    vi.restoreAllMocks();
+  });
+
   // Design-review #9: the adapter infers owner/repo from ambient context, so
   // review() must name the RESOLVED target (the PR's canonical URL) up front —
   // even on a skipped run — making a mis-inferred repo visible, not silent.

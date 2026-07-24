@@ -596,6 +596,22 @@ describe("GitHubAdapter", () => {
     expect(botComment?.reviewedConfig).toBe("1a2b3c4d5e6f");
   });
 
+  it("preserves malformed non-trailing marker behavior through the shared parser", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      return JSON.stringify([{
+        id: 889,
+        body: "prefix <!-- tgd-review-agent:sha=abc1234 --> trailing",
+        user: { login: "tgd-review-agent[bot]" },
+      }]);
+    });
+    await expect(new GitHubAdapter(execGh).findBotComment(locator42)).resolves.toMatchObject({
+      id: "889",
+      lastReviewedSha: "",
+      reviewedConfig: "",
+    });
+  });
+
   // --- Test coverage fix (DEBT.md): malformed/non-JSON gh output ---
   //
   // Pinning tests only (no code change): JSON.parse throws synchronously

@@ -46,6 +46,8 @@ const locator = (repo: GitLabRepositoryRef = selfManagedRepo) =>
 
 const fixturePath = fileURLToPath(new URL("../../fixtures/glab-mr.json", import.meta.url));
 const fixture = await readFile(fixturePath, "utf8");
+const notesFixturePath = fileURLToPath(new URL("../../fixtures/glab-notes.json", import.meta.url));
+const notesFixture = await readFile(notesFixturePath, "utf8");
 
 describe("GitLabAdapter merge request snapshot", () => {
   it.each([gitlabComRepo, selfManagedRepo, customPortRepo])(
@@ -155,6 +157,115 @@ describe("GitLabAdapter merge request snapshot", () => {
     await expect(adapter.getPullRequest(locator())).resolves.toMatchObject({
       description: expected,
     });
+  });
+});
+
+describe("GitLabAdapter review summary notes", () => {
+  it("caches the in-flight authenticated username once per normalized authority", async () => {
+    let releaseUser!: (value: string) => void;
+    const userResult = new Promise<string>((resolve) => { releaseUser = resolve; });
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      if (args[1] === "user") return userResult;
+      return notesFixture;
+    });
+    const adapter = new GitLabAdapter(execGlab);
+
+    const first = adapter.findBotComment(locator(customPortRepo));
+    const second = adapter.findBotComment(locator({ ...customPortRepo, canonicalUrl: customPortRepo.canonicalUrl }));
+    await vi.waitFor(() => {
+      expect(execGlab.mock.calls.filter(([args]) => args[1] === "user")).toHaveLength(1);
+    });
+    releaseUser(JSON.stringify({ username: "review-bot" }));
+    await Promise.all([first, second]);
+  });
+
+  it("inspects paginated NDJSON notes, ignores copied markers, and returns its own valid marker", async () => {
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
+      return notesFixture;
+    });
+    const result = await new GitLabAdapter(execGlab).findBotComment(locator(customPortRepo));
+
+    expect(result).toEqual({
+      id: "303",
+      body: "## tGD Review\n\n<!-- tgd-review-agent:sha=abc1234 cfg=deadbeef -->",
+      lastReviewedSha: "abc1234",
+      reviewedConfig: "deadbeef",
+    });
+    expect(execGlab).toHaveBeenCalledWith([
+      "api", "--method", "GET", "--paginate", "--output", "ndjson",
+      "--hostname", "gitlab.example.com",
+      "projects/group%2Fproject/merge_requests/42/notes",
+      "--field", "per_page=100",
+    ]);
+  });
+
+  it("returns its own malformed marker with empty SHA/config so it is updated", async () => {
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
+      return JSON.stringify({
+        id: 404,
+        body: "review\n<!-- tgd-review-agent:sha=CORRUPTED!! -->",
+        author: { username: "review-bot" },
+      });
+    });
+    await expect(new GitLabAdapter(execGlab).findBotComment(locator())).resolves.toEqual({
+      id: "404",
+      body: "review\n<!-- tgd-review-agent:sha=CORRUPTED!! -->",
+      lastReviewedSha: "",
+      reviewedConfig: "",
+    });
+  });
+
+  it("creates a note with JSON stdin and keeps markdown out of argv", async () => {
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(
+      JSON.stringify({ id: 505, body: "new **markdown**" }),
+    );
+    await new GitLabAdapter(execGlab).upsertComment(
+      locator(customPortRepo), "new **markdown**", null,
+    );
+    expect(execGlab).toHaveBeenCalledWith([
+      "api", "--method", "POST", "--hostname", "gitlab.example.com",
+      "projects/group%2Fproject/merge_requests/42/notes", "--input", "-",
+    ], JSON.stringify({ body: "new **markdown**" }));
+    expect(execGlab.mock.calls[0]![0]).not.toContain("new **markdown**");
+  });
+
+  it("updates the exact validated note ID with JSON stdin", async () => {
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(
+      JSON.stringify({ id: 303, body: "updated" }),
+    );
+    await new GitLabAdapter(execGlab).upsertComment(locator(customPortRepo), "updated", {
+      id: "303", body: "old", lastReviewedSha: "abc1234", reviewedConfig: "",
+    });
+    expect(execGlab).toHaveBeenCalledWith([
+      "api", "--method", "PUT", "--hostname", "gitlab.example.com",
+      "projects/group%2Fproject/merge_requests/42/notes/303", "--input", "-",
+    ], JSON.stringify({ body: "updated" }));
+  });
+
+  it.each([
+    ["bad existing id", "3/nope", JSON.stringify({ id: 3, body: "updated" })],
+    ["bad response JSON", "303", "not json"],
+    ["wrong response id", "303", JSON.stringify({ id: 999, body: "updated" })],
+    ["malformed response body", "303", JSON.stringify({ id: 303, body: 7 })],
+  ])("rejects %s", async (_name, id, response) => {
+    const adapter = new GitLabAdapter(async () => response);
+    await expect(adapter.upsertComment(locator(), "updated", {
+      id, body: "old", lastReviewedSha: "", reviewedConfig: "",
+    })).rejects.toThrow(/note|id|response/i);
+  });
+
+  it("rejects malformed note and user records", async () => {
+    const badUser = new GitLabAdapter(async () => JSON.stringify({ username: 42 }));
+    await expect(badUser.findBotComment(locator())).rejects.toThrow(/username/i);
+
+    const badNote = new GitLabAdapter(async (args) =>
+      args[1] === "user"
+        ? JSON.stringify({ username: "review-bot" })
+        : JSON.stringify({ id: "oops", body: "x", author: { username: "review-bot" } }),
+    );
+    await expect(badNote.findBotComment(locator())).rejects.toThrow(/note/i);
   });
 });
 

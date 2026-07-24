@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { parseBotMarker } from "../review/comment-marker.js";
 import type { GitLabRepositoryRef } from "../target/types.js";
 import type {
   BotComment,
@@ -230,6 +231,12 @@ interface GlabTreeEntry {
   mode: string;
 }
 
+interface GlabNote {
+  id: number;
+  body: string;
+  author: { username: string };
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -304,6 +311,65 @@ function parseTreeEntries(stdout: string): GlabTreeEntry[] {
   });
 }
 
+function parseUsername(stdout: string): string {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch (cause) {
+    throw new GlabOutputError("Invalid glab user response: malformed JSON", { cause });
+  }
+  if (!isRecord(value) || typeof value.username !== "string" || value.username.length === 0) {
+    throw new GlabOutputError("Invalid glab user response: malformed username");
+  }
+  return value.username;
+}
+
+function parseNotes(stdout: string): GlabNote[] {
+  return decodeNdjsonRecords<unknown>(stdout).map((value) => {
+    if (
+      !isRecord(value) ||
+      !Number.isSafeInteger(value.id) ||
+      (value.id as number) <= 0 ||
+      typeof value.body !== "string" ||
+      !isRecord(value.author) ||
+      typeof value.author.username !== "string" ||
+      value.author.username.length === 0
+    ) {
+      throw new GlabOutputError("Invalid glab note response");
+    }
+    return value as unknown as GlabNote;
+  });
+}
+
+function parseWrittenNote(stdout: string, expectedId?: number): void {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch (cause) {
+    throw new GlabOutputError("Invalid glab note response: malformed JSON", { cause });
+  }
+  if (
+    !isRecord(value) ||
+    !Number.isSafeInteger(value.id) ||
+    (value.id as number) <= 0 ||
+    typeof value.body !== "string" ||
+    (expectedId !== undefined && value.id !== expectedId)
+  ) {
+    throw new GlabOutputError("Invalid glab note response: malformed or mismatched note id/body");
+  }
+}
+
+function validatedNoteId(id: string): number {
+  if (!/^[1-9]\d*$/u.test(id)) {
+    throw new GlabOutputError("Invalid existing GitLab note id");
+  }
+  const value = Number(id);
+  if (!Number.isSafeInteger(value)) {
+    throw new GlabOutputError("Invalid existing GitLab note id");
+  }
+  return value;
+}
+
 function resolveMergeRequestLocator(locator: ReviewLocator): {
   repo: GitLabRepositoryRef;
   iid: string;
@@ -326,6 +392,20 @@ function unavailable(operation: string): never {
 
 export class GitLabAdapter implements VcsAdapter {
   constructor(private readonly execGlab: ExecGlab = realExecGlab) {}
+
+  private readonly usernamePromises = new Map<string, Promise<string>>();
+
+  private getUsername(repo: GitLabRepositoryRef): Promise<string> {
+    const authority = `${repo.host.toLowerCase()}${repo.port === undefined ? "" : `:${repo.port}`}`;
+    let promise = this.usernamePromises.get(authority);
+    if (!promise) {
+      promise = this.execGlab([
+        "api", "user", "--hostname", repo.host,
+      ]).then(parseUsername);
+      this.usernamePromises.set(authority, promise);
+    }
+    return promise;
+  }
 
   async getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo> {
     const { repo, iid } = resolveMergeRequestLocator(locator);
@@ -357,8 +437,21 @@ export class GitLabAdapter implements VcsAdapter {
   }
 
   async findBotComment(locator: ReviewLocator): Promise<BotComment | null> {
-    void locator;
-    return unavailable("comment lookup");
+    const { repo, iid } = resolveMergeRequestLocator(locator);
+    const username = await this.getUsername(repo);
+    const stdout = await this.execGlab([
+      "api", "--method", "GET", "--paginate", "--output", "ndjson",
+      "--hostname", repo.host,
+      projectEndpoint(repo, `merge_requests/${iid}/notes`),
+      "--field", "per_page=100",
+    ]);
+    for (const note of parseNotes(stdout)) {
+      if (note.author.username !== username) continue;
+      const marker = parseBotMarker(note.body);
+      if (marker === null) continue;
+      return { id: String(note.id), body: note.body, ...marker };
+    }
+    return null;
   }
 
   async upsertComment(
@@ -366,8 +459,16 @@ export class GitLabAdapter implements VcsAdapter {
     body: string,
     existing: BotComment | null,
   ): Promise<void> {
-    void [locator, body, existing];
-    return unavailable("comment upsert");
+    const { repo, iid } = resolveMergeRequestLocator(locator);
+    const baseEndpoint = projectEndpoint(repo, `merge_requests/${iid}/notes`);
+    const noteId = existing === null ? undefined : validatedNoteId(existing.id);
+    const stdout = await this.execGlab([
+      "api", "--method", existing === null ? "POST" : "PUT",
+      "--hostname", repo.host,
+      noteId === undefined ? baseEndpoint : `${baseEndpoint}/${noteId}`,
+      "--input", "-",
+    ], JSON.stringify({ body }));
+    parseWrittenNote(stdout, noteId);
   }
 
   async createInlineReview(
