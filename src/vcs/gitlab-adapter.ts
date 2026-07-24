@@ -368,7 +368,7 @@ function parseWrittenNote(stdout: string, expectedId?: number): void {
   }
 }
 
-function parseMergeRequestVersions(stdout: string): GlabMergeRequestVersion[] {
+function parseNewestMergeRequestVersion(stdout: string): GlabMergeRequestVersion {
   let value: unknown;
   try {
     value = JSON.parse(stdout);
@@ -378,16 +378,18 @@ function parseMergeRequestVersions(stdout: string): GlabMergeRequestVersion[] {
   if (!Array.isArray(value)) {
     throw new GlabOutputError("Invalid glab MR versions response: expected an array");
   }
-  return value.map((entry) => {
-    if (!isRecord(entry)) {
-      throw new GlabOutputError("Invalid glab MR versions response: expected an object");
-    }
-    return {
-      base_commit_sha: requiredString(entry, "base_commit_sha", { sha: true }),
-      head_commit_sha: requiredString(entry, "head_commit_sha", { sha: true }),
-      start_commit_sha: requiredString(entry, "start_commit_sha", { sha: true }),
-    };
-  });
+  const entry = value[0];
+  if (entry === undefined) {
+    throw new GlabOutputError("Invalid glab MR versions response: no versions");
+  }
+  if (!isRecord(entry)) {
+    throw new GlabOutputError("Invalid glab MR versions response: expected an object");
+  }
+  return {
+    base_commit_sha: requiredString(entry, "base_commit_sha", { sha: true }),
+    head_commit_sha: requiredString(entry, "head_commit_sha", { sha: true }),
+    start_commit_sha: requiredString(entry, "start_commit_sha", { sha: true }),
+  };
 }
 
 function validateWrittenDiscussion(stdout: string): void {
@@ -601,10 +603,7 @@ export class GitLabAdapter implements VcsAdapter {
       repo.host,
       projectEndpoint(repo, `merge_requests/${iid}/versions`),
     ]);
-    const version = parseMergeRequestVersions(versionsStdout)[0];
-    if (version === undefined) {
-      throw new GlabOutputError("Invalid glab MR versions response: no versions");
-    }
+    const version = parseNewestMergeRequestVersion(versionsStdout);
     if (metadata.startSha === undefined) {
       throw new GlabOutputError("Invalid glab MR metadata: missing start SHA");
     }

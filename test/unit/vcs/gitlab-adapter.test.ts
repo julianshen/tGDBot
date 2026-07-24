@@ -596,6 +596,38 @@ describe("GitLabAdapter inline discussions", () => {
     });
   });
 
+  it("ignores malformed older versions after a valid newest entry", async () => {
+    const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
+    const execGlab: ExecGlab = async (args, stdin) => {
+      calls.push({ args, stdin });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) {
+        return JSON.stringify([
+          {
+            base_commit_sha: BASE_SHA,
+            head_commit_sha: HEAD_SHA,
+            start_commit_sha: START_SHA,
+          },
+          { base_commit_sha: "malformed stale entry" },
+          null,
+        ]);
+      }
+      if (endpoint?.endsWith("/discussions")) return discussionsFixture;
+      return fixture;
+    };
+
+    await expect(
+      new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, [added]),
+    ).resolves.toEqual([{ clientId: "finding-0", status: "posted" }]);
+    expect(JSON.parse(calls[2]!.stdin!)).toMatchObject({
+      position: {
+        base_sha: BASE_SHA,
+        head_sha: HEAD_SHA,
+        start_sha: START_SHA,
+      },
+    });
+  });
+
   it("posts exact single-line and renamed-context payloads in order", async () => {
     const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
     const context = inlineComment("finding-1", {
