@@ -30,7 +30,7 @@ describe("orchestrate", () => {
     const diff = `diff --git a/src/foo.ts b/src/foo.ts
 --- a/src/foo.ts
 +++ b/src/foo.ts
-@@ -9,2 +9,2 @@
+@@ -9,1 +9,2 @@
  context
 +added
 `;
@@ -327,7 +327,7 @@ describe("inline anchoring", () => {
   const DIFF = `diff --git a/src/a.ts b/src/a.ts
 --- a/src/a.ts
 +++ b/src/a.ts
-@@ -10,2 +10,3 @@
+@@ -10,1 +10,3 @@
  ctx
 +added
 +added2

@@ -92,7 +92,7 @@ diff --git a/y.ts b/y.ts
 --- a/z.ts
 +++ b/z.ts
 @@ -3 +4 @@
-+only
+ only
 `;
     expect([...(commentableLines(diff).get("z.ts") ?? [])]).toEqual([4]);
   });
@@ -106,6 +106,7 @@ new mode 100755
 --- a/m.ts
 +++ b/m.ts
 @@ -1,1 +1,1 @@
+-old
 +changed
 \\ No newline at end of file
 `;
@@ -126,7 +127,7 @@ rename from src/old-name.ts
 rename to src/new-name.ts
 --- a/src/old-name.ts
 +++ b/src/new-name.ts
-@@ -9,3 +9,4 @@
+@@ -9,2 +9,4 @@
  context
 +added
 +added two
@@ -203,6 +204,50 @@ rename to src/new-name.ts
     expect(diffPositionRange(malformed, "a.ts", 1)).toBeUndefined();
     expect(commentableLines(malformed).get("a.ts")).toBeUndefined();
   });
+
+  it.each([
+    ["an unknown marker after a valid prefix", "@@ -1,2 +1,2 @@\n context\n?invalid"],
+    ["impossible context with no old-side lines", "@@ -1,0 +1,1 @@\n context"],
+    ["premature EOF with positive counters", "@@ -1,2 +1,2 @@\n context\n"],
+  ])("transactionally discards %s in both anchor APIs", (_name, hunk) => {
+    const malformed = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+${hunk}`;
+    expect(diffPositionRange(malformed, "a.ts", 1)).toBeUndefined();
+    expect(commentableLines(malformed).get("a.ts")).toBeUndefined();
+  });
+
+  it("a later malformed overlapping hunk cannot delete or overwrite an earlier valid hunk", () => {
+    const diff = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,1 +1,1 @@
+ valid
+@@ -1,2 +1,2 @@
+ later-prefix
+?invalid
+`;
+    expect(diffPositionRange(diff, "a.ts", 1)).toMatchObject({
+      start: { type: "old", oldLine: 1, newLine: 1 },
+    });
+    expect([...(commentableLines(diff).get("a.ts") ?? [])]).toEqual([1]);
+  });
+
+  it("preserves the earlier position when two valid hunks overlap", () => {
+    const diff = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,1 +1,1 @@
+ first
+@@ -9,1 +1,1 @@
+ second
+`;
+    expect(diffPositionRange(diff, "a.ts", 1)).toMatchObject({
+      start: { type: "old", oldLine: 1, newLine: 1 },
+    });
+    expect([...(commentableLines(diff).get("a.ts") ?? [])]).toEqual([1]);
+  });
 });
 
 describe("isCommentable", () => {
@@ -270,7 +315,7 @@ diff --git a/victim.ts b/victim.ts
   });
 
   it("emits no phantom anchor past the end of the last hunk (trailing blank lines)", () => {
-    const diff = "diff --git a/t.ts b/t.ts\n--- a/t.ts\n+++ b/t.ts\n@@ -1,1 +1,1 @@\n+only\n\n\n";
+    const diff = "diff --git a/t.ts b/t.ts\n--- a/t.ts\n+++ b/t.ts\n@@ -1,0 +1,1 @@\n+only\n\n\n";
     // Line 2 does not exist in the hunk; anchoring there would 422 the review.
     expect([...(commentableLines(diff).get("t.ts") ?? [])]).toEqual([1]);
   });
