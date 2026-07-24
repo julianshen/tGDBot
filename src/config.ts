@@ -2,15 +2,13 @@
 // a concrete VcsAdapter for the requested `--vcs` provider. See TASKS.md
 // Task 8's technical design.
 //
-// v1 only implements the "github" provider (GitHubAdapter, `gh`-backed).
-// GitLab is explicitly out of scope for this pass (SPEC.md/TASKS.md:
-// "GitLab adapter excluded from this task list ... Phase 2 fast-follow") —
-// requesting `--vcs gitlab` fails fast with a clear error rather than
-// silently falling back to GitHub or constructing a non-functional adapter.
+// Both providers are selected only after target normalization: GitHub uses
+// GitHubAdapter (`gh`-backed), and GitLab uses GitLabAdapter (`glab`-backed).
 import type { CliArgs } from "./cli.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
 import type { ReviewLocator, VcsAdapter } from "./vcs/adapter.js";
 import { GitHubAdapter } from "./vcs/github-adapter.js";
+import { GitLabAdapter } from "./vcs/gitlab-adapter.js";
 
 export interface ResolvedConfig extends CliArgs {
   readonly locator: ReviewLocator;
@@ -53,7 +51,7 @@ export function resolveConfig(args: CliArgs): ResolvedConfig {
   const locator = resolveReviewLocator(args);
   const provider = locator.kind === "ambient" ? locator.provider : locator.repo.provider;
   if (provider === "gitlab") {
-    throw new Error("GitLab support not yet implemented (Phase 2)");
+    return { ...args, locator, vcsAdapter: new GitLabAdapter() };
   }
 
   // args.vcs is now narrowed to "github" — GitHubAdapter defaults its

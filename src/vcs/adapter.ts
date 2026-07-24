@@ -15,10 +15,8 @@ export type ReviewLocator =
     };
 
 // VcsAdapter: provider-agnostic interface for fetching PR metadata/diff/comments
-// and posting a review comment. Implemented by GitHubAdapter (this task, `gh`-backed)
-// and, in a later phase, a GitLabAdapter (`glab`-backed) — see SPEC.md's Data Models
-// section and TASKS.md's Task 2 Context & Goal ("VcsAdapter provider-agnostic so a
-// GitLabAdapter is addable later without touching Tasks 3-9").
+// and posting a review comment. Implemented by GitHubAdapter (`gh`-backed) and
+// GitLabAdapter (`glab`-backed).
 export interface VcsAdapter {
   getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo>;
   getDiff(locator: ReviewLocator): Promise<string>;
@@ -113,6 +111,9 @@ export interface PullRequestInfo {
   id: string; // PR/MR number
   headSha: string;
   baseSha: string;
+  startSha?: string;
+  headRef?: string;
+  baseRef?: string;
   title: string;
   description: string;
   /**

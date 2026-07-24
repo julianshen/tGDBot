@@ -22,6 +22,7 @@ const hoisted = vi.hoisted(() => ({
   getRuleFilesFromBase: vi.fn(),
   createInlineReview: vi.fn(),
   resolveStaleReviewThreads: vi.fn(),
+  gitLabConstructed: vi.fn(),
 }));
 
 vi.mock("../../src/vcs/github-adapter.js", () => ({
@@ -35,6 +36,22 @@ vi.mock("../../src/vcs/github-adapter.js", () => ({
     resolveStaleReviewThreads = hoisted.resolveStaleReviewThreads;
   },
   realExecGh: vi.fn(),
+}));
+
+vi.mock("../../src/vcs/gitlab-adapter.js", () => ({
+  GitLabAdapter: class {
+    constructor() {
+      hoisted.gitLabConstructed();
+    }
+    getPullRequest = hoisted.getPullRequest;
+    createInlineReview = hoisted.createInlineReview;
+    getDiff = hoisted.getDiff;
+    findBotComment = hoisted.findBotComment;
+    upsertComment = hoisted.upsertComment;
+    getRuleFilesFromBase = hoisted.getRuleFilesFromBase;
+    resolveStaleReviewThreads = hoisted.resolveStaleReviewThreads;
+  },
+  realExecGlab: vi.fn(),
 }));
 
 vi.mock("../../src/rules/loader.js", () => ({
@@ -173,10 +190,26 @@ describe("review — default dependency wiring", () => {
     logSpy.mockRestore();
   });
 
-  it("with an explicit GitLab repository and no injected deps, the real resolveConfig throws the Phase 2 error", async () => {
-    await expect(review(makeArgs({ vcs: "gitlab", repo: "group/project" }))).rejects.toThrow(
-      /GitLab support not yet implemented \(Phase 2\)/,
+  it("with an explicit GitLab repository, default wiring constructs and drives GitLabAdapter", async () => {
+    hoisted.gitLabConstructed.mockClear();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(
+      review(makeArgs({ vcs: "gitlab", repo: "group/project" })),
+    ).resolves.toBe(0);
+
+    expect(hoisted.gitLabConstructed).toHaveBeenCalledTimes(1);
+    expect(hoisted.getPullRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "repository",
+        repo: expect.objectContaining({
+          provider: "gitlab",
+          canonicalUrl: "https://gitlab.com/group/project",
+        }),
+        number: 42,
+      }),
     );
+    logSpy.mockRestore();
   });
 
   it("passes --model in the object input, never in the direct deps argument", async () => {
