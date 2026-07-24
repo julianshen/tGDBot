@@ -1,5 +1,5 @@
 // orchestrate: a deterministic dedupe/grouping safety net over a
-// DispatchResult, plus rendering the final PR comment Markdown. See
+// DispatchResult, plus rendering the final review comment Markdown. See
 // SPEC.md's "Boundaries" ("Never fail silently") and TASKS.md Task 7.
 //
 // This is a PURE, SYNCHRONOUS function — no LLM calls, no I/O. Any advisor
@@ -85,10 +85,10 @@ function dedupeFindings(findings: Finding[]): Finding[] {
  * Turns a DispatchResult into the two things a review writes: inline comments
  * anchored to the diff, and a summary comment for everything else.
  *
- * `diff` is what makes anchoring possible AND safe: GitHub 422s the entire
- * review if any comment targets a line outside the diff, so a finding is only
+ * `diff` is what makes anchoring possible and safe: providers accept inline
+ * comments only at valid diff positions, so a finding is only
  * anchored when the diff itself proves the line is addressable (see
- * diff-anchors). Anything else — no line number, a file not touched by this PR,
+ * diff-anchors). Anything else — no line number, a file not touched by this change,
  * a line outside every hunk — is rendered into the summary instead of being
  * silently dropped.
  *
@@ -167,7 +167,7 @@ export function orchestrate(
     // Endpoint-only checking (the first draft, caught in review) is unsound:
     // `commentableLines` merges all of a file's hunks into one set, so a range
     // whose ends sit in DIFFERENT hunks passes while the lines between it are not
-    // in the diff at all. GitHub requires a multi-line comment's range to lie
+    // in the diff at all. A multi-line comment's range must lie
     // within a single hunk and 422s the ENTIRE review otherwise — killing every
     // inline comment on the run. Because context lines are included in the anchor
     // set, "every line in start..end is commentable" is exactly equivalent to
@@ -229,7 +229,7 @@ export function orchestrate(
     inlineComments.push({
       clientId,
       path: finding.file,
-      // GitHub anchors a multi-line comment with `line` = LAST and start_line = FIRST.
+      // Provider-neutral ranges use `line` = LAST and `startLine` = FIRST.
       line: multiLine ? (endLine as number) : start,
       ...(multiLine ? { startLine: start } : {}),
       position,

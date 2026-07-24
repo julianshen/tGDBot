@@ -57,3 +57,39 @@ describe("direct workflow scheduling documentation", () => {
     expect(readme).toMatch(/`legacy` engine does not consume this plan yet/i);
   });
 });
+
+describe("GitLab review documentation", () => {
+  it("documents GitLab CLI installation, authentication, and API transport", () => {
+    expect(readme).toMatch(/install.*`glab`/i);
+    expect(readme).toContain("glab auth login --hostname");
+    expect(readme).toMatch(
+      /glab auth login --hostname[\s\S]{0,120}--api-host/,
+    );
+    expect(readme).toContain("glab api");
+  });
+
+  it("documents GitLab.com, self-managed, custom-port, and full-URL targets", () => {
+    expect(readme).toContain("--repo gitlab.com/group/project");
+    expect(readme).toContain("--pr 42");
+    expect(readme).toContain(
+      "--repo gitlab.example.com:8443/group/subgroup/project",
+    );
+    expect(readme).toContain(
+      "--pr https://gitlab.example.com/group/project/-/merge_requests/42",
+    );
+  });
+
+  it("documents GitLab permissions, trusted rules, fallback, and dry-run behavior", () => {
+    expect(readme).toMatch(/minimum GitLab permissions/i);
+    expect(readme).toMatch(/notes.*discussions.*repository files/is);
+    expect(readme).toMatch(/base branch.*trusted rules/is);
+    expect(readme).toMatch(/inline.*partial.*fall(?:s|ing)? back.*summary/is);
+    expect(readme).toContain("--dry-run");
+  });
+
+  it("documents opt-in GitLab smoke testing while preserving GitHub defaults", () => {
+    expect(readme).toMatch(/GitHub remains the default/i);
+    expect(readme).toMatch(/opt-in GitLab smoke test/i);
+    expect(readme).toMatch(/not part of the default test suite/i);
+  });
+});

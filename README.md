@@ -79,6 +79,8 @@ and ordinary operational hygiene still benefit from these):
   `engines.node` requirement.
 - `gh` CLI, authenticated — run `gh auth login`, or set
   `GH_TOKEN`/`GITHUB_TOKEN` in the environment.
+- Install the `glab` CLI when reviewing GitLab merge requests, then authenticate
+  each GitLab host with `glab auth login --hostname <host>`.
 - Provider API key(s) for whichever models your rules use, set as environment
   variables (see "Provider API keys" below).
 
@@ -109,6 +111,53 @@ or from whatever CI system you already use — anywhere `gh` is authenticated
 and the provider keys are present in the environment. If you do automate it on
 untrusted PRs, read "⚠️ Security Considerations" above first.
 
+GitHub remains the default: a numeric `--pr` with no other target flags uses
+the current repository inferred by `gh`. GitLab targets use `glab`; the adapter
+invokes `glab mr` and `glab api` (including notes, discussions, and trusted
+repository-file reads), so the authenticated `glab` host is the authority for
+every GitLab operation.
+
+For GitLab.com, authenticate and identify the project explicitly when using a
+numeric merge-request IID:
+
+```bash
+glab auth login --hostname gitlab.com
+tgd-review-agent review \
+  --vcs gitlab \
+  --repo gitlab.com/group/project \
+  --pr 42
+```
+
+Self-managed GitLab supports nested namespaces and custom web ports:
+
+```bash
+glab auth login --hostname gitlab.example.com \
+  --api-host gitlab.example.com:8443
+tgd-review-agent review \
+  --vcs gitlab \
+  --repo gitlab.example.com:8443/group/subgroup/project \
+  --pr 42
+```
+
+`glab api --hostname` receives the hostname without its web port. When the API
+is exposed on a custom port, preserve the web port in `--repo` and configure
+the API mapping with
+`glab auth login --hostname gitlab.example.com --api-host gitlab.example.com:8443`.
+HTTP-only GitLab installations are not supported.
+
+A complete merge-request URL needs neither `--vcs` nor `--repo`:
+
+```bash
+tgd-review-agent review \
+  --pr https://gitlab.example.com/group/project/-/merge_requests/42
+```
+
+Minimum GitLab permissions are read access to the merge request, diff, and
+repository files plus permission to read/write notes and discussions. Do not
+grant repository-content write permission. Rules are fetched from the target
+merge request's base branch through `glab api`, so those base-branch files are
+the trusted rules; never use `--trust-local-rules` for untrusted changes.
+
 The `review` command sources rule files safely from the PR's base branch
 entirely inside the CLI (see "Rule files are sourced from the base branch"
 below) — no special setup required. Do **not** pass `--trust-local-rules`
@@ -121,8 +170,9 @@ The real flags, as parsed by `src/cli.ts`:
 
 ```
 tgd-review-agent review \
-  --pr <number>                  # required: PR number
-  --vcs github|gitlab            # default: github (gitlab adapter is Phase 2, not yet implemented)
+  --pr <number-or-url>           # required: PR/MR number or complete GitHub/GitLab review URL
+  --vcs github|gitlab            # default: github
+  --repo <repository>            # required for a numeric GitLab IID; optional target check for URLs
   --rules-dir <path>             # default: .review/rules — a REPO-RELATIVE path looked up on
                                   # the PR's BASE branch via the VCS provider's API (not a local
                                   # filesystem path), unless --trust-local-rules is also passed
@@ -134,7 +184,7 @@ tgd-review-agent review \
                                   # pi's settings default if credentialed, else the first provider
                                   # with working credentials on this machine. See "Which model
                                   # runs what?" below.
-  --suggestions on|off           # default: on. Renders a GitHub COMMITTABLE suggestion (a one-click
+  --suggestions on|off           # default: on. Renders a provider committable suggestion (a one-click
                                   # "Commit suggestion" button) when a rule supplies a concrete
                                   # replacement. `off` still SHOWS the proposed fix, as a plain
                                   # non-committable block. Never offered on files that execute with
@@ -208,14 +258,17 @@ the summary names it with an actionable reason
 running the review``). The *raw* provider error goes to the CI logs, never into
 the world-readable comment.
 
-**Nothing is ever lost.** GitHub rejects an inline comment on a line that isn't
-part of the diff — and rejects the *entire* review if even one is invalid. So a
+**Nothing is ever lost.** Review providers reject inline comments on lines that
+aren't part of the diff; GitHub rejects the *entire* review if even one is
+invalid, while GitLab reports outcomes per discussion. So a
 finding is only anchored when the diff itself proves the line is addressable
 (`src/review/diff-anchors.ts`). Anything else — a finding with no line number, a
 line outside the changed hunks, a file this PR doesn't touch — is rendered in full
 in the summary under **💬 Additional comments**. And if the inline post is
-rejected outright, the run falls back to a summary containing *every* finding. A
-finding is only ever relocated, never dropped.
+rejected outright, the run falls back to a summary containing every affected
+finding. GitLab inline partial failure falls back only the failed findings to
+the summary while successful discussions remain inline. A finding is only ever
+relocated, never dropped.
 
 ### Which model runs what?
 
@@ -260,7 +313,8 @@ A model id may carry a thinking suffix (`claude-opus-4-5:high`); it is stripped
 before lookup, so it resolves the same way it does for the rule's own subagent.
 
 Use `--dry-run` to test locally before wiring up CI — it runs the full
-pipeline (fetch PR + diff via `gh`, load rules, dispatch, orchestrate) but
+pipeline (fetch the review and diff via `gh` or `glab`, load rules, dispatch,
+orchestrate) but
 prints the would-be comment body to stdout instead of calling
 `upsertComment`, so nothing is posted to the PR:
 
@@ -268,6 +322,10 @@ prints the would-be comment body to stdout instead of calling
 gh auth login   # if not already authenticated
 node dist/cli.js review --pr 42 --dry-run
 ```
+
+For GitLab, use the same flag with either a complete MR URL or
+`--vcs gitlab --repo ... --pr 42`; the output includes the summary and every
+inline-comment preview without creating notes or discussions.
 
 ### Zero-config smoke test (AC-9.2)
 
@@ -290,6 +348,22 @@ directory, only the vendored built-in `tgd-review` rule.
    posts/edits the PR comment (creates it the first time; a second run
    against the same unchanged head SHA is skipped instead, per the dedup
    behavior described above).
+
+### Opt-in GitLab smoke test
+
+This live procedure is intentionally not part of the default test suite. It
+requires a user-provided GitLab.com or self-managed project, a real open merge
+request, provider credentials, and authenticated network access.
+
+1. Install `glab`, then run `glab auth login --hostname <host>` (and supply
+   `--api-host <host>:<port>` when the API uses a custom port).
+2. Export a provider API key and build the CLI with `npm ci && npm run build`.
+3. Run `node dist/cli.js review --vcs gitlab --repo <host/group/project> --pr
+   <iid> --dry-run`; confirm metadata, diff, trusted base-branch rules, summary,
+   and inline previews are present without any posted note or discussion.
+4. In a disposable test MR, optionally omit `--dry-run`; confirm the summary
+   note and inline discussions appear, then push a commit and confirm stale bot
+   discussions are resolved on the next run.
 
 ### Authoring a rule file
 
@@ -380,12 +454,12 @@ CLI-native fix), not by any workflow-YAML ceremony. By default (no
 `--trust-local-rules`), `review()` never reads `--rules-dir` off the local
 filesystem at all — instead it:
 
-1. Fetches the PR's `baseSha` (already resolved via `gh pr view` as part of
+1. Fetches the review's `baseSha` (resolved through `gh` or `glab` as part of
    `getPullRequest`).
 2. Calls `vcsAdapter.getRuleFilesFromBase(baseSha, rulesDir)`, which lists
    and fetches `<rulesDir>/*.md` **as it exists on the base branch** via the
-   VCS provider's own API — `gh api repos/{owner}/{repo}/contents/...` for
-   `GitHubAdapter` — never via a local git checkout/worktree.
+   VCS provider's own API — `gh api` for GitHub or `glab api` for GitLab —
+   never via a local git checkout/worktree.
 3. Writes the fetched files into a fresh, isolated temp directory and points
    `loadRules()` at that directory (cleaned up afterward).
 
@@ -410,8 +484,8 @@ Sourcing rules from the base branch instead means:
   handling `loadRules()` already has for the local-filesystem case.
 - Because this lives in the CLI (via the `VcsAdapter` abstraction), it works
   identically for a developer running `tgd-review-agent review` from their
-  own terminal against a real open PR, or (once a `GitLabAdapter` exists) any
-  CI system `gh`/`glab` can authenticate against — no bespoke `git worktree`
+  own terminal against a real open PR/MR, or any CI system `gh`/`glab` can
+  authenticate against — no bespoke `git worktree`
   step to remember, copy correctly, or accidentally "simplify" away.
 - `--trust-local-rules` is the one deliberate escape hatch: it skips
   `getRuleFilesFromBase` and reverts to reading `--rules-dir` directly off

@@ -1,4 +1,4 @@
-// Which (file, line) pairs in a PR's diff can carry an INLINE review comment.
+// Which (file, line) pairs in a code-review diff can carry an inline comment.
 //
 // This exists because of a hard GitHub constraint: `POST /pulls/{n}/reviews`
 // rejects the ENTIRE request with 422 if even one comment targets a line that
@@ -52,7 +52,7 @@ export function commentableLines(diff: string): CommentableLines {
 }
 
 /**
- * True iff an inline comment on `file`:`line` would be accepted by GitHub.
+ * True iff `file`:`line` is a valid new-side inline anchor.
  *
  * A finding with no line (`line: null`, per the JSON contract) can never be
  * anchored — it belongs in the summary comment.

@@ -15,9 +15,8 @@ export type ReviewLocator =
       readonly number: number;
     };
 
-// VcsAdapter: provider-agnostic interface for fetching PR metadata/diff/comments
-// and posting a review comment. Implemented by GitHubAdapter (`gh`-backed) and
-// GitLabAdapter (`glab`-backed).
+// Provider-neutral interface for fetching review metadata, diffs, rules, and
+// comments, then publishing the review through `gh` or `glab`.
 export interface VcsAdapter {
   getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo>;
   getDiff(locator: ReviewLocator): Promise<string>;
@@ -33,12 +32,11 @@ export interface VcsAdapter {
     existing: BotComment | null,
   ): Promise<BotComment>;
   /**
-   * Posts findings as INLINE review comments anchored to lines of the diff
-   * (GitHub: `POST /pulls/{n}/reviews` with `event: COMMENT`).
+   * Posts findings as inline review comments anchored to lines of the diff.
    *
    * `comments` MUST already be filtered to lines that are part of the diff — see
-   * review/diff-anchors. GitHub rejects the WHOLE request with 422 if even one
-   * anchor is invalid, which would lose every finding in the review.
+   * review/diff-anchors. Providers impose different batch/position constraints,
+   * and the adapter reports one outcome for every requested comment.
    *
    * Callers must treat a rejection as recoverable, not fatal: the review()
    * flow falls back to putting every finding in the summary comment, so a
@@ -52,7 +50,7 @@ export interface VcsAdapter {
   /**
    * Design-review #10 (stale-comment accumulation): RESOLVES (collapses, never
    * deletes) every still-unresolved inline review thread that THIS BOT started
-   * on the PR — the previous runs' comments, which a new run is about to
+   * on the review — the previous runs' comments, which a new run is about to
    * supersede. Inline review comments are append-only (there is no upsert for
    * them, unlike the summary comment), so without this every past head SHA's
    * comments pile up uncollapsed forever. Resolving keeps them as history but
@@ -74,12 +72,12 @@ export interface VcsAdapter {
 
   /**
    * ADR-002: fetches every `*.md` rule file under `rulesDir` AS IT EXISTS ON
-   * THE PR's BASE BRANCH (`baseSha`), via the VCS provider's own API (e.g.
-   * GitHub's Contents API through `gh api`, or a future GitLabAdapter's
+   * THE REVIEW's BASE BRANCH (`baseSha`), via the VCS provider's own API (e.g.
+   * GitHub's Contents API through `gh api`, or GitLab's repository API through
    * `glab api`) — never via a local git checkout/worktree. This is what
-   * makes it safe to call `loadRules()` against the result without a PR
+   * makes it safe to call `loadRules()` against the result without a review
    * being able to plant its own trusted rule file (see ADR-002's threat
-   * model): the base branch is a commit the PR author does not control.
+   * model): the base branch is a commit the change author does not control.
    *
    * `rulesDir` is a REPO-RELATIVE path (e.g. `.tgd-review/rules`), not a
    * local filesystem path — there may be no local checkout at all when this
@@ -105,7 +103,7 @@ export interface InlineReviewComment {
   path: string;
   /**
    * NEW-file line number; must lie inside a diff hunk. For a multi-line range
-   * (ADR-007's committable suggestions) this is the LAST line, per GitHub's API.
+   * (ADR-007's committable suggestions) this is the LAST line.
    */
   line: number;
   /** First line of a multi-line range; omitted for a single-line comment. */

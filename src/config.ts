@@ -1,6 +1,5 @@
-// Config resolution: turns the parsed CliArgs into a ResolvedConfig carrying
-// a concrete VcsAdapter for the requested `--vcs` provider. See TASKS.md
-// Task 8's technical design.
+// Config resolution turns parsed CLI arguments into a normalized review
+// locator and the concrete adapter for its provider.
 //
 // Both providers are selected only after target normalization: GitHub uses
 // GitHubAdapter (`gh`-backed), and GitLab uses GitLabAdapter (`glab`-backed).
@@ -54,8 +53,6 @@ export function resolveConfig(args: CliArgs): ResolvedConfig {
     return { ...args, locator, vcsAdapter: new GitLabAdapter() };
   }
 
-  // args.vcs is now narrowed to "github" — GitHubAdapter defaults its
-  // execGh parameter to the real `gh`-CLI-backed implementation, so
-  // production callers never need to pass one explicitly.
+  // GitHubAdapter defaults to the real `gh`-backed executor.
   return { ...args, locator, vcsAdapter: new GitHubAdapter() };
 }

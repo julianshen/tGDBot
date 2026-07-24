@@ -26,7 +26,7 @@ export interface Finding {
 
   /**
    * ADR-007: replacement text for the anchored line range — rendered as a
-   * GitHub COMMITTABLE SUGGESTION (a one-click "Commit suggestion" button).
+   * provider-native committable suggestion (a one-click commit action).
    *
    * SECURITY (this is the whole reason it is a separate field): free-text
    * `message` is LLM output over an ATTACKER-CONTROLLED diff, and any
@@ -61,7 +61,7 @@ export interface DispatchResult {
    * only "rules failed to run and were skipped", with the real cause (no API key
    * for the rule's pinned provider) captured from the subagent and then dropped.
    *
-   * Deliberately NOT the raw provider error: this is rendered into a PR comment,
+   * Deliberately NOT the raw provider error: this is rendered into a review comment,
    * which is world-readable on a public repo, and raw provider errors can echo
    * request details. The raw error goes to stderr (private CI logs) instead.
    *
