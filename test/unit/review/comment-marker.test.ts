@@ -7,6 +7,11 @@ describe("parseBotMarker", () => {
       .toEqual({ lastReviewedSha: "abc1234", reviewedConfig: "deadbeef" });
   });
 
+  it("recognizes an explicit pending marker without treating it as complete", () => {
+    expect(parseBotMarker("summary\n\n<!-- tgd-review-agent:pending -->"))
+      .toEqual({ lastReviewedSha: "", reviewedConfig: "" });
+  });
+
   it("distinguishes an own malformed trailing marker from no marker", () => {
     expect(parseBotMarker("<!-- tgd-review-agent:sha=malformed -->"))
       .toEqual({ lastReviewedSha: "", reviewedConfig: "" });

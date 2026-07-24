@@ -401,7 +401,11 @@ function parseDiscussions(stdout: string): GlabDiscussion[] {
   });
 }
 
-function parseWrittenNote(stdout: string, expectedId?: number): void {
+function parseWrittenNote(
+  stdout: string,
+  expectedBody: string,
+  expectedId?: number,
+): BotComment {
   let value: unknown;
   try {
     value = JSON.parse(stdout);
@@ -413,10 +417,17 @@ function parseWrittenNote(stdout: string, expectedId?: number): void {
     !Number.isSafeInteger(value.id) ||
     (value.id as number) <= 0 ||
     typeof value.body !== "string" ||
+    value.body !== expectedBody ||
     (expectedId !== undefined && value.id !== expectedId)
   ) {
     throw new GlabOutputError("Invalid glab note response: malformed or mismatched note id/body");
   }
+  const body = value.body as string;
+  return {
+    id: String(value.id),
+    body,
+    ...(parseBotMarker(body) ?? { lastReviewedSha: "", reviewedConfig: "" }),
+  };
 }
 
 function parseNewestMergeRequestVersion(stdout: string): GlabMergeRequestVersion {
@@ -630,7 +641,7 @@ export class GitLabAdapter implements VcsAdapter {
     locator: ReviewLocator,
     body: string,
     existing: BotComment | null,
-  ): Promise<void> {
+  ): Promise<BotComment> {
     const { repo, iid } = resolveMergeRequestLocator(locator);
     const baseEndpoint = projectEndpoint(repo, `merge_requests/${iid}/notes`);
     const noteId = existing === null ? undefined : validatedNoteId(existing.id);
@@ -640,7 +651,7 @@ export class GitLabAdapter implements VcsAdapter {
       noteId === undefined ? baseEndpoint : `${baseEndpoint}/${noteId}`,
       "--input", "-",
     ], JSON.stringify({ body }));
-    parseWrittenNote(stdout, noteId);
+    return parseWrittenNote(stdout, body, noteId);
   }
 
   async createInlineReview(

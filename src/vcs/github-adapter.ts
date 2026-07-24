@@ -67,6 +67,17 @@ interface GhIssueComment {
   user: { login: string };
 }
 
+function validatedIssueCommentId(id: string): number {
+  if (!/^[1-9]\d*$/u.test(id)) {
+    throw new Error("Invalid existing GitHub comment id");
+  }
+  const value = Number(id);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error("Invalid existing GitHub comment id");
+  }
+  return value;
+}
+
 interface GhUser {
   login: string;
 }
@@ -336,29 +347,53 @@ export class GitHubAdapter implements VcsAdapter {
   }
 
   /**
-   * AC-2.4: when `existing` is null, creates a new comment via
-   * `gh pr comment <id> --body-file -` (body piped via stdin) — never edits.
+   * AC-2.4: when `existing` is null, creates a new comment via the issue
+   * comments API with JSON piped through stdin. Unlike `gh pr comment`, this
+   * returns the authoritative created comment ID needed for a later exact edit.
    *
    * AC-2.5: when `existing` is a BotComment, edits that EXACT comment by id
    * via `gh api repos/{owner}/{repo}/issues/comments/{existing.id} -X PATCH
    * --input -` (JSON body piped via stdin) — never creates a second comment,
    * and never relies on `--edit-last` (which could target a human's comment
-   * posted after the bot's).
+   * posted after the bot's). Both paths validate and return the provider's
+   * response identity and body.
    */
   async upsertComment(
     locator: ReviewLocator,
     body: string,
     existing: BotComment | null,
-  ): Promise<void> {
+  ): Promise<BotComment> {
     const { repo, id } = resolvePullLocator(locator);
-    if (existing === null) {
-      await this.execGh(["pr", "comment", id, ...repoFlag(repo), "--body-file", "-"], body);
-    } else {
-      await this.execGh(
-        ["api", `${apiRepo(repo)}/issues/comments/${existing.id}`, ...apiHost(repo), "-X", "PATCH", "--input", "-"],
-        JSON.stringify({ body }),
-      );
+    const expectedId = existing === null ? undefined : validatedIssueCommentId(existing.id);
+    const out = await this.execGh(
+      existing === null
+        ? ["api", `${apiRepo(repo)}/issues/${id}/comments`, ...apiHost(repo), "-X", "POST", "--input", "-"]
+        : ["api", `${apiRepo(repo)}/issues/comments/${expectedId}`, ...apiHost(repo), "-X", "PATCH", "--input", "-"],
+      JSON.stringify({ body }),
+    );
+    let value: unknown;
+    try {
+      value = JSON.parse(out);
+    } catch (cause) {
+      throw new Error("Invalid GitHub comment write response: malformed JSON", { cause });
     }
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !Number.isSafeInteger((value as { id?: unknown }).id) ||
+      ((value as { id: number }).id <= 0) ||
+      typeof (value as { body?: unknown }).body !== "string" ||
+      (value as { body: string }).body !== body ||
+      (expectedId !== undefined && (value as { id: number }).id !== expectedId)
+    ) {
+      throw new Error("Invalid GitHub comment write response: malformed or mismatched id/body");
+    }
+    const writtenBody = (value as { body: string }).body;
+    return {
+      id: String((value as { id: number }).id),
+      body: writtenBody,
+      ...(parseBotMarker(writtenBody) ?? { lastReviewedSha: "", reviewedConfig: "" }),
+    };
   }
 
   /**

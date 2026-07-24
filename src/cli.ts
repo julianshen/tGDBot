@@ -6,6 +6,7 @@ import { parseArgs as nodeParseArgs } from "node:util";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
+import { BOT_PENDING_MARKER } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
@@ -549,10 +550,14 @@ export async function review(
   const renderOpts = { suggestions: config.suggestions !== "off" };
   const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
 
-  const buildBody = (o: OrchestrationResult, commentBody = o.commentBody): string => {
+  const buildBody = (
+    o: OrchestrationResult,
+    commentBody = o.commentBody,
+    marker = formatMarker(pr.headSha, configHash),
+  ): string => {
     const bodyParts = [commentBody];
     if (loadErrors.length > 0) bodyParts.push(renderLoadErrorsSection(loadErrors));
-    bodyParts.push(formatMarker(pr.headSha, configHash));
+    bodyParts.push(marker);
     return bodyParts.join("\n\n");
   };
 
@@ -567,27 +572,36 @@ export async function review(
     if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
     console.log(buildBody(orchestration));
   } else {
-    // ORDER MATTERS (review finding). Idempotency rests entirely on the SHA
-    // marker, which lives in the SUMMARY comment: decideDedup skips the whole run
-    // when the marker already names this head SHA. Inline review comments, by
-    // contrast, are append-only — there is no upsert for them.
+    // ORDER MATTERS. The summary is durable and updatable; inline comments are
+    // append-only.
     //
-    // So the marker is written FIRST. If the inline post then fails, we edit the
-    // summary to carry every finding. If we posted inline first and the summary
-    // write then threw, no marker would exist, and the next run on the same SHA
-    // would post every inline comment a SECOND time — a duplicate-comment storm
-    // strictly worse than the old behavior.
-    await config.vcsAdapter.upsertComment(
+    // Write an explicit PENDING marker first. It makes the durable summary
+    // rediscoverable without claiming this SHA/config is complete. Only after
+    // inline outcomes and selective fallback are settled do we replace it with
+    // the complete dedup marker, targeting the exact returned identity.
+    const writtenSummary = await config.vcsAdapter.upsertComment(
       config.locator,
-      buildBody(orchestration),
+      buildBody(orchestration, orchestration.commentBody, BOT_PENDING_MARKER),
       botComment,
     );
+    if (
+      !writtenSummary ||
+      typeof writtenSummary.id !== "string" ||
+      writtenSummary.id.length === 0 ||
+      writtenSummary.lastReviewedSha !== "" ||
+      writtenSummary.reviewedConfig !== "" ||
+      !writtenSummary.body.trimEnd().endsWith(BOT_PENDING_MARKER)
+    ) {
+      throw new Error(
+        "The VCS adapter did not return the exact identity of the pending summary note",
+      );
+    }
 
     // Design-review #10: collapse the PREVIOUS runs' inline threads before
     // posting this run's. Inline review comments are append-only, so without
     // this every past head SHA's comments accumulate uncollapsed forever.
     // Resolved threads stay visible as history — nothing is deleted, and only
-    // threads the bot itself started are touched. Runs AFTER the marker write
+    // threads the bot itself started are touched. Runs AFTER the pending write
     // (idempotency must never depend on cosmetic cleanup) and BEFORE the new
     // inline post (so this run's comments are the only unresolved ones left).
     // Strictly best-effort: a failure here must not abort or degrade the
@@ -604,6 +618,7 @@ export async function review(
       );
     }
 
+    let finalCommentBody = orchestration.commentBody;
     if (orchestration.inlineComments.length > 0) {
       const allInlineIds = new Set(
         orchestration.inlineComments.map((comment) => comment.clientId),
@@ -649,24 +664,23 @@ export async function review(
       }
 
       if (fallbackIds.size > 0) {
-        const fallbackBody = renderSummary(orchestration, fallbackIds);
-        const existing = await config.vcsAdapter.findBotComment(config.locator);
-        if (
-          existing === null ||
-          existing.lastReviewedSha !== pr.headSha ||
-          existing.reviewedConfig !== configHash ||
-          (botComment !== null && existing.id !== botComment.id)
-        ) {
-          throw new Error(
-            "The exact marker-bearing summary note could not be found after it was upserted; refusing to create a duplicate summary",
-          );
-        }
-        await config.vcsAdapter.upsertComment(
-          config.locator,
-          buildBody(orchestration, fallbackBody),
-          existing,
-        );
+        finalCommentBody = renderSummary(orchestration, fallbackIds);
       }
+    }
+    const finalizedSummary = await config.vcsAdapter.upsertComment(
+      config.locator,
+      buildBody(orchestration, finalCommentBody),
+      writtenSummary,
+    );
+    if (
+      !finalizedSummary ||
+      finalizedSummary.id !== writtenSummary.id ||
+      finalizedSummary.lastReviewedSha !== pr.headSha ||
+      finalizedSummary.reviewedConfig !== configHash
+    ) {
+      throw new Error(
+        "The VCS adapter could not confirm finalization of the exact completed summary note",
+      );
     }
   }
 

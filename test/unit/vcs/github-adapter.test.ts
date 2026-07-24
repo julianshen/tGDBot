@@ -101,7 +101,11 @@ describe("GitHubAdapter", () => {
     const execGh = vi.fn(async (args: string[]) => {
       if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
       if (args.includes("repos/octo-org/octo-repo/issues/42/comments")) {
+        if (args.includes("POST")) return JSON.stringify({ id: 88, body: "summary" });
         return readFixture("gh-comments.json");
+      }
+      if (args.includes("repos/octo-org/octo-repo/issues/comments/99")) {
+        return JSON.stringify({ id: 99, body: "updated" });
       }
       if (args.includes("repos/octo-org/octo-repo/contents/.tgd-review/rules?ref=def456")) {
         return "[]";
@@ -137,12 +141,13 @@ describe("GitHubAdapter", () => {
       "github.com",
     ]);
     expect(calls).toContainEqual([
-      "pr",
-      "comment",
-      "42",
-      "--repo",
-      "github.com/octo-org/octo-repo",
-      "--body-file",
+      "api",
+      "repos/octo-org/octo-repo/issues/42/comments",
+      "--hostname",
+      "github.com",
+      "-X",
+      "POST",
+      "--input",
       "-",
     ]);
     expect(calls).toContainEqual([
@@ -329,19 +334,26 @@ describe("GitHubAdapter", () => {
   // AC-2.4: Given existing is null, When upsertComment("42", body, null) is
   // called, Then the adapter issues a create-comment gh invocation (not an edit).
   it("AC-2.4: upsertComment with existing=null issues a create (not an edit)", async () => {
-    const execGh = vi.fn().mockResolvedValue("");
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      id: 777,
+      body: "review body text\n<!-- tgd-review-agent:pending -->",
+    }));
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.upsertComment(locator42, "review body text", null);
+    const written = await adapter.upsertComment(
+      locator42,
+      "review body text\n<!-- tgd-review-agent:pending -->",
+      null,
+    );
 
+    expect(written.id).toBe("777");
     expect(execGh).toHaveBeenCalledTimes(1);
     expect(execGh).toHaveBeenCalledWith(
-      ["pr", "comment", "42", "--body-file", "-"],
-      "review body text",
+      ["api", "repos/{owner}/{repo}/issues/42/comments", "-X", "POST", "--input", "-"],
+      JSON.stringify({ body: "review body text\n<!-- tgd-review-agent:pending -->" }),
     );
-    // Must never touch the `gh api .../issues/comments/{id}` edit endpoint.
+    // Must target the create collection, never the exact-comment edit endpoint.
     const [args] = execGh.mock.calls[0] as [string[], string?];
-    expect(args).not.toContain("api");
     expect(args.join(" ")).not.toMatch(/PATCH/);
   });
 
@@ -349,7 +361,10 @@ describe("GitHubAdapter", () => {
   // upsertComment("42", body, existing) is called, Then the adapter issues
   // an edit invocation targeting comment id 999 (never a second create).
   it("AC-2.5: upsertComment with an existing BotComment issues an edit targeting that exact comment id", async () => {
-    const execGh = vi.fn().mockResolvedValue("");
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      id: 999,
+      body: "updated review body\n<!-- tgd-review-agent:sha=abc1234 -->",
+    }));
     const adapter = new GitHubAdapter(execGh);
     const existing: BotComment = {
       id: "999",
@@ -358,16 +373,37 @@ describe("GitHubAdapter", () => {
       reviewedConfig: "",
     };
 
-    await adapter.upsertComment(locator42, "updated review body", existing);
+    const written = await adapter.upsertComment(
+      locator42,
+      "updated review body\n<!-- tgd-review-agent:sha=abc1234 -->",
+      existing,
+    );
 
+    expect(written.id).toBe("999");
     expect(execGh).toHaveBeenCalledTimes(1);
     expect(execGh).toHaveBeenCalledWith(
       ["api", "repos/{owner}/{repo}/issues/comments/999", "-X", "PATCH", "--input", "-"],
-      JSON.stringify({ body: "updated review body" }),
+      JSON.stringify({ body: "updated review body\n<!-- tgd-review-agent:sha=abc1234 -->" }),
     );
     // Never issues a `gh pr comment` create invocation.
     const [args] = execGh.mock.calls[0] as [string[], string?];
     expect(args).not.toEqual(expect.arrayContaining(["comment"]));
+  });
+
+  it.each([
+    ["bad JSON", "not json"],
+    ["missing id", JSON.stringify({ body: "x" })],
+    ["wrong update id", JSON.stringify({ id: 1000, body: "x" })],
+    ["malformed body", JSON.stringify({ id: 999, body: 42 })],
+    ["mismatched body", JSON.stringify({ id: 999, body: "different" })],
+  ])("rejects %s write responses", async (_name, response) => {
+    const adapter = new GitHubAdapter(vi.fn().mockResolvedValue(response));
+    await expect(adapter.upsertComment(locator42, "x", {
+      id: "999",
+      body: "old",
+      lastReviewedSha: "",
+      reviewedConfig: "",
+    })).rejects.toThrow(/comment|response|id/i);
   });
 
   // --- Review fix #1 (security): comment authorship verification ---

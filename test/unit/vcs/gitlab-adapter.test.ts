@@ -414,9 +414,15 @@ describe("GitLabAdapter review summary notes", () => {
     const execGlab = vi.fn<ExecGlab>().mockResolvedValue(
       JSON.stringify({ id: 505, body: "new **markdown**" }),
     );
-    await new GitLabAdapter(execGlab).upsertComment(
+    const written = await new GitLabAdapter(execGlab).upsertComment(
       locator(customPortRepo), "new **markdown**", null,
     );
+    expect(written).toEqual({
+      id: "505",
+      body: "new **markdown**",
+      lastReviewedSha: "",
+      reviewedConfig: "",
+    });
     expect(execGlab).toHaveBeenCalledWith([
       "api", "--method", "POST", "--hostname", "gitlab.example.com",
       "projects/group%2Fproject/merge_requests/42/notes", "--input", "-",
@@ -428,9 +434,10 @@ describe("GitLabAdapter review summary notes", () => {
     const execGlab = vi.fn<ExecGlab>().mockResolvedValue(
       JSON.stringify({ id: 303, body: "updated" }),
     );
-    await new GitLabAdapter(execGlab).upsertComment(locator(customPortRepo), "updated", {
+    const written = await new GitLabAdapter(execGlab).upsertComment(locator(customPortRepo), "updated", {
       id: "303", body: "old", lastReviewedSha: "abc1234", reviewedConfig: "",
     });
+    expect(written.id).toBe("303");
     expect(execGlab).toHaveBeenCalledWith([
       "api", "--method", "PUT", "--hostname", "gitlab.example.com",
       "projects/group%2Fproject/merge_requests/42/notes/303", "--input", "-",
@@ -442,6 +449,7 @@ describe("GitLabAdapter review summary notes", () => {
     ["bad response JSON", "303", "not json"],
     ["wrong response id", "303", JSON.stringify({ id: 999, body: "updated" })],
     ["malformed response body", "303", JSON.stringify({ id: 303, body: 7 })],
+    ["mismatched response body", "303", JSON.stringify({ id: 303, body: "different" })],
   ])("rejects %s", async (_name, id, response) => {
     const adapter = new GitLabAdapter(async () => response);
     await expect(adapter.upsertComment(locator(), "updated", {

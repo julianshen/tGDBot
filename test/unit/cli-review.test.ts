@@ -12,6 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 import { parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { computeReviewConfigHash } from "../../src/review/dedup.js";
+import { parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import { resolveReviewLocator } from "../../src/config.js";
 import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "../../src/vcs/adapter.js";
@@ -176,7 +177,16 @@ function makeHarness(options: {
     getPullRequest: vi.fn().mockResolvedValue(pr),
     getDiff: vi.fn().mockResolvedValue("diff --git a/x b/x"),
     findBotComment: vi.fn().mockResolvedValue(botComment),
-    upsertComment: vi.fn().mockResolvedValue(undefined),
+    upsertComment: vi.fn().mockImplementation(
+      (_locator, body: string, existing: BotComment | null) => {
+        const parsed = parseBotMarker(body);
+        return Promise.resolve({
+          id: existing?.id ?? "written-summary-1",
+          body,
+          ...(parsed ?? { lastReviewedSha: "", reviewedConfig: "" }),
+        });
+      },
+    ),
     getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
     createInlineReview: vi.fn().mockImplementation(
       (_locator, _headSha, comments: Array<{ clientId: string }>) =>
@@ -268,7 +278,7 @@ describe("review", () => {
     expect(unchanged.vcsAdapter.upsertComment).not.toHaveBeenCalled();
 
     await expect(review(changed.args, depsFrom(changed))).resolves.toBe(0);
-    expect(changed.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    expect(changed.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
     vi.restoreAllMocks();
   });
 
@@ -392,7 +402,7 @@ describe("review", () => {
       useAdvisor: true,
       orchestratorModel: undefined,
     });
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
 
     vi.restoreAllMocks();
   });
@@ -458,7 +468,7 @@ describe("review", () => {
       const exitCode = await review(h.args, depsFrom(h));
 
       expect(exitCode).toBe(0);
-      expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+      expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
       const warned = warnSpy.mock.calls.map((c) => c.join(" ")).join("\n");
       expect(warned).toContain("could not resolve stale inline comment threads");
 
@@ -478,12 +488,16 @@ describe("review", () => {
     const exitCode = await review(h.args, depsFrom(h));
 
     expect(exitCode).toBe(0);
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
-    const [prId, body, existing] = h.vcsAdapter.upsertComment.mock.calls[0];
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
+    const [prId, pendingBody, existing] = h.vcsAdapter.upsertComment.mock.calls[0];
     expect(prId).toEqual(h.config.locator);
     expect(existing).toBeNull();
+    expect(pendingBody).toContain("<!-- tgd-review-agent:pending -->");
     // The marker now carries the review-config hash after the SHA (#4).
-    expect(body).toContain("<!-- tgd-review-agent:sha=abc1234 cfg=");
+    expect(h.vcsAdapter.upsertComment.mock.calls[1]?.[1])
+      .toContain("<!-- tgd-review-agent:sha=abc1234 cfg=");
+    expect(h.vcsAdapter.upsertComment.mock.calls[1]?.[2])
+      .toMatchObject({ id: "written-summary-1" });
 
     vi.restoreAllMocks();
   });
@@ -493,7 +507,7 @@ describe("review", () => {
   // upsertComment is called with existing set to that comment (an edit,
   // not a create).
   it("AC-8.3: stale existing comment triggers an edit with the existing comment passed through", async () => {
-    const pr = makePr({ headSha: "newsha01" });
+    const pr = makePr({ headSha: "abcdef01" });
     const botComment: BotComment = {
       id: "555",
       body: "<!-- tgd-review-agent:sha=oldsha00 -->",
@@ -506,7 +520,7 @@ describe("review", () => {
     const exitCode = await review(h.args, depsFrom(h));
 
     expect(exitCode).toBe(0);
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
     const [, , existing] = h.vcsAdapter.upsertComment.mock.calls[0];
     expect(existing).toEqual(botComment);
 
@@ -579,8 +593,8 @@ describe("review", () => {
     const exitCode = await review(h.args, depsFrom(h));
 
     expect(exitCode).toBe(2);
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
-    const [, body] = h.vcsAdapter.upsertComment.mock.calls[0];
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
+    const [, body] = h.vcsAdapter.upsertComment.mock.calls[1];
     expect(body).toContain("rule-b");
 
     vi.restoreAllMocks();
@@ -613,8 +627,8 @@ describe("review", () => {
     expect(exitCode).toBe(2);
 
     // The comment is still posted (not swallowed).
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
-    const [, body] = h.vcsAdapter.upsertComment.mock.calls[0];
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
+    const [, body] = h.vcsAdapter.upsertComment.mock.calls[1];
     expect(body).toContain("/rules/bad.md");
     expect(body).toContain('missing required frontmatter field "model"');
 
@@ -668,8 +682,8 @@ describe("review", () => {
 
     expect(exitCode).toBe(2);
     // The comment WAS posted — never fail silently, even on total wipeout.
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
-    const [, body] = h.vcsAdapter.upsertComment.mock.calls[0];
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
+    const [, body] = h.vcsAdapter.upsertComment.mock.calls[1];
     expect(body).toContain("rule-a");
     expect(body).toContain("rule-b");
 
@@ -1088,7 +1102,7 @@ describe("inline review comments", () => {
     expect(headSha).toBe("cafef00d"); // makePr()'s head sha
     expect(comments).toEqual(withInline.inlineComments);
     // The summary is STILL upserted — that's what carries the dedup marker.
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
   });
 
   // GitHub 422s the ENTIRE review if any anchor is off-diff. Losing every
@@ -1112,7 +1126,7 @@ describe("inline review comments", () => {
     // The presentation is built once and the summary is selectively rendered.
     expect(h.orchestrate).toHaveBeenCalledTimes(1);
     // The summary is REWRITTEN (upserted again) to carry every finding. The
-    // marker-bearing summary is posted FIRST by design, so the fallback edits it.
+    // A pending summary is posted first, then finalized in place with all findings.
     const calls = h.vcsAdapter.upsertComment.mock.calls;
     expect(calls.length).toBe(2);
     expect(String(calls[calls.length - 1]?.[1])).toContain("finding 0");
@@ -1150,7 +1164,110 @@ describe("inline review comments", () => {
     expect(writes[1]?.[1]).not.toContain("finding 0");
     expect(writes[1]?.[1]).toContain("finding 1");
     expect(writes[1]?.[1]).not.toContain("finding 2");
-    expect(writes[1]?.[2]).toMatchObject({ id: "909" });
+    expect(writes[1]?.[2]).toMatchObject({ id: "written-summary-1" });
+  });
+
+  it("uses the exact written summary identity even when a competing marker note appears", async () => {
+    const presentation = partialPresentation();
+    const h = inlineHarness(presentation);
+    h.vcsAdapter.createInlineReview.mockResolvedValue([
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-1", status: "failed" },
+      { clientId: "finding-2", status: "posted" },
+    ]);
+    h.vcsAdapter.findBotComment
+      .mockResolvedValueOnce(null)
+      .mockResolvedValue({
+        id: "competing-999",
+        body: "competing",
+        lastReviewedSha: "cafef00d",
+        reviewedConfig: computeReviewConfigHash(h.config),
+      });
+    h.vcsAdapter.upsertComment
+      .mockResolvedValueOnce({
+        id: "written-777",
+        body: "<!-- tgd-review-agent:pending -->",
+        lastReviewedSha: "",
+        reviewedConfig: "",
+      })
+      .mockResolvedValueOnce({
+        id: "written-777",
+        body: "complete",
+        lastReviewedSha: "cafef00d",
+        reviewedConfig: computeReviewConfigHash(h.config),
+      });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.findBotComment).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.upsertComment.mock.calls[1]?.[2]).toMatchObject({
+      id: "written-777",
+    });
+  });
+
+  it("leaves a pending marker when finalization fails so a rerun reviews and retries the same note", async () => {
+    const h = inlineHarness({
+      ...withInline,
+      inlineComments: [],
+      findingsCount: 0,
+    });
+    let stored: BotComment | null = null;
+    let rejectFinalization = true;
+    h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(stored));
+    h.vcsAdapter.upsertComment.mockImplementation(
+      (_locator, body: string, existing: BotComment | null) => {
+        const parsed = parseBotMarker(body);
+        const written: BotComment = {
+          id: existing?.id ?? "written-777",
+          body,
+          ...(parsed ?? { lastReviewedSha: "", reviewedConfig: "" }),
+        };
+        if (written.lastReviewedSha !== "" && rejectFinalization) {
+          rejectFinalization = false;
+          return Promise.reject(new Error("final update failed"));
+        }
+        stored = written;
+        return Promise.resolve(written);
+      },
+    );
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/final update failed/);
+    expect(stored).toMatchObject({
+      id: "written-777",
+      lastReviewedSha: "",
+      reviewedConfig: "",
+    });
+
+    await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+    expect(h.dispatchRules).toHaveBeenCalledTimes(2);
+    expect(stored).toMatchObject({
+      id: "written-777",
+      lastReviewedSha: "cafef00d",
+      reviewedConfig: computeReviewConfigHash(h.config),
+    });
+  });
+
+  it("rejects a final write result that cannot confirm the exact completed marker", async () => {
+    const h = inlineHarness({
+      ...withInline,
+      inlineComments: [],
+      findingsCount: 0,
+    });
+    h.vcsAdapter.upsertComment
+      .mockResolvedValueOnce({
+        id: "written-777",
+        body: "<!-- tgd-review-agent:pending -->",
+        lastReviewedSha: "",
+        reviewedConfig: "",
+      })
+      .mockResolvedValueOnce({
+        id: "other-888",
+        body: "unexpected",
+        lastReviewedSha: "",
+        reviewedConfig: "",
+      });
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/exact|final|complete/i);
   });
 
   it.each([
@@ -1196,7 +1313,7 @@ describe("inline review comments", () => {
     vi.restoreAllMocks();
   });
 
-  it("fails instead of creating a duplicate when the marker note disappears after summary upsert", async () => {
+  it("fails before finalization when the pending write returns no exact identity", async () => {
     const presentation = partialPresentation();
     const h = inlineHarness(presentation);
     h.vcsAdapter.createInlineReview.mockResolvedValue([
@@ -1204,9 +1321,9 @@ describe("inline review comments", () => {
       { clientId: "finding-1", status: "failed" },
       { clientId: "finding-2", status: "posted" },
     ]);
-    h.vcsAdapter.findBotComment.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+    h.vcsAdapter.upsertComment.mockResolvedValueOnce(undefined);
 
-    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/summary|marker|note/i);
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/exact identity|pending summary/i);
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
   });
 
@@ -1231,7 +1348,7 @@ describe("inline review comments", () => {
     await review(h.args, depsFrom(h));
 
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
   });
 
   it("passes the DIFF to orchestrate (that's what makes anchoring possible)", async () => {

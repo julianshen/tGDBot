@@ -76,6 +76,7 @@ import { loadRules } from "../../src/rules/loader.js";
 import { dispatchRules } from "../../src/review/dispatch.js";
 import { dispatchRulesDirect } from "../../src/review/direct-dispatch.js";
 import { orchestrate } from "../../src/review/orchestrate.js";
+import { parseBotMarker } from "../../src/review/comment-marker.js";
 
 const ambientLocator = { kind: "ambient", provider: "github", number: 42 } as const;
 
@@ -97,14 +98,20 @@ describe("review — default dependency wiring", () => {
   it("with no injected deps, resolves the real config/loadRules/dispatchRules/orchestrate wiring against mocked modules (never real gh/network/LLM)", async () => {
     hoisted.getPullRequest.mockResolvedValue({
       id: "42",
-      headSha: "wired1234",
+      headSha: "abc12345",
       baseSha: "base0000",
       title: "Real wiring PR",
       description: "desc",
     });
     hoisted.getDiff.mockResolvedValue("diff --git a/x b/x");
     hoisted.findBotComment.mockResolvedValue(null);
-    hoisted.upsertComment.mockResolvedValue(undefined);
+    hoisted.upsertComment.mockImplementation(
+      (_locator, body: string, existing: { id: string } | null) => Promise.resolve({
+        id: existing?.id ?? "written-summary-1",
+        body,
+        ...(parseBotMarker(body) ?? { lastReviewedSha: "", reviewedConfig: "" }),
+      }),
+    );
     hoisted.getRuleFilesFromBase.mockResolvedValue([]);
     hoisted.resolveStaleReviewThreads.mockResolvedValue(0);
 
@@ -147,12 +154,14 @@ describe("review — default dependency wiring", () => {
     expect(hoisted.getPullRequest).toHaveBeenCalledWith(ambientLocator);
     expect(hoisted.findBotComment).toHaveBeenCalledWith(ambientLocator);
     expect(hoisted.getDiff).toHaveBeenCalledWith(ambientLocator);
-    expect(hoisted.upsertComment).toHaveBeenCalledTimes(1);
+    expect(hoisted.upsertComment).toHaveBeenCalledTimes(2);
 
-    const [prId, body, existing] = hoisted.upsertComment.mock.calls[0];
+    const [prId, pendingBody, existing] = hoisted.upsertComment.mock.calls[0];
     expect(prId).toEqual(ambientLocator);
     expect(existing).toBeNull();
-    expect(body).toContain("<!-- tgd-review-agent:sha=wired1234 cfg=");
+    expect(pendingBody).toContain("<!-- tgd-review-agent:pending -->");
+    expect(hoisted.upsertComment.mock.calls[1]?.[1])
+      .toContain("<!-- tgd-review-agent:sha=abc12345 cfg=");
 
     // ADR-002 CLI-native fix: rules are now sourced from the PR's base
     // branch via getRuleFilesFromBase, not the literal --rules-dir path.

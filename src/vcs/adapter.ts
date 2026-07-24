@@ -22,7 +22,16 @@ export interface VcsAdapter {
   getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo>;
   getDiff(locator: ReviewLocator): Promise<string>;
   findBotComment(locator: ReviewLocator): Promise<BotComment | null>;
-  upsertComment(locator: ReviewLocator, body: string, existing: BotComment | null): Promise<void>;
+  /**
+   * Creates or updates the summary and returns the exact provider-confirmed
+   * comment identity. Callers use that returned identity for subsequent edits;
+   * implementations must validate both the response ID and body.
+   */
+  upsertComment(
+    locator: ReviewLocator,
+    body: string,
+    existing: BotComment | null,
+  ): Promise<BotComment>;
   /**
    * Posts findings as INLINE review comments anchored to lines of the diff
    * (GitHub: `POST /pulls/{n}/reviews` with `event: COMMENT`).
