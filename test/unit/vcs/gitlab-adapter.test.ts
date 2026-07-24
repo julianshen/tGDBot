@@ -158,6 +158,127 @@ describe("GitLabAdapter merge request snapshot", () => {
   });
 });
 
+describe("GitLabAdapter trusted base-branch rules", () => {
+  it("lists paginated tree records and fetches sorted direct markdown blobs as UTF-8", async () => {
+    const content = new Map([
+      [".review/rules/a rule.md", "---\nname: α\n---\n繁體中文\n"],
+      [".review/rules/z.md", "plain UTF-8: café 🚀\n"],
+    ]);
+    const calls: readonly string[][] = [];
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      (calls as string[][]).push([...args]);
+      if (args.includes("--paginate")) {
+        return [
+          JSON.stringify({ id: "3", name: "z.md", type: "blob", path: ".review/rules/z.md", mode: "100644" }),
+          JSON.stringify({ id: "1", name: "nested", type: "tree", path: ".review/rules/nested", mode: "040000" }),
+          JSON.stringify({ id: "2", name: "a rule.md", type: "blob", path: ".review/rules/a rule.md", mode: "100644" }),
+          JSON.stringify({ id: "4", name: "link.md", type: "blob", path: ".review/rules/link.md", mode: "120000" }),
+          JSON.stringify({ id: "5", name: "module.md", type: "commit", path: ".review/rules/module.md", mode: "160000" }),
+          JSON.stringify({ id: "6", name: "notes.txt", type: "blob", path: ".review/rules/notes.txt", mode: "100644" }),
+          JSON.stringify({ id: "7", name: "deep.md", type: "blob", path: ".review/rules/nested/deep.md", mode: "100644" }),
+          "",
+        ].join("\n");
+      }
+      const endpoint = args.find((arg) => arg.includes("/repository/files/"));
+      const encodedPath = endpoint?.match(/repository\/files\/(.+)\/raw$/u)?.[1];
+      const path = encodedPath === undefined ? undefined : decodeURIComponent(encodedPath);
+      return content.get(path ?? "") ?? "";
+    });
+
+    await expect(
+      new GitLabAdapter(execGlab).getRuleFilesFromBase(
+        locator(customPortRepo),
+        "1111111111111111111111111111111111111111",
+        ".review/rules",
+      ),
+    ).resolves.toEqual([
+      { path: "a rule.md", content: "---\nname: α\n---\n繁體中文\n" },
+      { path: "z.md", content: "plain UTF-8: café 🚀\n" },
+    ]);
+
+    expect(calls).toEqual([
+      [
+        "api", "--method", "GET", "--paginate", "--output", "ndjson",
+        "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/repository/tree",
+        "--raw-field", "path=.review/rules",
+        "--raw-field", "ref=1111111111111111111111111111111111111111",
+        "--field", "per_page=100",
+      ],
+      [
+        "api", "--method", "GET", "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/repository/files/.review%2Frules%2Fa%20rule.md/raw",
+        "--raw-field", "ref=1111111111111111111111111111111111111111",
+      ],
+      [
+        "api", "--method", "GET", "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/repository/files/.review%2Frules%2Fz.md/raw",
+        "--raw-field", "ref=1111111111111111111111111111111111111111",
+      ],
+    ]);
+  });
+
+  it("returns no rules only when the initial tree listing is missing", async () => {
+    const missing = new GlabCommandError("missing", { httpStatus: 404 });
+    const execGlab = vi.fn<ExecGlab>().mockRejectedValue(missing);
+
+    await expect(
+      new GitLabAdapter(execGlab).getRuleFilesFromBase(
+        locator(),
+        "1111111111111111111111111111111111111111",
+        ".review/rules",
+      ),
+    ).resolves.toEqual([]);
+  });
+
+  it.each([
+    ["listed file 404", new GlabCommandError("missing file", { httpStatus: 404 })],
+    ["authentication", new GlabCommandError("auth", { httpStatus: 401 })],
+    ["permission", new GlabCommandError("forbidden", { httpStatus: 403 })],
+  ])("rejects %s failures", async (_name, failure) => {
+    const execGlab = vi.fn<ExecGlab>()
+      .mockResolvedValueOnce(
+        JSON.stringify({ id: "1", name: "rule.md", type: "blob", path: ".review/rules/rule.md", mode: "100644" }),
+      )
+      .mockRejectedValueOnce(failure);
+
+    await expect(
+      new GitLabAdapter(execGlab).getRuleFilesFromBase(
+        locator(),
+        "1111111111111111111111111111111111111111",
+        ".review/rules",
+      ),
+    ).rejects.toBe(failure);
+  });
+
+  it.each([
+    ["malformed NDJSON", "not-json"],
+    ["non-object record", "[]"],
+    ["missing path", JSON.stringify({ id: "1", name: "rule.md", type: "blob", mode: "100644" })],
+    ["malformed type", JSON.stringify({ id: "1", name: "rule.md", type: 4, path: ".review/rules/rule.md", mode: "100644" })],
+  ])("rejects %s tree output", async (_name, stdout) => {
+    const adapter = new GitLabAdapter(async () => stdout);
+    await expect(
+      adapter.getRuleFilesFromBase(
+        locator(),
+        "1111111111111111111111111111111111111111",
+        ".review/rules",
+      ),
+    ).rejects.toBeInstanceOf(GlabOutputError);
+  });
+
+  it("does not convert non-404 tree failures into an empty directory", async () => {
+    const failure = new GlabCommandError("forbidden", { httpStatus: 403 });
+    await expect(
+      new GitLabAdapter(async () => { throw failure; }).getRuleFilesFromBase(
+        locator(),
+        "1111111111111111111111111111111111111111",
+        ".review/rules",
+      ),
+    ).rejects.toBe(failure);
+  });
+});
+
 describe("GitLab adapter helpers", () => {
   it("encodes the complete namespace/project as one endpoint segment", () => {
     expect(projectEndpoint(selfManagedRepo, "merge_requests/42/versions")).toBe(

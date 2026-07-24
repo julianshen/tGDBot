@@ -221,6 +221,14 @@ interface GlabMergeRequest {
   };
 }
 
+interface GlabTreeEntry {
+  id: string;
+  name: string;
+  type: string;
+  path: string;
+  mode: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -277,6 +285,22 @@ function parseMergeRequest(stdout: string): GlabMergeRequest {
       start_sha: requiredString(diffRefs, "start_sha", { sha: true }),
     },
   };
+}
+
+function parseTreeEntries(stdout: string): GlabTreeEntry[] {
+  return decodeNdjsonRecords<unknown>(stdout).map((value) => {
+    if (!isRecord(value)) {
+      throw new GlabOutputError("Invalid glab repository tree response: expected an object");
+    }
+    for (const field of ["id", "name", "type", "path", "mode"] as const) {
+      if (typeof value[field] !== "string" || value[field].length === 0) {
+        throw new GlabOutputError(
+          `Invalid glab repository tree response: malformed ${field}`,
+        );
+      }
+    }
+    return value as unknown as GlabTreeEntry;
+  });
 }
 
 function resolveMergeRequestLocator(locator: ReviewLocator): {
@@ -364,7 +388,58 @@ export class GitLabAdapter implements VcsAdapter {
     baseSha: string,
     rulesDir: string,
   ): Promise<RuleFileContent[]> {
-    void [locator, baseSha, rulesDir];
-    return unavailable("base-branch rule loading");
+    const { repo } = resolveMergeRequestLocator(locator);
+    let stdout: string;
+    try {
+      stdout = await this.execGlab([
+        "api",
+        "--method",
+        "GET",
+        "--paginate",
+        "--output",
+        "ndjson",
+        "--hostname",
+        repo.host,
+        projectEndpoint(repo, "repository/tree"),
+        "--raw-field",
+        `path=${rulesDir}`,
+        "--raw-field",
+        `ref=${baseSha}`,
+        "--field",
+        "per_page=100",
+      ]);
+    } catch (error) {
+      if (error instanceof GlabCommandError && error.httpStatus === 404) {
+        return [];
+      }
+      throw error;
+    }
+
+    const normalizedDir = rulesDir.replace(/\/+$/u, "");
+    const prefix = `${normalizedDir}/`;
+    const selected = parseTreeEntries(stdout)
+      .filter((entry) => {
+        if (entry.type !== "blob" || entry.mode === "120000") return false;
+        if (!entry.path.startsWith(prefix)) return false;
+        const relativePath = entry.path.slice(prefix.length);
+        return relativePath.endsWith(".md") && !relativePath.includes("/");
+      })
+      .sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+
+    const files: RuleFileContent[] = [];
+    for (const entry of selected) {
+      const content = await this.execGlab([
+        "api",
+        "--method",
+        "GET",
+        "--hostname",
+        repo.host,
+        projectEndpoint(repo, `repository/files/${encodeURIComponent(entry.path)}/raw`),
+        "--raw-field",
+        `ref=${baseSha}`,
+      ]);
+      files.push({ path: entry.path.slice(prefix.length), content });
+    }
+    return files;
   }
 }
