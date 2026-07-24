@@ -207,6 +207,12 @@ function parseGitLabRepository(input: string): GitLabRepositoryRef {
       if (url.search !== "" || url.hash !== "") {
         throw invalid("GitLab repository", "queries and fragments are not allowed");
       }
+      if (url.port !== "" && url.port !== "22") {
+        throw invalid(
+          "GitLab repository",
+          "non-default SSH ports are not supported; use an HTTPS URL for a custom web/API port",
+        );
+      }
     } else {
       validateUrl(url, "GitLab repository", ["https:"]);
     }
@@ -214,9 +220,7 @@ function parseGitLabRepository(input: string): GitLabRepositoryRef {
     port =
       url.protocol === "https:"
         ? (explicitHttpsPort(input) ?? (url.port === "" ? undefined : Number(url.port)))
-        : url.port === ""
-          ? undefined
-          : Number(url.port);
+        : undefined;
     segments = pathSegments(url.pathname, "GitLab repository");
   } else {
     const scp = /^git@([^:/]+):(.+)$/.exec(input);
@@ -229,7 +233,9 @@ function parseGitLabRepository(input: string): GitLabRepositoryRef {
       if (authorityCandidate.includes("@")) {
         throw invalid("GitLab repository", "credentials are not allowed");
       }
-      const explicitHost = parts[0].includes(".") || /^[^:]+:\d+$/.test(parts[0]);
+      const explicitHost =
+        parts.length >= 3 &&
+        (parts[0].includes(".") || /^[^:]+:\d+$/.test(parts[0]));
       if (explicitHost) {
         const authority = new URL(`https://${parts.shift()!}`);
         host = authority.hostname;

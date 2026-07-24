@@ -20,7 +20,8 @@ import type {
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const RULE_FILE_FETCH_CONCURRENCY = 4;
 const SHA_RE = /^[0-9a-f]{40}$/i;
-const HTTP_DIAGNOSTIC_RE = /(?:^|\n)HTTP ([1-5]\d{2})\r?\n?$/;
+const HTTP_DIAGNOSTIC_RE =
+  /(?:^|\n)(?:HTTP ([1-5]\d{2})|glab: [^\r\n]* \(HTTP ([1-5]\d{2})\))\r?\n?$/;
 
 export type ExecGlab = (
   args: readonly string[],
@@ -80,7 +81,8 @@ function numericExitCode(error: NodeJS.ErrnoException): number | undefined {
 function apiHttpStatus(args: readonly string[], stderr: string): number | undefined {
   if (args[0] !== "api") return undefined;
   const match = HTTP_DIAGNOSTIC_RE.exec(stderr);
-  return match?.[1] === undefined ? undefined : Number(match[1]);
+  const status = match?.[1] ?? match?.[2];
+  return status === undefined ? undefined : Number(status);
 }
 
 export const realExecGlab: ExecGlab = (args, stdin) =>
@@ -454,7 +456,7 @@ function parseNewestMergeRequestVersion(stdout: string): GlabMergeRequestVersion
   };
 }
 
-function validateWrittenDiscussion(stdout: string): void {
+function validateWrittenDiscussion(stdout: string, expectedBody: string): void {
   let value: unknown;
   try {
     value = JSON.parse(stdout);
@@ -475,7 +477,8 @@ function validateWrittenDiscussion(stdout: string): void {
       Number.isSafeInteger(note.id) &&
       (note.id as number) > 0 &&
       typeof note.body === "string"
-    )
+    ) ||
+    !value.notes.some((note) => isRecord(note) && note.body === expectedBody)
   ) {
     throw new GlabOutputError("Invalid glab discussion response");
   }
@@ -744,7 +747,7 @@ export class GitLabAdapter implements VcsAdapter {
           "--input",
           "-",
         ], JSON.stringify(payload));
-        validateWrittenDiscussion(stdout);
+        validateWrittenDiscussion(stdout, comment.body);
         outcomes.push({ clientId: comment.clientId, status: "posted" });
       } catch (error) {
         if (!(error instanceof GlabCommandError)) throw error;

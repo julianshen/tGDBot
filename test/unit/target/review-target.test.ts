@@ -197,6 +197,57 @@ describe("parseRepositoryRef", () => {
     });
   });
 
+  it("preserves a dotted namespace in a hostless GitLab.com selector", () => {
+    expect(
+      parseRepositoryRef("engineering.platform/service", "gitlab"),
+    ).toEqual({
+      provider: "gitlab",
+      host: "gitlab.com",
+      port: undefined,
+      namespace: ["engineering.platform"],
+      repo: "service",
+      canonicalUrl: "https://gitlab.com/engineering.platform/service",
+    });
+  });
+
+  it("treats a dotted first segment as a custom host only with a namespace and project", () => {
+    expect(
+      parseRepositoryRef("gitlab.example.com/group/project", "gitlab"),
+    ).toEqual({
+      provider: "gitlab",
+      host: "gitlab.example.com",
+      port: undefined,
+      namespace: ["group"],
+      repo: "project",
+      canonicalUrl: "https://gitlab.example.com/group/project",
+    });
+  });
+
+  it("rejects non-default SSH transport ports instead of treating them as HTTPS ports", () => {
+    expect(() =>
+      parseRepositoryRef(
+        "ssh://git@gitlab.example.com:2222/group/project.git",
+        "gitlab",
+      ),
+    ).toThrow(/SSH.*port|HTTPS URL/i);
+  });
+
+  it("continues to normalize an explicit default SSH transport port", () => {
+    expect(
+      parseRepositoryRef(
+        "ssh://git@gitlab.example.com:22/group/project.git",
+        "gitlab",
+      ),
+    ).toEqual({
+      provider: "gitlab",
+      host: "gitlab.example.com",
+      port: undefined,
+      namespace: ["group"],
+      repo: "project",
+      canonicalUrl: "https://gitlab.example.com/group/project",
+    });
+  });
+
   it.each([
     "https://user:secret@gitlab.com/group/project",
     "http://gitlab.com/group/project",
@@ -204,7 +255,6 @@ describe("parseRepositoryRef", () => {
     "https://gitlab.com/group/project#x",
     "https://gitlab.com/group%2Fsub/project",
     "https://gitlab.com/group/%2e%2e/project",
-    "gitlab.com/group",
   ])("rejects the invalid GitLab repository form %s", (input) => {
     expect(() => parseRepositoryRef(input, "gitlab")).toThrow();
   });

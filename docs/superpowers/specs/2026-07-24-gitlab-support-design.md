@@ -60,6 +60,11 @@ GitLab numeric mode requires `--repo`; the adapter will not silently infer a
 self-managed target from an unrelated current directory. Repository values may
 be a namespace/project path, host/namespace/project path, full HTTPS URL, or Git
 URL accepted by `glab --repo`. A path without a host uses `gitlab.com`.
+For scheme-less values, a custom host is recognized only in the unambiguous
+`host/namespace/project` shape; dotted two-segment values remain GitLab.com
+`namespace/project` paths. A non-default explicit `ssh://` transport port is
+rejected because it cannot identify the HTTPS web/API port; callers must use a
+full HTTPS URL for a custom web/API port.
 
 ### Conflict rules
 

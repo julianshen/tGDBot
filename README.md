@@ -146,6 +146,14 @@ tgd-review-agent review \
   --pr 42
 ```
 
+In the scheme-less form, a custom host is unambiguous only when followed by
+both a namespace and project (`host/namespace/project`). A two-segment value
+such as `engineering.platform/service` is a GitLab.com namespace/project even
+though its namespace contains a dot; use a full HTTPS URL when a custom-host
+selector would otherwise be ambiguous. Non-default `ssh://` transport ports
+are not web/API ports and are rejected; use an HTTPS URL to select a custom
+web/API port.
+
 `glab api --hostname` receives the hostname without its web port. When the API
 is exposed on a custom port, preserve the web port in `--repo`. Current `glab`
 requires `--api-host`, `--api-protocol`, and `--git-protocol` to be supplied in

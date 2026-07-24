@@ -52,10 +52,10 @@ const notesFixturePath = fileURLToPath(new URL("../../fixtures/glab-notes.json",
 const notesFixture = await readFile(notesFixturePath, "utf8");
 const discussionsFixturePath = fileURLToPath(new URL("../../fixtures/glab-discussions.json", import.meta.url));
 const discussionsFixture = await readFile(discussionsFixturePath, "utf8");
-const writtenDiscussionFixture = JSON.stringify({
+const writtenDiscussionFixture = (body: string) => JSON.stringify({
   id: "discussion-1",
   individual_note: false,
-  notes: [{ id: 701, body: "review comment" }],
+  notes: [{ id: 701, body }],
 });
 
 const BASE_SHA = "1111111111111111111111111111111111111111";
@@ -650,7 +650,11 @@ describe("GitLabAdapter inline discussions", () => {
       calls.push({ args, stdin });
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/versions")) return versionsFixture();
-      if (endpoint?.endsWith("/discussions")) return writtenDiscussionFixture;
+      if (endpoint?.endsWith("/discussions")) {
+        return writtenDiscussionFixture(
+          (JSON.parse(stdin!) as { body: string }).body,
+        );
+      }
       return fixture;
     };
   }
@@ -747,7 +751,11 @@ describe("GitLabAdapter inline discussions", () => {
           null,
         ]);
       }
-      if (endpoint?.endsWith("/discussions")) return writtenDiscussionFixture;
+      if (endpoint?.endsWith("/discussions")) {
+        return writtenDiscussionFixture(
+          (JSON.parse(stdin!) as { body: string }).body,
+        );
+      }
       return fixture;
     };
 
@@ -892,7 +900,7 @@ describe("GitLabAdapter inline discussions", () => {
 
   it("continues after item failures and preserves input-order outcomes", async () => {
     let posts = 0;
-    const execGlab: ExecGlab = async (args) => {
+    const execGlab: ExecGlab = async (args, stdin) => {
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/versions")) return versionsFixture();
       if (endpoint?.endsWith("/discussions")) {
@@ -903,7 +911,9 @@ describe("GitLabAdapter inline discussions", () => {
             stderr: "private provider response TOKEN=secret",
           });
         }
-        return writtenDiscussionFixture;
+        return writtenDiscussionFixture(
+          (JSON.parse(stdin!) as { body: string }).body,
+        );
       }
       return fixture;
     };
@@ -935,13 +945,15 @@ describe("GitLabAdapter inline discussions", () => {
     [500, "stop"],
   ] as const)("classifies HTTP %i as %s", async (status, behavior) => {
     let posts = 0;
-    const execGlab: ExecGlab = async (args) => {
+    const execGlab: ExecGlab = async (args, stdin) => {
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/versions")) return versionsFixture();
       if (endpoint?.endsWith("/discussions")) {
         posts += 1;
         if (posts === 1) throw new GlabCommandError("write failed", { httpStatus: status });
-        return writtenDiscussionFixture;
+        return writtenDiscussionFixture(
+          (JSON.parse(stdin!) as { body: string }).body,
+        );
       }
       return fixture;
     };
@@ -1018,6 +1030,52 @@ describe("GitLabAdapter inline discussions", () => {
       new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, comments),
     ).rejects.toThrow(/discussion/i);
     expect(posts).toBe(1);
+  });
+
+  it("rejects a discussion response that does not contain the submitted body", async () => {
+    let posts = 0;
+    const execGlab: ExecGlab = async (args) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) {
+        posts += 1;
+        return JSON.stringify({
+          id: "discussion-1",
+          notes: [{ id: 701, body: "different body" }],
+        });
+      }
+      return fixture;
+    };
+
+    await expect(
+      new GitLabAdapter(execGlab).createInlineReview(
+        locator(),
+        HEAD_SHA,
+        [added, { ...added, clientId: "finding-1" }],
+      ),
+    ).rejects.toThrow(/discussion/i);
+    expect(posts).toBe(1);
+  });
+
+  it("accepts a discussion response containing a note with the submitted body", async () => {
+    const execGlab: ExecGlab = async (args) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) {
+        return JSON.stringify({
+          id: "discussion-1",
+          notes: [
+            { id: 700, body: "system-generated companion note" },
+            { id: 701, body: added.body },
+          ],
+        });
+      }
+      return fixture;
+    };
+
+    await expect(
+      new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, [added]),
+    ).resolves.toEqual([{ clientId: added.clientId, status: "posted" }]);
   });
 });
 
@@ -1182,7 +1240,32 @@ describe("realExecGlab", () => {
   it("parses anchored API HTTP diagnostics but not incidental or non-API statuses", async () => {
     const errors = [
       { args: ["api", "projects/x"], stderr: "request failed\nHTTP 403\n", status: 403 },
+      {
+        args: ["api", "projects/x"],
+        stderr: "glab: 404 Project Not Found (HTTP 404)\n",
+        status: 404,
+      },
+      {
+        args: ["api", "projects/x"],
+        stderr: "glab: Bad Request (HTTP 400)\n",
+        status: 400,
+      },
+      {
+        args: ["api", "projects/x"],
+        stderr: "glab: Conflict (HTTP 409)\n",
+        status: 409,
+      },
+      {
+        args: ["api", "projects/x"],
+        stderr: "glab: API request failed: 422 Unprocessable Entity (HTTP 422)\n",
+        status: 422,
+      },
       { args: ["api", "projects/x"], stderr: "body says HTTP 418 maybe\n", status: undefined },
+      {
+        args: ["api", "projects/x"],
+        stderr: '{"message":"user content (HTTP 409)"}\n',
+        status: undefined,
+      },
       { args: ["mr", "diff", "42"], stderr: "HTTP 403\n", status: undefined },
     ] as const;
 
