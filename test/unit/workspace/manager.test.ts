@@ -2,11 +2,15 @@ import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, sym
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RepositoryRef } from "../../../src/vcs/adapter.js";
+import type { WorkspaceRepositoryRef } from "../../../src/workspace/types.js";
 import { prepareWorkspace, realExecWorkspaceCommand } from "../../../src/workspace/manager.js";
 import { deriveWorkspacePaths } from "../../../src/workspace/paths.js";
 
-const repo: RepositoryRef = { host: "github.com", owner: "octo-org", repo: "octo-repo" };
+const repo: WorkspaceRepositoryRef = {
+  host: "github.com",
+  owner: "octo-org",
+  repo: "octo-repo",
+};
 const baseSha = "def4567890def4567890def4567890def4567890";
 const roots: string[] = [];
 

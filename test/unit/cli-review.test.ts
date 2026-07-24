@@ -48,6 +48,22 @@ describe("resolveReviewLocator", () => {
     });
   });
 
+  it("uses the URL provider to parse a matching --repo when --vcs was omitted", () => {
+    expect(resolveReviewLocator(makeArgs({
+      pr: "https://gitlab.example.com/group/project/-/merge_requests/42",
+      repo: "gitlab.example.com/group/project",
+    }))).toMatchObject({
+      kind: "repository",
+      repo: {
+        provider: "gitlab",
+        host: "gitlab.example.com",
+        namespace: ["group"],
+        repo: "project",
+      },
+      number: 42,
+    });
+  });
+
   it("rejects numeric GitLab targets without --repo", () => {
     expect(() => resolveReviewLocator(makeArgs({ vcs: "gitlab" }))).toThrow(/--repo/i);
   });

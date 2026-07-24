@@ -1,8 +1,12 @@
-import type { RepositoryRef } from "../vcs/adapter.js";
+export interface WorkspaceRepositoryRef {
+  readonly host: "github.com";
+  readonly owner: string;
+  readonly repo: string;
+}
 
 export interface WorkspaceRequest {
   root: string;
-  repo: RepositoryRef;
+  repo: WorkspaceRepositoryRef;
   baseSha: string;
 }
 

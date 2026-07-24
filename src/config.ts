@@ -40,7 +40,8 @@ export function resolveReviewLocator(args: CliArgs): ReviewLocator {
     );
   }
   if (args.repo !== undefined) {
-    const repo = parseRepositoryRef(args.repo, args.vcs);
+    const repoProvider = args.vcsExplicit === true ? args.vcs : target.provider;
+    const repo = parseRepositoryRef(args.repo, repoProvider);
     if (repo.provider !== target.repo.provider || repo.canonicalUrl !== target.repo.canonicalUrl) {
       throw new Error("Review URL repository does not match explicit --repo");
     }

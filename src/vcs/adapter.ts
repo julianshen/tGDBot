@@ -1,10 +1,6 @@
 import type {
-  GitHubRepositoryRef,
   RepositoryRef as ProviderNeutralRepositoryRef,
 } from "../target/types.js";
-
-/** @deprecated Workspace code remains GitHub-specific; review locators use the neutral target type. */
-export type RepositoryRef = GitHubRepositoryRef;
 
 export type ReviewLocator =
   | {
