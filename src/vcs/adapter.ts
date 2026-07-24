@@ -190,4 +190,5 @@ export interface BotComment {
    */
   reviewedConfig: string;
   pendingState?: import("../review/comment-marker.js").PendingReviewState;
+  invalidPendingState?: true;
 }

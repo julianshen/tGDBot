@@ -282,6 +282,25 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+  it("fails closed before dispatch or writes for malformed ready recovery metadata", async () => {
+    const h = makeHarness({
+      botComment: {
+        id: "written-777",
+        body: "<!-- tgd-review-agent:pending phase=ready sha=cafef00d cfg=bad result=v2.invalid -->",
+        lastReviewedSha: "",
+        reviewedConfig: "",
+        invalidPendingState: true,
+      },
+    });
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/invalid pending|recovery/i);
+
+    expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+  });
+
   // Design-review #9: the adapter infers owner/repo from ambient context, so
   // review() must name the RESOLVED target (the PR's canonical URL) up front —
   // even on a skipped run — making a mis-inferred repo visible, not silent.
@@ -1111,7 +1130,7 @@ describe("inline review comments", () => {
     expect(headSha).toBe("cafef00d"); // makePr()'s head sha
     expect(comments).toEqual(withInline.inlineComments);
     // The summary is STILL upserted — that's what carries the dedup marker.
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(3);
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(4);
   });
 
   // GitHub 422s the ENTIRE review if any anchor is off-diff. Losing every
@@ -1135,9 +1154,10 @@ describe("inline review comments", () => {
     // The presentation is built once and the summary is selectively rendered.
     expect(h.orchestrate).toHaveBeenCalledTimes(1);
     // The publishing summary is checkpointed with every finding before inline
-    // publication, then finalized in place with every finding after rejection.
+    // publication, checkpointed again with the validated outcome body, then
+    // finalized in place with every finding after rejection.
     const calls = h.vcsAdapter.upsertComment.mock.calls;
-    expect(calls.length).toBe(3);
+    expect(calls.length).toBe(4);
     expect(String(calls[0]?.[1])).not.toContain("finding 0");
     expect(String(calls[1]?.[1])).toContain("finding 0");
     expect(String(calls[1]?.[1])).toContain("finding 1");
@@ -1170,7 +1190,7 @@ describe("inline review comments", () => {
     await review(h.args, depsFrom(h));
 
     const writes = h.vcsAdapter.upsertComment.mock.calls;
-    expect(writes).toHaveLength(3);
+    expect(writes).toHaveLength(4);
     expect(writes[0]?.[1]).not.toContain("finding 0");
     expect(writes[0]?.[1]).not.toContain("finding 1");
     expect(writes[0]?.[1]).not.toContain("finding 2");
@@ -1181,6 +1201,10 @@ describe("inline review comments", () => {
     expect(writes[2]?.[1]).toContain("finding 1");
     expect(writes[2]?.[1]).not.toContain("finding 2");
     expect(writes[2]?.[2]).toMatchObject({ id: "written-summary-1" });
+    expect(writes[3]?.[1]).not.toContain("finding 0");
+    expect(writes[3]?.[1]).toContain("finding 1");
+    expect(writes[3]?.[1]).not.toContain("finding 2");
+    expect(writes[3]?.[2]).toMatchObject({ id: "written-summary-1" });
   });
 
   it("uses the exact written summary identity even when a competing marker note appears", async () => {
@@ -1210,11 +1234,14 @@ describe("inline review comments", () => {
     await review(h.args, depsFrom(h));
 
     expect(h.vcsAdapter.findBotComment).toHaveBeenCalledTimes(1);
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(3);
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(4);
     expect(h.vcsAdapter.upsertComment.mock.calls[1]?.[2]).toMatchObject({
       id: "written-777",
     });
     expect(h.vcsAdapter.upsertComment.mock.calls[2]?.[2]).toMatchObject({
+      id: "written-777",
+    });
+    expect(h.vcsAdapter.upsertComment.mock.calls[3]?.[2]).toMatchObject({
       id: "written-777",
     });
   });
@@ -1291,9 +1318,9 @@ describe("inline review comments", () => {
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/final update failed/);
     expect(h.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
-    expect(stored?.body).toContain("finding 0");
+    expect(stored?.body).not.toContain("finding 0");
     expect(stored?.body).toContain("finding 1");
-    expect(stored?.body).toContain("finding 2");
+    expect(stored?.body).not.toContain("finding 2");
 
     await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
     expect(h.dispatchRules).toHaveBeenCalledTimes(1);
@@ -1303,9 +1330,89 @@ describe("inline review comments", () => {
       lastReviewedSha: "cafef00d",
       reviewedConfig: computeReviewConfigHash(h.config),
     });
-    expect(stored?.body).toContain("finding 0");
+    expect(stored?.body).not.toContain("finding 0");
     expect(stored?.body).toContain("finding 1");
-    expect(stored?.body).toContain("finding 2");
+    expect(stored?.body).not.toContain("finding 2");
+  });
+
+  it("recovers the original partial terminal result and exit semantics", async () => {
+    const presentation = {
+      ...partialPresentation(),
+      rulesRun: ["rule-a"],
+      rulesFailed: ["rule-b"],
+    };
+    const loadResult: LoadResult = {
+      rules: [makeRule({ name: "rule-a" })],
+      errors: [{
+        sourcePath: "/rules/secret-rule.md",
+        message: "token=must-not-be-encoded",
+      }],
+    };
+    const h = makeHarness({
+      args: makeArgs(),
+      botComment: null,
+      loadResult,
+      orchestrationResult: presentation,
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
+    h.vcsAdapter.createInlineReview.mockResolvedValue([
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-1", status: "failed" },
+      { clientId: "finding-2", status: "posted" },
+    ]);
+    let stored: BotComment | null = null;
+    let rejectCompleteOnce = true;
+    h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(stored));
+    h.vcsAdapter.upsertComment.mockImplementation(
+      (_locator, body: string, existing: BotComment | null) => {
+        const parsed = parseBotMarker(body);
+        const written: BotComment = {
+          id: existing?.id ?? "written-777",
+          body,
+          ...(parsed ?? { lastReviewedSha: "", reviewedConfig: "" }),
+        };
+        if (written.lastReviewedSha !== "" && rejectCompleteOnce) {
+          rejectCompleteOnce = false;
+          return Promise.reject(new Error("final update failed"));
+        }
+        stored = written;
+        return Promise.resolve(written);
+      },
+    );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/final update failed/);
+    expect(stored?.pendingState?.terminalResult).toEqual({
+      status: "partial",
+      findingsCount: 3,
+      rulesRun: ["rule-a"],
+      rulesFailed: ["rule-b"],
+      exitCode: 2,
+    });
+    const marker = stored?.body.split("\n").at(-1) ?? "";
+    expect(marker).not.toContain("must-not-be-encoded");
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(2);
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
+    const statusCall = logSpy.mock.calls.findLast(
+      (call) => typeof call[0] === "string" &&
+        call[0].startsWith("TGD_REVIEW_RESULT: "),
+    );
+    const status = JSON.parse(
+      String(statusCall?.[0]).slice("TGD_REVIEW_RESULT: ".length),
+    );
+    expect(status).toMatchObject({
+      status: "partial",
+      findingsCount: 3,
+      rulesRun: ["rule-a"],
+      rulesFailed: ["rule-b"],
+      reason: "recovered-pending-review",
+    });
+    vi.restoreAllMocks();
   });
 
   it("rejects a final write result that cannot confirm the exact completed marker", async () => {

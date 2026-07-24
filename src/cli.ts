@@ -10,6 +10,7 @@ import {
   formatPendingMarker,
   replacePendingMarker,
 } from "./review/comment-marker.js";
+import type { TerminalReviewResult } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
@@ -295,6 +296,19 @@ function logStatus(log: StatusLog): void {
   console.log(`${STATUS_LOG_PREFIX}${JSON.stringify(log)}`);
 }
 
+function sameTerminalResult(
+  actual: TerminalReviewResult | undefined,
+  expected: TerminalReviewResult,
+): boolean {
+  return actual?.status === expected.status &&
+    actual.findingsCount === expected.findingsCount &&
+    actual.exitCode === expected.exitCode &&
+    actual.rulesRun.length === expected.rulesRun.length &&
+    actual.rulesRun.every((rule, index) => rule === expected.rulesRun[index]) &&
+    actual.rulesFailed.length === expected.rulesFailed.length &&
+    actual.rulesFailed.every((rule, index) => rule === expected.rulesFailed[index]);
+}
+
 // Task 8 review fix #1: renders a visible section naming every rule file
 // that failed to LOAD (as opposed to `orchestrate.ts`'s own "Rules that
 // failed" section, which only covers dispatch-time failures) — mirrors
@@ -462,6 +476,12 @@ export async function review(
   // computeReviewConfigHash for what is and isn't captured.
   const configHash = computeReviewConfigHash(config);
 
+  if (botComment?.invalidPendingState === true) {
+    throw new Error(
+      "Invalid pending review recovery metadata; refusing to dispatch or write",
+    );
+  }
+
   // A ready checkpoint means a previous process already made the conservative
   // all-inline fallback durable before attempting any inline writes. If that
   // process died during the final marker update, finalize the exact same note
@@ -473,7 +493,8 @@ export async function review(
     recovery?.phase === "ready" &&
     recovery.headSha === pr.headSha &&
     recovery.configHash === configHash &&
-    recovery.noteId === botComment.id
+    recovery.noteId === botComment.id &&
+    recovery.terminalResult !== undefined
   ) {
     const finalizedBody = replacePendingMarker(
       botComment.body,
@@ -494,13 +515,13 @@ export async function review(
       );
     }
     logStatus({
-      status: "posted",
-      findingsCount: 0,
-      rulesRun: [],
-      rulesFailed: [],
+      status: recovery.terminalResult.status,
+      findingsCount: recovery.terminalResult.findingsCount,
+      rulesRun: recovery.terminalResult.rulesRun,
+      rulesFailed: recovery.terminalResult.rulesFailed,
       reason: "recovered-pending-review",
     });
-    return EXIT_OK;
+    return recovery.terminalResult.exitCode;
   }
 
   // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
@@ -593,6 +614,14 @@ export async function review(
   // default (on), never a silent downgrade.
   const renderOpts = { suggestions: config.suggestions !== "off" };
   const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
+  const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
+  const terminalResult = {
+    status: hasFailure ? "partial" as const : "posted" as const,
+    findingsCount: orchestration.findingsCount,
+    rulesRun: orchestration.rulesRun,
+    rulesFailed: orchestration.rulesFailed,
+    exitCode: hasFailure ? EXIT_PARTIAL as 2 : EXIT_OK as 0,
+  };
 
   const buildBody = (
     o: OrchestrationResult,
@@ -667,6 +696,7 @@ export async function review(
             headSha: pr.headSha,
             configHash,
             noteId: writtenSummary.id,
+            terminalResult,
           }),
         ),
         writtenSummary,
@@ -678,7 +708,8 @@ export async function review(
         checkpoint.pendingState?.phase !== "ready" ||
         checkpoint.pendingState.headSha !== pr.headSha ||
         checkpoint.pendingState.configHash !== configHash ||
-        checkpoint.pendingState.noteId !== writtenSummary.id
+        checkpoint.pendingState.noteId !== writtenSummary.id ||
+        !sameTerminalResult(checkpoint.pendingState.terminalResult, terminalResult)
       ) {
         throw new Error(
           "The VCS adapter could not confirm the exact ready recovery checkpoint",
@@ -756,6 +787,40 @@ export async function review(
       if (fallbackIds.size > 0) {
         finalCommentBody = renderSummary(orchestration, fallbackIds);
       }
+
+      const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
+        config.locator,
+        buildBody(
+          orchestration,
+          finalCommentBody,
+          formatPendingMarker({
+            phase: "ready",
+            headSha: pr.headSha,
+            configHash,
+            noteId: summaryIdentity.id,
+            terminalResult,
+          }),
+        ),
+        summaryIdentity,
+      );
+      if (
+        selectiveCheckpoint.id !== summaryIdentity.id ||
+        selectiveCheckpoint.lastReviewedSha !== "" ||
+        selectiveCheckpoint.reviewedConfig !== "" ||
+        selectiveCheckpoint.pendingState?.phase !== "ready" ||
+        selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
+        selectiveCheckpoint.pendingState.configHash !== configHash ||
+        selectiveCheckpoint.pendingState.noteId !== summaryIdentity.id ||
+        !sameTerminalResult(
+          selectiveCheckpoint.pendingState.terminalResult,
+          terminalResult,
+        )
+      ) {
+        throw new Error(
+          "The VCS adapter could not confirm the exact selective recovery checkpoint",
+        );
+      }
+      summaryIdentity = selectiveCheckpoint;
     }
     const finalizedSummary = await config.vcsAdapter.upsertComment(
       config.locator,
@@ -774,7 +839,6 @@ export async function review(
     }
   }
 
-  const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
   logStatus({
     status: hasFailure ? "partial" : "posted",
     findingsCount: orchestration.findingsCount,

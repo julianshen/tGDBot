@@ -22,6 +22,13 @@ describe("parseBotMarker", () => {
       headSha: "abc1234",
       configHash: "deadbeef",
       noteId: "note-777",
+      terminalResult: {
+        status: "partial",
+        findingsCount: 3,
+        rulesRun: ["rule-a"],
+        rulesFailed: ["rule-b"],
+        exitCode: 2,
+      },
     });
     expect(parseBotMarker(`summary\n\n${marker}`)).toEqual({
       lastReviewedSha: "",
@@ -31,10 +38,31 @@ describe("parseBotMarker", () => {
         headSha: "abc1234",
         configHash: "deadbeef",
         noteId: "note-777",
+        terminalResult: {
+          status: "partial",
+          findingsCount: 3,
+          rulesRun: ["rule-a"],
+          rulesFailed: ["rule-b"],
+          exitCode: 2,
+        },
       },
     });
     expect(replacePendingMarker(`summary\n\n${marker}`, "<!-- complete -->"))
       .toBe("summary\n\n<!-- complete -->");
+  });
+
+  it.each([
+    "v2.eyJzdGF0dXMiOiJwb3N0ZWQifQ",
+    "v1.not-base64!",
+    `v1.${"a".repeat(3000)}`,
+  ])("rejects unknown, malformed, or oversized terminal result encoding %s", (result) => {
+    const body = "summary\n\n" +
+      `<!-- tgd-review-agent:pending phase=ready sha=abc1234 cfg=deadbeef note=note-777 result=${result} -->`;
+    expect(parseBotMarker(body)).toEqual({
+      lastReviewedSha: "",
+      reviewedConfig: "",
+      invalidPendingState: true,
+    });
   });
 
   it("distinguishes an own malformed trailing marker from no marker", () => {
