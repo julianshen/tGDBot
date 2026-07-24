@@ -26,8 +26,17 @@ function validateRawInput(input: string, kind: string): void {
 }
 
 function pathSegments(pathname: string, kind: string): string[] {
-  const trimmed = pathname.endsWith("/") ? pathname.slice(0, -1) : pathname;
-  const rawSegments = trimmed.split("/").filter((segment) => segment !== "");
+  if (!pathname.startsWith("/")) {
+    throw invalid(kind, "path must begin with one slash");
+  }
+  const withoutLeadingSlash = pathname.slice(1);
+  if (withoutLeadingSlash.startsWith("/") || withoutLeadingSlash.includes("//")) {
+    throw invalid(kind, "empty path segments and repeated slashes are not allowed");
+  }
+  const trimmed = withoutLeadingSlash.endsWith("/")
+    ? withoutLeadingSlash.slice(0, -1)
+    : withoutLeadingSlash;
+  const rawSegments = trimmed === "" ? [] : trimmed.split("/");
   let segments: string[];
   try {
     segments = rawSegments.map(decodeURIComponent);

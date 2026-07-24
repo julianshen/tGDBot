@@ -104,6 +104,29 @@ describe("parseReviewTarget", () => {
   ])("continues to reject the invalid GitHub target %s", (input) => {
     expect(() => parseReviewTarget(input)).toThrow();
   });
+
+  it.each([
+    "https://github.com//acme/widget/pull/42",
+    "https://github.com/acme//widget/pull/42",
+    "https://github.com/acme/widget/pull/42//",
+  ])("rejects empty segments in the GitHub target %s", (input) => {
+    expect(() => parseReviewTarget(input)).toThrow(/empty|slash|path/i);
+  });
+
+  it.each([
+    "https://gitlab.com//group/project/-/merge_requests/42",
+    "https://gitlab.com/group//project/-/merge_requests/42",
+    "https://gitlab.com/group/project/-/merge_requests/42//",
+  ])("rejects empty segments in the GitLab target %s", (input) => {
+    expect(() => parseReviewTarget(input)).toThrow(/empty|slash|path/i);
+  });
+
+  it.each([
+    "https://github.com/acme/widget/pull/42/",
+    "https://gitlab.com/group/project/-/merge_requests/42/",
+  ])("continues to allow one trailing slash in review target %s", (input) => {
+    expect(() => parseReviewTarget(input)).not.toThrow();
+  });
 });
 
 describe("parseRepositoryRef", () => {
@@ -184,6 +207,24 @@ describe("parseRepositoryRef", () => {
     "gitlab.com/group",
   ])("rejects the invalid GitLab repository form %s", (input) => {
     expect(() => parseRepositoryRef(input, "gitlab")).toThrow();
+  });
+
+  it.each([
+    "group//project",
+    "group/project//",
+    "gitlab.example.com/group//project",
+    "https://gitlab.example.com//group/project",
+    "https://gitlab.example.com/group//project",
+  ])("rejects empty segments in GitLab repository selector %s", (input) => {
+    expect(() => parseRepositoryRef(input, "gitlab")).toThrow(/empty|slash|path/i);
+  });
+
+  it.each([
+    "group/project/",
+    "gitlab.example.com/group/project/",
+    "https://gitlab.example.com/group/project/",
+  ])("continues to allow one trailing slash in GitLab repository selector %s", (input) => {
+    expect(() => parseRepositoryRef(input, "gitlab")).not.toThrow();
   });
 
   it("rejects a GitLab repository parsed as GitHub", () => {

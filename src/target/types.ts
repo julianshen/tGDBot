@@ -19,9 +19,18 @@ export interface GitLabRepositoryRef {
 
 export type RepositoryRef = GitHubRepositoryRef | GitLabRepositoryRef;
 
-export interface ReviewTarget {
-  readonly provider: ReviewProvider;
-  readonly repo: RepositoryRef;
+export interface GitHubReviewTarget {
+  readonly provider: "github";
+  readonly repo: GitHubRepositoryRef;
   readonly number: number;
   readonly canonicalUrl: string;
 }
+
+export interface GitLabReviewTarget {
+  readonly provider: "gitlab";
+  readonly repo: GitLabRepositoryRef;
+  readonly number: number;
+  readonly canonicalUrl: string;
+}
+
+export type ReviewTarget = GitHubReviewTarget | GitLabReviewTarget;
