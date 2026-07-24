@@ -50,8 +50,8 @@ function normalizeMessage(message: string): string {
 // encoding: it's provably collision-free (embedded characters are escaped
 // by JSON, unlike a literal separator character which could in principle
 // appear in a file path or message) and, unlike a NUL-byte-delimited
-// string, keeps this file plain text -- a NUL byte anywhere in the file
-// makes `git diff`/GitHub's PR view treat the whole file as binary.
+// string, keeps this file plain text -- a NUL byte anywhere in the file can
+// make diff tooling and review UIs treat the whole file as binary.
 function dedupeKey(finding: Finding): string {
   return JSON.stringify([finding.file, finding.line ?? null, normalizeMessage(finding.message)]);
 }
@@ -105,12 +105,13 @@ function dedupeFindings(findings: Finding[]): Finding[] {
  * boundary. So the residual risk is real, and the right response is to cap the BLAST
  * RADIUS rather than pretend it is mitigated.
  *
- * These paths are where a single mistaken click stops being "bad code in a PR" and
- * becomes "arbitrary execution with repository secrets": CI workflow definitions run
- * on merge (and often on PR) with tokens in scope; package manifests and lockfiles
- * execute install scripts; container/build files execute at build time. A one-click
- * commit into any of them is a different category of harm from a one-click commit
- * into application code, which a human reviews and CI then tests.
+ * These paths are where a single mistaken click stops being "bad code in a
+ * change" and becomes "arbitrary execution with repository secrets": CI
+ * workflow definitions run on merge (and often while reviewing a change) with
+ * tokens in scope; package manifests and lockfiles execute install scripts;
+ * container/build files execute at build time. A one-click commit into any of
+ * them is a different category of harm from a one-click commit into application
+ * code, which a human reviews and CI then tests.
  *
  * Findings on these files are still reported in full — only the COMMIT BUTTON is
  * withheld. The fix is shown as a plain, non-committable block.
@@ -167,11 +168,11 @@ export function orchestrate(
     // Endpoint-only checking (the first draft, caught in review) is unsound:
     // `commentableLines` merges all of a file's hunks into one set, so a range
     // whose ends sit in DIFFERENT hunks passes while the lines between it are not
-    // in the diff at all. A multi-line comment's range must lie
-    // within a single hunk and 422s the ENTIRE review otherwise — killing every
-    // inline comment on the run. Because context lines are included in the anchor
-    // set, "every line in start..end is commentable" is exactly equivalent to
-    // "the range is inside one hunk", so this check is both sufficient and simple.
+    // in the diff at all. A multi-line comment's range must lie within a single
+    // hunk for provider-neutral position construction. Because context lines are
+    // included in the anchor set, "every line in start..end is commentable" is
+    // exactly equivalent to "the range is inside one hunk", so this check is both
+    // sufficient and simple.
     const wantsRange = Number.isInteger(endLine) && (endLine as number) > start;
     const rangeOk =
       wantsRange &&

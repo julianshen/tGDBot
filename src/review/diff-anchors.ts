@@ -1,11 +1,10 @@
 // Which (file, line) pairs in a code-review diff can carry an inline comment.
 //
-// This exists because of a hard GitHub constraint: `POST /pulls/{n}/reviews`
-// rejects the ENTIRE request with 422 if even one comment targets a line that
-// isn't part of the diff. One bad anchor loses every finding in the review. So
-// rather than post hopefully and handle failure, we decide up front — from the
-// same diff we already fetched — exactly which lines are addressable, and route
-// everything else to the summary comment instead.
+// Providers accept inline comments only at eligible diff positions, with
+// provider-specific batching and error behavior handled by their adapters.
+// Rather than post hopeful anchors, shared orchestration decides up front from
+// the fetched diff which lines are addressable and routes everything else to
+// the summary.
 //
 // "Addressable" means: present on the RIGHT (new-file) side of a hunk, i.e. an
 // added (`+`) or context (` `) line. A removed (`-`) line exists only on the
@@ -96,12 +95,11 @@ export function changedFiles(diff: string): string[] {
 /**
  * True iff EVERY line in `start`..`end` (inclusive) is commentable.
  *
- * ADR-007's committable suggestions replace a whole line range, and GitHub
- * requires that range to lie within a SINGLE hunk — it 422s the entire review
- * otherwise, killing every inline comment on the run. Checking only the endpoints
- * is unsound, because this module merges a file's hunks into one set: two lines in
- * DIFFERENT hunks would both pass while the lines between them are not in the diff
- * at all.
+ * ADR-007's committable suggestions replace a whole line range, which must lie
+ * within a SINGLE hunk for provider-neutral position construction. Checking
+ * only the endpoints is unsound, because this module merges a file's hunks into
+ * one set: two lines in DIFFERENT hunks would both pass while the lines between
+ * them are not in the diff at all.
  *
  * Because context lines are part of the anchor set, "every line in the range is
  * commentable" is exactly equivalent to "the range is inside one hunk".
