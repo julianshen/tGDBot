@@ -179,6 +179,30 @@ rename to src/new-name.ts
     expect(diffPositionRange(renamed, "src/old-name.ts", 10, 10)).toBeUndefined();
     expect(diffPositionRange(renamed, "missing.ts", 1, 1)).toBeUndefined();
   });
+
+  it("fails the whole hunk closed when '+' appears after the new-side count is exhausted", () => {
+    const malformed = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,1 +1,1 @@
+ context
++overflow
+`;
+    expect(diffPositionRange(malformed, "a.ts", 1)).toBeUndefined();
+    expect(commentableLines(malformed).get("a.ts")).toBeUndefined();
+  });
+
+  it("fails the whole hunk closed when '-' appears after the old-side count is exhausted", () => {
+    const malformed = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,0 +1,1 @@
+-overflow
++would-otherwise-leak
+`;
+    expect(diffPositionRange(malformed, "a.ts", 1)).toBeUndefined();
+    expect(commentableLines(malformed).get("a.ts")).toBeUndefined();
+  });
 });
 
 describe("isCommentable", () => {

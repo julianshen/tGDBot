@@ -59,8 +59,19 @@ export function commentableLines(diff: string): CommentableLines {
   // the end of the last hunk into trailing blank lines.
   let oldRemaining = 0;
   let newRemaining = 0;
+  let hunkAnchors: Array<{ file: string; line: number }> = [];
 
   const inHunk = (): boolean => oldRemaining > 0 || newRemaining > 0;
+  const abandonHunk = (): void => {
+    for (const { file, line } of hunkAnchors) {
+      const lines = result.get(file);
+      lines?.delete(line);
+      if (lines?.size === 0) result.delete(file);
+    }
+    hunkAnchors = [];
+    oldRemaining = 0;
+    newRemaining = 0;
+  };
 
   for (const rawLine of diff.split("\n")) {
     if (inHunk()) {
@@ -68,10 +79,21 @@ export function commentableLines(diff: string): CommentableLines {
       // header patterns are considered here — that is the whole point.
       const marker = rawLine[0];
       if (marker === "+") {
-        if (currentFile) addLine(result, currentFile, newLine);
+        if (newRemaining <= 0) {
+          abandonHunk();
+          continue;
+        }
+        if (currentFile) {
+          addLine(result, currentFile, newLine);
+          hunkAnchors.push({ file: currentFile, line: newLine });
+        }
         newLine += 1;
         newRemaining -= 1;
       } else if (marker === "-") {
+        if (oldRemaining <= 0) {
+          abandonHunk();
+          continue;
+        }
         // Left side only: must NOT advance the new-file counter, or every
         // subsequent anchor in this hunk is off by one.
         oldRemaining -= 1;
@@ -91,7 +113,10 @@ export function commentableLines(diff: string): CommentableLines {
           newRemaining = 0;
           continue;
         }
-        if (currentFile) addLine(result, currentFile, newLine);
+        if (currentFile) {
+          addLine(result, currentFile, newLine);
+          hunkAnchors.push({ file: currentFile, line: newLine });
+        }
         newLine += 1;
         oldRemaining -= 1;
         newRemaining -= 1;
@@ -106,6 +131,7 @@ export function commentableLines(diff: string): CommentableLines {
 
     // --- Outside a hunk: header territory. ---
     if (rawLine.startsWith("diff --git ")) {
+      hunkAnchors = [];
       currentFile = undefined;
       continue;
     }
@@ -116,15 +142,21 @@ export function commentableLines(diff: string): CommentableLines {
       continue;
     }
 
-    if (rawLine.startsWith("--- ")) continue; // old-side header
+    if (rawLine.startsWith("--- ")) {
+      hunkAnchors = [];
+      continue;
+    } // old-side header
 
     const hunk = HUNK_RE.exec(rawLine);
     if (hunk) {
+      hunkAnchors = [];
       // `@@ -oldStart[,oldCount] +newStart[,newCount] @@`; an omitted count is 1.
       oldRemaining = hunk[2] === undefined ? 1 : Number(hunk[2]);
       newLine = Number(hunk[3]);
       newRemaining = hunk[4] === undefined ? 1 : Number(hunk[4]);
+      continue;
     }
+    if (rawLine.startsWith("+") || rawLine.startsWith("-")) abandonHunk();
   }
 
   return result;
@@ -239,7 +271,18 @@ function positionedLines(diff: string): Map<string, Map<number, PositionedLine>>
   let oldRemaining = 0;
   let newRemaining = 0;
   let hunk = 0;
+  let hunkAnchors: Array<{ file: string; line: number }> = [];
   const inHunk = (): boolean => oldRemaining > 0 || newRemaining > 0;
+  const abandonHunk = (): void => {
+    for (const { file, line } of hunkAnchors) {
+      const lines = result.get(file);
+      lines?.delete(line);
+      if (lines?.size === 0) result.delete(file);
+    }
+    hunkAnchors = [];
+    oldRemaining = 0;
+    newRemaining = 0;
+  };
   const record = (endpoint: DiffPositionEndpoint): void => {
     if (!oldPath || !newPath) return;
     let fileLines = result.get(newPath);
@@ -248,16 +291,25 @@ function positionedLines(diff: string): Map<string, Map<number, PositionedLine>>
       result.set(newPath, fileLines);
     }
     fileLines.set(endpoint.newLine, { endpoint, hunk, oldPath, newPath });
+    hunkAnchors.push({ file: newPath, line: endpoint.newLine });
   };
 
   for (const rawLine of diff.split("\n")) {
     if (inHunk()) {
       const marker = rawLine[0];
       if (marker === "+") {
+        if (newRemaining <= 0) {
+          abandonHunk();
+          continue;
+        }
         record({ type: "new", oldLine: undefined, newLine });
         newLine += 1;
         newRemaining -= 1;
       } else if (marker === "-") {
+        if (oldRemaining <= 0) {
+          abandonHunk();
+          continue;
+        }
         oldLine += 1;
         oldRemaining -= 1;
       } else if (marker === "\\") {
@@ -281,11 +333,13 @@ function positionedLines(diff: string): Map<string, Map<number, PositionedLine>>
     }
 
     if (rawLine.startsWith("diff --git ")) {
+      hunkAnchors = [];
       oldPath = undefined;
       newPath = undefined;
       continue;
     }
     if (rawLine.startsWith("--- ")) {
+      hunkAnchors = [];
       const path = rawLine.slice(4).trim();
       oldPath = path === "/dev/null" ? "/dev/null" : stripOldDiffPathPrefix(path);
       continue;
@@ -296,7 +350,11 @@ function positionedLines(diff: string): Map<string, Map<number, PositionedLine>>
       continue;
     }
     const match = HUNK_RE.exec(rawLine);
-    if (!match) continue;
+    if (!match) {
+      if (rawLine.startsWith("+") || rawLine.startsWith("-")) abandonHunk();
+      continue;
+    }
+    hunkAnchors = [];
     oldLine = Number(match[1]);
     oldRemaining = match[2] === undefined ? 1 : Number(match[2]);
     newLine = Number(match[3]);
