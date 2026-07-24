@@ -58,6 +58,8 @@ import { dispatchRules } from "../../src/review/dispatch.js";
 import { dispatchRulesDirect } from "../../src/review/direct-dispatch.js";
 import { orchestrate } from "../../src/review/orchestrate.js";
 
+const ambientLocator = { kind: "ambient", provider: "github", number: 42 } as const;
+
 function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
   return {
     pr: "42",
@@ -122,19 +124,23 @@ describe("review — default dependency wiring", () => {
 
     // resolveConfigReal must have constructed a real GitHubAdapter (our
     // mocked class) and review() must have driven it correctly.
-    expect(hoisted.getPullRequest).toHaveBeenCalledWith("42");
-    expect(hoisted.findBotComment).toHaveBeenCalledWith("42");
-    expect(hoisted.getDiff).toHaveBeenCalledWith("42");
+    expect(hoisted.getPullRequest).toHaveBeenCalledWith(ambientLocator);
+    expect(hoisted.findBotComment).toHaveBeenCalledWith(ambientLocator);
+    expect(hoisted.getDiff).toHaveBeenCalledWith(ambientLocator);
     expect(hoisted.upsertComment).toHaveBeenCalledTimes(1);
 
     const [prId, body, existing] = hoisted.upsertComment.mock.calls[0];
-    expect(prId).toBe("42");
+    expect(prId).toEqual(ambientLocator);
     expect(existing).toBeNull();
     expect(body).toContain("<!-- tgd-review-agent:sha=wired1234 cfg=");
 
     // ADR-002 CLI-native fix: rules are now sourced from the PR's base
     // branch via getRuleFilesFromBase, not the literal --rules-dir path.
-    expect(hoisted.getRuleFilesFromBase).toHaveBeenCalledWith("base0000", ".review/rules");
+    expect(hoisted.getRuleFilesFromBase).toHaveBeenCalledWith(
+      ambientLocator,
+      "base0000",
+      ".review/rules",
+    );
 
     // The real loadRulesReal/dispatchRulesReal/orchestrateReal references
     // were actually invoked (not silently skipped by a typo'd default) —
@@ -163,8 +169,8 @@ describe("review — default dependency wiring", () => {
     logSpy.mockRestore();
   });
 
-  it("with vcs: gitlab and no injected deps, the real resolveConfig throws the Phase 2 error", async () => {
-    await expect(review(makeArgs({ vcs: "gitlab" }))).rejects.toThrow(
+  it("with an explicit GitLab repository and no injected deps, the real resolveConfig throws the Phase 2 error", async () => {
+    await expect(review(makeArgs({ vcs: "gitlab", repo: "group/project" }))).rejects.toThrow(
       /GitLab support not yet implemented \(Phase 2\)/,
     );
   });

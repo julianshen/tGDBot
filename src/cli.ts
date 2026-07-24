@@ -22,6 +22,8 @@ import { parseReviewTarget } from "./target/review-target.js";
 export interface CliArgs {
   pr: string;
   vcs: "github" | "gitlab";
+  /** Internal parse provenance used to distinguish the default from an explicit --vcs. */
+  vcsExplicit?: boolean;
   repo?: string;
   /**
    * "<provider>/<model>" — the DEFAULT model (design-review #6). Runs the
@@ -204,7 +206,7 @@ export function parseArgs(argv: string[]): CliArgs {
     maxDiffChars = Number(maxDiffCharsRaw);
   }
 
-  return {
+  const result: CliArgs = {
     pr: values.pr as string,
     repo: values.repo as string | undefined,
     vcs,
@@ -218,6 +220,11 @@ export function parseArgs(argv: string[]): CliArgs {
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
     trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,
   };
+  Object.defineProperty(result, "vcsExplicit", {
+    value: values.vcs !== undefined,
+    enumerable: false,
+  });
+  return result;
 }
 
 /**
@@ -358,7 +365,11 @@ async function loadRulesForReview(
     return loadRulesFn(config.rulesDir, includeBuiltin);
   }
 
-  const ruleFiles = await config.vcsAdapter.getRuleFilesFromBase(pr.baseSha, config.rulesDir);
+  const ruleFiles = await config.vcsAdapter.getRuleFilesFromBase(
+    config.locator,
+    pr.baseSha,
+    config.rulesDir,
+  );
   const tempRulesDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-rules-"));
   try {
     // Written concurrently; v1's rule files are always a flat listing (see
@@ -425,7 +436,7 @@ export async function review(
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
 
   const config = resolveConfigFn(args);
-  const pr = await config.vcsAdapter.getPullRequest(config.pr);
+  const pr = await config.vcsAdapter.getPullRequest(config.locator);
 
   // Design-review item #9: name the RESOLVED review target up front. The VCS
   // adapter infers owner/repo from ambient context (`gh`'s git-remote /
@@ -438,7 +449,7 @@ export async function review(
   // so log scrapers can pick the status line out regardless.)
   console.log(`tgd-review-agent: reviewing ${pr.url ?? `PR #${config.pr}`} (head ${pr.headSha})`);
 
-  const botComment = await config.vcsAdapter.findBotComment(config.pr);
+  const botComment = await config.vcsAdapter.findBotComment(config.locator);
 
   // Config-aware dedup: a run is skipped only when this exact head SHA was
   // already reviewed WITH THE SAME review configuration. Computed from CLI flags
@@ -462,7 +473,7 @@ export async function review(
   // (the pre-existing behavior: the user asked for no ceiling).
   let diff: string;
   try {
-    diff = await config.vcsAdapter.getDiff(config.pr);
+    diff = await config.vcsAdapter.getDiff(config.locator);
   } catch (err) {
     if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
     console.warn(
@@ -565,7 +576,11 @@ export async function review(
     // write then threw, no marker would exist, and the next run on the same SHA
     // would post every inline comment a SECOND time — a duplicate-comment storm
     // strictly worse than the old behavior.
-    await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), botComment);
+    await config.vcsAdapter.upsertComment(
+      config.locator,
+      buildBody(orchestration),
+      botComment,
+    );
 
     // Design-review #10: collapse the PREVIOUS runs' inline threads before
     // posting this run's. Inline review comments are append-only, so without
@@ -577,7 +592,7 @@ export async function review(
     // Strictly best-effort: a failure here must not abort or degrade the
     // review — warn and carry on.
     try {
-      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.pr);
+      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.locator);
       if (resolved > 0) {
         console.log(`tgd-review-agent: resolved ${resolved} stale inline comment thread(s) from previous runs`);
       }
@@ -591,7 +606,7 @@ export async function review(
     if (orchestration.inlineComments.length > 0) {
       try {
         await config.vcsAdapter.createInlineReview(
-          config.pr,
+          config.locator,
           pr.headSha,
           orchestration.inlineComments,
         );
@@ -605,8 +620,12 @@ export async function review(
             `rewriting the summary comment to carry every finding instead`,
         );
         orchestration = orchestrateFn(dispatchResult, diff, { inline: false, ...renderOpts });
-        const existing = await config.vcsAdapter.findBotComment(config.pr);
-        await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), existing);
+        const existing = await config.vcsAdapter.findBotComment(config.locator);
+        await config.vcsAdapter.upsertComment(
+          config.locator,
+          buildBody(orchestration),
+          existing,
+        );
       }
     }
   }

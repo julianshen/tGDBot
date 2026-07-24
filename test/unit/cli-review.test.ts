@@ -13,11 +13,64 @@ import { parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { computeReviewConfigHash } from "../../src/review/dedup.js";
 import type { ResolvedConfig } from "../../src/config.js";
+import { resolveReviewLocator } from "../../src/config.js";
 import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "../../src/vcs/adapter.js";
 import type { LoadResult } from "../../src/rules/loader.js";
 import type { RuleDefinition } from "../../src/rules/types.js";
 import type { DispatchResult } from "../../src/review/types.js";
 import type { OrchestrationResult } from "../../src/review/orchestrate.js";
+
+describe("resolveReviewLocator", () => {
+  it("resolves numeric ambient GitHub targets", () => {
+    expect(resolveReviewLocator(makeArgs())).toEqual({
+      kind: "ambient",
+      provider: "github",
+      number: 42,
+    });
+  });
+
+  it("resolves numeric targets with an explicit GitHub repository", () => {
+    expect(resolveReviewLocator(makeArgs({ repo: "octo-org/octo-repo" }))).toMatchObject({
+      kind: "repository",
+      repo: { provider: "github", owner: "octo-org", repo: "octo-repo" },
+      number: 42,
+    });
+  });
+
+  it.each([
+    ["https://github.com/octo-org/octo-repo/pull/42", "github"],
+    ["https://gitlab.example.com/group/project/-/merge_requests/42", "gitlab"],
+  ] as const)("infers an explicit repository from %s", (pr, provider) => {
+    expect(resolveReviewLocator(makeArgs({ pr }))).toMatchObject({
+      kind: "repository",
+      repo: { provider },
+      number: 42,
+    });
+  });
+
+  it("rejects numeric GitLab targets without --repo", () => {
+    expect(() => resolveReviewLocator(makeArgs({ vcs: "gitlab" }))).toThrow(/--repo/i);
+  });
+
+  it("rejects URL and --repo provider mismatches", () => {
+    expect(() =>
+      resolveReviewLocator(makeArgs({
+        pr: "https://gitlab.com/group/project/-/merge_requests/42",
+        repo: "octo-org/octo-repo",
+      })),
+    ).toThrow(/match|mismatch/i);
+  });
+
+  it("rejects a review URL that conflicts with an explicitly supplied --vcs", () => {
+    expect(() =>
+      resolveReviewLocator(makeArgs({
+        pr: "https://gitlab.com/group/project/-/merge_requests/42",
+        vcs: "github",
+        vcsExplicit: true,
+      })),
+    ).toThrow(/does not match explicit --vcs/i);
+  });
+});
 
 function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
   return {
@@ -112,7 +165,12 @@ function makeHarness(options: {
     resolveStaleReviewThreads: vi.fn().mockResolvedValue(0),
   };
 
-  const config: ResolvedConfig = { ...args, vcsAdapter: vcsAdapter as unknown as VcsAdapter };
+  const locator = resolveReviewLocator(args);
+  const config: ResolvedConfig = {
+    ...args,
+    locator,
+    vcsAdapter: vcsAdapter as unknown as VcsAdapter,
+  };
 
   return {
     args,
@@ -307,7 +365,7 @@ describe("review", () => {
 
       expect(exitCode).toBe(0);
       expect(h.vcsAdapter.resolveStaleReviewThreads).toHaveBeenCalledTimes(1);
-      expect(h.vcsAdapter.resolveStaleReviewThreads).toHaveBeenCalledWith("42");
+      expect(h.vcsAdapter.resolveStaleReviewThreads).toHaveBeenCalledWith(h.config.locator);
       const upsertOrder = h.vcsAdapter.upsertComment.mock.invocationCallOrder[0];
       const resolveOrder = h.vcsAdapter.resolveStaleReviewThreads.mock.invocationCallOrder[0];
       expect(resolveOrder).toBeGreaterThan(upsertOrder);
@@ -377,7 +435,7 @@ describe("review", () => {
     expect(exitCode).toBe(0);
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
     const [prId, body, existing] = h.vcsAdapter.upsertComment.mock.calls[0];
-    expect(prId).toBe("42");
+    expect(prId).toEqual(h.config.locator);
     expect(existing).toBeNull();
     // The marker now carries the review-config hash after the SHA (#4).
     expect(body).toContain("<!-- tgd-review-agent:sha=abc1234 cfg=");
@@ -637,7 +695,11 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
 
     await review(h.args, depsFrom(h));
 
-    expect(h.vcsAdapter.getRuleFilesFromBase).toHaveBeenCalledWith("based00d", ".review/rules");
+    expect(h.vcsAdapter.getRuleFilesFromBase).toHaveBeenCalledWith(
+      h.config.locator,
+      "based00d",
+      ".review/rules",
+    );
 
     vi.restoreAllMocks();
   });
@@ -693,6 +755,7 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
     await review(h.args, depsFrom(h));
 
     expect(h.vcsAdapter.getRuleFilesFromBase).toHaveBeenCalledWith(
+      h.config.locator,
       "based00d",
       ".tgd-review/rules",
     );
@@ -934,7 +997,7 @@ describe("inline review comments", () => {
     expect(exitCode).toBe(0);
     expect(h.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
     const [prId, headSha, comments] = h.vcsAdapter.createInlineReview.mock.calls[0];
-    expect(prId).toBe("42");
+    expect(prId).toEqual(h.config.locator);
     expect(headSha).toBe("cafef00d"); // makePr()'s head sha
     expect(comments).toEqual(withInline.inlineComments);
     // The summary is STILL upserted — that's what carries the dedup marker.

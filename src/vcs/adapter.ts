@@ -1,13 +1,33 @@
+import type {
+  GitHubRepositoryRef,
+  RepositoryRef as ProviderNeutralRepositoryRef,
+} from "../target/types.js";
+
+/** @deprecated Workspace code remains GitHub-specific; review locators use the neutral target type. */
+export type RepositoryRef = GitHubRepositoryRef;
+
+export type ReviewLocator =
+  | {
+      readonly kind: "ambient";
+      readonly provider: "github";
+      readonly number: number;
+    }
+  | {
+      readonly kind: "repository";
+      readonly repo: ProviderNeutralRepositoryRef;
+      readonly number: number;
+    };
+
 // VcsAdapter: provider-agnostic interface for fetching PR metadata/diff/comments
 // and posting a review comment. Implemented by GitHubAdapter (this task, `gh`-backed)
 // and, in a later phase, a GitLabAdapter (`glab`-backed) — see SPEC.md's Data Models
 // section and TASKS.md's Task 2 Context & Goal ("VcsAdapter provider-agnostic so a
 // GitLabAdapter is addable later without touching Tasks 3-9").
 export interface VcsAdapter {
-  getPullRequest(id: string): Promise<PullRequestInfo>;
-  getDiff(id: string): Promise<string>;
-  findBotComment(id: string): Promise<BotComment | null>;
-  upsertComment(id: string, body: string, existing: BotComment | null): Promise<void>;
+  getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo>;
+  getDiff(locator: ReviewLocator): Promise<string>;
+  findBotComment(locator: ReviewLocator): Promise<BotComment | null>;
+  upsertComment(locator: ReviewLocator, body: string, existing: BotComment | null): Promise<void>;
   /**
    * Posts findings as INLINE review comments anchored to lines of the diff
    * (GitHub: `POST /pulls/{n}/reviews` with `event: COMMENT`).
@@ -21,7 +41,7 @@ export interface VcsAdapter {
    * finding is only ever relocated, never lost.
    */
   createInlineReview(
-    id: string,
+    locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
   ): Promise<void>;
@@ -46,7 +66,7 @@ export interface VcsAdapter {
    * Callers must treat a rejection as non-fatal: this is cosmetic cleanup, and
    * a failure here must never abort or degrade the review being posted.
    */
-  resolveStaleReviewThreads(id: string): Promise<number>;
+  resolveStaleReviewThreads(locator: ReviewLocator): Promise<number>;
 
   /**
    * ADR-002: fetches every `*.md` rule file under `rulesDir` AS IT EXISTS ON
@@ -68,46 +88,8 @@ export interface VcsAdapter {
    * resolve to `[]`. Genuine errors (auth failure, network error, malformed
    * API response) should still propagate/reject.
    */
-  getRuleFilesFromBase(baseSha: string, rulesDir: string): Promise<RuleFileContent[]>;
-}
-
-export interface RepositoryRef {
-  host: "github.com";
-  owner: string;
-  repo: string;
-}
-
-export interface PullRequestSnapshot {
-  number: number;
-  headSha: string;
-  baseSha: string;
-  headRef: string;
-  baseRef: string;
-  title: string;
-  description: string;
-  url: string;
-}
-
-/** Location-independent VCS operations used by canonical-URL review runs. */
-export interface RepositoryScopedVcsAdapter {
-  getPullRequest(repo: RepositoryRef, number: number): Promise<PullRequestSnapshot>;
-  getDiff(repo: RepositoryRef, number: number): Promise<string>;
-  findBotComment(repo: RepositoryRef, number: number): Promise<BotComment | null>;
-  upsertComment(
-    repo: RepositoryRef,
-    number: number,
-    body: string,
-    existing: BotComment | null,
-  ): Promise<void>;
-  createInlineReview(
-    repo: RepositoryRef,
-    number: number,
-    headSha: string,
-    comments: InlineReviewComment[],
-  ): Promise<void>;
-  resolveStaleReviewThreads(repo: RepositoryRef, number: number): Promise<number>;
   getRuleFilesFromBase(
-    repo: RepositoryRef,
+    locator: ReviewLocator,
     baseSha: string,
     rulesDir: string,
   ): Promise<RuleFileContent[]>;
