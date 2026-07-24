@@ -377,7 +377,7 @@ All automated tests are offline.
 - base-SHA rule listing, file decoding, missing-directory handling, pagination,
   and genuine failure propagation;
 - inline single-line, multi-line, and suggestion positions;
-- renamed-file context-line positions and mixed added/context range rejection;
+- renamed-file context-line and mixed added/context range positions;
 - stale-head preflight;
 - partial inline success/failure accounting;
 - stale discussion filtering, pagination, per-thread failure isolation, and
