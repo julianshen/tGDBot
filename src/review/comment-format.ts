@@ -259,8 +259,8 @@ export interface RenderOptions {
  *    the content cannot close it early and inject markdown/HTML around the block;
  *  - the content is emitted verbatim and never sanitized, because it is CODE
  *    destined for the file — escaping it would corrupt what gets committed. It is
- *    inert: everything between the fences is literal, and the adapter scopes the
- *    commit to the anchored line range according to provider constraints;
+ *    inert: everything between the fences is literal, and the Git provider/UI
+ *    applies it to the anchored line range according to provider constraints;
  *  - the explicit warning below is not decoration. A suggestion is the one thing
  *    this tool emits that a human can accept without reading the reasoning.
  */

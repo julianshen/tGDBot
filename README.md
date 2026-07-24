@@ -111,6 +111,15 @@ or from whatever CI system you already use — anywhere `gh` is authenticated
 and the provider keys are present in the environment. If you do automate it on
 untrusted PRs, read "⚠️ Security Considerations" above first.
 
+### GitLab targets and authentication
+
+Install `glab` before reviewing GitLab merge requests. The ordinary interactive
+login for GitLab.com or a self-managed host is:
+
+```bash
+glab auth login --hostname gitlab.example.com
+```
+
 GitHub remains the default: a numeric `--pr` with no other target flags uses
 the current repository inferred by `gh`. GitLab targets use `glab`; the adapter
 invokes `glab mr` and `glab api` (including notes, discussions, and trusted
@@ -131,8 +140,6 @@ tgd-review-agent review \
 Self-managed GitLab supports nested namespaces and custom web ports:
 
 ```bash
-glab auth login --hostname gitlab.example.com \
-  --api-host gitlab.example.com:8443
 tgd-review-agent review \
   --vcs gitlab \
   --repo gitlab.example.com:8443/group/subgroup/project \
@@ -140,9 +147,21 @@ tgd-review-agent review \
 ```
 
 `glab api --hostname` receives the hostname without its web port. When the API
-is exposed on a custom port, preserve the web port in `--repo` and configure
-the API mapping with
-`glab auth login --hostname gitlab.example.com --api-host gitlab.example.com:8443`.
+is exposed on a custom port, preserve the web port in `--repo`. Current `glab`
+requires `--api-host`, `--api-protocol`, and `--git-protocol` to be supplied in
+non-interactive mode. Put the token in a permission-restricted file and pass it
+on standard input so it does not appear in process argv or shell history:
+
+```bash
+glab auth login --hostname gitlab.example.com \
+  --api-host gitlab.example.com:8443 \
+  --api-protocol https \
+  --git-protocol ssh \
+  --stdin < /secure/path/glab-token
+```
+
+Use `chmod 600 /secure/path/glab-token`, remove the file after login, and never
+put the token directly in the command line.
 HTTP-only GitLab installations are not supported.
 
 A complete merge-request URL needs neither `--vcs` nor `--repo`:
@@ -152,11 +171,25 @@ tgd-review-agent review \
   --pr https://gitlab.example.com/group/project/-/merge_requests/42
 ```
 
-Minimum GitLab permissions are read access to the merge request, diff, and
-repository files plus permission to read/write notes and discussions. Do not
-grant repository-content write permission. Rules are fetched from the target
-merge request's base branch through `glab api`, so those base-branch files are
-the trusted rules; never use `--trust-local-rules` for untrusted changes.
+GitLab project roles and token scopes are separate permission layers:
+
+- At the project-role layer, use a dedicated project account with the lowest
+  role that your GitLab instance allows to read merge requests, diffs, and
+  repository files and to create/update notes and discussions. Do not reuse an
+  owner or administrator account.
+- At the token-scope layer, current `glab auth login` documents `api` and
+  `write_repository` as its minimum required token scopes. The `api` scope is
+  broad, and `write_repository` permits repository writes; these scopes are a
+  `glab` authentication requirement, not evidence that this review tool writes
+  repository contents. Limit the dedicated account's project membership and
+  rotate/revoke its token independently.
+
+Rules are fetched from the target merge request's base branch through
+`glab api`, so those base-branch files are the trusted rules; never use
+`--trust-local-rules` for untrusted changes. GitLab inline partial failure falls
+back only failed findings to the summary, while successful discussions remain
+inline. Use `--dry-run` to preview the summary and inline comments without
+posting notes or discussions.
 
 The `review` command sources rule files safely from the PR's base branch
 entirely inside the CLI (see "Rule files are sourced from the base branch"
@@ -355,8 +388,19 @@ This live procedure is intentionally not part of the default test suite. It
 requires a user-provided GitLab.com or self-managed project, a real open merge
 request, provider credentials, and authenticated network access.
 
-1. Install `glab`, then run `glab auth login --hostname <host>` (and supply
-   `--api-host <host>:<port>` when the API uses a custom port).
+1. Install `glab`. For an ordinary host, run
+   `glab auth login --hostname <host>`. For a custom API port, use the
+   non-interactive form with a protected token file:
+
+   ```bash
+   glab auth login --hostname gitlab.example.com \
+     --api-host gitlab.example.com:8443 \
+     --api-protocol https \
+     --git-protocol ssh \
+     --stdin < /secure/path/glab-token
+   ```
+
+   The token travels over standard input, not argv or shell history.
 2. Export a provider API key and build the CLI with `npm ci && npm run build`.
 3. Run `node dist/cli.js review --vcs gitlab --repo <host/group/project> --pr
    <iid> --dry-run`; confirm metadata, diff, trusted base-branch rules, summary,
