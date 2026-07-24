@@ -270,6 +270,25 @@ describe("GitLabAdapter stale discussion cleanup", () => {
     warn.mockRestore();
   });
 
+  it("isolates plain Error PUT failures without leaking their message", async () => {
+    let puts = 0;
+    const execGlab: ExecGlab = async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
+      if (args.includes("--paginate")) return discussionsFixture;
+      puts += 1;
+      if (puts === 1) throw new Error("private TOKEN=secret from provider");
+      return JSON.stringify({ id: "resolved" });
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(new GitLabAdapter(execGlab).resolveStaleReviewThreads(locator()))
+      .resolves.toBe(1);
+    expect(puts).toBe(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls.flat().join("\n")).not.toMatch(/TOKEN|secret|private|provider/i);
+    warn.mockRestore();
+  });
+
   it.each([
     "",
     "../escape",

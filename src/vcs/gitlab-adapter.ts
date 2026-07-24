@@ -784,11 +784,14 @@ export class GitLabAdapter implements VcsAdapter {
         ], JSON.stringify({ resolved: true }));
         resolved += 1;
       } catch (error) {
-        if (!(error instanceof GlabCommandError)) throw error;
-        void classifyGlabWriteFailure(error);
+        let reason = "unexpected cleanup failure";
+        if (error instanceof GlabCommandError) {
+          void classifyGlabWriteFailure(error);
+          reason = sanitizedWriteFailureReason(error);
+        }
         console.warn(
           `GitLabAdapter: could not resolve a stale review discussion ` +
-            `(${sanitizedWriteFailureReason(error)}); continuing with the remaining discussions`,
+            `(${reason}); continuing with the remaining discussions`,
         );
       }
     }
