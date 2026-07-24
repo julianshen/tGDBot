@@ -289,6 +289,9 @@ async function prepareWorkspaceUnlocked(
     repository: repositoryIdentity(request.repo),
     baseSha: request.baseSha.toLowerCase(),
   };
+  const legacyGitHubRepository = request.repo.provider === "github"
+    ? `${request.repo.host}/${request.repo.owner}/${request.repo.repo}`
+    : undefined;
 
   if (await exists(paths.baseWorktreePath)) {
     let marker: typeof expectedMarker;
@@ -301,12 +304,18 @@ async function prepareWorkspaceUnlocked(
     } catch {
       throw new Error(`Refusing unmanaged worktree collision at ${paths.baseWorktreePath}`);
     }
-    if (
+    const currentMarkerMismatch =
       marker.version !== expectedMarker.version ||
       marker.provider !== expectedMarker.provider ||
       marker.repository !== expectedMarker.repository ||
-      marker.baseSha !== expectedMarker.baseSha
-    ) {
+      marker.baseSha !== expectedMarker.baseSha;
+    const isLegacyGitHubMarker =
+      legacyGitHubRepository !== undefined &&
+      Object.keys(marker).sort().join(",") === "baseSha,repository,version" &&
+      marker.version === expectedMarker.version &&
+      marker.repository === legacyGitHubRepository &&
+      marker.baseSha === expectedMarker.baseSha;
+    if (currentMarkerMismatch && !isLegacyGitHubMarker) {
       throw new Error(`Refusing unmanaged worktree ownership mismatch at ${paths.baseWorktreePath}`);
     }
     const commonDir = (await execManaged("git", [

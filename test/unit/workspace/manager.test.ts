@@ -490,6 +490,31 @@ describe("prepareWorkspace", () => {
     expect(exec).toHaveBeenCalledWith("git", ["-C", worktreePath, "clean", "-ffdx"]);
   });
 
+  it("reuses a legacy GitHub v1 ownership marker after verifying its mirror and HEAD", async () => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    await mkdir(paths.baseWorktreePath, { recursive: true });
+    await mkdir(paths.mirrorPath, { recursive: true });
+    await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
+    await writeFile(paths.ownerMarkerPath, JSON.stringify({
+      version: 1,
+      repository: "github.com/octo-org/octo-repo",
+      baseSha,
+    }));
+    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
+      args.includes("--git-common-dir") ? `${paths.mirrorPath}\n` : `${baseSha}\n`);
+
+    await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).resolves.toMatchObject({
+      baseWorktreePath: paths.baseWorktreePath,
+    });
+    expect(exec).toHaveBeenCalledWith("git", [
+      "-C", paths.baseWorktreePath, "rev-parse", "--path-format=absolute", "--git-common-dir",
+    ]);
+    expect(exec).toHaveBeenCalledWith("git", ["-C", paths.baseWorktreePath, "rev-parse", "HEAD"]);
+    expect(exec).toHaveBeenCalledWith("git", ["-C", paths.baseWorktreePath, "reset", "--hard", "HEAD"]);
+    expect(exec).toHaveBeenCalledWith("git", ["-C", paths.baseWorktreePath, "clean", "-ffdx"]);
+  });
+
   it("rejects a forged marker for a checkout not registered to the managed mirror", async () => {
     const root = await tempRoot();
     const paths = deriveWorkspacePaths({ root, repo, baseSha });
