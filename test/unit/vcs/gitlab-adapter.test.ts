@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -126,6 +127,7 @@ describe("GitLabAdapter merge request snapshot", () => {
     [JSON.stringify([]), "object"],
     [JSON.stringify({ ...JSON.parse(fixture), iid: "42" }), "iid"],
     [JSON.stringify({ ...JSON.parse(fixture), source_branch: null }), "source_branch"],
+    [JSON.stringify({ ...JSON.parse(fixture), description: 123 }), "description"],
     [JSON.stringify({ ...JSON.parse(fixture), diff_refs: undefined }), "diff_refs"],
     [
       JSON.stringify({
@@ -139,6 +141,19 @@ describe("GitLabAdapter merge request snapshot", () => {
     await expect(adapter.getPullRequest(locator())).rejects.toMatchObject({
       name: "GlabOutputError",
       message: expect.stringMatching(new RegExp(expected, "i")),
+    });
+  });
+
+  it.each([
+    [null, ""],
+    ["", ""],
+  ])("normalizes a %s description without rejecting valid emptiness", async (description, expected) => {
+    const adapter = new GitLabAdapter(async () =>
+      JSON.stringify({ ...JSON.parse(fixture), description }),
+    );
+
+    await expect(adapter.getPullRequest(locator())).resolves.toMatchObject({
+      description: expected,
     });
   });
 });
@@ -164,7 +179,12 @@ describe("GitLab adapter helpers", () => {
 
 describe("realExecGlab", () => {
   it("uses execFile argv, a 10 MiB buffer, non-interactive environment, and optional stdin", async () => {
-    const end = vi.fn();
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback();
+      },
+    });
+    const end = vi.spyOn(stdin, "end");
     vi.mocked(execFile).mockImplementation(((
       file: string,
       args: readonly string[],
@@ -178,11 +198,39 @@ describe("realExecGlab", () => {
         env: expect.objectContaining({ GLAB_PROMPT_DISABLED: "true" }),
       });
       queueMicrotask(() => callback(null, "ok\n", ""));
-      return { stdin: { end } };
+      return { stdin };
     }) as typeof execFile);
 
     await expect(realExecGlab(["api", "user"], "secret stdin")).resolves.toBe("ok\n");
     expect(end).toHaveBeenCalledWith("secret stdin");
+  });
+
+  it("maps an early stdin EPIPE into one sanitized typed rejection even if the callback later succeeds", async () => {
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(Object.assign(new Error("write EPIPE TOKEN=secret"), { code: "EPIPE" }));
+      },
+    });
+    vi.mocked(execFile).mockImplementation(((
+      _file: string,
+      _args: readonly string[],
+      _options: object,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      setImmediate(() => callback(null, "late success", ""));
+      return { stdin };
+    }) as typeof execFile);
+
+    const error = await realExecGlab(
+      ["api", "--hostname", "gitlab.example.com", "projects/x"],
+      "sensitive body",
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GlabCommandError);
+    expect(error).toMatchObject({ stderr: "", exitCode: undefined });
+    expect((error as Error).message).toMatch(/write input.*gitlab\.example\.com/i);
+    expect((error as Error).message).not.toContain("TOKEN=secret");
+    await new Promise((resolve) => setImmediate(resolve));
   });
 
   it("maps ENOENT to actionable installation and host-specific auth guidance", async () => {

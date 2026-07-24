@@ -76,6 +76,17 @@ function apiHttpStatus(args: readonly string[], stderr: string): number | undefi
 
 export const realExecGlab: ExecGlab = (args, stdin) =>
   new Promise((resolve, reject) => {
+    let settled = false;
+    const resolveOnce = (stdout: string): void => {
+      if (settled) return;
+      settled = true;
+      resolve(stdout);
+    };
+    const rejectOnce = (error: GlabCommandError): void => {
+      if (settled) return;
+      settled = true;
+      reject(error);
+    };
     const child = execFile(
       "glab",
       [...args],
@@ -88,14 +99,14 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
       },
       (error, stdout, stderr) => {
         if (error === null) {
-          resolve(stdout);
+          resolveOnce(stdout);
           return;
         }
 
         const processError = error as NodeJS.ErrnoException;
         const host = commandHost(args);
         if (processError.code === "ENOENT") {
-          reject(
+          rejectOnce(
             new GlabCommandError(
               `Unable to run glab. Install the GitLab CLI, then authenticate with glab auth login --hostname ${host}.`,
               { cause: error, stderr },
@@ -104,7 +115,7 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
           return;
         }
         if (processError.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
-          reject(
+          rejectOnce(
             new GlabCommandError(
               "glab output exceeded the 10 MiB safety limit; narrow the requested output or reduce the merge request diff.",
               { cause: error, exitCode: numericExitCode(processError), stderr },
@@ -113,7 +124,7 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
           return;
         }
 
-        reject(
+        rejectOnce(
           new GlabCommandError(
             `glab command failed for ${host}; verify authentication, permissions, and host configuration.`,
             {
@@ -127,7 +138,32 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
       },
     );
     if (stdin !== undefined) {
-      child.stdin?.end(stdin);
+      if (child.stdin === null) {
+        rejectOnce(
+          new GlabCommandError(
+            `Unable to write input to glab for ${commandHost(args)} because stdin is unavailable.`,
+          ),
+        );
+      } else {
+        child.stdin.on("error", (cause: NodeJS.ErrnoException) => {
+          rejectOnce(
+            new GlabCommandError(
+              `Unable to write input to glab for ${commandHost(args)}; the process closed stdin early.`,
+              { cause },
+            ),
+          );
+        });
+        try {
+          child.stdin.end(stdin);
+        } catch (cause) {
+          rejectOnce(
+            new GlabCommandError(
+              `Unable to write input to glab for ${commandHost(args)}; the process closed stdin early.`,
+              { cause },
+            ),
+          );
+        }
+      }
     }
   });
 
@@ -186,6 +222,12 @@ function requiredString(
   return value;
 }
 
+function description(value: unknown): string {
+  if (value === null) return "";
+  if (typeof value === "string") return value;
+  throw new GlabOutputError("Invalid glab MR response: malformed description");
+}
+
 function parseMergeRequest(stdout: string): GlabMergeRequest {
   let value: unknown;
   try {
@@ -206,8 +248,7 @@ function parseMergeRequest(stdout: string): GlabMergeRequest {
   return {
     iid: value.iid as number,
     title: requiredString(value, "title"),
-    description:
-      value.description === null ? null : requiredString(value, "description"),
+    description: description(value.description),
     web_url: requiredString(value, "web_url"),
     source_branch: requiredString(value, "source_branch"),
     target_branch: requiredString(value, "target_branch"),
