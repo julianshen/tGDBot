@@ -12,7 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 import { parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { computeReviewConfigHash } from "../../src/review/dedup.js";
-import { parseBotMarker } from "../../src/review/comment-marker.js";
+import { formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import { resolveReviewLocator } from "../../src/config.js";
 import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "../../src/vcs/adapter.js";
@@ -294,6 +294,36 @@ describe("review", () => {
     });
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/invalid pending|recovery/i);
+
+    expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+  });
+
+  it("fails closed for a current ready recovery note with the wrong exact note binding", async () => {
+    const h = makeHarness({ botComment: null });
+    const configHash = computeReviewConfigHash(h.config);
+    const body = formatPendingMarker({
+      phase: "ready",
+      headSha: "cafef00d",
+      configHash,
+      noteId: "other-888",
+      terminalResult: {
+        status: "posted",
+        findingsCount: 0,
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+        exitCode: 0,
+      },
+    });
+    h.vcsAdapter.findBotComment.mockResolvedValue({
+      id: "written-777",
+      body,
+      ...parseBotMarker(body)!,
+    });
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/binding|recovery|note/i);
 
     expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
@@ -1117,6 +1147,18 @@ describe("inline review comments", () => {
       { inline: true },
     );
   }
+
+  it("rejects unrepresentable recovery metadata before the first external write", async () => {
+    const h = inlineHarness({
+      ...withInline,
+      rulesRun: ["x".repeat(100_000)],
+    });
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/too large|terminal/i);
+
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+  });
 
   it("posts the inline comments via createInlineReview, pinned to the head SHA", async () => {
     const h = inlineHarness(withInline);

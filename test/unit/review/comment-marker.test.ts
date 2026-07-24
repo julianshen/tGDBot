@@ -51,11 +51,72 @@ describe("parseBotMarker", () => {
       .toBe("summary\n\n<!-- complete -->");
   });
 
+  it("accepts 65 rules and rule names longer than 128 characters", () => {
+    const longRule = "long-rule-" + "x".repeat(256);
+    const rulesRun = Array.from({ length: 65 }, (_, index) => `rule-${index}`);
+    rulesRun.push(longRule);
+    const marker = formatPendingMarker({
+      phase: "ready",
+      headSha: "abc1234",
+      configHash: "deadbeef",
+      noteId: "note-777",
+      terminalResult: {
+        status: "posted",
+        findingsCount: 0,
+        rulesRun,
+        rulesFailed: [],
+        exitCode: 0,
+      },
+    });
+
+    expect(parseBotMarker(marker)?.pendingState?.terminalResult?.rulesRun)
+      .toEqual(rulesRun);
+  });
+
+  it("accepts the 32 KiB encoded boundary and rejects the next larger encoding", () => {
+    const encodedLength = (name: string) =>
+      Buffer.from(JSON.stringify({
+        status: "posted",
+        findingsCount: 0,
+        rulesRun: [name],
+        rulesFailed: [],
+        exitCode: 0,
+      }), "utf8").toString("base64url").length;
+    let boundaryName = "";
+    for (let length = 1; length < 32_768; length += 1) {
+      const candidate = "x".repeat(length);
+      if (encodedLength(candidate) === 32_768) {
+        boundaryName = candidate;
+        break;
+      }
+    }
+    expect(boundaryName).not.toBe("");
+    let oversizedName = boundaryName + "x";
+    while (encodedLength(oversizedName) <= 32_768) oversizedName += "x";
+
+    const makeMarker = (ruleName: string) => formatPendingMarker({
+      phase: "ready",
+      headSha: "abc1234",
+      configHash: "deadbeef",
+      noteId: "note-777",
+      terminalResult: {
+        status: "posted",
+        findingsCount: 0,
+        rulesRun: [ruleName],
+        rulesFailed: [],
+        exitCode: 0,
+      },
+    });
+
+    expect(() => makeMarker(boundaryName)).not.toThrow();
+    expect(() => makeMarker(oversizedName)).toThrow(/too large/i);
+  });
+
   it.each([
-    "v2.eyJzdGF0dXMiOiJwb3N0ZWQifQ",
-    "v1.not-base64!",
-    `v1.${"a".repeat(3000)}`,
-  ])("rejects unknown, malformed, or oversized terminal result encoding %s", (result) => {
+    ["unknown version", "v2.eyJzdGF0dXMiOiJwb3N0ZWQifQ"],
+    ["malformed payload", "v1.not-base64!"],
+    ["oversized payload", `v1.${"a".repeat(32_769)}`],
+  ])("rejects %s terminal result encoding", (_label, result) => {
     const body = "summary\n\n" +
       `<!-- tgd-review-agent:pending phase=ready sha=abc1234 cfg=deadbeef note=note-777 result=${result} -->`;
     expect(parseBotMarker(body)).toEqual({

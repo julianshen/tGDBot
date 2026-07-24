@@ -29,9 +29,7 @@ const BOT_RECOVERY_MARKER_RE =
   /<!-- tgd-review-agent:pending phase=(publishing|ready) sha=([0-9a-f]{7,40}) cfg=([0-9a-z]+)(?: note=([A-Za-z0-9._~-]+))?(?: result=(v1\.[A-Za-z0-9_-]+))? -->\s*$/u;
 const BOT_ANY_PENDING_MARKER_RE =
   /<!-- tgd-review-agent:pending(?: phase=(?:publishing|ready) sha=[0-9a-f]{7,40} cfg=[0-9a-z]+(?: note=[A-Za-z0-9._~-]+)?(?: result=v1\.[A-Za-z0-9_-]+)?)? -->\s*$/u;
-const MAX_TERMINAL_RESULT_CHARS = 2048;
-const MAX_RULES = 64;
-const MAX_RULE_NAME_CHARS = 128;
+const MAX_TERMINAL_RESULT_CHARS = 32_768;
 
 export const BOT_PENDING_MARKER = "<!-- tgd-review-agent:pending -->";
 
@@ -125,13 +123,7 @@ function invalidPendingMarker(): ParsedBotMarker {
 
 function validRuleNames(value: unknown): value is string[] {
   return Array.isArray(value) &&
-    value.length <= MAX_RULES &&
-    value.every((name) =>
-      typeof name === "string" &&
-      name.length > 0 &&
-      name.length <= MAX_RULE_NAME_CHARS &&
-      !/[\u0000-\u001f\u007f]/u.test(name)
-    );
+    value.every((name) => typeof name === "string");
 }
 
 function validateTerminalResult(value: unknown): TerminalReviewResult | null {

@@ -487,15 +487,26 @@ export async function review(
   // process died during the final marker update, finalize the exact same note
   // without dispatching again or risking duplicate inline POSTs.
   const recovery = botComment?.pendingState;
+  // Only a ready checkpoint for this exact SHA/config can represent an
+  // interrupted current run. Once those two fields match, every remaining
+  // binding is mandatory and a mismatch is corruption, not permission to
+  // republish inline comments. A stale SHA/config intentionally falls through
+  // to the normal re-review path for the new revision/configuration.
   if (
     !config.dryRun &&
     botComment !== null &&
     recovery?.phase === "ready" &&
     recovery.headSha === pr.headSha &&
-    recovery.configHash === configHash &&
-    recovery.noteId === botComment.id &&
-    recovery.terminalResult !== undefined
+    recovery.configHash === configHash
   ) {
+    if (
+      recovery.noteId !== botComment.id ||
+      recovery.terminalResult === undefined
+    ) {
+      throw new Error(
+        "Invalid current pending review recovery binding; refusing to dispatch or write",
+      );
+    }
     const finalizedBody = replacePendingMarker(
       botComment.body,
       formatMarker(pr.headSha, configHash),
@@ -652,6 +663,24 @@ export async function review(
     // rediscoverable without claiming this SHA/config is complete. Only after
     // inline outcomes and selective fallback are settled do we replace it with
     // the complete dedup marker, targeting the exact returned identity.
+    let conservativeRecoveryBody: string | undefined;
+    if (orchestration.inlineComments.length > 0) {
+      const allInlineIds = new Set(
+        orchestration.inlineComments.map((comment) => comment.clientId),
+      );
+      conservativeRecoveryBody = renderSummary(orchestration, allInlineIds);
+      // The provider assigns the real note identity on the first write, but
+      // every already-known recovery field must be representable before that
+      // write. A safe placeholder exercises the exact same bounded encoder.
+      formatPendingMarker({
+        phase: "ready",
+        headSha: pr.headSha,
+        configHash,
+        noteId: "preflight",
+        terminalResult,
+      });
+    }
+
     const writtenSummary = await config.vcsAdapter.upsertComment(
       config.locator,
       buildBody(
@@ -682,15 +711,11 @@ export async function review(
 
     let summaryIdentity = writtenSummary;
     if (orchestration.inlineComments.length > 0) {
-      const allInlineIds = new Set(
-        orchestration.inlineComments.map((comment) => comment.clientId),
-      );
-      const recoveryBody = renderSummary(orchestration, allInlineIds);
       const checkpoint = await config.vcsAdapter.upsertComment(
         config.locator,
         buildBody(
           orchestration,
-          recoveryBody,
+          conservativeRecoveryBody!,
           formatPendingMarker({
             phase: "ready",
             headSha: pr.headSha,
