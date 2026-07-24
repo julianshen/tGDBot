@@ -200,10 +200,9 @@ function apiHost(repo?: GitHubRepositoryRef): string[] {
 /**
  * GitHubAdapter: VcsAdapter implementation backed by the `gh` CLI.
  *
- * Canonical-URL calls accept a RepositoryRef and use `--repo host/owner/repo`,
- * explicit REST paths, and explicit GraphQL variables. Legacy one-argument
- * calls retain ambient gh context for backward compatibility until their
- * documented migration path is retired.
+ * Repository locators use `--repo host/owner/repo`, explicit REST paths, and
+ * explicit GraphQL variables. Ambient locators retain `gh`'s repository
+ * inference and reproduce the existing ambient command arguments.
  */
 export class GitHubAdapter implements VcsAdapter {
   constructor(private readonly execGh: ExecGh = realExecGh) {}

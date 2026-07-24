@@ -21,6 +21,7 @@ const hoisted = vi.hoisted(() => ({
   upsertComment: vi.fn(),
   getRuleFilesFromBase: vi.fn(),
   createInlineReview: vi.fn(),
+  resolveStaleReviewThreads: vi.fn(),
 }));
 
 vi.mock("../../src/vcs/github-adapter.js", () => ({
@@ -31,6 +32,7 @@ vi.mock("../../src/vcs/github-adapter.js", () => ({
     findBotComment = hoisted.findBotComment;
     upsertComment = hoisted.upsertComment;
     getRuleFilesFromBase = hoisted.getRuleFilesFromBase;
+    resolveStaleReviewThreads = hoisted.resolveStaleReviewThreads;
   },
   realExecGh: vi.fn(),
 }));
@@ -87,6 +89,7 @@ describe("review — default dependency wiring", () => {
     hoisted.findBotComment.mockResolvedValue(null);
     hoisted.upsertComment.mockResolvedValue(undefined);
     hoisted.getRuleFilesFromBase.mockResolvedValue([]);
+    hoisted.resolveStaleReviewThreads.mockResolvedValue(0);
 
     vi.mocked(loadRules).mockResolvedValue({
       rules: [
@@ -141,6 +144,7 @@ describe("review — default dependency wiring", () => {
       "base0000",
       ".review/rules",
     );
+    expect(hoisted.resolveStaleReviewThreads).toHaveBeenCalledWith(ambientLocator);
 
     // The real loadRulesReal/dispatchRulesReal/orchestrateReal references
     // were actually invoked (not silently skipped by a typo'd default) —

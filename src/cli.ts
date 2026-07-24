@@ -91,7 +91,7 @@ const DEFAULTS = {
  *
  * `--rules-dir <path>` (default `.review/rules`): a REPO-RELATIVE path,
  * NOT a local filesystem path by default. `review()` passes it to
- * `vcsAdapter.getRuleFilesFromBase(pr.baseSha, rulesDir)`, which fetches
+ * `vcsAdapter.getRuleFilesFromBase(locator, pr.baseSha, rulesDir)`, which fetches
  * `<rulesDir>/*.md` as it exists on the PR's BASE branch via the VCS
  * provider's API (`gh api` for GitHub) — never from whatever happens to be
  * checked out locally. This is what closes the rule-file trust-boundary gap
