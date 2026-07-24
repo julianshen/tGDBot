@@ -19,7 +19,8 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { digestArtifactInputs, digestDegradedArtifactInputs } from "./artifact-validator.js";
-import type { ArtifactInput, ContextCacheKey } from "./types.js";
+import { contextCacheKeyForRepository, type ArtifactInput, type ContextCacheKey } from "./types.js";
+import type { RepositoryRef } from "../target/types.js";
 import type {
   ContextMapper,
   ContextMapRequest,
@@ -154,17 +155,13 @@ async function copyMappedGraphsFromTgdLayout(sourceRoot: string, outputRoot: str
   }
 }
 
-function validationKey(baseSha: string): ContextCacheKey {
-  return {
-    provider: "github",
-    host: "github.com",
-    owner: "mapping-validation",
-    repo: "mapping-validation",
+function validationKey(repository: RepositoryRef, baseSha: string): ContextCacheKey {
+  return contextCacheKeyForRepository(repository, {
     baseSha,
     schemaVersion: 1,
     tgdVersion: "mapping-validation",
     policyVersion: "mapping-validation",
-  };
+  });
 }
 
 async function countAnalyzedFiles(outputRoot: string): Promise<number> {
@@ -332,7 +329,7 @@ export class TgdPiMapper implements ContextMapper {
         const degradedReasons: DegradedReason[] = [
           !hasKnowledge ? "knowledge-graph-unavailable" : "domain-context-unavailable",
         ];
-        await digestDegradedArtifactInputs(outputRoot, validationKey(request.baseSha), [
+        await digestDegradedArtifactInputs(outputRoot, validationKey(request.repository, request.baseSha), [
           { kind: "context", path: CONTEXT_PATH },
           { kind: "mapping-metadata", path: METADATA_PATH },
         ]);
@@ -347,7 +344,7 @@ export class TgdPiMapper implements ContextMapper {
       }
 
       const artifacts = mappingArtifacts(hasDomain);
-      await digestArtifactInputs(outputRoot, validationKey(request.baseSha), artifacts);
+      await digestArtifactInputs(outputRoot, validationKey(request.repository, request.baseSha), artifacts);
       const analyzedFiles = await countAnalyzedFiles(outputRoot);
       this.#onProgress({ stage: "validation", status: "completed" });
       return {

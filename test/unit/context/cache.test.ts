@@ -18,6 +18,7 @@ import type {
   ContextManifest,
   ContextManifestInput,
 } from "../../../src/context/types.js";
+import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 
 const key: ContextCacheKey = {
   provider: "github",
@@ -30,6 +31,14 @@ const key: ContextCacheKey = {
   policyVersion: "2026-07-18",
 };
 const createdAt = "2026-07-18T08:00:00.000Z";
+const gitlabRepo: GitLabRepositoryRef = {
+  provider: "gitlab",
+  host: "gitlab.example.com",
+  port: 8443,
+  namespace: ["group", "subgroup"],
+  repo: "project",
+  canonicalUrl: "https://gitlab.example.com:8443/group/subgroup/project",
+};
 const roots: string[] = [];
 const execFileAsync = promisify(execFile);
 
@@ -246,6 +255,68 @@ afterEach(async () => {
 });
 
 describe("ContextCache", () => {
+  it("preserves the legacy GitHub identity and isolates deterministic GitLab identities", async () => {
+    const root = await tempRoot("context-cache-");
+    const cache = new ContextCache(root);
+    const githubKey: ContextCacheKey = {
+      provider: "github",
+      host: "github.com",
+      owner: "octo-org",
+      repo: "octo-repo",
+      baseSha: "a".repeat(40),
+      schemaVersion: 1,
+      tgdVersion: "1",
+      policyVersion: "1",
+    };
+    const gitlabKey = {
+      provider: gitlabRepo.provider,
+      host: gitlabRepo.host,
+      port: gitlabRepo.port,
+      namespace: gitlabRepo.namespace,
+      repo: gitlabRepo.repo,
+      baseSha: githubKey.baseSha,
+      schemaVersion: githubKey.schemaVersion,
+      tgdVersion: githubKey.tgdVersion,
+      policyVersion: githubKey.policyVersion,
+    } as ContextCacheKey;
+
+    expect(cache.entryPath(githubKey)).toBe(path.join(
+      root,
+      "contexts",
+      "feb1bd747ff047615bd4a66891be80a5e99f34c4ec83a88f4492e7f852918515",
+    ));
+    expect(cache.entryPath(gitlabKey)).toBe(path.join(
+      root,
+      "contexts",
+      "89cf774341ca75513b85555ac5c3472e0d2286d46e6f138a9b49718ff88f0aae",
+    ));
+    expect(cache.entryPath(gitlabKey)).not.toBe(cache.entryPath(githubKey));
+  });
+
+  it.each([
+    { namespace: ["group/subgroup"] },
+    { namespace: ["group\\subgroup"] },
+    { namespace: ["group\nsubgroup"] },
+    { namespace: ["group"], repo: "project\u007fhidden" },
+  ])("rejects separators and control data in GitLab cache segments", async (override) => {
+    const root = await tempRoot("context-cache-");
+    const cache = new ContextCache(root);
+    const gitlabKey = {
+      provider: "gitlab",
+      host: gitlabRepo.host,
+      port: gitlabRepo.port,
+      namespace: gitlabRepo.namespace,
+      repo: gitlabRepo.repo,
+      baseSha: "a".repeat(40),
+      schemaVersion: 1,
+      tgdVersion: "1",
+      policyVersion: "1",
+      ...override,
+    } as ContextCacheKey;
+
+    expect(() => cache.entryPath(gitlabKey)).toThrow(/key|namespace|repo/i);
+  });
+
   it("promotes complete artifacts and returns a validated cache hit", async () => {
     const root = await tempRoot();
     const cache = new ContextCache(root);
@@ -787,7 +858,7 @@ describe("ContextCache", () => {
     const root = await tempRoot();
     const cache = new ContextCache(root);
     expect(() => cache.entryPath(null as unknown as ContextCacheKey)).toThrow(/key/i);
-    expect(() => cache.entryPath({ ...key, provider: "gitlab" } as ContextCacheKey)).toThrow(/provider/i);
+    expect(() => cache.entryPath({ ...key, provider: "gitlab" } as ContextCacheKey)).toThrow(/key|fields/i);
     expect(() => cache.entryPath({ ...key, schemaVersion: 0 })).toThrow(/schemaVersion/i);
     expect(() => cache.entryPath({ ...key, unexpected: true } as ContextCacheKey)).toThrow(/key/i);
     await expect(cache.lookupContext(null as unknown as ContextCacheKey)).resolves.toBeUndefined();

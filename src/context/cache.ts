@@ -110,6 +110,7 @@ function validateComponent(name: string, value: unknown): asserts value is strin
     value.includes("\0") ||
     value.includes("/") ||
     value.includes("\\") ||
+    /[\u0000-\u001f\u007f]/u.test(value) ||
     path.isAbsolute(value)
   ) {
     throw new ContextValidationError(`Invalid context cache key ${name}`);
@@ -118,23 +119,40 @@ function validateComponent(name: string, value: unknown): asserts value is strin
 
 function validateKey(value: unknown): asserts value is ContextCacheKey {
   if (!isRecord(value)) throw new ContextValidationError("Invalid context cache key");
-  if (
-    !hasExactKeys(value, [
+  const commonKeys = [
       "baseSha",
       "host",
-      "owner",
       "policyVersion",
       "provider",
       "repo",
       "schemaVersion",
       "tgdVersion",
-    ])
-  ) {
+  ];
+  const expectedKeys = value.provider === "github"
+    ? [...commonKeys, "owner"]
+    : value.provider === "gitlab"
+      ? [...commonKeys, "namespace", ...(value.port === undefined ? [] : ["port"])]
+      : undefined;
+  if (expectedKeys === undefined) throw new ContextValidationError("Invalid context cache key provider");
+  if (!hasExactKeys(value, expectedKeys.sort())) {
     throw new ContextValidationError("Invalid context cache key fields");
   }
-  if (value.provider !== "github") throw new ContextValidationError("Invalid context cache key provider");
-  for (const name of ["host", "owner", "repo", "baseSha", "tgdVersion", "policyVersion"] as const) {
+  for (const name of ["host", "repo", "baseSha", "tgdVersion", "policyVersion"] as const) {
     validateComponent(name, value[name]);
+  }
+  if (value.provider === "github") {
+    validateComponent("owner", value.owner);
+  } else {
+    if (!Array.isArray(value.namespace) || value.namespace.length === 0) {
+      throw new ContextValidationError("Invalid context cache key namespace");
+    }
+    value.namespace.forEach((segment, index) => validateComponent(`namespace[${index}]`, segment));
+    if (
+      value.port !== undefined &&
+      (!Number.isSafeInteger(value.port) || (value.port as number) < 1 || (value.port as number) > 65535)
+    ) {
+      throw new ContextValidationError("Invalid context cache key port");
+    }
   }
   if (!Number.isSafeInteger(value.schemaVersion) || (value.schemaVersion as number) < 1) {
     throw new ContextValidationError("Invalid context cache key schemaVersion");

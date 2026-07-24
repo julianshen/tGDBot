@@ -2,10 +2,27 @@ import { chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as artifactValidator from "../../../src/context/artifact-validator.js";
 import { TgdPiMapper } from "../../../src/context/tgd-mapper.js";
 import type { MappingSession } from "../../../src/context/tgd-mapper.js";
+import type { GitHubRepositoryRef, GitLabRepositoryRef } from "../../../src/target/types.js";
 
 const baseSha = "def4567890def4567890def4567890def4567890";
+const githubRepo: GitHubRepositoryRef = {
+  provider: "github",
+  host: "github.com",
+  owner: "octo-org",
+  repo: "octo-repo",
+  canonicalUrl: "https://github.com/octo-org/octo-repo",
+};
+const gitlabRepo: GitLabRepositoryRef = {
+  provider: "gitlab",
+  host: "gitlab.example.com",
+  port: 8443,
+  namespace: ["group", "sub"],
+  repo: "project",
+  canonicalUrl: "https://gitlab.example.com:8443/group/sub/project",
+};
 const roots: string[] = [];
 
 async function tempRoot(prefix: string): Promise<string> {
@@ -95,13 +112,59 @@ afterEach(async () => {
 });
 
 describe("TgdPiMapper", () => {
+  it("builds validation identity from a GitLab repository", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const createSession = vi.fn(async () => session(async () => {
+      await writeReadyArtifacts(outputRoot);
+    }));
+
+    const result = await new TgdPiMapper({ createSession }).map({
+      sourceRoot,
+      outputRoot,
+      baseSha,
+      repository: gitlabRepo,
+    });
+
+    expect(result.status).toBe("ready");
+  });
+
+  it("does not substitute a synthetic GitHub validation identity", async () => {
+    const sourceRoot = await tempRoot("tgd-mapper-source-");
+    const outputRoot = await tempRoot("tgd-mapper-output-");
+    const createSession = vi.fn(async () => session(async () => {
+      await writeReadyArtifacts(outputRoot);
+    }));
+    const digest = vi.spyOn(artifactValidator, "digestArtifactInputs");
+
+    const result = await new TgdPiMapper({ createSession }).map({
+      sourceRoot,
+      outputRoot,
+      baseSha,
+      repository: gitlabRepo,
+    });
+
+    expect(result.status).toBe("ready");
+    expect(digest).toHaveBeenCalledWith(outputRoot, {
+      provider: "gitlab",
+      host: "gitlab.example.com",
+      port: 8443,
+      namespace: ["group", "sub"],
+      repo: "project",
+      baseSha,
+      schemaVersion: 1,
+      tgdVersion: "mapping-validation",
+      policyVersion: "mapping-validation",
+    }, expect.any(Array));
+  });
+
   it.each([
     { name: "relative source", sourceRoot: "relative-source", outputRoot: "/tmp/output" },
     { name: "relative output", sourceRoot: "/tmp/source", outputRoot: "relative-output" },
   ])("AC-6.1: rejects $name roots before creating a session", async ({ sourceRoot, outputRoot }) => {
     const createSession = vi.fn(async () => session(async () => undefined));
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
     expect(createSession).not.toHaveBeenCalled();
@@ -112,7 +175,7 @@ describe("TgdPiMapper", () => {
     const outputRoot = path.join(sourceRoot, "mapping-output");
     const createSession = vi.fn(async () => session(async () => undefined));
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
     expect(createSession).not.toHaveBeenCalled();
@@ -129,6 +192,7 @@ describe("TgdPiMapper", () => {
       sourceRoot: name === "source" ? fileRoot : sourceRoot,
       outputRoot: name === "output" ? fileRoot : outputRoot,
       baseSha,
+      repository: githubRepo,
     });
 
     expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
@@ -147,6 +211,7 @@ describe("TgdPiMapper", () => {
       sourceRoot: name === "source" ? linkedRoot : realSourceRoot,
       outputRoot: name === "output" ? linkedRoot : realOutputRoot,
       baseSha,
+      repository: githubRepo,
     });
 
     expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-request" } });
@@ -161,7 +226,7 @@ describe("TgdPiMapper", () => {
     const outputRoot = path.join(aliasRoot, "source-link", "mapping-output");
     const createSession = vi.fn(async () => session(async () => undefined));
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result).toMatchObject({
       status: "failed",
@@ -182,7 +247,7 @@ describe("TgdPiMapper", () => {
       });
     });
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(prompts).toEqual(["/tgd-map"]);
     expect(result).toMatchObject({
@@ -206,7 +271,7 @@ describe("TgdPiMapper", () => {
       throw new Error("provider unavailable");
     }));
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result).toMatchObject({
       status: "failed",
@@ -225,7 +290,8 @@ describe("TgdPiMapper", () => {
       abort,
     }));
 
-    const result = await new TgdPiMapper({ createSession, timeoutMs: 5 }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession, timeoutMs: 5 })
+      .map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result).toMatchObject({
       status: "failed",
@@ -248,7 +314,7 @@ describe("TgdPiMapper", () => {
     }));
 
     const mapping = new TgdPiMapper({ createSession, timeoutMs: 5 })
-      .map({ sourceRoot, outputRoot, baseSha });
+      .map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
     let settled = false;
     void mapping.finally(() => {
       settled = true;
@@ -271,7 +337,7 @@ describe("TgdPiMapper", () => {
       await writeTgdLayoutArtifacts(sourceRoot, outputRoot);
     }));
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result.status).toBe("ready");
     await expect(readFile(path.join(outputRoot, ".understand-anything/knowledge-graph.json"), "utf8"))
@@ -287,7 +353,7 @@ describe("TgdPiMapper", () => {
       await writeTgdLayoutArtifacts(sourceRoot, outputRoot);
     }));
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result).toMatchObject({
       status: "failed",
@@ -308,6 +374,7 @@ describe("TgdPiMapper", () => {
       sourceRoot,
       outputRoot,
       baseSha: "abc4567890abc4567890abc4567890abc4567890",
+      repository: githubRepo,
     });
 
     expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-artifacts" } });
@@ -329,6 +396,7 @@ describe("TgdPiMapper", () => {
       sourceRoot,
       outputRoot,
       baseSha: "abc4567890abc4567890abc4567890abc4567890",
+      repository: githubRepo,
     });
 
     expect(result).toMatchObject({ status: "failed", failure: { code: "invalid-artifacts" } });
@@ -351,6 +419,7 @@ describe("TgdPiMapper", () => {
         sourceRoot,
         outputRoot,
         baseSha: "abc4567890abc4567890abc4567890abc4567890",
+        repository: githubRepo,
       });
 
       expect(result).toMatchObject({
@@ -370,7 +439,7 @@ describe("TgdPiMapper", () => {
       await writeFile(path.join(outputRoot, "CONTEXT.md"), "# Partial context\n", "utf8");
     }));
 
-    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha });
+    const result = await new TgdPiMapper({ createSession }).map({ sourceRoot, outputRoot, baseSha, repository: githubRepo });
 
     expect(result).toMatchObject({
       status: "failed",
@@ -391,6 +460,7 @@ describe("TgdPiMapper", () => {
       sourceRoot,
       outputRoot,
       baseSha,
+      repository: githubRepo,
       allowDegradedContext: true,
     });
 
@@ -416,6 +486,7 @@ describe("TgdPiMapper", () => {
       sourceRoot,
       outputRoot,
       baseSha,
+      repository: githubRepo,
       allowDegradedContext: true,
     });
 

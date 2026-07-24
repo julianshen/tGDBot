@@ -4,7 +4,12 @@ import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { ContextValidationError, validateArtifactRecords } from "./artifact-validator.js";
 import { computeManifestHash } from "./cache.js";
-import type { ArtifactRecord, ContextManifest, DocumentRecord } from "./types.js";
+import {
+  repositoryLabel,
+  type ArtifactRecord,
+  type ContextManifest,
+  type DocumentRecord,
+} from "./types.js";
 
 export const DEFAULT_CONTEXT_MAX_CHARS = 30_000;
 export const MIN_CONTEXT_MAX_CHARS = 4_000;
@@ -189,14 +194,13 @@ function validateManifestIdentity(manifest: unknown): asserts manifest is Contex
     return invalid("Context manifest is not a ready version 1 manifest");
   }
   if (
-    manifestKey.provider !== "github" ||
+    (manifestKey.provider !== "github" && manifestKey.provider !== "gitlab") ||
     !Number.isSafeInteger(manifestKey.schemaVersion) ||
     (manifestKey.schemaVersion as number) < 1
   ) {
     return invalid("Context manifest key is invalid");
   }
-  for (const name of ["host", "owner", "repo", "baseSha", "tgdVersion", "policyVersion"] as const) {
-    const value = manifestKey[name];
+  const validateKeyComponent = (name: string, value: unknown): void => {
     if (
       typeof value !== "string" ||
       value.length === 0 ||
@@ -209,6 +213,24 @@ function validateManifestIdentity(manifest: unknown): asserts manifest is Contex
       path.isAbsolute(value)
     ) {
       return invalid(`Context manifest key ${name} is invalid`);
+    }
+  };
+  for (const name of ["host", "repo", "baseSha", "tgdVersion", "policyVersion"] as const) {
+    validateKeyComponent(name, manifestKey[name]);
+  }
+  if (manifestKey.provider === "github") {
+    validateKeyComponent("owner", manifestKey.owner);
+  } else {
+    if (!Array.isArray(manifestKey.namespace) || manifestKey.namespace.length === 0) {
+      return invalid("Context manifest key namespace is invalid");
+    }
+    manifestKey.namespace.forEach((segment, index) => validateKeyComponent(`namespace[${index}]`, segment));
+    if (
+      manifestKey.port !== undefined &&
+      (!Number.isSafeInteger(manifestKey.port) || (manifestKey.port as number) < 1 ||
+        (manifestKey.port as number) > 65535)
+    ) {
+      return invalid("Context manifest key port is invalid");
     }
   }
   let computed: string;
@@ -582,7 +604,7 @@ function renderPack(
     "## Repository and Base Identity",
     "",
     `Rule: ${ruleName}`,
-    `Repository: ${manifest.key.host}/${manifest.key.owner}/${manifest.key.repo}`,
+    `Repository: ${repositoryLabel(manifest.key)}`,
     `Base SHA: ${manifest.key.baseSha}`,
     `Manifest hash: ${manifest.manifestHash}`,
     `Degraded reasons: ${degradedReasons.length === 0 ? "none" : degradedReasons.join(", ")}`,
