@@ -41,6 +41,27 @@ describe("parseReviewTarget", () => {
     });
   });
 
+  it("retains an explicit default HTTPS port in a GitLab merge-request identity", () => {
+    expect(
+      parseReviewTarget(
+        "https://gitlab.example.com:443/group/project/-/merge_requests/42",
+      ),
+    ).toEqual({
+      provider: "gitlab",
+      repo: {
+        provider: "gitlab",
+        host: "gitlab.example.com",
+        port: 443,
+        namespace: ["group"],
+        repo: "project",
+        canonicalUrl: "https://gitlab.example.com:443/group/project",
+      },
+      number: 42,
+      canonicalUrl:
+        "https://gitlab.example.com:443/group/project/-/merge_requests/42",
+    });
+  });
+
   it("rejects a review URL when it does not match the expected provider", () => {
     expect(() =>
       parseReviewTarget(
@@ -100,6 +121,41 @@ describe("parseRepositoryRef", () => {
       repo: "project",
       canonicalUrl: "https://gitlab.example.com:8443/group/sub/project",
     });
+  });
+
+  it("retains an explicit default HTTPS port as repository identity", () => {
+    expect(
+      parseRepositoryRef(
+        "https://gitlab.example.com:443/group/project",
+        "gitlab",
+      ),
+    ).toEqual({
+      provider: "gitlab",
+      host: "gitlab.example.com",
+      port: 443,
+      namespace: ["group"],
+      repo: "project",
+      canonicalUrl: "https://gitlab.example.com:443/group/project",
+    });
+  });
+
+  it.each([
+    "user:secret@gitlab.example.com/group/project",
+    "user@gitlab.example.com/group/project",
+    "user:secret@localhost/group/project",
+  ])("rejects credentials in host/path repository selector %s without echoing them", (input) => {
+
+    let caught: unknown;
+    try {
+      parseRepositoryRef(input, "gitlab");
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).message).toMatch(/credentials/i);
+    expect((caught as Error).message).not.toContain("user");
+    expect((caught as Error).message).not.toContain("secret");
   });
 
   it.each([

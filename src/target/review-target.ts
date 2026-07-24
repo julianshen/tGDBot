@@ -63,6 +63,17 @@ function validateUrl(url: URL, kind: string, protocols: readonly string[]): void
   }
 }
 
+function explicitHttpsPort(input: string): number | undefined {
+  if (!input.startsWith("https://")) {
+    return undefined;
+  }
+  const afterScheme = input.slice("https://".length);
+  const authorityEnd = afterScheme.search(/[/?#]/u);
+  const authority = afterScheme.slice(0, authorityEnd === -1 ? undefined : authorityEnd);
+  const portMatch = /:(\d+)$/u.exec(authority);
+  return portMatch === null ? undefined : Number(portMatch[1]);
+}
+
 function makeGitHubRepo(owner: string, repo: string): GitHubRepositoryRef {
   if (!/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(owner)) {
     throw invalid("GitHub repository", "owner is missing or invalid");
@@ -191,7 +202,12 @@ function parseGitLabRepository(input: string): GitLabRepositoryRef {
       validateUrl(url, "GitLab repository", ["https:"]);
     }
     host = url.hostname;
-    port = url.port === "" ? undefined : Number(url.port);
+    port =
+      url.protocol === "https:"
+        ? (explicitHttpsPort(input) ?? (url.port === "" ? undefined : Number(url.port)))
+        : url.port === ""
+          ? undefined
+          : Number(url.port);
     segments = pathSegments(url.pathname, "GitLab repository");
   } else {
     const scp = /^git@([^:/]+):(.+)$/.exec(input);
@@ -200,6 +216,10 @@ function parseGitLabRepository(input: string): GitLabRepositoryRef {
       segments = pathSegments(`/${scp[2]}`, "GitLab repository");
     } else {
       const parts = input.split("/");
+      const authorityCandidate = parts[0];
+      if (authorityCandidate.includes("@")) {
+        throw invalid("GitLab repository", "credentials are not allowed");
+      }
       const explicitHost = parts[0].includes(".") || /^[^:]+:\d+$/.test(parts[0]);
       if (explicitHost) {
         const authority = new URL(`https://${parts.shift()!}`);
@@ -227,8 +247,8 @@ export function parseRepositoryRef(input: string, provider: ReviewProvider): Rep
     : parseGitLabRepository(input);
 }
 
-function parseGitHubTarget(url: URL): ReviewTarget {
-  if (url.port !== "") {
+function parseGitHubTarget(url: URL, explicitPort: number | undefined): ReviewTarget {
+  if (url.port !== "" || explicitPort !== undefined) {
     throw invalid("GitHub review target", "custom ports are not allowed");
   }
   const segments = pathSegments(url.pathname, "GitHub review target");
@@ -245,7 +265,7 @@ function parseGitHubTarget(url: URL): ReviewTarget {
   };
 }
 
-function parseGitLabTarget(url: URL): ReviewTarget {
+function parseGitLabTarget(url: URL, explicitPort: number | undefined): ReviewTarget {
   const segments = pathSegments(url.pathname, "GitLab review target");
   const marker = segments.length - 3;
   if (
@@ -258,7 +278,7 @@ function parseGitLabTarget(url: URL): ReviewTarget {
       "path must be NAMESPACE/PROJECT/-/merge_requests/IID",
     );
   }
-  const port = url.port === "" ? undefined : Number(url.port);
+  const port = explicitPort ?? (url.port === "" ? undefined : Number(url.port));
   const repo = makeGitLabRepo(url.hostname, port, segments.slice(0, marker));
   const number = positiveNumber(segments[marker + 2], "GitLab review target");
   return {
@@ -289,5 +309,8 @@ export function parseReviewTarget(
       `URL provider ${provider} does not match expected provider ${expectedProvider}`,
     );
   }
-  return provider === "github" ? parseGitHubTarget(url) : parseGitLabTarget(url);
+  const explicitPort = explicitHttpsPort(input);
+  return provider === "github"
+    ? parseGitHubTarget(url, explicitPort)
+    : parseGitLabTarget(url, explicitPort);
 }
