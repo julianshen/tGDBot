@@ -399,9 +399,15 @@ export class GitLabAdapter implements VcsAdapter {
     const authority = `${repo.host.toLowerCase()}${repo.port === undefined ? "" : `:${repo.port}`}`;
     let promise = this.usernamePromises.get(authority);
     if (!promise) {
-      promise = this.execGlab([
+      const lookup = this.execGlab([
         "api", "user", "--hostname", repo.host,
       ]).then(parseUsername);
+      promise = lookup.catch((error: unknown) => {
+        if (this.usernamePromises.get(authority) === promise) {
+          this.usernamePromises.delete(authority);
+        }
+        throw error;
+      });
       this.usernamePromises.set(authority, promise);
     }
     return promise;

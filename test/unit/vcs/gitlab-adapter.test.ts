@@ -179,6 +179,45 @@ describe("GitLabAdapter review summary notes", () => {
     await Promise.all([first, second]);
   });
 
+  it("evicts a rejected username lookup so a later call can retry successfully", async () => {
+    let userAttempts = 0;
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      if (args[1] === "user") {
+        userAttempts += 1;
+        if (userAttempts === 1) throw new Error("temporary auth failure");
+        return JSON.stringify({ username: "review-bot" });
+      }
+      return notesFixture;
+    });
+    const adapter = new GitLabAdapter(execGlab);
+
+    await expect(adapter.findBotComment(locator(customPortRepo))).rejects.toThrow(
+      "temporary auth failure",
+    );
+    await expect(adapter.findBotComment(locator(customPortRepo))).resolves.toMatchObject({
+      id: "303",
+    });
+    expect(userAttempts).toBe(2);
+  });
+
+  it("keeps authenticated username caches separate across ports", async () => {
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
+      return notesFixture;
+    });
+    const adapter = new GitLabAdapter(execGlab);
+    const otherPortRepo = {
+      ...customPortRepo,
+      port: 9443,
+      canonicalUrl: "https://gitlab.example.com:9443/group/project",
+    };
+
+    await adapter.findBotComment(locator(customPortRepo));
+    await adapter.findBotComment(locator(otherPortRepo));
+
+    expect(execGlab.mock.calls.filter(([args]) => args[1] === "user")).toHaveLength(2);
+  });
+
   it("inspects paginated NDJSON notes, ignores copied markers, and returns its own valid marker", async () => {
     const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
       if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
