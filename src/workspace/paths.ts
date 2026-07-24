@@ -6,8 +6,26 @@ const REPO_RE = /^[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-f]{7,64}$/i;
 const SEGMENT_RE = /^[^/\\\u0000-\u001f\u007f]+$/u;
 
+function percentEncodeCharacter(character: string): string {
+  return [...new TextEncoder().encode(character)]
+    .map((byte) => `%${byte.toString(16).toUpperCase().padStart(2, "0")}`)
+    .join("");
+}
+
+export function encodeWorkspaceComponent(value: string): string {
+  let encoded = encodeURIComponent(value).replace(
+    /[!'()*]/gu,
+    (character) => percentEncodeCharacter(character),
+  );
+  encoded = encoded.replace(/\.+$/u, (dots) => "%2E".repeat(dots.length));
+  if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(value)) {
+    encoded = `${percentEncodeCharacter(value[0]!)}${encoded.slice(1)}`;
+  }
+  return encoded;
+}
+
 export function encodeWorkspaceAuthority(host: string, port?: number): string {
-  return encodeURIComponent(port === undefined ? host : `${host}:${port}`);
+  return encodeWorkspaceComponent(port === undefined ? host : `${host}:${port}`);
 }
 
 function validateGitLabSegment(kind: string, segment: string): void {
@@ -65,8 +83,8 @@ export function deriveWorkspacePaths(request: WorkspaceRequest): WorkspacePaths 
     }
     repositorySegments = [
       encodeWorkspaceAuthority(request.repo.host, request.repo.port),
-      ...request.repo.namespace,
-      request.repo.repo,
+      ...request.repo.namespace.map(encodeWorkspaceComponent),
+      encodeWorkspaceComponent(request.repo.repo),
     ];
   }
   if (!SHA_RE.test(request.baseSha)) {

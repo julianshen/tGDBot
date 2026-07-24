@@ -182,7 +182,15 @@ function normalizedOriginPath(pathname: string): string | undefined {
   if (trimmed === "" || trimmed.includes("//")) return undefined;
   try {
     const segments = trimmed.split("/").map(decodeURIComponent);
-    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return undefined;
+    if (
+      segments.some((segment) =>
+        segment === "" ||
+        segment === "." ||
+        segment === ".." ||
+        segment.includes("/") ||
+        segment.includes("\\") ||
+        /[\u0000-\u001f\u007f]/u.test(segment))
+    ) return undefined;
     return segments.join("/");
   } catch {
     return undefined;

@@ -50,6 +50,37 @@ describe("prepareWorkspace", () => {
     );
   });
 
+  it("reversibly encodes platform-sensitive GitLab filesystem components without collisions", async () => {
+    const root = await tempRoot();
+    const sensitiveRepo: GitLabRepositoryRef = {
+      provider: "gitlab",
+      host: "gitlab*.example.com",
+      namespace: ["CON", "team*one", "trailing."],
+      repo: "project%2A",
+      canonicalUrl: "https://gitlab*.example.com/CON/team*one/trailing./project%252A",
+    };
+    const paths = deriveWorkspacePaths({ root, repo: sensitiveRepo, baseSha });
+    const relative = path.relative(path.join(root, "repos"), paths.repositoryRoot).split(path.sep);
+
+    expect(relative).toEqual([
+      "gitlab%2A.example.com",
+      "%43ON",
+      "team%2Aone",
+      "trailing%2E",
+      "project%252A",
+    ]);
+    expect(relative.map(decodeURIComponent)).toEqual([
+      "gitlab*.example.com",
+      "CON",
+      "team*one",
+      "trailing.",
+      "project%2A",
+    ]);
+    expect(encodeWorkspaceAuthority("gitlab*.example.com")).not.toBe(
+      encodeWorkspaceAuthority("gitlab%2A.example.com"),
+    );
+  });
+
   it("clones GitLab mirrors with git and the canonical HTTPS clone URL", async () => {
     const root = await tempRoot();
     const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
@@ -132,6 +163,10 @@ describe("prepareWorkspace", () => {
     "ssh://git@gitlab.example.com/group/sub/project.git",
     "ssh://git:password@gitlab.example.com:8443/group/sub/project.git",
     "https://gitlab.example.com:8443/Group/sub/project.git",
+    "https://gitlab.example.com:8443/group%2Fsub/project.git",
+    "https://gitlab.example.com:8443/group%2fsub/project.git",
+    "https://gitlab.example.com:8443/group%5Csub/project.git",
+    "https://gitlab.example.com:8443/group%5csub/project.git",
   ])("rejects a mismatched or unsafe GitLab managed mirror origin: %s", async (origin) => {
     const root = await tempRoot();
     const paths = deriveWorkspacePaths({ root, repo: gitlabRepo, baseSha });
