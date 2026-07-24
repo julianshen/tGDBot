@@ -3,13 +3,14 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withRepositoryLock } from "./lock.js";
-import { deriveWorkspacePaths } from "./paths.js";
+import { deriveWorkspacePaths, encodeWorkspaceAuthority } from "./paths.js";
 import type {
   ExecWorkspaceCommand,
   PreparedWorkspace,
   WorkspaceDependencies,
   WorkspaceRequest,
 } from "./types.js";
+import type { RepositoryRef } from "../target/types.js";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
@@ -166,25 +167,92 @@ async function protectWorkspaceRoot(root: string): Promise<void> {
   }
 }
 
-function isExpectedOrigin(origin: string, owner: string, repo: string): boolean {
-  const slug = `${owner}/${repo}`.toLowerCase();
-  const normalized = origin.trim().replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+function repositoryPath(repo: RepositoryRef): string {
+  return repo.provider === "github"
+    ? `${repo.owner}/${repo.repo}`
+    : [...repo.namespace, repo.repo].join("/");
+}
+
+function repositoryIdentity(repo: RepositoryRef): string {
+  return repo.canonicalUrl;
+}
+
+function normalizedOriginPath(pathname: string): string | undefined {
+  const trimmed = pathname.replace(/^\/|\/$/g, "").replace(/\.git$/i, "");
+  if (trimmed === "" || trimmed.includes("//")) return undefined;
   try {
-    const parsed = new URL(normalized);
+    const segments = trimmed.split("/").map(decodeURIComponent);
+    if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return undefined;
+    return segments.join("/");
+  } catch {
+    return undefined;
+  }
+}
+
+function explicitOriginPort(origin: string): string {
+  const authority = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]+)/u.exec(origin)?.[1];
+  if (authority === undefined) return "";
+  const withoutCredentials = authority.slice(authority.lastIndexOf("@") + 1);
+  return /:(\d+)$/u.exec(withoutCredentials)?.[1] ?? "";
+}
+
+function isExpectedOrigin(origin: string, repo: RepositoryRef): boolean {
+  const slug = repositoryPath(repo).toLowerCase();
+  const normalized = origin.trim().replace(/\/+$/, "").replace(/\.git$/i, "").toLowerCase();
+  if (repo.provider === "github") {
+    try {
+      const parsed = new URL(normalized);
+      if (
+        parsed.protocol === "https:" &&
+        parsed.hostname === "github.com" &&
+        parsed.port === "" &&
+        parsed.pathname.replace(/^\//, "") === slug
+      ) {
+        return true;
+      }
+    } catch {
+      // SCP-style Git origins are not valid URLs and are checked below.
+    }
+    return normalized === `https://github.com/${slug}` ||
+      normalized === `git@github.com:${slug}` ||
+      normalized === `ssh://git@github.com/${slug}`;
+  }
+  const expectedHost = repo.host.toLowerCase();
+  const expectedHttpsPort = repo.port === undefined ? "" : String(repo.port);
+  const gitLabOrigin = origin.trim().replace(/\/+$/, "");
+  try {
+    const parsed = new URL(gitLabOrigin);
     if (
       parsed.protocol === "https:" &&
-      parsed.hostname === "github.com" &&
-      parsed.port === "" &&
-      parsed.pathname.replace(/^\//, "") === slug
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.hostname.toLowerCase() === expectedHost &&
+      explicitOriginPort(gitLabOrigin) === expectedHttpsPort &&
+      parsed.search === "" &&
+      parsed.hash === "" &&
+      normalizedOriginPath(parsed.pathname) === repositoryPath(repo)
+    ) {
+      return true;
+    }
+    if (
+      parsed.protocol === "ssh:" &&
+      parsed.username === "git" &&
+      parsed.password === "" &&
+      parsed.hostname.toLowerCase() === expectedHost &&
+      explicitOriginPort(gitLabOrigin) === expectedHttpsPort &&
+      parsed.search === "" &&
+      parsed.hash === "" &&
+      normalizedOriginPath(parsed.pathname) === repositoryPath(repo)
     ) {
       return true;
     }
   } catch {
     // SCP-style Git origins are not valid URLs and are checked below.
   }
-  return normalized === `https://github.com/${slug}` ||
-    normalized === `git@github.com:${slug}` ||
-    normalized === `ssh://git@github.com/${slug}`;
+  const scp = /^git@([^:/]+):(.+)$/u.exec(gitLabOrigin);
+  return scp !== null &&
+    scp[1]!.toLowerCase() === expectedHost &&
+    normalizedOriginPath(scp[2]!) === repositoryPath(repo);
 }
 
 /**
@@ -205,7 +273,8 @@ async function prepareWorkspaceUnlocked(
   };
   const expectedMarker = {
     version: 1,
-    repository: `${request.repo.host}/${request.repo.owner}/${request.repo.repo}`,
+    provider: request.repo.provider,
+    repository: repositoryIdentity(request.repo),
     baseSha: request.baseSha.toLowerCase(),
   };
 
@@ -222,6 +291,7 @@ async function prepareWorkspaceUnlocked(
     }
     if (
       marker.version !== expectedMarker.version ||
+      marker.provider !== expectedMarker.provider ||
       marker.repository !== expectedMarker.repository ||
       marker.baseSha !== expectedMarker.baseSha
     ) {
@@ -258,18 +328,22 @@ async function prepareWorkspaceUnlocked(
   await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
 
   if (!(await exists(paths.mirrorPath))) {
-    await execManaged("gh", [
-      "repo",
-      "clone",
-      `https://${request.repo.host}/${request.repo.owner}/${request.repo.repo}`,
-      paths.mirrorPath,
-      "--",
-      "--mirror",
-    ]);
+    if (request.repo.provider === "github") {
+      await execManaged("gh", [
+        "repo",
+        "clone",
+        `https://${request.repo.host}/${request.repo.owner}/${request.repo.repo}`,
+        paths.mirrorPath,
+        "--",
+        "--mirror",
+      ]);
+    } else {
+      await execManaged("git", ["clone", "--mirror", request.repo.canonicalUrl, paths.mirrorPath]);
+    }
   } else {
     const origin = await execManaged("git", ["-C", paths.mirrorPath, "remote", "get-url", "origin"]);
-    if (!isExpectedOrigin(origin, request.repo.owner, request.repo.repo)) {
-      throw new Error(`Managed mirror origin does not match ${request.repo.owner}/${request.repo.repo}`);
+    if (!isExpectedOrigin(origin, request.repo)) {
+      throw new Error(`Managed mirror origin does not match ${repositoryPath(request.repo)}`);
     }
     await execManaged("git", ["-C", paths.mirrorPath, "fetch", "--prune", "origin"]);
   }
@@ -311,13 +385,15 @@ export async function prepareWorkspace(
   const normalizedRequest = { ...request, root: paths.root };
   await mkdir(paths.root, { recursive: true });
   await protectWorkspaceRoot(paths.root);
-  const lockPath = path.join(
-    paths.root,
-    ".locks",
-    request.repo.host,
-    request.repo.owner,
-    `${request.repo.repo}.lock`,
-  );
+  const lockPath = request.repo.provider === "github"
+    ? path.join(paths.root, ".locks", request.repo.host, request.repo.owner, `${request.repo.repo}.lock`)
+    : path.join(
+      paths.root,
+      ".locks",
+      encodeWorkspaceAuthority(request.repo.host, request.repo.port),
+      ...request.repo.namespace,
+      `${request.repo.repo}.lock`,
+    );
   await assertNoSymlinkedAncestors(
     paths.root,
     [lockPath, paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],

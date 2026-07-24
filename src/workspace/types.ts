@@ -1,12 +1,8 @@
-export interface WorkspaceRepositoryRef {
-  readonly host: "github.com";
-  readonly owner: string;
-  readonly repo: string;
-}
+import type { RepositoryRef } from "../target/types.js";
 
 export interface WorkspaceRequest {
   root: string;
-  repo: WorkspaceRepositoryRef;
+  repo: RepositoryRef;
   baseSha: string;
 }
 

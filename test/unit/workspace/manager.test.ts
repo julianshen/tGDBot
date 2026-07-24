@@ -2,14 +2,25 @@ import { chmod, lstat, mkdtemp, mkdir, readFile, realpath, rename, rm, stat, sym
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { WorkspaceRepositoryRef } from "../../../src/workspace/types.js";
+import type { GitLabRepositoryRef } from "../../../src/target/types.js";
+import type { WorkspaceRequest } from "../../../src/workspace/types.js";
 import { prepareWorkspace, realExecWorkspaceCommand } from "../../../src/workspace/manager.js";
-import { deriveWorkspacePaths } from "../../../src/workspace/paths.js";
+import { deriveWorkspacePaths, encodeWorkspaceAuthority } from "../../../src/workspace/paths.js";
 
-const repo: WorkspaceRepositoryRef = {
+const repo: WorkspaceRequest["repo"] = {
+  provider: "github",
   host: "github.com",
   owner: "octo-org",
   repo: "octo-repo",
+  canonicalUrl: "https://github.com/octo-org/octo-repo",
+};
+const gitlabRepo: GitLabRepositoryRef = {
+  provider: "gitlab",
+  host: "gitlab.example.com",
+  port: 8443,
+  namespace: ["group", "sub"],
+  repo: "project",
+  canonicalUrl: "https://gitlab.example.com:8443/group/sub/project",
 };
 const baseSha = "def4567890def4567890def4567890def4567890";
 const roots: string[] = [];
@@ -25,6 +36,145 @@ afterEach(async () => {
 });
 
 describe("prepareWorkspace", () => {
+  it("preserves GitHub paths and isolates GitLab paths by encoded authority and namespace", async () => {
+    const root = await tempRoot();
+
+    expect(deriveWorkspacePaths({ root, repo, baseSha }).repositoryRoot).toBe(
+      path.join(root, "repos", "github.com", "octo-org", "octo-repo"),
+    );
+    expect(deriveWorkspacePaths({ root, repo: gitlabRepo, baseSha }).repositoryRoot).toBe(
+      path.join(root, "repos", "gitlab.example.com%3A8443", "group", "sub", "project"),
+    );
+    expect(decodeURIComponent(encodeWorkspaceAuthority(gitlabRepo.host, gitlabRepo.port))).toBe(
+      "gitlab.example.com:8443",
+    );
+  });
+
+  it("clones GitLab mirrors with git and the canonical HTTPS clone URL", async () => {
+    const root = await tempRoot();
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "git" && args[0] === "clone") await mkdir(args.at(-1)!, { recursive: true });
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2)!, { recursive: true });
+      }
+      return "";
+    });
+
+    const result = await prepareWorkspace({ root, repo: gitlabRepo, baseSha }, { exec });
+
+    expect(exec).toHaveBeenCalledWith("git", [
+      "clone",
+      "--mirror",
+      "https://gitlab.example.com:8443/group/sub/project",
+      result.mirrorPath,
+    ]);
+    expect(exec.mock.calls.some(([tool]) => tool === "gh")).toBe(false);
+    await expect(readFile(result.ownerMarkerPath, "utf8")).resolves.toContain(
+      '"repository": "https://gitlab.example.com:8443/group/sub/project"',
+    );
+  });
+
+  it.each([
+    "https://gitlab.example.com:8443/group/sub/project.git",
+    "git@gitlab.example.com:group/sub/project.git",
+    "ssh://git@gitlab.example.com:8443/group/sub/project.git",
+  ])("accepts an equivalent GitLab managed mirror origin: %s", async (origin) => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo: gitlabRepo, baseSha });
+    await mkdir(paths.mirrorPath, { recursive: true });
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (args.includes("get-url")) return `${origin}\n`;
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2)!, { recursive: true });
+      }
+      return "";
+    });
+
+    await expect(prepareWorkspace({ root, repo: gitlabRepo, baseSha }, { exec }))
+      .resolves.toMatchObject({ mirrorPath: paths.mirrorPath });
+  });
+
+  it("distinguishes an explicit default port in a GitLab HTTPS origin", async () => {
+    const root = await tempRoot();
+    const explicitDefaultPortRepo: GitLabRepositoryRef = {
+      ...gitlabRepo,
+      port: 443,
+      canonicalUrl: "https://gitlab.example.com:443/group/sub/project",
+    };
+    const paths = deriveWorkspacePaths({ root, repo: explicitDefaultPortRepo, baseSha });
+    await mkdir(paths.mirrorPath, { recursive: true });
+    let origin = "https://gitlab.example.com:443/group/sub/project.git";
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (args.includes("get-url")) return `${origin}\n`;
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2)!, { recursive: true });
+      }
+      return "";
+    });
+
+    await expect(prepareWorkspace({ root, repo: explicitDefaultPortRepo, baseSha }, { exec })).resolves.toBeDefined();
+    await rm(paths.baseWorktreePath, { recursive: true, force: true });
+    await rm(paths.ownerMarkerPath, { force: true });
+    origin = "https://gitlab.example.com/group/sub/project.git";
+    await expect(prepareWorkspace({ root, repo: explicitDefaultPortRepo, baseSha }, { exec }))
+      .rejects.toThrow(/origin does not match/i);
+  });
+
+  it.each([
+    "https://token@gitlab.example.com:8443/group/sub/project.git",
+    "http://gitlab.example.com:8443/group/sub/project.git",
+    "https://gitlab.example.com/group/sub/project.git",
+    "https://gitlab.example.com:9443/group/sub/project.git",
+    "https://other.example.com:8443/group/sub/project.git",
+    "https://gitlab.example.com:8443/group/other/project.git",
+    "https://gitlab.example.com:8443/group/sub/other.git",
+    "git@other.example.com:group/sub/project.git",
+    "ssh://git@gitlab.example.com/group/sub/project.git",
+    "ssh://git:password@gitlab.example.com:8443/group/sub/project.git",
+    "https://gitlab.example.com:8443/Group/sub/project.git",
+  ])("rejects a mismatched or unsafe GitLab managed mirror origin: %s", async (origin) => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo: gitlabRepo, baseSha });
+    await mkdir(paths.mirrorPath, { recursive: true });
+    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
+      args.includes("get-url") ? `${origin}\n` : "");
+
+    await expect(prepareWorkspace({ root, repo: gitlabRepo, baseSha }, { exec }))
+      .rejects.toThrow(/origin does not match/i);
+    expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["fetch"]));
+  });
+
+  it.each([
+    {
+      provider: "github",
+      repository: "https://gitlab.example.com:8443/group/sub/project",
+    },
+    {
+      provider: "gitlab",
+      repository: "https://other.example.com:8443/group/sub/project",
+    },
+    {
+      provider: "gitlab",
+      repository: "https://gitlab.example.com:8443/group/other/project",
+    },
+  ])("rejects a GitLab ownership marker with mismatched identity: $repository", async (marker) => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo: gitlabRepo, baseSha });
+    await mkdir(paths.baseWorktreePath, { recursive: true });
+    await mkdir(paths.mirrorPath, { recursive: true });
+    await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
+    await writeFile(paths.ownerMarkerPath, JSON.stringify({
+      version: 1,
+      ...marker,
+      baseSha,
+    }));
+    const exec = vi.fn(async () => baseSha);
+
+    await expect(prepareWorkspace({ root, repo: gitlabRepo, baseSha }, { exec }))
+      .rejects.toThrow(/ownership mismatch/i);
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it.skipIf(process.platform === "win32")("protects the managed root from other operating-system users", async () => {
     const root = await tempRoot();
     await chmod(root, 0o777);
@@ -247,7 +397,8 @@ describe("prepareWorkspace", () => {
     await mkdir(path.dirname(markerPath), { recursive: true });
     await writeFile(markerPath, JSON.stringify({
       version: 1,
-      repository: "github.com/octo-org/octo-repo",
+      provider: "github",
+      repository: "https://github.com/octo-org/octo-repo",
       baseSha: abbreviatedSha,
     }));
     const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
@@ -271,7 +422,8 @@ describe("prepareWorkspace", () => {
     await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
     await writeFile(paths.ownerMarkerPath, JSON.stringify({
       version: 1,
-      repository: "github.com/octo-org/octo-repo",
+      provider: "github",
+      repository: "https://github.com/octo-org/octo-repo",
       baseSha,
     }));
     const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
@@ -292,7 +444,8 @@ describe("prepareWorkspace", () => {
     await mkdir(path.dirname(paths.ownerMarkerPath), { recursive: true });
     await writeFile(paths.ownerMarkerPath, JSON.stringify({
       version: 1,
-      repository: "github.com/octo-org/octo-repo",
+      provider: "github",
+      repository: "https://github.com/octo-org/octo-repo",
       baseSha,
     }));
     const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) => {
@@ -380,9 +533,21 @@ describe("prepareWorkspace", () => {
       return "";
     });
 
-    const first = prepareWorkspace({ root, repo: { ...repo, owner: "a-b", repo: "c" }, baseSha }, { exec });
+    const firstRepo = {
+      ...repo,
+      owner: "a-b",
+      repo: "c",
+      canonicalUrl: "https://github.com/a-b/c",
+    };
+    const secondRepo = {
+      ...repo,
+      owner: "a",
+      repo: "b-c",
+      canonicalUrl: "https://github.com/a/b-c",
+    };
+    const first = prepareWorkspace({ root, repo: firstRepo, baseSha }, { exec });
     await firstStarted;
-    const second = prepareWorkspace({ root, repo: { ...repo, owner: "a", repo: "b-c" }, baseSha }, { exec });
+    const second = prepareWorkspace({ root, repo: secondRepo, baseSha }, { exec });
     const overlapped = await Promise.race([
       secondStarted.then(() => true),
       new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 250)),
