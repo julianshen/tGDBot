@@ -81,6 +81,49 @@ describe("prepareWorkspace", () => {
     );
   });
 
+  it("uses the same safe GitLab encoding for repository lock components", async () => {
+    const root = await tempRoot();
+    const sensitiveRepo: GitLabRepositoryRef = {
+      provider: "gitlab",
+      host: "gitlab*.example.com",
+      namespace: ["CON", "team*one"],
+      repo: "project.",
+      canonicalUrl: "https://gitlab*.example.com/CON/team*one/project.",
+    };
+    const expectedLockPath = path.join(
+      root,
+      ".locks",
+      "gitlab%2A.example.com",
+      "%43ON",
+      "team%2Aone",
+      "project%2E.lock",
+    );
+    let lockObserved = false;
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "git" && args[0] === "clone") {
+        lockObserved = (await stat(expectedLockPath)).isFile();
+        await mkdir(args.at(-1)!, { recursive: true });
+      }
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2)!, { recursive: true });
+      }
+      return "";
+    });
+
+    await prepareWorkspace({ root, repo: sensitiveRepo, baseSha }, { exec });
+
+    expect(lockObserved).toBe(true);
+    await expect(stat(path.join(
+      root,
+      ".locks",
+      "gitlab%2A.example.com",
+      "%43ON",
+      "team%2Aone",
+    ))).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+    await expect(stat(path.join(root, ".locks", "gitlab*.example.com", "CON", "team*one")))
+      .rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("clones GitLab mirrors with git and the canonical HTTPS clone URL", async () => {
     const root = await tempRoot();
     const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {

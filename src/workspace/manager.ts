@@ -3,7 +3,11 @@ import { randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { withRepositoryLock } from "./lock.js";
-import { deriveWorkspacePaths, encodeWorkspaceAuthority } from "./paths.js";
+import {
+  deriveWorkspacePaths,
+  encodeWorkspaceAuthority,
+  encodeWorkspaceComponent,
+} from "./paths.js";
 import type {
   ExecWorkspaceCommand,
   PreparedWorkspace,
@@ -399,8 +403,8 @@ export async function prepareWorkspace(
       paths.root,
       ".locks",
       encodeWorkspaceAuthority(request.repo.host, request.repo.port),
-      ...request.repo.namespace,
-      `${request.repo.repo}.lock`,
+      ...request.repo.namespace.map(encodeWorkspaceComponent),
+      `${encodeWorkspaceComponent(request.repo.repo)}.lock`,
     );
   await assertNoSymlinkedAncestors(
     paths.root,
