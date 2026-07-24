@@ -256,10 +256,11 @@ Each orchestrated inline comment receives a unique, stable `clientId`.
 - `{ clientId, status: "posted" }`;
 - `{ clientId, status: "failed", reason }`.
 
-GitHub reports all posted after its atomic request succeeds and all failed when
-it rejects. GitLab posts sequentially in input order and records each result.
-Missing, duplicate, or unknown IDs in an adapter result are treated as a batch
-contract failure.
+GitHub reports all posted after its atomic request succeeds. If GitHub rejects
+that atomic write, the adapter converts the rejection into a failed outcome for
+every input because the provider guarantees that none were posted. GitLab posts
+sequentially in input order and records each result. Missing, duplicate, or
+unknown IDs in an adapter result are treated as a batch contract failure.
 
 Orchestration retains a provider-neutral presentation record mapping every
 `clientId` to its normalized finding. A pure rendering helper accepts the set
@@ -268,11 +269,13 @@ redispatch rules or rerun an LLM. The first summary contains normal non-inline
 findings. After a partial publish, only failed inline findings are added.
 Already-posted findings are not duplicated, and no finding is lost.
 
-Failures before the first write, including metadata/diff-version preflight,
-reject the batch and cause every inline candidate to fall back to summary. Once
-posting starts, individual write failures are returned as outcomes rather than
-throwing. A process-level failure that makes remaining writes impossible marks
-each unattempted input failed before returning.
+Only batch preflight and adapter-contract failures reject: invalid input,
+metadata/diff-version mismatch, or an invalid outcome set. A provider write
+rejection is represented as outcome data. GitHub converts its atomic rejection
+to all failed; GitLab records the failed discussion and continues. A
+process-level failure that makes remaining GitLab writes impossible marks each
+unattempted input failed before returning. Thus every provider write attempt
+has one CLI path: validate first, then return a complete outcome set.
 
 Dry-run performs no note or discussion writes.
 
@@ -306,9 +309,20 @@ Credentials embedded in URLs, HTTP origins, unexpected ports, mismatched hosts,
 and mismatched namespace/project paths are rejected. Filesystem path components
 are derived only from validated normalized segments.
 
-Existing GitHub cache entries and workspace layout remain readable or are
-migrated explicitly; the change must not silently reinterpret a GitHub cache as
-GitLab data.
+Existing GitHub cache keys and workspace paths remain byte-for-byte unchanged;
+there is no migration. `ContextCacheKey` becomes a discriminated union whose
+GitHub member retains the current exact fields and canonical JSON, so its
+hashed entry path is identical. The GitLab member uses `provider: "gitlab"`, a
+normalized host authority, and namespace segments, producing a different hash.
+
+Workspace derivation likewise preserves the current
+`repos/github.com/<owner>/<repo>` layout. GitLab uses
+`repos/<normalized-host-authority>/<namespace...>/<project>`. A filesystem-safe
+reversible encoding represents an explicit port in the host component.
+Ownership markers include provider and the normalized canonical repository
+identity. If an existing path or marker identifies a different provider,
+authority, namespace, or project, preparation fails as a conflict; it is never
+adopted or overwritten.
 
 ## Error Handling
 
@@ -363,6 +377,7 @@ All automated tests are offline.
 - base-SHA rule listing, file decoding, missing-directory handling, pagination,
   and genuine failure propagation;
 - inline single-line, multi-line, and suggestion positions;
+- renamed-file context-line positions and mixed added/context range rejection;
 - stale-head preflight;
 - partial inline success/failure accounting;
 - stale discussion filtering, pagination, per-thread failure isolation, and
