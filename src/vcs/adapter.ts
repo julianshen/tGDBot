@@ -111,6 +111,22 @@ export interface InlinePublishOutcome {
   readonly reason?: string;
 }
 
+export function validateInlinePublishInputs(
+  comments: readonly InlineReviewComment[],
+): void {
+  const clientIds = new Set<string>();
+  for (const comment of comments) {
+    if (
+      typeof comment.clientId !== "string" ||
+      comment.clientId.length === 0 ||
+      clientIds.has(comment.clientId)
+    ) {
+      throw new Error("inline comments require unique, non-empty clientId values");
+    }
+    clientIds.add(comment.clientId);
+  }
+}
+
 export function validateInlinePublishOutcomes(
   comments: readonly InlineReviewComment[],
   outcomes: readonly InlinePublishOutcome[],

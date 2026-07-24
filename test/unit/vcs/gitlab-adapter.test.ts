@@ -540,6 +540,18 @@ describe("GitLabAdapter inline discussions", () => {
     sameHunk: true,
   });
 
+  it.each([
+    ["empty", [{ ...added, clientId: "" }]],
+    ["duplicate", [added, { ...added }]],
+  ])("rejects %s client IDs before any external call", async (_name, comments) => {
+    const execGlab = vi.fn<ExecGlab>();
+
+    await expect(
+      new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, comments),
+    ).rejects.toThrow(/unique|non-empty|clientId/i);
+    expect(execGlab).not.toHaveBeenCalled();
+  });
+
   it("preflights fresh metadata and the newest version before posting", async () => {
     const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
     const result = await new GitLabAdapter(successfulExecutor(calls))
@@ -858,6 +870,31 @@ describe("GitLabAdapter inline discussions", () => {
     await expect(
       new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, [added]),
     ).rejects.toThrow(TypeError);
+  });
+
+  it.each([
+    ["empty discussion id", { id: "", notes: [{ id: 701, body: "posted" }] }],
+    ["numeric discussion id", { id: 123, notes: [{ id: 701, body: "posted" }] }],
+    ["empty notes", { id: "discussion-1", notes: [] }],
+    ["malformed note id", { id: "discussion-1", notes: [{ id: 0, body: "posted" }] }],
+    ["malformed note body", { id: "discussion-1", notes: [{ id: 701, body: 42 }] }],
+  ])("rejects a POST response with %s and stops before later writes", async (_name, response) => {
+    let posts = 0;
+    const execGlab: ExecGlab = async (args) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) {
+        posts += 1;
+        return JSON.stringify(response);
+      }
+      return fixture;
+    };
+    const comments = [added, { ...added, clientId: "finding-1" }];
+
+    await expect(
+      new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, comments),
+    ).rejects.toThrow(/discussion/i);
+    expect(posts).toBe(1);
   });
 });
 

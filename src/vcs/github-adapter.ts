@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
 import { parseBotMarker } from "../review/comment-marker.js";
+import { validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -383,12 +384,9 @@ export class GitHubAdapter implements VcsAdapter {
     headSha: string,
     comments: InlineReviewComment[],
   ): Promise<InlinePublishOutcome[]> {
+    validateInlinePublishInputs(comments);
     const { repo, id } = resolvePullLocator(locator);
     if (comments.length === 0) return [];
-    const clientIds = new Set(comments.map(({ clientId }) => clientId));
-    if (clientIds.size !== comments.length || comments.some(({ clientId }) => clientId === "")) {
-      throw new Error("inline comments require unique, non-empty clientId values");
-    }
 
     const payload = {
       commit_id: headSha,

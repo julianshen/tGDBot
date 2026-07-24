@@ -119,7 +119,13 @@ describe("GitHubAdapter", () => {
       reviewedConfig: "cfg",
     });
     await adapter.createInlineReview(explicitLocator, "abc123", [
-      { path: "src/a.ts", line: 7, body: "finding" },
+      {
+        clientId: "finding-0",
+        path: "src/a.ts",
+        line: 7,
+        body: "finding",
+        position: {} as never,
+      },
     ]);
     await adapter.getRuleFilesFromBase(explicitLocator, "def456", ".tgd-review/rules");
 

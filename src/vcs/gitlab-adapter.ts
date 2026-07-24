@@ -2,7 +2,10 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { parseBotMarker } from "../review/comment-marker.js";
 import type { GitLabRepositoryRef } from "../target/types.js";
-import { validateInlinePublishOutcomes } from "./adapter.js";
+import {
+  validateInlinePublishInputs,
+  validateInlinePublishOutcomes,
+} from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -404,8 +407,16 @@ function validateWrittenDiscussion(stdout: string): void {
   }
   if (
     !isRecord(value) ||
-    (typeof value.id !== "string" && typeof value.id !== "number") ||
-    !Array.isArray(value.notes)
+    typeof value.id !== "string" ||
+    value.id.length === 0 ||
+    !Array.isArray(value.notes) ||
+    value.notes.length === 0 ||
+    !value.notes.every((note) =>
+      isRecord(note) &&
+      Number.isSafeInteger(note.id) &&
+      (note.id as number) > 0 &&
+      typeof note.body === "string"
+    )
   ) {
     throw new GlabOutputError("Invalid glab discussion response");
   }
@@ -593,6 +604,7 @@ export class GitLabAdapter implements VcsAdapter {
     headSha: string,
     comments: InlineReviewComment[],
   ): Promise<InlinePublishOutcome[]> {
+    validateInlinePublishInputs(comments);
     const { repo, iid } = resolveMergeRequestLocator(locator);
     const metadata = await this.getPullRequest(locator);
     const versionsStdout = await this.execGlab([
