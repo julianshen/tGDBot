@@ -14,6 +14,7 @@ import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
+import { parseReviewTarget } from "./target/review-target.js";
 
 /**
  * Parsed configuration for the `review` command, per SPEC.md's API Contract.
@@ -21,6 +22,7 @@ import type { PullRequestInfo } from "./vcs/adapter.js";
 export interface CliArgs {
   pr: string;
   vcs: "github" | "gitlab";
+  repo?: string;
   /**
    * "<provider>/<model>" — the DEFAULT model (design-review #6). Runs the
    * ORCHESTRATING session and every rule that doesn't pin its own
@@ -115,6 +117,7 @@ export function parseArgs(argv: string[]): CliArgs {
     allowPositionals: true,
     options: {
       pr: { type: "string" },
+      repo: { type: "string" },
       vcs: { type: "string" },
       "rules-dir": { type: "string" },
       "disable-builtin-rule": { type: "boolean" },
@@ -142,9 +145,13 @@ export function parseArgs(argv: string[]): CliArgs {
   // any future path/query-string interpolation from accepting non-numeric
   // input.
   if (!/^\d+$/.test(values.pr as string)) {
-    throw new Error(
-      `Invalid --pr value: "${values.pr as string}" (expected a positive integer, e.g. --pr 42)`,
-    );
+    try {
+      parseReviewTarget(values.pr as string);
+    } catch {
+      throw new Error(
+        `Invalid --pr value: "${values.pr as string}" (expected a positive integer or complete GitHub/GitLab review URL)`,
+      );
+    }
   }
 
   const vcs = (values.vcs as string | undefined) ?? DEFAULTS.vcs;
@@ -199,6 +206,7 @@ export function parseArgs(argv: string[]): CliArgs {
 
   return {
     pr: values.pr as string,
+    repo: values.repo as string | undefined,
     vcs,
     model,
     maxDiffChars,

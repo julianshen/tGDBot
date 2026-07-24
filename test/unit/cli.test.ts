@@ -10,6 +10,7 @@ describe("parseArgs", () => {
     expect(result).toEqual({
       pr: "42",
       vcs: "github",
+      repo: undefined,
       rulesDir: ".review/rules",
       disableBuiltinRule: false,
       advisor: "on",
@@ -154,5 +155,28 @@ describe("parseArgs", () => {
   it("security hardening: still accepts a plain positive integer --pr value", () => {
     expect(() => parseArgs(["review", "--pr", "007"])).not.toThrow();
     expect(parseArgs(["review", "--pr", "0"]).pr).toBe("0");
+  });
+
+  it("accepts an explicit GitLab repository with a numeric IID", () => {
+    const result = parseArgs([
+      "review",
+      "--pr",
+      "42",
+      "--vcs",
+      "gitlab",
+      "--repo",
+      "gitlab.example.com/group/project",
+    ]);
+
+    expect(result.repo).toBe("gitlab.example.com/group/project");
+  });
+
+  it("accepts a complete GitLab merge-request URL as --pr", () => {
+    const url = "https://gitlab.example.com/group/project/-/merge_requests/42";
+    expect(parseArgs(["review", "--pr", url]).pr).toBe(url);
+  });
+
+  it("rejects a nonnumeric --pr that is not a complete PR or MR URL", () => {
+    expect(() => parseArgs(["review", "--pr", "group/project!42"])).toThrow(/--pr/);
   });
 });

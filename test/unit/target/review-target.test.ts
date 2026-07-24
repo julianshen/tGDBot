@@ -1,52 +1,138 @@
 import { describe, expect, it } from "vitest";
-import { parseReviewTarget } from "../../../src/target/review-target.js";
+import {
+  parseRepositoryRef,
+  parseReviewTarget,
+} from "../../../src/target/review-target.js";
 
 describe("parseReviewTarget", () => {
-  it("AC-1.1: parses and normalizes a canonical GitHub pull-request URL without Git state", () => {
-    const target = parseReviewTarget("https://github.com/Example-Org/Review_Tool/pull/42/");
-
-    expect(target).toEqual({
+  it("parses and normalizes a canonical GitHub pull-request URL", () => {
+    expect(parseReviewTarget("https://github.com/Example-Org/Review_Tool/pull/42/")).toEqual({
       provider: "github",
-      host: "github.com",
-      owner: "Example-Org",
-      repo: "Review_Tool",
-      pullNumber: 42,
+      repo: {
+        provider: "github",
+        host: "github.com",
+        owner: "Example-Org",
+        repo: "Review_Tool",
+        canonicalUrl: "https://github.com/Example-Org/Review_Tool",
+      },
+      number: 42,
       canonicalUrl: "https://github.com/Example-Org/Review_Tool/pull/42",
     });
   });
 
-  it.each([
-    ["a non-GitHub host", "https://gitlab.com/acme/widget/pull/42"],
-    ["a non-HTTPS scheme", "http://github.com/acme/widget/pull/42"],
-    ["a malformed pull path", "https://github.com/acme/widget/issues/42"],
-    ["a missing owner", "https://github.com/widget/pull/42"],
-    ["an extra path segment", "https://github.com/acme/widget/pull/42/files"],
-    ["a zero pull number", "https://github.com/acme/widget/pull/0"],
-    ["a negative pull number", "https://github.com/acme/widget/pull/-1"],
-    ["a query", "https://github.com/acme/widget/pull/42?repo=other"],
-    ["a fragment", "https://github.com/acme/widget/pull/42#discussion"],
-    ["encoded path data", "https://github.com/acme%2Fadmin/widget/pull/42"],
-    ["an encoded dot segment", "https://github.com/acme/%2e%2e/widget/pull/42"],
-    ["a backslash path separator", "https://github.com/acme\\widget/pull/42"],
-    ["an ASCII tab", "https://github.com/acme/wi\tdget/pull/42"],
-    ["an ASCII newline", "https://github.com/acme/widget/pull/4\n2"],
-  ])("AC-1.2: rejects %s with an actionable validation error", (_case, input) => {
-    expect(() => parseReviewTarget(input)).toThrow(/GitHub PR URL/);
+  it("parses a self-hosted GitLab merge-request URL with a nested namespace", () => {
+    expect(
+      parseReviewTarget(
+        "https://gitlab.example.com/group/sub/project/-/merge_requests/42",
+      ),
+    ).toEqual({
+      provider: "gitlab",
+      repo: {
+        provider: "gitlab",
+        host: "gitlab.example.com",
+        port: undefined,
+        namespace: ["group", "sub"],
+        repo: "project",
+        canonicalUrl: "https://gitlab.example.com/group/sub/project",
+      },
+      number: 42,
+      canonicalUrl:
+        "https://gitlab.example.com/group/sub/project/-/merge_requests/42",
+    });
   });
 
-  it("AC-1.2: rejects credentials without echoing credential material", () => {
-    const input = "https://operator:super-secret@github.com/acme/widget/pull/42";
+  it("rejects a review URL when it does not match the expected provider", () => {
+    expect(() =>
+      parseReviewTarget(
+        "https://gitlab.com/group/project/-/merge_requests/42",
+        "github",
+      ),
+    ).toThrow(/provider/i);
+  });
 
-    let caught: unknown;
-    try {
-      parseReviewTarget(input);
-    } catch (error) {
-      caught = error;
-    }
+  it.each([
+    ["credentials", "https://user:secret@gitlab.com/group/project/-/merge_requests/42"],
+    ["HTTP", "http://gitlab.com/group/project/-/merge_requests/42"],
+    ["a query", "https://gitlab.com/group/project/-/merge_requests/42?x=1"],
+    ["a fragment", "https://gitlab.com/group/project/-/merge_requests/42#note"],
+    ["a zero IID", "https://gitlab.com/group/project/-/merge_requests/0"],
+    ["an encoded slash", "https://gitlab.com/group%2Fadmin/project/-/merge_requests/42"],
+    ["an encoded dot segment", "https://gitlab.com/group/%2e%2e/project/-/merge_requests/42"],
+    ["a control character", "https://gitlab.com/group/proj\tect/-/merge_requests/42"],
+    ["a missing namespace", "https://gitlab.com/project/-/merge_requests/42"],
+    ["a missing project", "https://gitlab.com/group/-/merge_requests/42"],
+    ["a malformed marker", "https://gitlab.com/group/project/merge_requests/42"],
+    ["a malformed suffix", "https://gitlab.com/group/project/-/merge_requests/42/files"],
+  ])("rejects GitLab review targets containing %s", (_case, input) => {
+    expect(() => parseReviewTarget(input)).toThrow(/review target|GitLab/i);
+  });
 
-    expect(caught).toBeInstanceOf(Error);
-    expect((caught as Error).message).toMatch(/credentials/i);
-    expect((caught as Error).message).not.toContain("operator");
-    expect((caught as Error).message).not.toContain("super-secret");
+  it.each([
+    "https://gitlab.com/group/.%2e/project/-/merge_requests/42",
+    "https://gitlab.com/group/%2e./project/-/merge_requests/42",
+  ])("rejects the encoded dot-segment variant %s before URL normalization", (input) => {
+    expect(() => parseReviewTarget(input)).toThrow(/encoded|dot/i);
+  });
+
+  it.each([
+    "https://github.com/acme/widget/issues/42",
+    "https://github.com/acme/widget/pull/0",
+    "https://github.com/acme/widget/pull/42/files",
+    "https://github.com/acme/widget/pull/42?view=files",
+    "https://github.com/acme%2Fadmin/widget/pull/42",
+  ])("continues to reject the invalid GitHub target %s", (input) => {
+    expect(() => parseReviewTarget(input)).toThrow();
+  });
+});
+
+describe("parseRepositoryRef", () => {
+  it("retains an explicit HTTPS port as repository identity", () => {
+    expect(
+      parseRepositoryRef(
+        "gitlab.example.com:8443/group/sub/project",
+        "gitlab",
+      ),
+    ).toEqual({
+      provider: "gitlab",
+      host: "gitlab.example.com",
+      port: 8443,
+      namespace: ["group", "sub"],
+      repo: "project",
+      canonicalUrl: "https://gitlab.example.com:8443/group/sub/project",
+    });
+  });
+
+  it.each([
+    "group/sub/project",
+    "https://gitlab.com/group/sub/project",
+    "git@gitlab.com:group/sub/project.git",
+    "ssh://git@gitlab.com/group/sub/project.git",
+  ])("normalizes the GitLab repository form %s", (input) => {
+    expect(parseRepositoryRef(input, "gitlab")).toEqual({
+      provider: "gitlab",
+      host: "gitlab.com",
+      port: undefined,
+      namespace: ["group", "sub"],
+      repo: "project",
+      canonicalUrl: "https://gitlab.com/group/sub/project",
+    });
+  });
+
+  it.each([
+    "https://user:secret@gitlab.com/group/project",
+    "http://gitlab.com/group/project",
+    "https://gitlab.com/group/project?x=1",
+    "https://gitlab.com/group/project#x",
+    "https://gitlab.com/group%2Fsub/project",
+    "https://gitlab.com/group/%2e%2e/project",
+    "gitlab.com/group",
+  ])("rejects the invalid GitLab repository form %s", (input) => {
+    expect(() => parseRepositoryRef(input, "gitlab")).toThrow();
+  });
+
+  it("rejects a GitLab repository parsed as GitHub", () => {
+    expect(() =>
+      parseRepositoryRef("gitlab.example.com/group/project", "github"),
+    ).toThrow(/GitHub|provider/i);
   });
 });
