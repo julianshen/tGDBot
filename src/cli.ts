@@ -8,12 +8,13 @@ import type { ResolvedConfig } from "./config.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
-import { orchestrate as orchestrateReal } from "./review/orchestrate.js";
+import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
+import { validateInlinePublishOutcomes } from "./vcs/adapter.js";
 import { parseReviewTarget } from "./target/review-target.js";
 
 /**
@@ -546,10 +547,10 @@ export async function review(
   // Only an explicit "off" disables them — an absent value means the documented
   // default (on), never a silent downgrade.
   const renderOpts = { suggestions: config.suggestions !== "off" };
-  let orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
+  const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
 
-  const buildBody = (o: OrchestrationResult): string => {
-    const bodyParts = [o.commentBody];
+  const buildBody = (o: OrchestrationResult, commentBody = o.commentBody): string => {
+    const bodyParts = [commentBody];
     if (loadErrors.length > 0) bodyParts.push(renderLoadErrorsSection(loadErrors));
     bodyParts.push(formatMarker(pr.headSha, configHash));
     return bodyParts.join("\n\n");
@@ -604,26 +605,65 @@ export async function review(
     }
 
     if (orchestration.inlineComments.length > 0) {
+      const allInlineIds = new Set(
+        orchestration.inlineComments.map((comment) => comment.clientId),
+      );
+      let fallbackIds: Set<string> | undefined;
       try {
-        await config.vcsAdapter.createInlineReview(
+        const outcomes = await config.vcsAdapter.createInlineReview(
           config.locator,
           pr.headSha,
           orchestration.inlineComments,
         );
+        try {
+          const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
+            if (typeof outcome !== "object" || outcome === null) return false;
+            const candidate = outcome as Record<string, unknown>;
+            return typeof candidate.clientId === "string" &&
+              (candidate.status === "posted" || candidate.status === "failed") &&
+              (candidate.reason === undefined || typeof candidate.reason === "string");
+          });
+          if (!shapesValid) throw new Error("malformed inline publish outcome");
+          const validated = validateInlinePublishOutcomes(
+            orchestration.inlineComments,
+            outcomes,
+          );
+          fallbackIds = new Set(
+            validated
+              .filter((outcome) => outcome.status === "failed")
+              .map((outcome) => outcome.clientId),
+          );
+        } catch (err) {
+          console.warn(
+            `tgd-review-agent: inline review returned invalid outcomes (${(err as Error).message}); ` +
+              `rewriting the summary comment to carry every inline finding instead`,
+          );
+          fallbackIds = allInlineIds;
+        }
       } catch (err) {
-        // Recoverable by design: GitHub rejects the WHOLE review if any single
-        // anchor is off-diff. Rather than lose every finding to that, re-render
-        // the summary with all of them inline-in-body and edit it in place. A
-        // finding is only ever RELOCATED, never lost.
         console.warn(
           `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
             `rewriting the summary comment to carry every finding instead`,
         );
-        orchestration = orchestrateFn(dispatchResult, diff, { inline: false, ...renderOpts });
+        fallbackIds = allInlineIds;
+      }
+
+      if (fallbackIds.size > 0) {
+        const fallbackBody = renderSummary(orchestration, fallbackIds);
         const existing = await config.vcsAdapter.findBotComment(config.locator);
+        if (
+          existing === null ||
+          existing.lastReviewedSha !== pr.headSha ||
+          existing.reviewedConfig !== configHash ||
+          (botComment !== null && existing.id !== botComment.id)
+        ) {
+          throw new Error(
+            "The exact marker-bearing summary note could not be found after it was upserted; refusing to create a duplicate summary",
+          );
+        }
         await config.vcsAdapter.upsertComment(
           config.locator,
-          buildBody(orchestration),
+          buildBody(orchestration, fallbackBody),
           existing,
         );
       }

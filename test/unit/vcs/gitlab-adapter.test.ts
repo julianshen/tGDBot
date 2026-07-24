@@ -52,6 +52,11 @@ const notesFixturePath = fileURLToPath(new URL("../../fixtures/glab-notes.json",
 const notesFixture = await readFile(notesFixturePath, "utf8");
 const discussionsFixturePath = fileURLToPath(new URL("../../fixtures/glab-discussions.json", import.meta.url));
 const discussionsFixture = await readFile(discussionsFixturePath, "utf8");
+const writtenDiscussionFixture = JSON.stringify({
+  id: "discussion-1",
+  individual_note: false,
+  notes: [{ id: 701, body: "review comment" }],
+});
 
 const BASE_SHA = "1111111111111111111111111111111111111111";
 const HEAD_SHA = "2222222222222222222222222222222222222222";
@@ -196,6 +201,97 @@ describe("GitLabAdapter merge request snapshot", () => {
     await expect(adapter.getPullRequest(locator())).resolves.toMatchObject({
       description: expected,
     });
+  });
+});
+
+describe("GitLabAdapter stale discussion cleanup", () => {
+  it("lists every page and resolves only own marked unresolved discussions", async () => {
+    const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
+    const execGlab: ExecGlab = async (args, stdin) => {
+      calls.push({ args, stdin });
+      if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
+      if (args.includes("--paginate")) return discussionsFixture;
+      return JSON.stringify({ id: "resolved" });
+    };
+
+    const count = await new GitLabAdapter(execGlab).resolveStaleReviewThreads(locator());
+
+    expect(count).toBe(2);
+    expect(calls).toEqual([
+      { args: ["api", "user", "--hostname", "gitlab.example.com"], stdin: undefined },
+      {
+        args: [
+          "api", "--method", "GET", "--paginate", "--output", "ndjson",
+          "--hostname", "gitlab.example.com",
+          `projects/${encodeURIComponent("group/subgroup/project")}/merge_requests/42/discussions`,
+          "--field", "per_page=100",
+        ],
+        stdin: undefined,
+      },
+      {
+        args: [
+          "api", "--method", "PUT", "--hostname", "gitlab.example.com",
+          `projects/${encodeURIComponent("group/subgroup/project")}/merge_requests/42/discussions/${encodeURIComponent("own-marked-one")}`,
+          "--input", "-",
+        ],
+        stdin: JSON.stringify({ resolved: true }),
+      },
+      {
+        args: [
+          "api", "--method", "PUT", "--hostname", "gitlab.example.com",
+          `projects/${encodeURIComponent("group/subgroup/project")}/merge_requests/42/discussions/${encodeURIComponent("own-marked.two")}`,
+          "--input", "-",
+        ],
+        stdin: JSON.stringify({ resolved: true }),
+      },
+    ]);
+  });
+
+  it("warns with sanitized errors, continues after each resolve failure, and counts successes", async () => {
+    let puts = 0;
+    const execGlab: ExecGlab = async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
+      if (args.includes("--paginate")) return discussionsFixture;
+      puts += 1;
+      if (puts === 1) {
+        throw new GlabCommandError("TOKEN=secret", {
+          httpStatus: 401,
+          stderr: "private TOKEN=secret",
+        });
+      }
+      return JSON.stringify({ id: "resolved" });
+    };
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(new GitLabAdapter(execGlab).resolveStaleReviewThreads(locator()))
+      .resolves.toBe(1);
+    expect(puts).toBe(2);
+    expect(warn.mock.calls.flat().join("\n")).not.toMatch(/TOKEN|secret|private/i);
+    warn.mockRestore();
+  });
+
+  it.each([
+    "",
+    "../escape",
+    "space id",
+    "slash%2Fescape",
+    "unicode-討論",
+  ])("rejects invalid opaque discussion id %j before resolving", async (id) => {
+    const execGlab: ExecGlab = async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "review-bot" });
+      return JSON.stringify({
+        id,
+        notes: [{
+          id: 1,
+          body: "<!-- tgd-review-agent:inline -->",
+          author: { username: "review-bot" },
+          resolved: false,
+        }],
+      });
+    };
+
+    await expect(new GitLabAdapter(execGlab).resolveStaleReviewThreads(locator()))
+      .rejects.toThrow(/discussion/i);
   });
 });
 
@@ -527,7 +623,7 @@ describe("GitLabAdapter inline discussions", () => {
       calls.push({ args, stdin });
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/versions")) return versionsFixture();
-      if (endpoint?.endsWith("/discussions")) return discussionsFixture;
+      if (endpoint?.endsWith("/discussions")) return writtenDiscussionFixture;
       return fixture;
     };
   }
@@ -624,7 +720,7 @@ describe("GitLabAdapter inline discussions", () => {
           null,
         ]);
       }
-      if (endpoint?.endsWith("/discussions")) return discussionsFixture;
+      if (endpoint?.endsWith("/discussions")) return writtenDiscussionFixture;
       return fixture;
     };
 
@@ -780,7 +876,7 @@ describe("GitLabAdapter inline discussions", () => {
             stderr: "private provider response TOKEN=secret",
           });
         }
-        return discussionsFixture;
+        return writtenDiscussionFixture;
       }
       return fixture;
     };
@@ -818,7 +914,7 @@ describe("GitLabAdapter inline discussions", () => {
       if (endpoint?.endsWith("/discussions")) {
         posts += 1;
         if (posts === 1) throw new GlabCommandError("write failed", { httpStatus: status });
-        return discussionsFixture;
+        return writtenDiscussionFixture;
       }
       return fixture;
     };

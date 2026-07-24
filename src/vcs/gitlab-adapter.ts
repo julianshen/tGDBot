@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { parseBotMarker } from "../review/comment-marker.js";
+import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
 import type { GitLabRepositoryRef } from "../target/types.js";
 import {
   validateInlinePublishInputs,
@@ -249,6 +250,15 @@ interface GlabMergeRequestVersion {
   start_commit_sha: string;
 }
 
+interface GlabDiscussion {
+  id: string;
+  notes: Array<{
+    body: string;
+    author: { username: string };
+    resolved: boolean;
+  }>;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -353,6 +363,44 @@ function parseNotes(stdout: string): GlabNote[] {
   });
 }
 
+// GitLab documents discussion IDs as opaque strings. Restrict endpoint
+// interpolation to RFC 3986 unreserved characters, then encode even that
+// validated value below so the safety property survives future allowlist edits.
+const OPAQUE_DISCUSSION_ID_RE = /^[A-Za-z0-9._~-]+$/u;
+
+function parseDiscussions(stdout: string): GlabDiscussion[] {
+  return decodeNdjsonRecords<unknown>(stdout).map((value) => {
+    if (
+      !isRecord(value) ||
+      typeof value.id !== "string" ||
+      value.id.length === 0 ||
+      !OPAQUE_DISCUSSION_ID_RE.test(value.id) ||
+      value.id.includes("..") ||
+      !Array.isArray(value.notes)
+    ) {
+      throw new GlabOutputError("Invalid glab discussion response");
+    }
+    const notes = value.notes.map((note) => {
+      if (
+        !isRecord(note) ||
+        typeof note.body !== "string" ||
+        !isRecord(note.author) ||
+        typeof note.author.username !== "string" ||
+        note.author.username.length === 0 ||
+        typeof note.resolved !== "boolean"
+      ) {
+        throw new GlabOutputError("Invalid glab discussion response");
+      }
+      return {
+        body: note.body,
+        author: { username: note.author.username },
+        resolved: note.resolved,
+      };
+    });
+    return { id: value.id, notes };
+  });
+}
+
 function parseWrittenNote(stdout: string, expectedId?: number): void {
   let value: unknown;
   try {
@@ -447,10 +495,6 @@ function resolveMergeRequestLocator(locator: ReviewLocator): {
     throw new Error("Review locator number must be a positive integer");
   }
   return { repo: locator.repo, iid: String(locator.number) };
-}
-
-function unavailable(operation: string): never {
-  throw new Error(`GitLab ${operation} is not available yet`);
 }
 
 export function classifyGlabWriteFailure(
@@ -711,8 +755,44 @@ export class GitLabAdapter implements VcsAdapter {
   }
 
   async resolveStaleReviewThreads(locator: ReviewLocator): Promise<number> {
-    void locator;
-    return unavailable("thread cleanup");
+    const { repo, iid } = resolveMergeRequestLocator(locator);
+    const username = await this.getUsername(repo);
+    const baseEndpoint = projectEndpoint(
+      repo,
+      `merge_requests/${iid}/discussions`,
+    );
+    const stdout = await this.execGlab([
+      "api", "--method", "GET", "--paginate", "--output", "ndjson",
+      "--hostname", repo.host,
+      baseEndpoint,
+      "--field", "per_page=100",
+    ]);
+    const stale = parseDiscussions(stdout).filter((discussion) => {
+      const firstNote = discussion.notes[0];
+      return firstNote?.resolved === false &&
+        firstNote.author.username === username &&
+        firstNote.body.includes(INLINE_COMMENT_MARKER);
+    });
+
+    let resolved = 0;
+    for (const discussion of stale) {
+      try {
+        await this.execGlab([
+          "api", "--method", "PUT", "--hostname", repo.host,
+          `${baseEndpoint}/${encodeURIComponent(discussion.id)}`,
+          "--input", "-",
+        ], JSON.stringify({ resolved: true }));
+        resolved += 1;
+      } catch (error) {
+        if (!(error instanceof GlabCommandError)) throw error;
+        void classifyGlabWriteFailure(error);
+        console.warn(
+          `GitLabAdapter: could not resolve a stale review discussion ` +
+            `(${sanitizedWriteFailureReason(error)}); continuing with the remaining discussions`,
+        );
+      }
+    }
+    return resolved;
   }
 
   async getRuleFilesFromBase(
