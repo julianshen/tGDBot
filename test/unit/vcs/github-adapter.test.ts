@@ -3,7 +3,11 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
 import { INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
-import type { BotComment, ReviewLocator } from "../../../src/vcs/adapter.js";
+import {
+  validateInlinePublishOutcomes,
+  type BotComment,
+  type ReviewLocator,
+} from "../../../src/vcs/adapter.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
 
 const fixturePath = (name: string): string =>
@@ -1121,9 +1125,14 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
     };
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.createInlineReview(locator42, "deadbeef", [
-      { path: "a.ts", line: 13, startLine: 11, body: "multi" },
-      { path: "b.ts", line: 5, body: "single" },
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 13, startLine: 11, body: "multi", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 5, body: "single", position: {} as never },
+    ];
+    const outcomes = await adapter.createInlineReview(locator42, "deadbeef", comments);
+    expect(outcomes).toEqual([
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-1", status: "posted" },
     ]);
 
     const payload = JSON.parse(calls[0].stdin as string) as {
@@ -1149,5 +1158,39 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
       side: "RIGHT",
       body: "single",
     });
+  });
+
+  it("returns one safe failed outcome per comment when GitHub rejects the atomic write", async () => {
+    const adapter = new GitHubAdapter(async () => {
+      throw new Error("HTTP 422 secret-token=do-not-publish");
+    });
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 1, body: "a", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 2, body: "b", position: {} as never },
+    ];
+    const outcomes = await adapter.createInlineReview(locator42, "deadbeef", comments);
+    expect(outcomes).toEqual([
+      { clientId: "finding-0", status: "failed", reason: "GitHub rejected the inline review" },
+      { clientId: "finding-1", status: "failed", reason: "GitHub rejected the inline review" },
+    ]);
+    expect(JSON.stringify(outcomes)).not.toContain("secret-token");
+  });
+
+  it("validates complete, unique, known outcome IDs", () => {
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 1, body: "a", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 2, body: "b", position: {} as never },
+    ];
+    expect(() => validateInlinePublishOutcomes(comments, [
+      { clientId: "finding-0", status: "posted" },
+    ])).toThrow(/complete/i);
+    expect(() => validateInlinePublishOutcomes(comments, [
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-0", status: "posted" },
+    ])).toThrow(/duplicate/i);
+    expect(() => validateInlinePublishOutcomes(comments, [
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "unknown", status: "posted" },
+    ])).toThrow(/unknown/i);
   });
 });

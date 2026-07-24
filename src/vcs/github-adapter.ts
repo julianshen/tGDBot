@@ -4,6 +4,7 @@ import { parseBotMarker } from "../review/comment-marker.js";
 import type {
   BotComment,
   InlineReviewComment,
+  InlinePublishOutcome,
   PullRequestInfo,
   ReviewLocator,
   RuleFileContent,
@@ -381,9 +382,13 @@ export class GitHubAdapter implements VcsAdapter {
     locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
-  ): Promise<void> {
+  ): Promise<InlinePublishOutcome[]> {
     const { repo, id } = resolvePullLocator(locator);
-    if (comments.length === 0) return;
+    if (comments.length === 0) return [];
+    const clientIds = new Set(comments.map(({ clientId }) => clientId));
+    if (clientIds.size !== comments.length || comments.some(({ clientId }) => clientId === "")) {
+      throw new Error("inline comments require unique, non-empty clientId values");
+    }
 
     const payload = {
       commit_id: headSha,
@@ -401,10 +406,19 @@ export class GitHubAdapter implements VcsAdapter {
       })),
     };
 
-    await this.execGh(
-      ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"],
-      JSON.stringify(payload),
-    );
+    try {
+      await this.execGh(
+        ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"],
+        JSON.stringify(payload),
+      );
+      return comments.map(({ clientId }) => ({ clientId, status: "posted" }));
+    } catch {
+      return comments.map(({ clientId }) => ({
+        clientId,
+        status: "failed",
+        reason: "GitHub rejected the inline review",
+      }));
+    }
   }
 
   // Caches the resolved "owner/name" (same promise-caching pattern as

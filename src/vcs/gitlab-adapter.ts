@@ -481,7 +481,7 @@ export class GitLabAdapter implements VcsAdapter {
     locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
-  ): Promise<void> {
+  ): Promise<import("./adapter.js").InlinePublishOutcome[]> {
     void [locator, headSha, comments];
     return unavailable("inline review");
   }

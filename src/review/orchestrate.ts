@@ -8,7 +8,7 @@
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
 import type { RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
-import { changedFiles, commentableLines, isCommentable, rangeIsCommentable } from "./diff-anchors.js";
+import { changedFiles, commentableLines, diffPositionRange, isCommentable, rangeIsCommentable } from "./diff-anchors.js";
 import type { DispatchResult, Finding } from "./types.js";
 
 export type { InlineComment } from "./comment-format.js";
@@ -27,6 +27,8 @@ export interface OrchestrationResult {
   findingsCount: number;
   rulesRun: string[];
   rulesFailed: string[];
+  findingByClientId: ReadonlyMap<string, Finding>;
+  readonly summaryInput: import("./comment-format.js").SummaryInput;
 }
 
 
@@ -147,6 +149,8 @@ export function orchestrate(
 
   const inlineComments: InlineComment[] = [];
   const unanchored: Finding[] = [];
+  const findingByClientId = new Map<string, Finding>();
+  let nextClientId = 0;
   for (const finding of dedupedFindings) {
     if (!inlineEnabled || !isCommentable(anchors, finding.file, finding.line)) {
       unanchored.push(finding);
@@ -208,17 +212,32 @@ export function orchestrate(
     // Only anchor across a range when a COMMITTABLE suggestion will actually use it —
     // otherwise it is a range that exists to serve nothing.
     const multiLine = committable && rangeOk;
+    const position = diffPositionRange(
+      diff,
+      finding.file,
+      start,
+      multiLine ? (endLine as number) : start,
+    );
+    if (!position) {
+      unanchored.push(finding);
+      continue;
+    }
+    const clientId = `finding-${nextClientId}`;
+    nextClientId += 1;
+    findingByClientId.set(clientId, finding);
 
     inlineComments.push({
+      clientId,
       path: finding.file,
       // GitHub anchors a multi-line comment with `line` = LAST and start_line = FIRST.
       line: multiLine ? (endLine as number) : start,
       ...(multiLine ? { startLine: start } : {}),
+      position,
       body: rendered,
     });
   }
 
-  const commentBody = renderSummaryComment({
+  const summaryInput = {
     allFindings: dedupedFindings,
     inlineCount: inlineComments.length,
     unanchored,
@@ -227,7 +246,8 @@ export function orchestrate(
     rulesFailed: dispatchResult.rulesFailed,
     ruleFailureReasons: dispatchResult.ruleFailureReasons,
     inlineUnavailable: !inlineEnabled && dedupedFindings.length > 0,
-  });
+  };
+  const commentBody = renderSummaryComment(summaryInput);
 
   return {
     commentBody,
@@ -235,5 +255,24 @@ export function orchestrate(
     findingsCount: dedupedFindings.length,
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
+    findingByClientId,
+    summaryInput,
   };
+}
+
+export function renderSummary(
+  presentation: OrchestrationResult,
+  failedIds: ReadonlySet<string>,
+): string {
+  const failed = [...failedIds].map((id) => {
+    const finding = presentation.findingByClientId.get(id);
+    if (!finding) throw new Error(`unknown inline finding clientId: ${id}`);
+    return finding;
+  });
+  return renderSummaryComment({
+    ...presentation.summaryInput,
+    inlineCount: presentation.inlineComments.length - failed.length,
+    unanchored: [...presentation.summaryInput.unanchored, ...failed],
+    inlineUnavailable: presentation.summaryInput.inlineUnavailable,
+  });
 }

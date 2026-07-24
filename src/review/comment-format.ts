@@ -23,6 +23,7 @@ import type { Finding } from "./types.js";
 export const INLINE_COMMENT_MARKER = "<!-- tgd-review-agent:inline -->";
 
 export interface InlineComment {
+  clientId: string;
   /** Repo-relative path, as it appears on the NEW side of the diff. */
   path: string;
   /**
@@ -33,6 +34,7 @@ export interface InlineComment {
   line: number;
   /** First line of a multi-line range (ADR-007). Omitted for a single line. */
   startLine?: number;
+  position: import("./diff-anchors.js").DiffPositionRange;
   body: string;
 }
 

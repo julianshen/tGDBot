@@ -1,6 +1,7 @@
 import type {
   RepositoryRef as ProviderNeutralRepositoryRef,
 } from "../target/types.js";
+import type { DiffPositionRange } from "../review/diff-anchors.js";
 
 export type ReviewLocator =
   | {
@@ -38,7 +39,7 @@ export interface VcsAdapter {
     locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
-  ): Promise<void>;
+  ): Promise<InlinePublishOutcome[]>;
   /**
    * Design-review #10 (stale-comment accumulation): RESOLVES (collapses, never
    * deletes) every still-unresolved inline review thread that THIS BOT started
@@ -90,6 +91,7 @@ export interface VcsAdapter {
 }
 
 export interface InlineReviewComment {
+  readonly clientId: string;
   /** Repo-relative path on the NEW side of the diff. */
   path: string;
   /**
@@ -99,7 +101,30 @@ export interface InlineReviewComment {
   line: number;
   /** First line of a multi-line range; omitted for a single-line comment. */
   startLine?: number;
+  readonly position: DiffPositionRange;
   body: string;
+}
+
+export interface InlinePublishOutcome {
+  readonly clientId: string;
+  readonly status: "posted" | "failed";
+  readonly reason?: string;
+}
+
+export function validateInlinePublishOutcomes(
+  comments: readonly InlineReviewComment[],
+  outcomes: readonly InlinePublishOutcome[],
+): InlinePublishOutcome[] {
+  const expected = new Set(comments.map((comment) => comment.clientId));
+  if (expected.size !== comments.length) throw new Error("duplicate inline comment clientId");
+  const seen = new Set<string>();
+  for (const outcome of outcomes) {
+    if (!expected.has(outcome.clientId)) throw new Error(`unknown inline outcome clientId: ${outcome.clientId}`);
+    if (seen.has(outcome.clientId)) throw new Error(`duplicate inline outcome clientId: ${outcome.clientId}`);
+    seen.add(outcome.clientId);
+  }
+  if (seen.size !== expected.size) throw new Error("incomplete inline publish outcomes");
+  return [...outcomes];
 }
 
 export interface RuleFileContent {

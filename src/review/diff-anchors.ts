@@ -18,6 +18,27 @@
 /** file path (new-file, repo-relative) -> set of commentable NEW-file line numbers. */
 export type CommentableLines = Map<string, Set<number>>;
 
+export interface DiffPositionEndpoint {
+  readonly type: "old" | "new";
+  readonly oldLine?: number;
+  readonly newLine: number;
+}
+
+export interface DiffPositionRange {
+  readonly oldPath: string;
+  readonly newPath: string;
+  readonly start: DiffPositionEndpoint;
+  readonly end: DiffPositionEndpoint;
+  readonly sameHunk: true;
+}
+
+interface PositionedLine {
+  endpoint: DiffPositionEndpoint;
+  hunk: number;
+  oldPath: string;
+  newPath: string;
+}
+
 // `@@ -oldStart[,oldCount] +newStart[,newCount] @@`. The counts are optional and
 // default to 1 when omitted (git emits `@@ -3 +4 @@` for single-line hunks).
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
@@ -183,4 +204,108 @@ export function rangeIsCommentable(
     if (!lines.has(line)) return false;
   }
   return true;
+}
+
+/**
+ * Resolves new-side finding lines into provider-neutral diff coordinates.
+ * Context lines deliberately use `type: "old"` while retaining both counters;
+ * added lines use `type: "new"` and have no old counter.
+ */
+export function diffPositionRange(
+  diff: string,
+  file: string,
+  startLine: number,
+  endLine = startLine,
+): DiffPositionRange | undefined {
+  const positions = positionedLines(diff).get(file);
+  const start = positions?.get(startLine);
+  const end = positions?.get(endLine);
+  if (!start || !end || start.hunk !== end.hunk) return undefined;
+  return {
+    oldPath: start.oldPath,
+    newPath: start.newPath,
+    start: start.endpoint,
+    end: end.endpoint,
+    sameHunk: true,
+  };
+}
+
+function positionedLines(diff: string): Map<string, Map<number, PositionedLine>> {
+  const result = new Map<string, Map<number, PositionedLine>>();
+  let oldPath: string | undefined;
+  let newPath: string | undefined;
+  let oldLine = 0;
+  let newLine = 0;
+  let oldRemaining = 0;
+  let newRemaining = 0;
+  let hunk = 0;
+  const inHunk = (): boolean => oldRemaining > 0 || newRemaining > 0;
+  const record = (endpoint: DiffPositionEndpoint): void => {
+    if (!oldPath || !newPath) return;
+    let fileLines = result.get(newPath);
+    if (!fileLines) {
+      fileLines = new Map();
+      result.set(newPath, fileLines);
+    }
+    fileLines.set(endpoint.newLine, { endpoint, hunk, oldPath, newPath });
+  };
+
+  for (const rawLine of diff.split("\n")) {
+    if (inHunk()) {
+      const marker = rawLine[0];
+      if (marker === "+") {
+        record({ type: "new", oldLine: undefined, newLine });
+        newLine += 1;
+        newRemaining -= 1;
+      } else if (marker === "-") {
+        oldLine += 1;
+        oldRemaining -= 1;
+      } else if (marker === "\\") {
+        // metadata, consumes neither side
+      } else if (marker === " " || rawLine === "") {
+        if (oldRemaining <= 0 || newRemaining <= 0) {
+          oldRemaining = 0;
+          newRemaining = 0;
+          continue;
+        }
+        record({ type: "old", oldLine, newLine });
+        oldLine += 1;
+        newLine += 1;
+        oldRemaining -= 1;
+        newRemaining -= 1;
+      } else {
+        oldRemaining = 0;
+        newRemaining = 0;
+      }
+      continue;
+    }
+
+    if (rawLine.startsWith("diff --git ")) {
+      oldPath = undefined;
+      newPath = undefined;
+      continue;
+    }
+    if (rawLine.startsWith("--- ")) {
+      const path = rawLine.slice(4).trim();
+      oldPath = path === "/dev/null" ? "/dev/null" : stripOldDiffPathPrefix(path);
+      continue;
+    }
+    if (rawLine.startsWith("+++ ")) {
+      const path = rawLine.slice(4).trim();
+      newPath = path === "/dev/null" ? undefined : stripDiffPathPrefix(path);
+      continue;
+    }
+    const match = HUNK_RE.exec(rawLine);
+    if (!match) continue;
+    oldLine = Number(match[1]);
+    oldRemaining = match[2] === undefined ? 1 : Number(match[2]);
+    newLine = Number(match[3]);
+    newRemaining = match[4] === undefined ? 1 : Number(match[4]);
+    hunk += 1;
+  }
+  return result;
+}
+
+function stripOldDiffPathPrefix(target: string): string {
+  return target.startsWith("a/") ? target.slice(2) : target;
 }

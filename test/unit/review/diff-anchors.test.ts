@@ -6,7 +6,11 @@
 // added (`+`) or context (` `) line. Removed (`-`) lines exist only on the LEFT
 // and cannot carry a RIGHT-side comment.
 import { describe, expect, it } from "vitest";
-import { commentableLines, isCommentable } from "../../../src/review/diff-anchors.js";
+import {
+  commentableLines,
+  diffPositionRange,
+  isCommentable,
+} from "../../../src/review/diff-anchors.js";
 
 const SIMPLE = `diff --git a/src/a.go b/src/a.go
 index 111..222 100644
@@ -112,6 +116,68 @@ new mode 100755
 
   it("returns an empty map for an empty diff, never throws", () => {
     expect(commentableLines("").size).toBe(0);
+  });
+});
+
+describe("diffPositionRange", () => {
+  const renamed = `diff --git a/src/old-name.ts b/src/new-name.ts
+similarity index 80%
+rename from src/old-name.ts
+rename to src/new-name.ts
+--- a/src/old-name.ts
++++ b/src/new-name.ts
+@@ -9,3 +9,4 @@
+ context
++added
++added two
+ tail
+@@ -30,1 +31,1 @@
+ later
+`;
+
+  it("retains provider-neutral paths, endpoint sides, line numbers, and hunk identity", () => {
+    expect(diffPositionRange(renamed, "src/new-name.ts", 10, 12)).toEqual({
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      start: { type: "new", oldLine: undefined, newLine: 10 },
+      end: { type: "old", oldLine: 10, newLine: 12 },
+      sameHunk: true,
+    });
+    expect(diffPositionRange(renamed, "src/new-name.ts", 12, 10)).toEqual({
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      start: { type: "old", oldLine: 10, newLine: 12 },
+      end: { type: "new", oldLine: undefined, newLine: 10 },
+      sameHunk: true,
+    });
+  });
+
+  it("represents added ranges and context endpoints exactly", () => {
+    const added = `diff --git a/src/new.ts b/src/new.ts
+--- /dev/null
++++ b/src/new.ts
+@@ -0,0 +10,3 @@
++one
++two
++three
+`;
+    expect(diffPositionRange(added, "src/new.ts", 10, 12)).toEqual({
+      oldPath: "/dev/null",
+      newPath: "src/new.ts",
+      start: { type: "new", oldLine: undefined, newLine: 10 },
+      end: { type: "new", oldLine: undefined, newLine: 12 },
+      sameHunk: true,
+    });
+    expect(diffPositionRange(renamed, "src/new-name.ts", 9)).toMatchObject({
+      start: { type: "old", oldLine: 9, newLine: 9 },
+      end: { type: "old", oldLine: 9, newLine: 9 },
+    });
+  });
+
+  it("rejects cross-hunk, removed-side, cross-file, and missing endpoints", () => {
+    expect(diffPositionRange(renamed, "src/new-name.ts", 10, 31)).toBeUndefined();
+    expect(diffPositionRange(renamed, "src/old-name.ts", 10, 10)).toBeUndefined();
+    expect(diffPositionRange(renamed, "missing.ts", 1, 1)).toBeUndefined();
   });
 });
 

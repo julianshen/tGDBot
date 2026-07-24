@@ -1,7 +1,7 @@
 // Tests for orchestrate — see TASKS.md Task 7 "Acceptance Criteria (BDD)"
 // AC-7.1 through AC-7.4.
 import { describe, expect, it } from "vitest";
-import { orchestrate } from "../../../src/review/orchestrate.js";
+import { orchestrate, renderSummary } from "../../../src/review/orchestrate.js";
 import type { DispatchResult, Finding } from "../../../src/review/types.js";
 
 function makeFinding(overrides: Partial<Finding> = {}): Finding {
@@ -26,6 +26,25 @@ function makeDispatchResult(overrides: Partial<DispatchResult> = {}): DispatchRe
 }
 
 describe("orchestrate", () => {
+  it("assigns stable IDs, maps every inline candidate, and selectively falls back", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -9,2 +9,2 @@
+ context
++added
+`;
+    const presentation = orchestrate(makeDispatchResult({ findings: [
+      makeFinding({ line: 9, message: "first finding" }),
+      makeFinding({ line: 10, message: "second finding" }),
+    ] }), diff, { inline: true });
+
+    expect(presentation.inlineComments.map((c) => c.clientId)).toEqual(["finding-0", "finding-1"]);
+    expect([...presentation.findingByClientId.keys()]).toEqual(["finding-0", "finding-1"]);
+    const body = renderSummary(presentation, new Set(["finding-1"]));
+    expect(body).toContain("second finding");
+    expect(body).not.toContain("first finding");
+  });
   // AC-7.1: Given two findings with the same file, line, and near-identical
   // message from two different rules, When orchestrate runs, Then the
   // resulting commentBody reflects only one occurrence of that finding.
