@@ -1,9 +1,12 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { parseBotMarker } from "../review/comment-marker.js";
 import type { GitLabRepositoryRef } from "../target/types.js";
+import { validateInlinePublishOutcomes } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
+  InlinePublishOutcome,
   PullRequestInfo,
   ReviewLocator,
   RuleFileContent,
@@ -237,6 +240,12 @@ interface GlabNote {
   author: { username: string };
 }
 
+interface GlabMergeRequestVersion {
+  base_commit_sha: string;
+  head_commit_sha: string;
+  start_commit_sha: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -359,6 +368,47 @@ function parseWrittenNote(stdout: string, expectedId?: number): void {
   }
 }
 
+function parseMergeRequestVersions(stdout: string): GlabMergeRequestVersion[] {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch (cause) {
+    throw new GlabOutputError("Invalid glab MR versions response: malformed JSON", { cause });
+  }
+  if (!Array.isArray(value)) {
+    throw new GlabOutputError("Invalid glab MR versions response: expected an array");
+  }
+  return value.map((entry) => {
+    if (!isRecord(entry)) {
+      throw new GlabOutputError("Invalid glab MR versions response: expected an object");
+    }
+    return {
+      base_commit_sha: requiredString(entry, "base_commit_sha", { sha: true }),
+      head_commit_sha: requiredString(entry, "head_commit_sha", { sha: true }),
+      start_commit_sha: requiredString(entry, "start_commit_sha", { sha: true }),
+    };
+  });
+}
+
+function validateWrittenDiscussion(stdout: string): void {
+  let value: unknown;
+  try {
+    value = JSON.parse(stdout);
+  } catch (cause) {
+    throw new GlabOutputError(
+      "Invalid glab discussion response: malformed JSON",
+      { cause },
+    );
+  }
+  if (
+    !isRecord(value) ||
+    (typeof value.id !== "string" && typeof value.id !== "number") ||
+    !Array.isArray(value.notes)
+  ) {
+    throw new GlabOutputError("Invalid glab discussion response");
+  }
+}
+
 function validatedNoteId(id: string): number {
   if (!/^[1-9]\d*$/u.test(id)) {
     throw new GlabOutputError("Invalid existing GitLab note id");
@@ -388,6 +438,65 @@ function resolveMergeRequestLocator(locator: ReviewLocator): {
 
 function unavailable(operation: string): never {
   throw new Error(`GitLab ${operation} is not available yet`);
+}
+
+export function classifyGlabWriteFailure(
+  error: GlabCommandError,
+): "continue" | "stop" {
+  return error.httpStatus === 400 ||
+    error.httpStatus === 409 ||
+    error.httpStatus === 422
+    ? "continue"
+    : "stop";
+}
+
+function sanitizedWriteFailureReason(error: GlabCommandError): string {
+  return error.httpStatus === undefined
+    ? "GitLab could not post the inline discussion"
+    : `GitLab rejected the inline discussion (HTTP ${error.httpStatus})`;
+}
+
+function unsupportedPositionReason(): string {
+  return "GitLab cannot address this diff position";
+}
+
+function validLine(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+function supportedInlinePosition(comment: InlineReviewComment): boolean {
+  const { position } = comment;
+  if (
+    position.sameHunk !== true ||
+    position.oldPath.length === 0 ||
+    position.newPath.length === 0
+  ) {
+    return false;
+  }
+  for (const endpoint of [position.start, position.end]) {
+    if (!validLine(endpoint.newLine)) return false;
+    if (endpoint.type === "old" && !validLine(endpoint.oldLine)) return false;
+    if (
+      endpoint.type === "new" &&
+      endpoint.oldLine !== undefined &&
+      !validLine(endpoint.oldLine)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function lineRangeEndpoint(
+  pathHash: string,
+  endpoint: InlineReviewComment["position"]["start"],
+): Record<string, string | number> {
+  return {
+    line_code: `${pathHash}_${endpoint.oldLine ?? ""}_${endpoint.newLine}`,
+    type: endpoint.type,
+    ...(endpoint.oldLine === undefined ? {} : { old_line: endpoint.oldLine }),
+    new_line: endpoint.newLine,
+  };
 }
 
 export class GitLabAdapter implements VcsAdapter {
@@ -481,9 +590,113 @@ export class GitLabAdapter implements VcsAdapter {
     locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
-  ): Promise<import("./adapter.js").InlinePublishOutcome[]> {
-    void [locator, headSha, comments];
-    return unavailable("inline review");
+  ): Promise<InlinePublishOutcome[]> {
+    const { repo, iid } = resolveMergeRequestLocator(locator);
+    const metadata = await this.getPullRequest(locator);
+    const versionsStdout = await this.execGlab([
+      "api",
+      "--method",
+      "GET",
+      "--hostname",
+      repo.host,
+      projectEndpoint(repo, `merge_requests/${iid}/versions`),
+    ]);
+    const version = parseMergeRequestVersions(versionsStdout)[0];
+    if (version === undefined) {
+      throw new GlabOutputError("Invalid glab MR versions response: no versions");
+    }
+    if (metadata.startSha === undefined) {
+      throw new GlabOutputError("Invalid glab MR metadata: missing start SHA");
+    }
+    if (metadata.headSha !== headSha) {
+      throw new GlabOutputError("GitLab merge request head changed before inline review");
+    }
+    if (
+      metadata.baseSha !== version.base_commit_sha ||
+      metadata.headSha !== version.head_commit_sha ||
+      metadata.startSha !== version.start_commit_sha
+    ) {
+      throw new GlabOutputError(
+        "GitLab merge request metadata does not match its newest diff version",
+      );
+    }
+
+    const outcomes: InlinePublishOutcome[] = [];
+    const discussionEndpoint = projectEndpoint(
+      repo,
+      `merge_requests/${iid}/discussions`,
+    );
+    for (let index = 0; index < comments.length; index += 1) {
+      const comment = comments[index]!;
+      if (!supportedInlinePosition(comment)) {
+        outcomes.push({
+          clientId: comment.clientId,
+          status: "failed",
+          reason: unsupportedPositionReason(),
+        });
+        continue;
+      }
+
+      const { position } = comment;
+      const isRange =
+        position.start.newLine !== position.end.newLine ||
+        position.start.oldLine !== position.end.oldLine ||
+        position.start.type !== position.end.type;
+      const pathHash = createHash("sha1").update(position.newPath).digest("hex");
+      const payload = {
+        body: comment.body,
+        position: {
+          base_sha: version.base_commit_sha,
+          start_sha: version.start_commit_sha,
+          head_sha: version.head_commit_sha,
+          position_type: "text",
+          old_path: position.oldPath,
+          new_path: position.newPath,
+          ...(position.end.oldLine === undefined
+            ? {}
+            : { old_line: position.end.oldLine }),
+          new_line: position.end.newLine,
+          ...(isRange
+            ? {
+                line_range: {
+                  start: lineRangeEndpoint(pathHash, position.start),
+                  end: lineRangeEndpoint(pathHash, position.end),
+                },
+              }
+            : {}),
+        },
+      };
+
+      try {
+        const stdout = await this.execGlab([
+          "api",
+          "--method",
+          "POST",
+          "--hostname",
+          repo.host,
+          discussionEndpoint,
+          "--input",
+          "-",
+        ], JSON.stringify(payload));
+        validateWrittenDiscussion(stdout);
+        outcomes.push({ clientId: comment.clientId, status: "posted" });
+      } catch (error) {
+        if (!(error instanceof GlabCommandError)) throw error;
+        const reason = sanitizedWriteFailureReason(error);
+        outcomes.push({ clientId: comment.clientId, status: "failed", reason });
+        if (classifyGlabWriteFailure(error) === "stop") {
+          for (const remaining of comments.slice(index + 1)) {
+            outcomes.push({
+              clientId: remaining.clientId,
+              status: "failed",
+              reason,
+            });
+          }
+          break;
+        }
+      }
+    }
+    return validateInlinePublishOutcomes(comments, outcomes);
   }
 
   async resolveStaleReviewThreads(locator: ReviewLocator): Promise<number> {

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
@@ -13,6 +14,7 @@ import {
   type ExecGlab,
 } from "../../../src/vcs/gitlab-adapter.js";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
+import type { InlineReviewComment } from "../../../src/vcs/adapter.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 
@@ -48,6 +50,43 @@ const fixturePath = fileURLToPath(new URL("../../fixtures/glab-mr.json", import.
 const fixture = await readFile(fixturePath, "utf8");
 const notesFixturePath = fileURLToPath(new URL("../../fixtures/glab-notes.json", import.meta.url));
 const notesFixture = await readFile(notesFixturePath, "utf8");
+const discussionsFixturePath = fileURLToPath(new URL("../../fixtures/glab-discussions.json", import.meta.url));
+const discussionsFixture = await readFile(discussionsFixturePath, "utf8");
+
+const BASE_SHA = "1111111111111111111111111111111111111111";
+const HEAD_SHA = "2222222222222222222222222222222222222222";
+const START_SHA = "0000000000000000000000000000000000000000";
+
+const versionsFixture = (overrides: Record<string, unknown> = {}) =>
+  JSON.stringify([{
+    id: 9,
+    base_commit_sha: BASE_SHA,
+    head_commit_sha: HEAD_SHA,
+    start_commit_sha: START_SHA,
+    ...overrides,
+  }, {
+    id: 8,
+    base_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    head_commit_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    start_commit_sha: "cccccccccccccccccccccccccccccccccccccccc",
+  }]);
+
+function inlineComment(
+  clientId: string,
+  position: InlineReviewComment["position"],
+  body = `body:${clientId}`,
+): InlineReviewComment {
+  return {
+    clientId,
+    path: position.newPath,
+    line: position.end.newLine,
+    ...(position.start.newLine === position.end.newLine
+      ? {}
+      : { startLine: position.start.newLine }),
+    position,
+    body,
+  };
+}
 
 describe("GitLabAdapter merge request snapshot", () => {
   it.each([gitlabComRepo, selfManagedRepo, customPortRepo])(
@@ -479,6 +518,314 @@ describe("GitLabAdapter trusted base-branch rules", () => {
         ".review/rules",
       ),
     ).rejects.toBe(failure);
+  });
+});
+
+describe("GitLabAdapter inline discussions", () => {
+  function successfulExecutor(calls: Array<{ args: readonly string[]; stdin?: string }>): ExecGlab {
+    return async (args, stdin) => {
+      calls.push({ args, stdin });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) return discussionsFixture;
+      return fixture;
+    };
+  }
+
+  const added = inlineComment("finding-0", {
+    oldPath: "src/new.ts",
+    newPath: "src/new.ts",
+    start: { type: "new", newLine: 10 },
+    end: { type: "new", newLine: 10 },
+    sameHunk: true,
+  });
+
+  it("preflights fresh metadata and the newest version before posting", async () => {
+    const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
+    const result = await new GitLabAdapter(successfulExecutor(calls))
+      .createInlineReview(locator(customPortRepo), HEAD_SHA, [added]);
+
+    expect(calls.map(({ args }) => args)).toEqual([
+      [
+        "api", "--method", "GET", "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/merge_requests/42",
+      ],
+      [
+        "api", "--method", "GET", "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/merge_requests/42/versions",
+      ],
+      [
+        "api", "--method", "POST", "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/merge_requests/42/discussions", "--input", "-",
+      ],
+    ]);
+    expect(result).toEqual([{ clientId: "finding-0", status: "posted" }]);
+  });
+
+  it.each([
+    ["empty versions", JSON.stringify([]), fixture, HEAD_SHA],
+    ["malformed version base SHA", versionsFixture({ base_commit_sha: "bad" }), fixture, HEAD_SHA],
+    ["malformed version head SHA", versionsFixture({ head_commit_sha: "bad" }), fixture, HEAD_SHA],
+    ["malformed version start SHA", versionsFixture({ start_commit_sha: "bad" }), fixture, HEAD_SHA],
+    ["metadata/version base mismatch", versionsFixture({ base_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }), fixture, HEAD_SHA],
+    ["metadata/version head mismatch", versionsFixture({ head_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }), fixture, HEAD_SHA],
+    ["metadata/version start mismatch", versionsFixture({ start_commit_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }), fixture, HEAD_SHA],
+    ["caller/metadata head mismatch", versionsFixture(), fixture, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+  ])("rejects %s before any POST", async (_name, versions, metadata, callerHead) => {
+    const calls: readonly string[][] = [];
+    const execGlab = vi.fn<ExecGlab>().mockImplementation(async (args) => {
+      (calls as string[][]).push([...args]);
+      return args.some((arg) => arg.endsWith("/versions")) ? versions : metadata;
+    });
+
+    await expect(
+      new GitLabAdapter(execGlab).createInlineReview(locator(), callerHead, [added]),
+    ).rejects.toThrow();
+    expect(calls.some((args) => args.includes("POST"))).toBe(false);
+  });
+
+  it("uses element zero only when selecting the newest version", async () => {
+    const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
+    await new GitLabAdapter(successfulExecutor(calls))
+      .createInlineReview(locator(), HEAD_SHA, [added]);
+    const payload = JSON.parse(calls[2]!.stdin!) as { position: Record<string, unknown> };
+    expect(payload.position).toMatchObject({
+      base_sha: BASE_SHA,
+      head_sha: HEAD_SHA,
+      start_sha: START_SHA,
+    });
+  });
+
+  it("posts exact single-line and renamed-context payloads in order", async () => {
+    const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
+    const context = inlineComment("finding-1", {
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      start: { type: "old", oldLine: 7, newLine: 8 },
+      end: { type: "old", oldLine: 7, newLine: 8 },
+      sameHunk: true,
+    }, "context suggestion");
+
+    await new GitLabAdapter(successfulExecutor(calls))
+      .createInlineReview(locator(customPortRepo), HEAD_SHA, [added, context]);
+
+    const posts = calls.slice(2);
+    expect(posts.map(({ args }) => args)).toEqual([
+      [
+        "api", "--method", "POST", "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/merge_requests/42/discussions", "--input", "-",
+      ],
+      [
+        "api", "--method", "POST", "--hostname", "gitlab.example.com",
+        "projects/group%2Fproject/merge_requests/42/discussions", "--input", "-",
+      ],
+    ]);
+    expect(JSON.parse(posts[0]!.stdin!)).toEqual({
+      body: "body:finding-0",
+      position: {
+        base_sha: BASE_SHA,
+        start_sha: START_SHA,
+        head_sha: HEAD_SHA,
+        position_type: "text",
+        old_path: "src/new.ts",
+        new_path: "src/new.ts",
+        new_line: 10,
+      },
+    });
+    expect(JSON.parse(posts[1]!.stdin!)).toEqual({
+      body: "context suggestion",
+      position: {
+        base_sha: BASE_SHA,
+        start_sha: START_SHA,
+        head_sha: HEAD_SHA,
+        position_type: "text",
+        old_path: "src/old-name.ts",
+        new_path: "src/new-name.ts",
+        old_line: 7,
+        new_line: 8,
+      },
+    });
+  });
+
+  it.each([
+    [
+      "added",
+      { type: "new" as const, newLine: 10 },
+      { type: "new" as const, newLine: 12 },
+    ],
+    [
+      "context",
+      { type: "old" as const, oldLine: 9, newLine: 10 },
+      { type: "old" as const, oldLine: 11, newLine: 12 },
+    ],
+    [
+      "mixed added-to-context",
+      { type: "new" as const, newLine: 10 },
+      { type: "old" as const, oldLine: 11, newLine: 12 },
+    ],
+    [
+      "mixed context-to-added",
+      { type: "old" as const, oldLine: 9, newLine: 10 },
+      { type: "new" as const, newLine: 12 },
+    ],
+  ])("posts exact %s multi-line position", async (_name, start, end) => {
+    const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
+    const comment = inlineComment("finding-range", {
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      start,
+      end,
+      sameHunk: true,
+    }, "```suggestion\nreplacement\n```");
+
+    await new GitLabAdapter(successfulExecutor(calls))
+      .createInlineReview(locator(), HEAD_SHA, [comment]);
+
+    const payload = JSON.parse(calls[2]!.stdin!) as {
+      body: string;
+      position: { line_range: { start: Record<string, unknown>; end: Record<string, unknown> } };
+    };
+    const pathHash = createHash("sha1").update("src/new-name.ts").digest("hex");
+    expect(payload.body).toBe("```suggestion\nreplacement\n```");
+    expect(payload.position.line_range).toEqual({
+      start: {
+        line_code: `${pathHash}_${start.oldLine ?? ""}_${start.newLine}`,
+        type: start.type,
+        ...(start.oldLine === undefined ? {} : { old_line: start.oldLine }),
+        new_line: start.newLine,
+      },
+      end: {
+        line_code: `${pathHash}_${end.oldLine ?? ""}_${end.newLine}`,
+        type: end.type,
+        ...(end.oldLine === undefined ? {} : { old_line: end.oldLine }),
+        new_line: end.newLine,
+      },
+    });
+  });
+
+  it.each([
+    ["cross-hunk", { ...added.position, sameHunk: false }],
+    ["removed-side", {
+      ...added.position,
+      end: { type: "old", oldLine: 10, newLine: undefined },
+    }],
+  ])("returns a failed outcome without posting unsupported %s positions", async (_name, position) => {
+    const calls: Array<{ args: readonly string[]; stdin?: string }> = [];
+    const comment = { ...added, clientId: `unsupported-${_name}`, position } as InlineReviewComment;
+    const result = await new GitLabAdapter(successfulExecutor(calls))
+      .createInlineReview(locator(), HEAD_SHA, [comment]);
+
+    expect(result).toEqual([{
+      clientId: `unsupported-${_name}`,
+      status: "failed",
+      reason: expect.any(String),
+    }]);
+    expect(calls).toHaveLength(2);
+  });
+
+  it("continues after item failures and preserves input-order outcomes", async () => {
+    let posts = 0;
+    const execGlab: ExecGlab = async (args) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) {
+        posts += 1;
+        if (posts === 2) {
+          throw new GlabCommandError("TOKEN=secret", {
+            httpStatus: 422,
+            stderr: "private provider response TOKEN=secret",
+          });
+        }
+        return discussionsFixture;
+      }
+      return fixture;
+    };
+    const comments = [0, 1, 2].map((index) => ({
+      ...added,
+      clientId: `finding-${index}`,
+      body: `body-${index}`,
+    }));
+
+    const outcomes = await new GitLabAdapter(execGlab)
+      .createInlineReview(locator(), HEAD_SHA, comments);
+    expect(outcomes).toEqual([
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-1", status: "failed", reason: expect.any(String) },
+      { clientId: "finding-2", status: "posted" },
+    ]);
+    expect(outcomes[1]?.reason).not.toMatch(/TOKEN|secret|private provider/i);
+  });
+
+  it.each([
+    [400, "continue"],
+    [409, "continue"],
+    [422, "continue"],
+    [401, "stop"],
+    [403, "stop"],
+    [404, "stop"],
+    [408, "stop"],
+    [429, "stop"],
+    [500, "stop"],
+  ] as const)("classifies HTTP %i as %s", async (status, behavior) => {
+    let posts = 0;
+    const execGlab: ExecGlab = async (args) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) {
+        posts += 1;
+        if (posts === 1) throw new GlabCommandError("write failed", { httpStatus: status });
+        return discussionsFixture;
+      }
+      return fixture;
+    };
+    const comments = [0, 1].map((index) => ({
+      ...added, clientId: `finding-${index}`,
+    }));
+
+    const outcomes = await new GitLabAdapter(execGlab)
+      .createInlineReview(locator(), HEAD_SHA, comments);
+    expect(posts).toBe(behavior === "continue" ? 2 : 1);
+    expect(outcomes).toEqual([
+      { clientId: "finding-0", status: "failed", reason: expect.any(String) },
+      behavior === "continue"
+        ? { clientId: "finding-1", status: "posted" }
+        : { clientId: "finding-1", status: "failed", reason: expect.any(String) },
+    ]);
+  });
+
+  it("stops on transport failures and marks every unattempted item failed", async () => {
+    let posts = 0;
+    const execGlab: ExecGlab = async (args) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) {
+        posts += 1;
+        throw new GlabCommandError("process failed without status");
+      }
+      return fixture;
+    };
+    const comments = [0, 1, 2].map((index) => ({
+      ...added, clientId: `finding-${index}`,
+    }));
+
+    const outcomes = await new GitLabAdapter(execGlab)
+      .createInlineReview(locator(), HEAD_SHA, comments);
+    expect(posts).toBe(1);
+    expect(outcomes).toHaveLength(3);
+    expect(outcomes.every((outcome) => outcome.status === "failed")).toBe(true);
+  });
+
+  it("rethrows programming errors instead of publishing them as outcomes", async () => {
+    const execGlab: ExecGlab = async (args) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/versions")) return versionsFixture();
+      if (endpoint?.endsWith("/discussions")) throw new TypeError("programming defect");
+      return fixture;
+    };
+
+    await expect(
+      new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, [added]),
+    ).rejects.toThrow(TypeError);
   });
 });
 
