@@ -331,6 +331,84 @@ describe("review", () => {
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
   });
 
+  it("fails closed for a dry-run current ready recovery note with the wrong binding", async () => {
+    const h = makeHarness({
+      args: makeArgs({ dryRun: true }),
+      botComment: null,
+    });
+    const configHash = computeReviewConfigHash(h.config);
+    const body = formatPendingMarker({
+      phase: "ready",
+      headSha: "cafef00d",
+      configHash,
+      noteId: "other-888",
+      terminalResult: {
+        status: "posted",
+        findingsCount: 0,
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+        exitCode: 0,
+      },
+    });
+    h.vcsAdapter.findBotComment.mockResolvedValue({
+      id: "written-777",
+      body,
+      ...parseBotMarker(body)!,
+    });
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/binding|recovery|note/i);
+
+    expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+  });
+
+  it("validates a dry-run ready checkpoint without finalizing and reproduces its result", async () => {
+    const h = makeHarness({
+      args: makeArgs({ dryRun: true }),
+      botComment: null,
+    });
+    const configHash = computeReviewConfigHash(h.config);
+    const body = formatPendingMarker({
+      phase: "ready",
+      headSha: "cafef00d",
+      configHash,
+      noteId: "written-777",
+      terminalResult: {
+        status: "partial",
+        findingsCount: 4,
+        rulesRun: ["rule-a"],
+        rulesFailed: ["rule-b"],
+        exitCode: 2,
+      },
+    });
+    h.vcsAdapter.findBotComment.mockResolvedValue({
+      id: "written-777",
+      body,
+      ...parseBotMarker(body)!,
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).resolves.toBe(2);
+
+    expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    const status = logSpy.mock.calls
+      .map(([line]) => String(line))
+      .find((line) => line.startsWith("TGD_REVIEW_RESULT: "));
+    expect(JSON.parse(status!.slice("TGD_REVIEW_RESULT: ".length))).toEqual({
+      status: "partial",
+      findingsCount: 4,
+      rulesRun: ["rule-a"],
+      rulesFailed: ["rule-b"],
+      reason: "recovered-pending-review-dry-run",
+    });
+    vi.restoreAllMocks();
+  });
+
   // Design-review #9: the adapter infers owner/repo from ambient context, so
   // review() must name the RESOLVED target (the PR's canonical URL) up front —
   // even on a skipped run — making a mis-inferred repo visible, not silent.

@@ -493,7 +493,6 @@ export async function review(
   // republish inline comments. A stale SHA/config intentionally falls through
   // to the normal re-review path for the new revision/configuration.
   if (
-    !config.dryRun &&
     botComment !== null &&
     recovery?.phase === "ready" &&
     recovery.headSha === pr.headSha &&
@@ -506,6 +505,16 @@ export async function review(
       throw new Error(
         "Invalid current pending review recovery binding; refusing to dispatch or write",
       );
+    }
+    if (config.dryRun) {
+      logStatus({
+        status: recovery.terminalResult.status,
+        findingsCount: recovery.terminalResult.findingsCount,
+        rulesRun: recovery.terminalResult.rulesRun,
+        rulesFailed: recovery.terminalResult.rulesFailed,
+        reason: "recovered-pending-review-dry-run",
+      });
+      return recovery.terminalResult.exitCode;
     }
     const finalizedBody = replacePendingMarker(
       botComment.body,
