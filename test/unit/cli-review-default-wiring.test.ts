@@ -159,7 +159,7 @@ describe("review — default dependency wiring", () => {
     const [prId, pendingBody, existing] = hoisted.upsertComment.mock.calls[0];
     expect(prId).toEqual(ambientLocator);
     expect(existing).toBeNull();
-    expect(pendingBody).toContain("<!-- tgd-review-agent:pending -->");
+    expect(pendingBody).toContain("<!-- tgd-review-agent:pending phase=publishing");
     expect(hoisted.upsertComment.mock.calls[1]?.[1])
       .toContain("<!-- tgd-review-agent:sha=abc12345 cfg=");
 

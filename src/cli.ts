@@ -6,7 +6,10 @@ import { parseArgs as nodeParseArgs } from "node:util";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
-import { BOT_PENDING_MARKER } from "./review/comment-marker.js";
+import {
+  formatPendingMarker,
+  replacePendingMarker,
+} from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
@@ -459,6 +462,47 @@ export async function review(
   // computeReviewConfigHash for what is and isn't captured.
   const configHash = computeReviewConfigHash(config);
 
+  // A ready checkpoint means a previous process already made the conservative
+  // all-inline fallback durable before attempting any inline writes. If that
+  // process died during the final marker update, finalize the exact same note
+  // without dispatching again or risking duplicate inline POSTs.
+  const recovery = botComment?.pendingState;
+  if (
+    !config.dryRun &&
+    botComment !== null &&
+    recovery?.phase === "ready" &&
+    recovery.headSha === pr.headSha &&
+    recovery.configHash === configHash &&
+    recovery.noteId === botComment.id
+  ) {
+    const finalizedBody = replacePendingMarker(
+      botComment.body,
+      formatMarker(pr.headSha, configHash),
+    );
+    const finalized = await config.vcsAdapter.upsertComment(
+      config.locator,
+      finalizedBody,
+      botComment,
+    );
+    if (
+      finalized.id !== botComment.id ||
+      finalized.lastReviewedSha !== pr.headSha ||
+      finalized.reviewedConfig !== configHash
+    ) {
+      throw new Error(
+        "The VCS adapter could not confirm recovery of the exact completed summary note",
+      );
+    }
+    logStatus({
+      status: "posted",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "recovered-pending-review",
+    });
+    return EXIT_OK;
+  }
+
   // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
   if (decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
     logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
@@ -581,7 +625,15 @@ export async function review(
     // the complete dedup marker, targeting the exact returned identity.
     const writtenSummary = await config.vcsAdapter.upsertComment(
       config.locator,
-      buildBody(orchestration, orchestration.commentBody, BOT_PENDING_MARKER),
+      buildBody(
+        orchestration,
+        orchestration.commentBody,
+        formatPendingMarker({
+          phase: "publishing",
+          headSha: pr.headSha,
+          configHash,
+        }),
+      ),
       botComment,
     );
     if (
@@ -590,11 +642,49 @@ export async function review(
       writtenSummary.id.length === 0 ||
       writtenSummary.lastReviewedSha !== "" ||
       writtenSummary.reviewedConfig !== "" ||
-      !writtenSummary.body.trimEnd().endsWith(BOT_PENDING_MARKER)
+      writtenSummary.pendingState?.phase !== "publishing" ||
+      writtenSummary.pendingState.headSha !== pr.headSha ||
+      writtenSummary.pendingState.configHash !== configHash
     ) {
       throw new Error(
         "The VCS adapter did not return the exact identity of the pending summary note",
       );
+    }
+
+    let summaryIdentity = writtenSummary;
+    if (orchestration.inlineComments.length > 0) {
+      const allInlineIds = new Set(
+        orchestration.inlineComments.map((comment) => comment.clientId),
+      );
+      const recoveryBody = renderSummary(orchestration, allInlineIds);
+      const checkpoint = await config.vcsAdapter.upsertComment(
+        config.locator,
+        buildBody(
+          orchestration,
+          recoveryBody,
+          formatPendingMarker({
+            phase: "ready",
+            headSha: pr.headSha,
+            configHash,
+            noteId: writtenSummary.id,
+          }),
+        ),
+        writtenSummary,
+      );
+      if (
+        checkpoint.id !== writtenSummary.id ||
+        checkpoint.lastReviewedSha !== "" ||
+        checkpoint.reviewedConfig !== "" ||
+        checkpoint.pendingState?.phase !== "ready" ||
+        checkpoint.pendingState.headSha !== pr.headSha ||
+        checkpoint.pendingState.configHash !== configHash ||
+        checkpoint.pendingState.noteId !== writtenSummary.id
+      ) {
+        throw new Error(
+          "The VCS adapter could not confirm the exact ready recovery checkpoint",
+        );
+      }
+      summaryIdentity = checkpoint;
     }
 
     // Design-review #10: collapse the PREVIOUS runs' inline threads before
@@ -670,11 +760,11 @@ export async function review(
     const finalizedSummary = await config.vcsAdapter.upsertComment(
       config.locator,
       buildBody(orchestration, finalCommentBody),
-      writtenSummary,
+      summaryIdentity,
     );
     if (
       !finalizedSummary ||
-      finalizedSummary.id !== writtenSummary.id ||
+      finalizedSummary.id !== summaryIdentity.id ||
       finalizedSummary.lastReviewedSha !== pr.headSha ||
       finalizedSummary.reviewedConfig !== configHash
     ) {

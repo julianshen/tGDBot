@@ -189,4 +189,5 @@ export interface BotComment {
    * changed even though the head SHA didn't.
    */
   reviewedConfig: string;
+  pendingState?: import("../review/comment-marker.js").PendingReviewState;
 }
