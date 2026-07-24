@@ -202,7 +202,7 @@ describe("realExecGlab", () => {
     }) as typeof execFile);
 
     await expect(realExecGlab(["api", "user"], "secret stdin")).resolves.toBe("ok\n");
-    expect(end).toHaveBeenCalledWith("secret stdin");
+    expect(end).toHaveBeenCalledWith("secret stdin", expect.any(Function));
   });
 
   it("maps an early stdin EPIPE into one sanitized typed rejection even if the callback later succeeds", async () => {
@@ -231,6 +231,43 @@ describe("realExecGlab", () => {
     expect((error as Error).message).toMatch(/write input.*gitlab\.example\.com/i);
     expect((error as Error).message).not.toContain("TOKEN=secret");
     await new Promise((resolve) => setImmediate(resolve));
+  });
+
+  it("prefers a later API process failure over an earlier stdin EPIPE", async () => {
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        callback(Object.assign(new Error("write EPIPE TOKEN=stdin-secret"), { code: "EPIPE" }));
+      },
+    });
+    vi.mocked(execFile).mockImplementation(((
+      _file: string,
+      _args: readonly string[],
+      _options: object,
+      callback: (error: Error, stdout: string, stderr: string) => void,
+    ) => {
+      setImmediate(() =>
+        callback(
+          Object.assign(new Error("process TOKEN=process-secret"), { code: 1 }),
+          "",
+          "request failed\nHTTP 403\n",
+        ),
+      );
+      return { stdin };
+    }) as typeof execFile);
+
+    const error = await realExecGlab(
+      ["api", "--hostname", "gitlab.example.com", "projects/x"],
+      "sensitive body",
+    ).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(GlabCommandError);
+    expect(error).toMatchObject({
+      exitCode: 1,
+      httpStatus: 403,
+      stderr: "request failed\nHTTP 403\n",
+    });
+    expect((error as Error).message).toMatch(/command failed.*gitlab\.example\.com/i);
+    expect((error as Error).message).not.toMatch(/stdin-secret|process-secret/);
   });
 
   it("maps ENOENT to actionable installation and host-specific auth guidance", async () => {

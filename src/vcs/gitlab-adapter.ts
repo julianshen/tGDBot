@@ -77,6 +77,10 @@ function apiHttpStatus(args: readonly string[], stderr: string): number | undefi
 export const realExecGlab: ExecGlab = (args, stdin) =>
   new Promise((resolve, reject) => {
     let settled = false;
+    let processFinished = false;
+    let processStdout = "";
+    let stdinFinished = stdin === undefined;
+    let stdinFailure: GlabCommandError | undefined;
     const resolveOnce = (stdout: string): void => {
       if (settled) return;
       settled = true;
@@ -86,6 +90,22 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
       if (settled) return;
       settled = true;
       reject(error);
+    };
+    const finishSuccessfulProcess = (): void => {
+      if (!processFinished || !stdinFinished) return;
+      if (stdinFailure !== undefined) {
+        rejectOnce(stdinFailure);
+      } else {
+        resolveOnce(processStdout);
+      }
+    };
+    const captureStdinFailure = (cause?: unknown): void => {
+      stdinFailure ??= new GlabCommandError(
+        `Unable to write input to glab for ${commandHost(args)}; the process closed stdin early.`,
+        { cause },
+      );
+      stdinFinished = true;
+      finishSuccessfulProcess();
     };
     const child = execFile(
       "glab",
@@ -99,7 +119,9 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
       },
       (error, stdout, stderr) => {
         if (error === null) {
-          resolveOnce(stdout);
+          processStdout = stdout;
+          processFinished = true;
+          finishSuccessfulProcess();
           return;
         }
 
@@ -139,29 +161,26 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
     );
     if (stdin !== undefined) {
       if (child.stdin === null) {
-        rejectOnce(
-          new GlabCommandError(
-            `Unable to write input to glab for ${commandHost(args)} because stdin is unavailable.`,
-          ),
+        stdinFailure = new GlabCommandError(
+          `Unable to write input to glab for ${commandHost(args)} because stdin is unavailable.`,
         );
+        stdinFinished = true;
+        finishSuccessfulProcess();
       } else {
         child.stdin.on("error", (cause: NodeJS.ErrnoException) => {
-          rejectOnce(
-            new GlabCommandError(
-              `Unable to write input to glab for ${commandHost(args)}; the process closed stdin early.`,
-              { cause },
-            ),
-          );
+          captureStdinFailure(cause);
         });
         try {
-          child.stdin.end(stdin);
+          child.stdin.end(stdin, (error?: Error | null) => {
+            if (error) {
+              captureStdinFailure(error);
+              return;
+            }
+            stdinFinished = true;
+            finishSuccessfulProcess();
+          });
         } catch (cause) {
-          rejectOnce(
-            new GlabCommandError(
-              `Unable to write input to glab for ${commandHost(args)}; the process closed stdin early.`,
-              { cause },
-            ),
-          );
+          captureStdinFailure(cause);
         }
       }
     }
