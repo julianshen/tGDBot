@@ -99,10 +99,10 @@ describe("prepareWorkspace", () => {
       "project%2E.lock",
     );
     let lockObserved = false;
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
-      if (tool === "git" && args[0] === "clone") {
+    const exec = vi.fn(async (tool: "gh" | "glab" | "git", args: string[]) => {
+      if (tool === "glab" && args[0] === "repo" && args[1] === "clone") {
         lockObserved = (await stat(expectedLockPath)).isFile();
-        await mkdir(args.at(-1)!, { recursive: true });
+        await mkdir(args[3]!, { recursive: true });
       }
       if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2)!, { recursive: true });
@@ -124,10 +124,12 @@ describe("prepareWorkspace", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("clones GitLab mirrors with git and the canonical HTTPS clone URL", async () => {
+  it("clones GitLab mirrors through glab so its configured Git transport is honored", async () => {
     const root = await tempRoot();
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
-      if (tool === "git" && args[0] === "clone") await mkdir(args.at(-1)!, { recursive: true });
+    const exec = vi.fn(async (tool: "gh" | "git" | "glab", args: string[]) => {
+      if (tool === "glab" && args[0] === "repo" && args[1] === "clone") {
+        await mkdir(args[3]!, { recursive: true });
+      }
       if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2)!, { recursive: true });
       }
@@ -136,13 +138,16 @@ describe("prepareWorkspace", () => {
 
     const result = await prepareWorkspace({ root, repo: gitlabRepo, baseSha }, { exec });
 
-    expect(exec).toHaveBeenCalledWith("git", [
+    expect(exec).toHaveBeenCalledWith("glab", [
+      "repo",
       "clone",
-      "--mirror",
       "https://gitlab.example.com:8443/group/sub/project",
       result.mirrorPath,
+      "--",
+      "--mirror",
     ]);
     expect(exec.mock.calls.some(([tool]) => tool === "gh")).toBe(false);
+    expect(exec.mock.calls.some(([tool, args]) => tool === "git" && args[0] === "clone")).toBe(false);
     await expect(readFile(result.ownerMarkerPath, "utf8")).resolves.toContain(
       '"repository": "https://gitlab.example.com:8443/group/sub/project"',
     );

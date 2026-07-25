@@ -66,6 +66,28 @@ describe("resolveReviewLocator", () => {
     });
   });
 
+  it("compares redundant GitHub repository selectors case-insensitively", () => {
+    expect(resolveReviewLocator(makeArgs({
+      pr: "https://github.com/OpenAI/Foo/pull/42",
+      repo: "openai/foo",
+    }))).toMatchObject({
+      kind: "repository",
+      repo: {
+        provider: "github",
+        owner: "OpenAI",
+        repo: "Foo",
+      },
+      number: 42,
+    });
+  });
+
+  it("keeps redundant GitLab repository selectors case-sensitive", () => {
+    expect(() => resolveReviewLocator(makeArgs({
+      pr: "https://gitlab.com/Group/Project/-/merge_requests/42",
+      repo: "gitlab.com/group/project",
+    }))).toThrow(/does not match explicit --repo/i);
+  });
+
   it("rejects numeric GitLab targets without --repo", () => {
     expect(() => resolveReviewLocator(makeArgs({ vcs: "gitlab" }))).toThrow(/--repo/i);
   });

@@ -19,7 +19,7 @@ export interface PreparedWorkspace extends WorkspacePaths {
   baseSha: string;
 }
 
-export type WorkspaceTool = "gh" | "git";
+export type WorkspaceTool = "gh" | "glab" | "git";
 export type ExecWorkspaceCommand = (tool: WorkspaceTool, args: string[], timeoutMs?: number) => Promise<string>;
 
 export interface WorkspaceDependencies {

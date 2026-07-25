@@ -13,6 +13,7 @@ import type {
   PreparedWorkspace,
   WorkspaceDependencies,
   WorkspaceRequest,
+  WorkspaceTool,
 } from "./types.js";
 import type { RepositoryRef } from "../target/types.js";
 
@@ -79,7 +80,7 @@ async function exists(path: string): Promise<boolean> {
 
 function execWorkspace(
   dependencies: WorkspaceDependencies,
-  tool: "gh" | "git",
+  tool: WorkspaceTool,
   args: string[],
 ): Promise<string> {
   return dependencies.commandTimeoutMs === undefined
@@ -276,7 +277,7 @@ async function prepareWorkspaceUnlocked(
   dependencies: WorkspaceDependencies,
 ): Promise<PreparedWorkspace> {
   const paths = deriveWorkspacePaths(request);
-  const execManaged = async (tool: "gh" | "git", args: string[]): Promise<string> => {
+  const execManaged = async (tool: WorkspaceTool, args: string[]): Promise<string> => {
     await assertNoSymlinkedAncestors(
       paths.root,
       [paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
@@ -359,7 +360,14 @@ async function prepareWorkspaceUnlocked(
         "--mirror",
       ]);
     } else {
-      await execManaged("git", ["clone", "--mirror", request.repo.canonicalUrl, paths.mirrorPath]);
+      await execManaged("glab", [
+        "repo",
+        "clone",
+        request.repo.canonicalUrl,
+        paths.mirrorPath,
+        "--",
+        "--mirror",
+      ]);
     }
   } else {
     const origin = await execManaged("git", ["-C", paths.mirrorPath, "remote", "get-url", "origin"]);
