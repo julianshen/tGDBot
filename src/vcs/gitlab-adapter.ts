@@ -29,6 +29,7 @@ export type ExecGlab = (
 ) => Promise<string>;
 
 export class GlabCommandError extends Error {
+  readonly code?: string;
   readonly exitCode?: number;
   readonly httpStatus?: number;
   readonly stderr: string;
@@ -36,6 +37,7 @@ export class GlabCommandError extends Error {
   constructor(
     message: string,
     options: {
+      code?: string;
       exitCode?: number;
       httpStatus?: number;
       stderr?: string;
@@ -44,6 +46,7 @@ export class GlabCommandError extends Error {
   ) {
     super(message, { cause: options.cause });
     this.name = "GlabCommandError";
+    this.code = options.code;
     this.exitCode = options.exitCode;
     this.httpStatus = options.httpStatus;
     this.stderr = options.stderr ?? "";
@@ -151,7 +154,12 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
           rejectOnce(
             new GlabCommandError(
               "glab output exceeded the 10 MiB safety limit; narrow the requested output or reduce the merge request diff.",
-              { cause: error, exitCode: numericExitCode(processError), stderr },
+              {
+                cause: error,
+                code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
+                exitCode: numericExitCode(processError),
+                stderr,
+              },
             ),
           );
           return;
@@ -570,6 +578,15 @@ function lineRangeEndpoint(
   };
 }
 
+function downgradeGitLabRangeSuggestion(body: string): string {
+  return body
+    .replace(
+      "<summary>📝 Committable suggestion</summary>",
+      "<summary>💡 Proposed fix (not committable)</summary>",
+    )
+    .replace(/^(`{3,})suggestion\s*$/m, (_match, fence: string) => `${fence}text`);
+}
+
 export class GitLabAdapter implements VcsAdapter {
   constructor(private readonly execGlab: ExecGlab = realExecGlab) {}
 
@@ -713,7 +730,11 @@ export class GitLabAdapter implements VcsAdapter {
         position.start.type !== position.end.type;
       const pathHash = createHash("sha1").update(position.newPath).digest("hex");
       const payload = {
-        body: comment.body,
+        // GitLab suggestion fences need provider-specific offsets to replace a
+        // range. Until the neutral contract carries those offsets, keep the
+        // proposed fix visible but non-committable instead of risking a
+        // one-line replacement for a multi-line finding.
+        body: isRange ? downgradeGitLabRangeSuggestion(comment.body) : comment.body,
         position: {
           base_sha: version.base_commit_sha,
           start_sha: version.start_commit_sha,

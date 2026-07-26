@@ -861,7 +861,7 @@ describe("GitLabAdapter inline discussions", () => {
       position: { line_range: { start: Record<string, unknown>; end: Record<string, unknown> } };
     };
     const pathHash = createHash("sha1").update("src/new-name.ts").digest("hex");
-    expect(payload.body).toBe("```suggestion\nreplacement\n```");
+    expect(payload.body).toBe("```text\nreplacement\n```");
     expect(payload.position.line_range).toEqual({
       start: {
         line_code: `${pathHash}_${start.oldLine ?? ""}_${start.newLine}`,
@@ -1237,6 +1237,7 @@ describe("realExecGlab", () => {
 
     await expect(realExecGlab(["mr", "diff", "42"])).rejects.toMatchObject({
       name: "GlabCommandError",
+      code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER",
       message: expect.stringMatching(/output exceeded.*10 MiB/i),
       stderr: "TOKEN=secret",
     });
