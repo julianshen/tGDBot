@@ -853,7 +853,7 @@ describe("GitLabAdapter inline discussions", () => {
       sameHunk: true,
     }, "```suggestion\nreplacement\n```");
 
-    await new GitLabAdapter(successfulExecutor(calls))
+    const outcomes = await new GitLabAdapter(successfulExecutor(calls))
       .createInlineReview(locator(), HEAD_SHA, [comment]);
 
     const payload = JSON.parse(calls[2]!.stdin!) as {
@@ -862,6 +862,7 @@ describe("GitLabAdapter inline discussions", () => {
     };
     const pathHash = createHash("sha1").update("src/new-name.ts").digest("hex");
     expect(payload.body).toBe("```text\nreplacement\n```");
+    expect(outcomes).toEqual([{ clientId: "finding-range", status: "posted" }]);
     expect(payload.position.line_range).toEqual({
       start: {
         line_code: `${pathHash}_${start.oldLine ?? ""}_${start.newLine}`,

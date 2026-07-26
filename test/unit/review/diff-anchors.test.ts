@@ -174,7 +174,7 @@ rename to src/new-name.ts
 +three
 `;
     expect(diffPositionRange(added, "src/new.ts", 10, 12)).toEqual({
-      oldPath: "/dev/null",
+      oldPath: "src/new.ts",
       newPath: "src/new.ts",
       start: { type: "new", oldLine: undefined, newLine: 10 },
       end: { type: "new", oldLine: undefined, newLine: 12 },

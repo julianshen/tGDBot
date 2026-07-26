@@ -282,7 +282,7 @@ export function parseDiffPositions(diff: string): DiffPositions {
       oldRemaining: match[2] === undefined ? 1 : Number(match[2]),
       newLine: Number(match[3]),
       newRemaining: match[4] === undefined ? 1 : Number(match[4]),
-      oldPath,
+      oldPath: oldPath === "/dev/null" ? newPath : oldPath,
       newPath,
       hunk,
       staged: new Map(),

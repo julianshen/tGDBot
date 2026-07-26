@@ -768,7 +768,7 @@ export class GitLabAdapter implements VcsAdapter {
           "--input",
           "-",
         ], JSON.stringify(payload));
-        validateWrittenDiscussion(stdout, comment.body);
+        validateWrittenDiscussion(stdout, payload.body);
         outcomes.push({ clientId: comment.clientId, status: "posted" });
       } catch (error) {
         if (error instanceof GlabOutputError) {
