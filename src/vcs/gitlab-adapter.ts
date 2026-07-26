@@ -21,7 +21,7 @@ const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const RULE_FILE_FETCH_CONCURRENCY = 4;
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const HTTP_DIAGNOSTIC_RE =
-  /(?:^|\n)(?:HTTP ([1-5]\d{2})|glab: [^\r\n]* \(HTTP ([1-5]\d{2})\))\r?\n?$/;
+  /(?:^|\r?\n)(?:HTTP ([1-5]\d{2})|glab: [^\r\n]* \(HTTP ([1-5]\d{2})\))\r?(?=\n|$)/;
 
 export type ExecGlab = (
   args: readonly string[],
@@ -750,6 +750,18 @@ export class GitLabAdapter implements VcsAdapter {
         validateWrittenDiscussion(stdout, comment.body);
         outcomes.push({ clientId: comment.clientId, status: "posted" });
       } catch (error) {
+        if (error instanceof GlabOutputError) {
+          const reason = "GitLab returned an invalid inline discussion response";
+          outcomes.push({ clientId: comment.clientId, status: "failed", reason });
+          for (const remaining of comments.slice(index + 1)) {
+            outcomes.push({
+              clientId: remaining.clientId,
+              status: "failed",
+              reason,
+            });
+          }
+          break;
+        }
         if (!(error instanceof GlabCommandError)) throw error;
         const reason = sanitizedWriteFailureReason(error);
         outcomes.push({ clientId: comment.clientId, status: "failed", reason });

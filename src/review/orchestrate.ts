@@ -8,7 +8,14 @@
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
 import type { RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
-import { changedFiles, commentableLines, diffPositionRange, isCommentable, rangeIsCommentable } from "./diff-anchors.js";
+import {
+  changedFiles,
+  commentableLines,
+  diffPositionRange,
+  isCommentable,
+  parseDiffPositions,
+  rangeIsCommentable,
+} from "./diff-anchors.js";
 import type { DispatchResult, Finding } from "./types.js";
 
 export type { InlineComment } from "./comment-format.js";
@@ -146,7 +153,8 @@ export function orchestrate(
   );
   const inlineEnabled = options.inline !== false && diff !== "";
 
-  const anchors = inlineEnabled ? commentableLines(diff) : new Map<string, Set<number>>();
+  const positions = inlineEnabled ? parseDiffPositions(diff) : undefined;
+  const anchors = positions ? commentableLines(positions) : new Map<string, Set<number>>();
 
   const inlineComments: InlineComment[] = [];
   const unanchored: Finding[] = [];
@@ -214,7 +222,7 @@ export function orchestrate(
     // otherwise it is a range that exists to serve nothing.
     const multiLine = committable && rangeOk;
     const position = diffPositionRange(
-      diff,
+      positions!,
       finding.file,
       start,
       multiLine ? (endLine as number) : start,
@@ -273,7 +281,9 @@ export function renderSummary(
   return renderSummaryComment({
     ...presentation.summaryInput,
     inlineCount: presentation.inlineComments.length - failed.length,
-    unanchored: [...presentation.summaryInput.unanchored, ...failed],
+    unanchored: [...presentation.summaryInput.unanchored, ...failed].sort(
+      (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
+    ),
     inlineUnavailable: presentation.summaryInput.inlineUnavailable,
   });
 }

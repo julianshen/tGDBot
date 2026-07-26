@@ -256,7 +256,7 @@ afterEach(async () => {
 
 describe("ContextCache", () => {
   it("preserves the legacy GitHub identity and isolates deterministic GitLab identities", async () => {
-    const root = await tempRoot("context-cache-");
+    const root = await tempRoot();
     const cache = new ContextCache(root);
     const githubKey: ContextCacheKey = {
       provider: "github",
@@ -299,7 +299,7 @@ describe("ContextCache", () => {
     { namespace: ["group\nsubgroup"] },
     { namespace: ["group"], repo: "project\u007fhidden" },
   ])("rejects separators and control data in GitLab cache segments", async (override) => {
-    const root = await tempRoot("context-cache-");
+    const root = await tempRoot();
     const cache = new ContextCache(root);
     const gitlabKey = {
       provider: "gitlab",

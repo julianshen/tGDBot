@@ -31,20 +31,24 @@ export interface DiffPositionRange {
   readonly sameHunk: true;
 }
 
-interface PositionedLine {
+export interface PositionedLine {
   endpoint: DiffPositionEndpoint;
   hunk: number;
   oldPath: string;
   newPath: string;
 }
 
+/** Parsed diff positions, reusable across all findings in one orchestration. */
+export type DiffPositions = Map<string, Map<number, PositionedLine>>;
+
 // `@@ -oldStart[,oldCount] +newStart[,newCount] @@`. The counts are optional and
 // default to 1 when omitted (git emits `@@ -3 +4 @@` for single-line hunks).
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
-export function commentableLines(diff: string): CommentableLines {
+export function commentableLines(diff: string | DiffPositions): CommentableLines {
   const result: CommentableLines = new Map();
-  for (const [file, lines] of positionedLines(diff)) {
+  const positions = typeof diff === "string" ? parseDiffPositions(diff) : diff;
+  for (const [file, lines] of positions) {
     result.set(file, new Set(lines.keys()));
   }
   return result;
@@ -125,12 +129,13 @@ export function rangeIsCommentable(
  * added lines use `type: "new"` and have no old counter.
  */
 export function diffPositionRange(
-  diff: string,
+  diff: string | DiffPositions,
   file: string,
   startLine: number,
   endLine = startLine,
 ): DiffPositionRange | undefined {
-  const positions = positionedLines(diff).get(file);
+  const positions =
+    (typeof diff === "string" ? parseDiffPositions(diff) : diff).get(file);
   const start = positions?.get(startLine);
   const end = positions?.get(endLine);
   if (!start || !end || start.hunk !== end.hunk) return undefined;
@@ -143,8 +148,8 @@ export function diffPositionRange(
   };
 }
 
-function positionedLines(diff: string): Map<string, Map<number, PositionedLine>> {
-  const result = new Map<string, Map<number, PositionedLine>>();
+export function parseDiffPositions(diff: string): DiffPositions {
+  const result: DiffPositions = new Map();
   let oldPath: string | undefined;
   let newPath: string | undefined;
   let hunk = 0;

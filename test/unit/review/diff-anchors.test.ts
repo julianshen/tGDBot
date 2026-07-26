@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   commentableLines,
   diffPositionRange,
+  parseDiffPositions,
   isCommentable,
 } from "../../../src/review/diff-anchors.js";
 
@@ -150,6 +151,16 @@ rename to src/new-name.ts
       start: { type: "old", oldLine: 10, newLine: 12 },
       end: { type: "new", oldLine: undefined, newLine: 10 },
       sameHunk: true,
+    });
+  });
+
+  it("reuses one parsed position index for commentability and range lookup", () => {
+    const positions = parseDiffPositions(renamed);
+    expect(commentableLines(positions).get("src/new-name.ts")?.has(10)).toBe(true);
+    expect(diffPositionRange(positions, "src/new-name.ts", 10, 12)).toMatchObject({
+      newPath: "src/new-name.ts",
+      start: { newLine: 10 },
+      end: { newLine: 12 },
     });
   });
 

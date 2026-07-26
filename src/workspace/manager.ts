@@ -252,7 +252,6 @@ function isExpectedOrigin(origin: string, repo: RepositoryRef): boolean {
       parsed.username === "git" &&
       parsed.password === "" &&
       parsed.hostname.toLowerCase() === expectedHost &&
-      explicitOriginPort(gitLabOrigin) === expectedHttpsPort &&
       parsed.search === "" &&
       parsed.hash === "" &&
       normalizedOriginPath(parsed.pathname) === repositoryPath(repo)

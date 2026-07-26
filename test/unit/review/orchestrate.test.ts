@@ -45,6 +45,23 @@ describe("orchestrate", () => {
     expect(body).toContain("second finding");
     expect(body).not.toContain("first finding");
   });
+
+  it("keeps severity order when failed inline findings join existing summary findings", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -9,1 +9,2 @@
+ context
++added
+`;
+    const presentation = orchestrate(makeDispatchResult({ findings: [
+      makeFinding({ line: null, severity: "suggestion", message: "summary suggestion" }),
+      makeFinding({ line: 10, severity: "blocking", message: "failed blocking" }),
+    ] }), diff);
+
+    const body = renderSummary(presentation, new Set(["finding-0"]));
+    expect(body.indexOf("failed blocking")).toBeLessThan(body.indexOf("summary suggestion"));
+  });
   // AC-7.1: Given two findings with the same file, line, and near-identical
   // message from two different rules, When orchestrate runs, Then the
   // resulting commentBody reflects only one occurrence of that finding.

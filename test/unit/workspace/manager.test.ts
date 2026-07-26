@@ -113,13 +113,14 @@ describe("prepareWorkspace", () => {
     await prepareWorkspace({ root, repo: sensitiveRepo, baseSha }, { exec });
 
     expect(lockObserved).toBe(true);
-    await expect(stat(path.join(
+    const lockDir = await stat(path.join(
       root,
       ".locks",
       "gitlab%2A.example.com",
       "%43ON",
       "team%2Aone",
-    ))).resolves.toMatchObject({ isDirectory: expect.any(Function) });
+    ));
+    expect(lockDir.isDirectory()).toBe(true);
     await expect(stat(path.join(root, ".locks", "gitlab*.example.com", "CON", "team*one")))
       .rejects.toMatchObject({ code: "ENOENT" });
   });
@@ -156,6 +157,8 @@ describe("prepareWorkspace", () => {
   it.each([
     "https://gitlab.example.com:8443/group/sub/project.git",
     "git@gitlab.example.com:group/sub/project.git",
+    "ssh://git@gitlab.example.com/group/sub/project.git",
+    "ssh://git@gitlab.example.com:2222/group/sub/project.git",
     "ssh://git@gitlab.example.com:8443/group/sub/project.git",
   ])("accepts an equivalent GitLab managed mirror origin: %s", async (origin) => {
     const root = await tempRoot();
@@ -208,7 +211,6 @@ describe("prepareWorkspace", () => {
     "https://gitlab.example.com:8443/group/other/project.git",
     "https://gitlab.example.com:8443/group/sub/other.git",
     "git@other.example.com:group/sub/project.git",
-    "ssh://git@gitlab.example.com/group/sub/project.git",
     "ssh://git:password@gitlab.example.com:8443/group/sub/project.git",
     "https://gitlab.example.com:8443/Group/sub/project.git",
     "https://gitlab.example.com:8443/group%2Fsub/project.git",

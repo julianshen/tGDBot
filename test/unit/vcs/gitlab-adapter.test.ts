@@ -48,9 +48,9 @@ const locator = (repo: GitLabRepositoryRef = selfManagedRepo) =>
 
 const fixturePath = fileURLToPath(new URL("../../fixtures/glab-mr.json", import.meta.url));
 const fixture = await readFile(fixturePath, "utf8");
-const notesFixturePath = fileURLToPath(new URL("../../fixtures/glab-notes.json", import.meta.url));
+const notesFixturePath = fileURLToPath(new URL("../../fixtures/glab-notes.jsonl", import.meta.url));
 const notesFixture = await readFile(notesFixturePath, "utf8");
-const discussionsFixturePath = fileURLToPath(new URL("../../fixtures/glab-discussions.json", import.meta.url));
+const discussionsFixturePath = fileURLToPath(new URL("../../fixtures/glab-discussions.jsonl", import.meta.url));
 const discussionsFixture = await readFile(discussionsFixturePath, "utf8");
 const writtenDiscussionFixture = (body: string) => JSON.stringify({
   id: "discussion-1",
@@ -1013,7 +1013,7 @@ describe("GitLabAdapter inline discussions", () => {
     ["empty notes", { id: "discussion-1", notes: [] }],
     ["malformed note id", { id: "discussion-1", notes: [{ id: 0, body: "posted" }] }],
     ["malformed note body", { id: "discussion-1", notes: [{ id: 701, body: 42 }] }],
-  ])("rejects a POST response with %s and stops before later writes", async (_name, response) => {
+  ])("turns a malformed POST response into failed outcomes and stops before later writes", async (_name, response) => {
     let posts = 0;
     const execGlab: ExecGlab = async (args) => {
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
@@ -1028,7 +1028,10 @@ describe("GitLabAdapter inline discussions", () => {
 
     await expect(
       new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, comments),
-    ).rejects.toThrow(/discussion/i);
+    ).resolves.toEqual([
+      { clientId: "finding-0", status: "failed", reason: expect.any(String) },
+      { clientId: "finding-1", status: "failed", reason: expect.any(String) },
+    ]);
     expect(posts).toBe(1);
   });
 
@@ -1053,7 +1056,10 @@ describe("GitLabAdapter inline discussions", () => {
         HEAD_SHA,
         [added, { ...added, clientId: "finding-1" }],
       ),
-    ).rejects.toThrow(/discussion/i);
+    ).resolves.toEqual([
+      { clientId: "finding-0", status: "failed", reason: expect.any(String) },
+      { clientId: "finding-1", status: "failed", reason: expect.any(String) },
+    ]);
     expect(posts).toBe(1);
   });
 
@@ -1240,6 +1246,11 @@ describe("realExecGlab", () => {
   it("parses anchored API HTTP diagnostics but not incidental or non-API statuses", async () => {
     const errors = [
       { args: ["api", "projects/x"], stderr: "request failed\nHTTP 403\n", status: 403 },
+      {
+        args: ["api", "projects/x"],
+        stderr: "glab: Forbidden (HTTP 403)\n{\"message\":\"details\"}\n",
+        status: 403,
+      },
       {
         args: ["api", "projects/x"],
         stderr: "glab: 404 Project Not Found (HTTP 404)\n",
