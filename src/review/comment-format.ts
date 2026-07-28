@@ -336,6 +336,10 @@ function renderUnanchoredFinding(finding: Finding): string {
   } else {
     parts.push(full);
   }
+  const suggestion = finding.suggestion?.trim() ? capSuggestion(finding.suggestion) : undefined;
+  if (suggestion) {
+    parts.push("", renderSuggestionBlock(suggestion, false));
+  }
   return parts.join("\n");
 }
 

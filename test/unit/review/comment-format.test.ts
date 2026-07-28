@@ -180,6 +180,15 @@ describe("renderSummaryComment", () => {
     expect(body).toMatch(/couldn't be anchored/i);
   });
 
+  it("preserves a failed inline suggestion as a non-committable block", () => {
+    const f = makeFinding({ suggestion: "const fixed = true;" });
+    const body = renderSummaryComment({ ...base, allFindings: [f], unanchored: [f] });
+
+    expect(body).toContain("💡 Proposed fix (not committable)");
+    expect(body).toContain("const fixed = true;");
+    expect(body).not.toMatch(/^`{3,}suggestion$/m);
+  });
+
   it("lists failed rules with their reasons", () => {
     const body = renderSummaryComment({
       ...base,
