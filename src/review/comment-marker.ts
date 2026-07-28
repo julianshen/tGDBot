@@ -18,6 +18,7 @@ export interface TerminalReviewResult {
   readonly findingsCount: number;
   readonly rulesRun: string[];
   readonly rulesFailed: string[];
+  readonly loadErrors?: string[];
   readonly exitCode: 0 | 2;
 }
 
@@ -126,18 +127,25 @@ function validRuleNames(value: unknown): value is string[] {
     value.every((name) => typeof name === "string");
 }
 
+function validOptionalStrings(value: unknown): value is string[] | undefined {
+  return value === undefined || validRuleNames(value);
+}
+
 function validateTerminalResult(value: unknown): TerminalReviewResult | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
   if (
-    Object.keys(candidate).sort().join(",") !==
-      "exitCode,findingsCount,rulesFailed,rulesRun,status" ||
+    ![
+      "exitCode,findingsCount,rulesFailed,rulesRun,status",
+      "exitCode,findingsCount,loadErrors,rulesFailed,rulesRun,status",
+    ].includes(Object.keys(candidate).sort().join(",")) ||
     (candidate.status !== "posted" && candidate.status !== "partial") ||
     !Number.isSafeInteger(candidate.findingsCount) ||
     (candidate.findingsCount as number) < 0 ||
     (candidate.findingsCount as number) > 1_000_000 ||
     !validRuleNames(candidate.rulesRun) ||
     !validRuleNames(candidate.rulesFailed) ||
+    !validOptionalStrings(candidate.loadErrors) ||
     (candidate.exitCode !== 0 && candidate.exitCode !== 2) ||
     (candidate.status === "posted" && candidate.exitCode !== 0) ||
     (candidate.status === "partial" && candidate.exitCode !== 2)
