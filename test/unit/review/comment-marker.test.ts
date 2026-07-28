@@ -27,6 +27,7 @@ describe("parseBotMarker", () => {
         findingsCount: 3,
         rulesRun: ["rule-a"],
         rulesFailed: ["rule-b"],
+        loadErrors: ["/rules/bad.md: missing model"],
         exitCode: 2,
       },
     });
@@ -43,6 +44,7 @@ describe("parseBotMarker", () => {
           findingsCount: 3,
           rulesRun: ["rule-a"],
           rulesFailed: ["rule-b"],
+          loadErrors: ["/rules/bad.md: missing model"],
           exitCode: 2,
         },
       },
@@ -82,15 +84,15 @@ describe("parseBotMarker", () => {
         rulesFailed: [],
         exitCode: 0,
       }), "utf8").toString("base64url").length;
-    let boundaryName = "";
-    for (let length = 1; length < 32_768; length += 1) {
-      const candidate = "x".repeat(length);
-      if (encodedLength(candidate) === 32_768) {
-        boundaryName = candidate;
-        break;
-      }
+    let low = 1;
+    let high = 32_768;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (encodedLength("x".repeat(middle)) < 32_768) low = middle + 1;
+      else high = middle;
     }
-    expect(boundaryName).not.toBe("");
+    const boundaryName = "x".repeat(low);
+    expect(encodedLength(boundaryName)).toBe(32_768);
     let oversizedName = boundaryName + "x";
     while (encodedLength(oversizedName) <= 32_768) oversizedName += "x";
 
