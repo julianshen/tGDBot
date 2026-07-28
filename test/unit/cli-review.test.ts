@@ -1530,10 +1530,11 @@ describe("inline review comments", () => {
       findingsCount: 3,
       rulesRun: ["rule-a"],
       rulesFailed: ["rule-b"],
+      loadErrors: ["/rules/secret-rule.md: token=must-not-be-encoded"],
       exitCode: 2,
     });
     const marker = stored?.body.split("\n").at(-1) ?? "";
-    expect(marker).not.toContain("must-not-be-encoded");
+    expect(marker).not.toContain("token=must-not-be-encoded");
 
     const exitCode = await review(h.args, depsFrom(h));
 
@@ -1552,6 +1553,7 @@ describe("inline review comments", () => {
       findingsCount: 3,
       rulesRun: ["rule-a"],
       rulesFailed: ["rule-b"],
+      loadErrors: ["/rules/secret-rule.md: token=must-not-be-encoded"],
       reason: "recovered-pending-review",
     });
     vi.restoreAllMocks();
