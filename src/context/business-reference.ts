@@ -4,6 +4,7 @@ import { link, lstat, open, realpath, unlink } from "node:fs/promises";
 import path from "node:path";
 import { withRepositoryLock } from "../workspace/lock.js";
 import { realExecWorkspaceCommand } from "../workspace/manager.js";
+import type { RepositoryRef } from "../target/types.js";
 
 const SEMANTIC_HEADINGS = [
   "architecture",
@@ -25,6 +26,7 @@ export interface BusinessReferenceInput {
   sourceRoot: string;
   explicitPaths: string[];
   generatedPath: string;
+  repository: RepositoryRef;
 }
 
 export interface BusinessReferenceResult {
@@ -48,6 +50,7 @@ interface DomainGraphSource {
   projectName: string;
   baseSha: string;
   sha256: string;
+  repository: RepositoryRef;
   nodes: Array<{ id: string; type: "domain" | "flow" | "step"; name: string; summary: string }>;
 }
 
@@ -240,7 +243,7 @@ async function readRegularFileNoFollow(filePath: string, invalidMessage: string)
 async function readDomainGraph(
   generationRoot: string,
   physicalGenerationRoot: string,
-): Promise<DomainGraphSource | undefined> {
+): Promise<Omit<DomainGraphSource, "repository"> | undefined> {
   const graphPath = path.join(generationRoot, ".understand-anything", "domain-graph.json");
   let info;
   try {
@@ -307,8 +310,8 @@ function generateBusinessContext(source: DomainGraphSource, generatedAt: Date): 
   return [
     "---",
     "generated: true",
-    "provider: github",
-    `repository: ${safeScalar(source.projectName)}`,
+    `provider: ${source.repository.provider}`,
+    `repository: ${safeScalar(source.repository.canonicalUrl)}`,
     `base_sha: ${safeScalar(source.baseSha)}`,
     "source: .understand-anything/domain-graph.json",
     `source_sha256: ${source.sha256}`,
@@ -481,8 +484,9 @@ export async function selectBusinessReference(
   }
 
   const destination = await validateGenerationRoot(path.resolve(input.sourceRoot), input.generatedPath);
-  const domainGraph = await readDomainGraph(destination.generationRoot, destination.identity.realPath);
-  if (domainGraph === undefined) return { kind: "none", paths: [], digest: emptyDigest() };
+  const discoveredDomainGraph = await readDomainGraph(destination.generationRoot, destination.identity.realPath);
+  if (discoveredDomainGraph === undefined) return { kind: "none", paths: [], digest: emptyDigest() };
+  const domainGraph: DomainGraphSource = { ...discoveredDomainGraph, repository: input.repository };
   let contents = await readReusableGenerated(destination, domainGraph);
   if (contents === undefined) {
     contents = await withRepositoryLock({

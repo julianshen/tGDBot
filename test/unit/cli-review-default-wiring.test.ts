@@ -21,6 +21,8 @@ const hoisted = vi.hoisted(() => ({
   upsertComment: vi.fn(),
   getRuleFilesFromBase: vi.fn(),
   createInlineReview: vi.fn(),
+  resolveStaleReviewThreads: vi.fn(),
+  gitLabConstructed: vi.fn(),
 }));
 
 vi.mock("../../src/vcs/github-adapter.js", () => ({
@@ -31,8 +33,25 @@ vi.mock("../../src/vcs/github-adapter.js", () => ({
     findBotComment = hoisted.findBotComment;
     upsertComment = hoisted.upsertComment;
     getRuleFilesFromBase = hoisted.getRuleFilesFromBase;
+    resolveStaleReviewThreads = hoisted.resolveStaleReviewThreads;
   },
   realExecGh: vi.fn(),
+}));
+
+vi.mock("../../src/vcs/gitlab-adapter.js", () => ({
+  GitLabAdapter: class {
+    constructor() {
+      hoisted.gitLabConstructed();
+    }
+    getPullRequest = hoisted.getPullRequest;
+    createInlineReview = hoisted.createInlineReview;
+    getDiff = hoisted.getDiff;
+    findBotComment = hoisted.findBotComment;
+    upsertComment = hoisted.upsertComment;
+    getRuleFilesFromBase = hoisted.getRuleFilesFromBase;
+    resolveStaleReviewThreads = hoisted.resolveStaleReviewThreads;
+  },
+  realExecGlab: vi.fn(),
 }));
 
 vi.mock("../../src/rules/loader.js", () => ({
@@ -57,6 +76,9 @@ import { loadRules } from "../../src/rules/loader.js";
 import { dispatchRules } from "../../src/review/dispatch.js";
 import { dispatchRulesDirect } from "../../src/review/direct-dispatch.js";
 import { orchestrate } from "../../src/review/orchestrate.js";
+import { parseBotMarker } from "../../src/review/comment-marker.js";
+
+const ambientLocator = { kind: "ambient", provider: "github", number: 42 } as const;
 
 function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
   return {
@@ -76,15 +98,22 @@ describe("review — default dependency wiring", () => {
   it("with no injected deps, resolves the real config/loadRules/dispatchRules/orchestrate wiring against mocked modules (never real gh/network/LLM)", async () => {
     hoisted.getPullRequest.mockResolvedValue({
       id: "42",
-      headSha: "wired1234",
+      headSha: "abc12345",
       baseSha: "base0000",
       title: "Real wiring PR",
       description: "desc",
     });
     hoisted.getDiff.mockResolvedValue("diff --git a/x b/x");
     hoisted.findBotComment.mockResolvedValue(null);
-    hoisted.upsertComment.mockResolvedValue(undefined);
+    hoisted.upsertComment.mockImplementation(
+      (_locator, body: string, existing: { id: string } | null) => Promise.resolve({
+        id: existing?.id ?? "written-summary-1",
+        body,
+        ...(parseBotMarker(body) ?? { lastReviewedSha: "", reviewedConfig: "" }),
+      }),
+    );
     hoisted.getRuleFilesFromBase.mockResolvedValue([]);
+    hoisted.resolveStaleReviewThreads.mockResolvedValue(0);
 
     vi.mocked(loadRules).mockResolvedValue({
       rules: [
@@ -122,19 +151,26 @@ describe("review — default dependency wiring", () => {
 
     // resolveConfigReal must have constructed a real GitHubAdapter (our
     // mocked class) and review() must have driven it correctly.
-    expect(hoisted.getPullRequest).toHaveBeenCalledWith("42");
-    expect(hoisted.findBotComment).toHaveBeenCalledWith("42");
-    expect(hoisted.getDiff).toHaveBeenCalledWith("42");
-    expect(hoisted.upsertComment).toHaveBeenCalledTimes(1);
+    expect(hoisted.getPullRequest).toHaveBeenCalledWith(ambientLocator);
+    expect(hoisted.findBotComment).toHaveBeenCalledWith(ambientLocator);
+    expect(hoisted.getDiff).toHaveBeenCalledWith(ambientLocator);
+    expect(hoisted.upsertComment).toHaveBeenCalledTimes(2);
 
-    const [prId, body, existing] = hoisted.upsertComment.mock.calls[0];
-    expect(prId).toBe("42");
+    const [prId, pendingBody, existing] = hoisted.upsertComment.mock.calls[0];
+    expect(prId).toEqual(ambientLocator);
     expect(existing).toBeNull();
-    expect(body).toContain("<!-- tgd-review-agent:sha=wired1234 cfg=");
+    expect(pendingBody).toContain("<!-- tgd-review-agent:pending phase=publishing");
+    expect(hoisted.upsertComment.mock.calls[1]?.[1])
+      .toContain("<!-- tgd-review-agent:sha=abc12345 cfg=");
 
     // ADR-002 CLI-native fix: rules are now sourced from the PR's base
     // branch via getRuleFilesFromBase, not the literal --rules-dir path.
-    expect(hoisted.getRuleFilesFromBase).toHaveBeenCalledWith("base0000", ".review/rules");
+    expect(hoisted.getRuleFilesFromBase).toHaveBeenCalledWith(
+      ambientLocator,
+      "base0000",
+      ".review/rules",
+    );
+    expect(hoisted.resolveStaleReviewThreads).toHaveBeenCalledWith(ambientLocator);
 
     // The real loadRulesReal/dispatchRulesReal/orchestrateReal references
     // were actually invoked (not silently skipped by a typo'd default) —
@@ -163,10 +199,26 @@ describe("review — default dependency wiring", () => {
     logSpy.mockRestore();
   });
 
-  it("with vcs: gitlab and no injected deps, the real resolveConfig throws the Phase 2 error", async () => {
-    await expect(review(makeArgs({ vcs: "gitlab" }))).rejects.toThrow(
-      /GitLab support not yet implemented \(Phase 2\)/,
+  it("with an explicit GitLab repository, default wiring constructs and drives GitLabAdapter", async () => {
+    hoisted.gitLabConstructed.mockClear();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(
+      review(makeArgs({ vcs: "gitlab", repo: "group/project" })),
+    ).resolves.toBe(0);
+
+    expect(hoisted.gitLabConstructed).toHaveBeenCalledTimes(1);
+    expect(hoisted.getPullRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "repository",
+        repo: expect.objectContaining({
+          provider: "gitlab",
+          canonicalUrl: "https://gitlab.com/group/project",
+        }),
+        number: 42,
+      }),
     );
+    logSpy.mockRestore();
   });
 
   it("passes --model in the object input, never in the direct deps argument", async () => {

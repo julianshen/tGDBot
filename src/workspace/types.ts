@@ -1,4 +1,4 @@
-import type { RepositoryRef } from "../vcs/adapter.js";
+import type { RepositoryRef } from "../target/types.js";
 
 export interface WorkspaceRequest {
   root: string;
@@ -19,7 +19,7 @@ export interface PreparedWorkspace extends WorkspacePaths {
   baseSha: string;
 }
 
-export type WorkspaceTool = "gh" | "git";
+export type WorkspaceTool = "gh" | "glab" | "git";
 export type ExecWorkspaceCommand = (tool: WorkspaceTool, args: string[], timeoutMs?: number) => Promise<string>;
 
 export interface WorkspaceDependencies {

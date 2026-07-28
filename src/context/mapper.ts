@@ -1,7 +1,10 @@
+import type { RepositoryRef } from "../target/types.js";
+
 export interface ContextMapRequest {
   sourceRoot: string;
   outputRoot: string;
   baseSha: string;
+  repository: RepositoryRef;
   allowDegradedContext?: boolean;
 }
 

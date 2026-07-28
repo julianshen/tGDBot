@@ -3,7 +3,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
 import { INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
-import type { BotComment, RepositoryRef } from "../../../src/vcs/adapter.js";
+import {
+  validateInlinePublishOutcomes,
+  type BotComment,
+  type ReviewLocator,
+} from "../../../src/vcs/adapter.js";
+import { parseRepositoryRef } from "../../../src/target/review-target.js";
 
 const fixturePath = (name: string): string =>
   fileURLToPath(new URL(`../../fixtures/${name}`, import.meta.url));
@@ -30,11 +35,19 @@ const mockExecGhWithIdentity = (userFixture: string, commentsFixture: string) =>
     return readFixture(commentsFixture);
   });
 
+const locator = (number: number): ReviewLocator => ({
+  kind: "ambient",
+  provider: "github",
+  number,
+});
+const locator42 = locator(42);
+
 describe("GitHubAdapter", () => {
-  const explicitRepo: RepositoryRef = {
-    host: "github.com",
-    owner: "octo-org",
-    repo: "octo-repo",
+  const explicitRepo = parseRepositoryRef("octo-org/octo-repo", "github");
+  const explicitLocator: ReviewLocator = {
+    kind: "repository",
+    repo: explicitRepo,
+    number: 42,
   };
 
   it("AC-2.1: scopes PR metadata and diff calls to the explicit repository", async () => {
@@ -54,15 +67,13 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    const pr = await adapter.getPullRequest(explicitRepo, 42);
-    const diff = await adapter.getDiff(explicitRepo, 42);
+    const pr = await adapter.getPullRequest(explicitLocator);
+    const diff = await adapter.getDiff(explicitLocator);
 
     expect(pr).toEqual({
-      number: 42,
+      id: "42",
       headSha: "abc123",
       baseSha: "def456",
-      headRef: "feature/topic",
-      baseRef: "main",
       title: "Explicit target",
       description: "Body",
       url: "https://github.com/octo-org/octo-repo/pull/42",
@@ -90,7 +101,11 @@ describe("GitHubAdapter", () => {
     const execGh = vi.fn(async (args: string[]) => {
       if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
       if (args.includes("repos/octo-org/octo-repo/issues/42/comments")) {
+        if (args.includes("POST")) return JSON.stringify({ id: 88, body: "summary" });
         return readFixture("gh-comments.json");
+      }
+      if (args.includes("repos/octo-org/octo-repo/issues/comments/99")) {
+        return JSON.stringify({ id: 99, body: "updated" });
       }
       if (args.includes("repos/octo-org/octo-repo/contents/.tgd-review/rules?ref=def456")) {
         return "[]";
@@ -99,18 +114,24 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.findBotComment(explicitRepo, 42);
-    await adapter.upsertComment(explicitRepo, 42, "summary", null);
-    await adapter.upsertComment(explicitRepo, 42, "updated", {
+    await adapter.findBotComment(explicitLocator);
+    await adapter.upsertComment(explicitLocator, "summary", null);
+    await adapter.upsertComment(explicitLocator, "updated", {
       id: "99",
       body: "old",
       lastReviewedSha: "abc1234",
       reviewedConfig: "cfg",
     });
-    await adapter.createInlineReview(explicitRepo, 42, "abc123", [
-      { path: "src/a.ts", line: 7, body: "finding" },
+    await adapter.createInlineReview(explicitLocator, "abc123", [
+      {
+        clientId: "finding-0",
+        path: "src/a.ts",
+        line: 7,
+        body: "finding",
+        position: {} as never,
+      },
     ]);
-    await adapter.getRuleFilesFromBase(explicitRepo, "def456", ".tgd-review/rules");
+    await adapter.getRuleFilesFromBase(explicitLocator, "def456", ".tgd-review/rules");
 
     const calls = execGh.mock.calls.map(([args]) => args as string[]);
     expect(calls).toContainEqual([
@@ -120,12 +141,13 @@ describe("GitHubAdapter", () => {
       "github.com",
     ]);
     expect(calls).toContainEqual([
-      "pr",
-      "comment",
-      "42",
-      "--repo",
-      "github.com/octo-org/octo-repo",
-      "--body-file",
+      "api",
+      "repos/octo-org/octo-repo/issues/42/comments",
+      "--hostname",
+      "github.com",
+      "-X",
+      "POST",
+      "--input",
       "-",
     ]);
     expect(calls).toContainEqual([
@@ -179,7 +201,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.resolveStaleReviewThreads(explicitRepo, 42)).resolves.toBe(0);
+    await expect(adapter.resolveStaleReviewThreads(explicitLocator)).resolves.toBe(0);
 
     expect(execGh.mock.calls.some(([args]) => (args as string[])[0] === "repo")).toBe(false);
     const graphQlArgs = execGh.mock.calls
@@ -192,6 +214,34 @@ describe("GitHubAdapter", () => {
     expect(graphQlArgs?.[graphQlArgs.indexOf("--hostname") + 1]).toBe("github.com");
   });
 
+  it("rejects a GitLab repository locator before invoking gh", async () => {
+    const execGh = vi.fn();
+    const adapter = new GitHubAdapter(execGh);
+    const locator: ReviewLocator = {
+      kind: "repository",
+      repo: parseRepositoryRef("gitlab.com/group/project", "gitlab"),
+      number: 42,
+    };
+
+    await expect(adapter.getDiff(locator)).rejects.toThrow(/GitHubAdapter.*GitLab/i);
+    expect(execGh).not.toHaveBeenCalled();
+  });
+
+  it("preserves the existing ambient metadata and diff commands", async () => {
+    const execGh = vi.fn()
+      .mockResolvedValueOnce(readFixture("gh-pr-view.json"))
+      .mockResolvedValueOnce("diff");
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.getPullRequest(locator42);
+    await adapter.getDiff(locator42);
+
+    expect(execGh).toHaveBeenNthCalledWith(1, [
+      "pr", "view", "42", "--json", "headRefOid,baseRefOid,title,body,url",
+    ]);
+    expect(execGh).toHaveBeenNthCalledWith(2, ["pr", "diff", "42"]);
+  });
+
   // AC-2.1: Given a mocked `gh pr view` response for PR 42, When
   // getPullRequest("42") is called, Then it returns a PullRequestInfo with
   // the correct headSha, baseSha, title, description parsed from that JSON.
@@ -199,7 +249,7 @@ describe("GitHubAdapter", () => {
     const execGh = vi.fn().mockResolvedValue(readFixture("gh-pr-view.json"));
     const adapter = new GitHubAdapter(execGh);
 
-    const pr = await adapter.getPullRequest("42");
+    const pr = await adapter.getPullRequest(locator42);
 
     expect(pr).toEqual({
       id: "42",
@@ -233,8 +283,8 @@ describe("GitHubAdapter", () => {
     }));
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.getPullRequest(explicitRepo, 42)).resolves.toMatchObject({ description: "" });
-    await expect(adapter.getPullRequest("42")).resolves.toMatchObject({ description: "" });
+    await expect(adapter.getPullRequest(explicitLocator)).resolves.toMatchObject({ description: "" });
+    await expect(adapter.getPullRequest(locator42)).resolves.toMatchObject({ description: "" });
   });
 
   // AC-2.2: Given a mocked comment list containing one comment authored by
@@ -245,7 +295,7 @@ describe("GitHubAdapter", () => {
     const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments.json");
     const adapter = new GitHubAdapter(execGh);
 
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     expect(botComment).toEqual({
       id: "222",
@@ -265,7 +315,7 @@ describe("GitHubAdapter", () => {
     const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments-no-marker.json");
     const adapter = new GitHubAdapter(execGh);
 
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     expect(botComment).toBeNull();
   });
@@ -278,25 +328,32 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    expect(await adapter.findBotComment("42")).toBeNull();
+    expect(await adapter.findBotComment(locator42)).toBeNull();
   });
 
   // AC-2.4: Given existing is null, When upsertComment("42", body, null) is
   // called, Then the adapter issues a create-comment gh invocation (not an edit).
   it("AC-2.4: upsertComment with existing=null issues a create (not an edit)", async () => {
-    const execGh = vi.fn().mockResolvedValue("");
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      id: 777,
+      body: "review body text\n<!-- tgd-review-agent:pending -->",
+    }));
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.upsertComment("42", "review body text", null);
+    const written = await adapter.upsertComment(
+      locator42,
+      "review body text\n<!-- tgd-review-agent:pending -->",
+      null,
+    );
 
+    expect(written.id).toBe("777");
     expect(execGh).toHaveBeenCalledTimes(1);
     expect(execGh).toHaveBeenCalledWith(
-      ["pr", "comment", "42", "--body-file", "-"],
-      "review body text",
+      ["api", "repos/{owner}/{repo}/issues/42/comments", "-X", "POST", "--input", "-"],
+      JSON.stringify({ body: "review body text\n<!-- tgd-review-agent:pending -->" }),
     );
-    // Must never touch the `gh api .../issues/comments/{id}` edit endpoint.
+    // Must target the create collection, never the exact-comment edit endpoint.
     const [args] = execGh.mock.calls[0] as [string[], string?];
-    expect(args).not.toContain("api");
     expect(args.join(" ")).not.toMatch(/PATCH/);
   });
 
@@ -304,7 +361,10 @@ describe("GitHubAdapter", () => {
   // upsertComment("42", body, existing) is called, Then the adapter issues
   // an edit invocation targeting comment id 999 (never a second create).
   it("AC-2.5: upsertComment with an existing BotComment issues an edit targeting that exact comment id", async () => {
-    const execGh = vi.fn().mockResolvedValue("");
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      id: 999,
+      body: "updated review body\n<!-- tgd-review-agent:sha=abc1234 -->",
+    }));
     const adapter = new GitHubAdapter(execGh);
     const existing: BotComment = {
       id: "999",
@@ -313,16 +373,37 @@ describe("GitHubAdapter", () => {
       reviewedConfig: "",
     };
 
-    await adapter.upsertComment("42", "updated review body", existing);
+    const written = await adapter.upsertComment(
+      locator42,
+      "updated review body\n<!-- tgd-review-agent:sha=abc1234 -->",
+      existing,
+    );
 
+    expect(written.id).toBe("999");
     expect(execGh).toHaveBeenCalledTimes(1);
     expect(execGh).toHaveBeenCalledWith(
       ["api", "repos/{owner}/{repo}/issues/comments/999", "-X", "PATCH", "--input", "-"],
-      JSON.stringify({ body: "updated review body" }),
+      JSON.stringify({ body: "updated review body\n<!-- tgd-review-agent:sha=abc1234 -->" }),
     );
     // Never issues a `gh pr comment` create invocation.
     const [args] = execGh.mock.calls[0] as [string[], string?];
     expect(args).not.toEqual(expect.arrayContaining(["comment"]));
+  });
+
+  it.each([
+    ["bad JSON", "not json"],
+    ["missing id", JSON.stringify({ body: "x" })],
+    ["wrong update id", JSON.stringify({ id: 1000, body: "x" })],
+    ["malformed body", JSON.stringify({ id: 999, body: 42 })],
+    ["mismatched body", JSON.stringify({ id: 999, body: "different" })],
+  ])("rejects %s write responses", async (_name, response) => {
+    const adapter = new GitHubAdapter(vi.fn().mockResolvedValue(response));
+    await expect(adapter.upsertComment(locator42, "x", {
+      id: "999",
+      body: "old",
+      lastReviewedSha: "",
+      reviewedConfig: "",
+    })).rejects.toThrow(/comment|response|id/i);
   });
 
   // --- Review fix #1 (security): comment authorship verification ---
@@ -336,7 +417,7 @@ describe("GitHubAdapter", () => {
     // ("tgd-review-agent[bot]"). An attacker on a public PR could post this
     // to trick decideDedup() into skipping review forever; the fix requires
     // the comment's author to match the authenticated `gh` identity.
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     expect(botComment).toBeNull();
   });
@@ -360,7 +441,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     expect(botComment).toEqual({
       id: "222",
@@ -374,8 +455,8 @@ describe("GitHubAdapter", () => {
     const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments.json");
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.findBotComment("42");
-    await adapter.findBotComment("42");
+    await adapter.findBotComment(locator42);
+    await adapter.findBotComment(locator42);
 
     const userCalls = execGh.mock.calls.filter(
       ([args]) => args[0] === "api" && args[1] === "user",
@@ -390,7 +471,7 @@ describe("GitHubAdapter", () => {
     const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments.json");
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.findBotComment("42");
+    await adapter.findBotComment(locator42);
 
     expect(execGh).toHaveBeenCalledWith([
       "api",
@@ -416,7 +497,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.findBotComment("42")).resolves.toMatchObject({ id: "222", lastReviewedSha: "abc1234" });
+    await expect(adapter.findBotComment(locator42)).resolves.toMatchObject({ id: "222", lastReviewedSha: "abc1234" });
     expect(execGh).toHaveBeenCalledWith([
       "api", "-X", "GET", "--paginate", "--slurp", "-f", "per_page=100",
       "repos/{owner}/{repo}/issues/42/comments",
@@ -442,7 +523,7 @@ describe("GitHubAdapter", () => {
     const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments.json");
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.findBotComment("42");
+    await adapter.findBotComment(locator42);
 
     const paginatedCall = execGh.mock.calls.find(
       ([args]) => args[0] === "api" && args.includes("--paginate"),
@@ -459,7 +540,7 @@ describe("GitHubAdapter", () => {
     const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments-malformed-marker.json");
     const adapter = new GitHubAdapter(execGh);
 
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     // The comment IS the bot's own (correct author) and DOES contain the
     // marker prefix, so it must be returned (never null, which would cause
@@ -495,7 +576,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     // Both comments are authored by the bot and both match the marker
     // pattern; findBotComment iterates the list in order and returns on
@@ -525,7 +606,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     expect(botComment).toEqual({
       id: "777",
@@ -554,11 +635,27 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    const botComment = await adapter.findBotComment("42");
+    const botComment = await adapter.findBotComment(locator42);
 
     // The trailing marker wins — never the earlier decoy.
     expect(botComment?.lastReviewedSha).toBe("abc1234");
     expect(botComment?.reviewedConfig).toBe("1a2b3c4d5e6f");
+  });
+
+  it("preserves malformed non-trailing marker behavior through the shared parser", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
+      return JSON.stringify([{
+        id: 889,
+        body: "prefix <!-- tgd-review-agent:sha=abc1234 --> trailing",
+        user: { login: "tgd-review-agent[bot]" },
+      }]);
+    });
+    await expect(new GitHubAdapter(execGh).findBotComment(locator42)).resolves.toMatchObject({
+      id: "889",
+      lastReviewedSha: "",
+      reviewedConfig: "",
+    });
   });
 
   // --- Test coverage fix (DEBT.md): malformed/non-JSON gh output ---
@@ -584,7 +681,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.findBotComment("42")).rejects.toThrow(SyntaxError);
+    await expect(adapter.findBotComment(locator42)).rejects.toThrow(SyntaxError);
   });
 
   it("test coverage fix (pinning): findBotComment rejects when the `gh api user` call returns malformed/non-JSON output", async () => {
@@ -594,7 +691,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.findBotComment("42")).rejects.toThrow(SyntaxError);
+    await expect(adapter.findBotComment(locator42)).rejects.toThrow(SyntaxError);
   });
 
   // --- Review fix #4 (test gap): realExecGh coverage ---
@@ -691,7 +788,7 @@ describe("GitHubAdapter", () => {
       const adapter = new MockedGitHubAdapter();
       // getPullRequest routes through the default (real) execGh, which in
       // turn shells out via the mocked child_process.execFile.
-      await adapter.getPullRequest("1");
+      await adapter.getPullRequest(locator(1));
 
       expect(execFileMock).toHaveBeenCalledWith(
         "gh",
@@ -730,7 +827,7 @@ describe("GitHubAdapter", () => {
       });
       const adapter = new GitHubAdapter(execGh);
 
-      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+      const files = await adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules");
 
       expect(files).toEqual(
         expect.arrayContaining([
@@ -750,7 +847,7 @@ describe("GitHubAdapter", () => {
       });
       const adapter = new GitHubAdapter(execGh);
 
-      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+      const files = await adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules");
 
       expect(files).toEqual([]);
     });
@@ -759,7 +856,7 @@ describe("GitHubAdapter", () => {
       const execGh = vi.fn().mockResolvedValue("[]");
       const adapter = new GitHubAdapter(execGh);
 
-      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+      const files = await adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules");
 
       expect(files).toEqual([]);
     });
@@ -782,7 +879,7 @@ describe("GitHubAdapter", () => {
       });
       const adapter = new GitHubAdapter(execGh);
 
-      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+      const files = await adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules");
 
       expect(files).toEqual([{ path: "security-review.md", content: "Body" }]);
     });
@@ -791,7 +888,7 @@ describe("GitHubAdapter", () => {
       const execGh = vi.fn().mockResolvedValue("[]");
       const adapter = new GitHubAdapter(execGh);
 
-      await adapter.getRuleFilesFromBase("abc123", ".tgd-review/rules");
+      await adapter.getRuleFilesFromBase(locator42, "abc123", ".tgd-review/rules");
 
       expect(execGh).toHaveBeenCalledWith(["api", "repos/{owner}/{repo}/contents/.tgd-review/rules?ref=abc123"]);
     });
@@ -800,7 +897,7 @@ describe("GitHubAdapter", () => {
       const execGh = vi.fn().mockRejectedValue(new Error("gh: authentication required (HTTP 401)"));
       const adapter = new GitHubAdapter(execGh);
 
-      await expect(adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules")).rejects.toThrow(
+      await expect(adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules")).rejects.toThrow(
         /HTTP 401/,
       );
     });
@@ -809,7 +906,7 @@ describe("GitHubAdapter", () => {
       const execGh = vi.fn().mockResolvedValue("not valid json{{{");
       const adapter = new GitHubAdapter(execGh);
 
-      await expect(adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules")).rejects.toThrow(
+      await expect(adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules")).rejects.toThrow(
         SyntaxError,
       );
     });
@@ -827,7 +924,7 @@ describe("GitHubAdapter", () => {
       });
       const adapter = new GitHubAdapter(execGh);
 
-      await expect(adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules")).rejects.toThrow(
+      await expect(adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules")).rejects.toThrow(
         /ECONNRESET/,
       );
     });
@@ -842,7 +939,7 @@ describe("GitHubAdapter", () => {
       );
       const adapter = new GitHubAdapter(execGh);
 
-      const files = await adapter.getRuleFilesFromBase("deadbeef", ".tgd-review/rules");
+      const files = await adapter.getRuleFilesFromBase(locator42, "deadbeef", ".tgd-review/rules");
 
       expect(files).toEqual([]);
     });
@@ -922,7 +1019,7 @@ describe("resolveStaleReviewThreads", () => {
     ]);
     const adapter = new GitHubAdapter(execGh);
 
-    const count = await adapter.resolveStaleReviewThreads("42");
+    const count = await adapter.resolveStaleReviewThreads(locator42);
 
     expect(count).toBe(1);
     expect(resolvedThreadIds()).toEqual(["T-bot-open"]);
@@ -946,7 +1043,7 @@ describe("resolveStaleReviewThreads", () => {
     ]);
     const adapter = new GitHubAdapter(execGh);
 
-    const count = await adapter.resolveStaleReviewThreads("42");
+    const count = await adapter.resolveStaleReviewThreads(locator42);
 
     expect(count).toBe(1);
     expect(resolvedThreadIds()).toEqual(["T-tool"]);
@@ -959,7 +1056,7 @@ describe("resolveStaleReviewThreads", () => {
     ]);
     const adapter = new GitHubAdapter(execGh);
 
-    const count = await adapter.resolveStaleReviewThreads("42");
+    const count = await adapter.resolveStaleReviewThreads(locator42);
 
     expect(count).toBe(2);
     expect(resolvedThreadIds()).toEqual(["T-page1", "T-page2"]);
@@ -969,7 +1066,7 @@ describe("resolveStaleReviewThreads", () => {
     const { execGh, resolvedThreadIds } = makeResolveExecGh([threadsPage([])]);
     const adapter = new GitHubAdapter(execGh);
 
-    expect(await adapter.resolveStaleReviewThreads("42")).toBe(0);
+    expect(await adapter.resolveStaleReviewThreads(locator42)).toBe(0);
     expect(resolvedThreadIds()).toEqual([]);
   });
 
@@ -980,7 +1077,7 @@ describe("resolveStaleReviewThreads", () => {
     };
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(/gh repo view failed/);
+    await expect(adapter.resolveStaleReviewThreads(locator42)).rejects.toThrow(/gh repo view failed/);
   });
 
   // Gemini review (PR #6): one thread failing to resolve must not abandon the
@@ -1018,7 +1115,7 @@ describe("resolveStaleReviewThreads", () => {
       };
       const adapter = new GitHubAdapter(execGh);
 
-      const count = await adapter.resolveStaleReviewThreads("42");
+      const count = await adapter.resolveStaleReviewThreads(locator42);
 
       expect(count).toBe(1); // what actually resolved, not what was attempted
       expect(resolvedIds).toEqual(["T-ok"]);
@@ -1040,7 +1137,7 @@ describe("resolveStaleReviewThreads", () => {
     };
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(
+    await expect(adapter.resolveStaleReviewThreads(locator42)).rejects.toThrow(
       /missing expected data/,
     );
   });
@@ -1053,7 +1150,7 @@ describe("resolveStaleReviewThreads", () => {
     };
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.resolveStaleReviewThreads("42")).rejects.toThrow(
+    await expect(adapter.resolveStaleReviewThreads(locator42)).rejects.toThrow(
       /invalid response from gh repo view/,
     );
   });
@@ -1070,9 +1167,14 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
     };
     const adapter = new GitHubAdapter(execGh);
 
-    await adapter.createInlineReview("42", "deadbeef", [
-      { path: "a.ts", line: 13, startLine: 11, body: "multi" },
-      { path: "b.ts", line: 5, body: "single" },
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 13, startLine: 11, body: "multi", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 5, body: "single", position: {} as never },
+    ];
+    const outcomes = await adapter.createInlineReview(locator42, "deadbeef", comments);
+    expect(outcomes).toEqual([
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-1", status: "posted" },
     ]);
 
     const payload = JSON.parse(calls[0].stdin as string) as {
@@ -1098,5 +1200,39 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
       side: "RIGHT",
       body: "single",
     });
+  });
+
+  it("returns one safe failed outcome per comment when GitHub rejects the atomic write", async () => {
+    const adapter = new GitHubAdapter(async () => {
+      throw new Error("HTTP 422 secret-token=do-not-publish");
+    });
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 1, body: "a", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 2, body: "b", position: {} as never },
+    ];
+    const outcomes = await adapter.createInlineReview(locator42, "deadbeef", comments);
+    expect(outcomes).toEqual([
+      { clientId: "finding-0", status: "failed", reason: "GitHub rejected the inline review" },
+      { clientId: "finding-1", status: "failed", reason: "GitHub rejected the inline review" },
+    ]);
+    expect(JSON.stringify(outcomes)).not.toContain("secret-token");
+  });
+
+  it("validates complete, unique, known outcome IDs", () => {
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 1, body: "a", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 2, body: "b", position: {} as never },
+    ];
+    expect(() => validateInlinePublishOutcomes(comments, [
+      { clientId: "finding-0", status: "posted" },
+    ])).toThrow(/complete/i);
+    expect(() => validateInlinePublishOutcomes(comments, [
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-0", status: "posted" },
+    ])).toThrow(/duplicate/i);
+    expect(() => validateInlinePublishOutcomes(comments, [
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "unknown", status: "posted" },
+    ])).toThrow(/unknown/i);
   });
 });

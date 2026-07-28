@@ -1,15 +1,17 @@
 import { execFile } from "node:child_process";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
+import { parseBotMarker } from "../review/comment-marker.js";
+import { validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
+  InlinePublishOutcome,
   PullRequestInfo,
-  PullRequestSnapshot,
-  RepositoryRef,
-  RepositoryScopedVcsAdapter,
+  ReviewLocator,
   RuleFileContent,
   VcsAdapter,
 } from "./adapter.js";
+import type { GitHubRepositoryRef } from "../target/types.js";
 
 /**
  * Seam for shelling out to the `gh` CLI. GitHubAdapter accepts an ExecGh
@@ -49,31 +51,6 @@ export const realExecGh: ExecGh = (args, stdin) =>
     }
   });
 
-// Detects the *presence* of our marker prefix, regardless of whether the SHA
-// that follows is well-formed. Used to distinguish "the bot posted a marker
-// comment (possibly with a malformed SHA)" from "this isn't our comment at
-// all" — see findBotComment.
-const BOT_MARKER_PREFIX_RE = /<!-- tgd-review-agent:sha=/;
-
-// Matches the bot's own HTML marker comment, e.g.
-// `<!-- tgd-review-agent:sha=abc1234 -->` or, since config-aware dedup,
-// `<!-- tgd-review-agent:sha=abc1234 cfg=1a2b3c4d5e6f -->`. Capture group 1 is
-// lastReviewedSha; group 2 (optional) is the review-config hash, absent on a
-// legacy marker. A comment can match BOT_MARKER_PREFIX_RE without matching this
-// (malformed SHA) — that's still treated as "the bot's marker comment", just
-// with an empty lastReviewedSha/reviewedConfig (see findBotComment).
-//
-// The `\s*$` anchor is load-bearing (hardening, CodeRabbit review): buildBody
-// (cli.ts) always appends this marker as the LAST thing in the comment body, so
-// the AUTHORITATIVE marker is the trailing one. Without the anchor, `exec`
-// returns the FIRST marker-shaped match anywhere in the body — so a review
-// finding that quoted a marker-shaped string earlier in the comment could be
-// parsed as the reviewed SHA/config, causing an incorrect skip. (Finding text
-// is already sanitized to defang `<!--`/`-->`, so this is defense-in-depth on
-// top of that — but anchoring makes the parse correct by construction rather
-// than resting on the sanitizer.)
-const BOT_MARKER_RE = /<!-- tgd-review-agent:sha=([0-9a-f]{7,40})(?: cfg=([0-9a-z]+))? -->\s*$/;
-
 interface GhPrViewJson {
   headRefOid: string;
   baseRefOid: string;
@@ -88,6 +65,17 @@ interface GhIssueComment {
   id: number | string;
   body: string;
   user: { login: string };
+}
+
+function validatedIssueCommentId(id: string): number {
+  if (!/^[1-9]\d*$/u.test(id)) {
+    throw new Error("Invalid existing GitHub comment id");
+  }
+  const value = Number(id);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error("Invalid existing GitHub comment id");
+  }
+  return value;
 }
 
 interface GhUser {
@@ -165,49 +153,47 @@ function isNotFoundError(err: unknown): boolean {
   return err instanceof Error && /HTTP 404/.test(err.message);
 }
 
-function isRepositoryRef(value: string | RepositoryRef): value is RepositoryRef {
-  return typeof value !== "string";
-}
-
-function resolvePullLocator(
-  repoOrId: string | RepositoryRef,
-  number?: number,
-): { repo?: RepositoryRef; id: string } {
-  if (isRepositoryRef(repoOrId)) {
-    if (!Number.isSafeInteger(number) || (number ?? 0) <= 0) {
-      throw new Error("A positive pull-request number is required with an explicit repository");
-    }
-    return { repo: repoOrId, id: String(number) };
+function resolvePullLocator(locator: ReviewLocator): {
+  repo?: GitHubRepositoryRef;
+  id: string;
+} {
+  if (!Number.isSafeInteger(locator.number) || locator.number <= 0) {
+    throw new Error("Review locator number must be a positive integer");
   }
-  return { id: repoOrId };
+  if (locator.kind === "repository") {
+    if (locator.repo.provider !== "github") {
+      throw new Error("GitHubAdapter cannot use a GitLab repository locator");
+    }
+    return { repo: locator.repo, id: String(locator.number) };
+  }
+  return { id: String(locator.number) };
 }
 
-function repoFlag(repo?: RepositoryRef): string[] {
+function repoFlag(repo?: GitHubRepositoryRef): string[] {
   // `gh pr` documents `--repo [HOST/]OWNER/REPO` as the explicit selector:
   // https://cli.github.com/manual/gh_pr_view
   return repo ? ["--repo", `${repo.host}/${repo.owner}/${repo.repo}`] : [];
 }
 
-function apiRepo(repo?: RepositoryRef): string {
+function apiRepo(repo?: GitHubRepositoryRef): string {
   // `gh api` documents that {owner}/{repo} placeholders use ambient context;
   // canonical-URL runs therefore render the REST path explicitly instead:
   // https://cli.github.com/manual/gh_api
   return repo ? `repos/${repo.owner}/${repo.repo}` : "repos/{owner}/{repo}";
 }
 
-function apiHost(repo?: RepositoryRef): string[] {
+function apiHost(repo?: GitHubRepositoryRef): string[] {
   return repo ? ["--hostname", repo.host] : [];
 }
 
 /**
  * GitHubAdapter: VcsAdapter implementation backed by the `gh` CLI.
  *
- * Canonical-URL calls accept a RepositoryRef and use `--repo host/owner/repo`,
- * explicit REST paths, and explicit GraphQL variables. Legacy one-argument
- * calls retain ambient gh context for backward compatibility until their
- * documented migration path is retired.
+ * Repository locators use `--repo host/owner/repo`, explicit REST paths, and
+ * explicit GraphQL variables. Ambient locators retain `gh`'s repository
+ * inference and reproduce the existing ambient command arguments.
  */
-export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
+export class GitHubAdapter implements VcsAdapter {
   constructor(private readonly execGh: ExecGh = realExecGh) {}
 
   // Caches the resolved bot login (the currently-authenticated `gh` identity)
@@ -224,7 +210,7 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
    * user` resolves that user's login — the identity findBotComment matches
    * against so a spoofed marker from another author can't trick dedup.
    */
-  private getBotLogin(repo?: RepositoryRef): Promise<string> {
+  private getBotLogin(repo?: GitHubRepositoryRef): Promise<string> {
     const cacheKey = repo?.host ?? "";
     let promise = this.botLoginPromises.get(cacheKey);
     if (!promise) {
@@ -244,13 +230,8 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
    * owner/repo `gh` actually resolved from its ambient context — review() logs
    * it so a mis-inferred repo target is visible, not silent.
    */
-  async getPullRequest(id: string): Promise<PullRequestInfo>;
-  async getPullRequest(repo: RepositoryRef, number: number): Promise<PullRequestSnapshot>;
-  async getPullRequest(
-    repoOrId: string | RepositoryRef,
-    number?: number,
-  ): Promise<PullRequestInfo | PullRequestSnapshot> {
-    const { repo, id } = resolvePullLocator(repoOrId, number);
+  async getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo> {
+    const { repo, id } = resolvePullLocator(locator);
     const fields = repo
       ? "headRefOid,baseRefOid,headRefName,baseRefName,title,body,url"
       : "headRefOid,baseRefOid,title,body,url";
@@ -268,11 +249,9 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
         throw new Error("invalid response from gh pr view: missing base/head ref names");
       }
       return {
-        number: Number(id),
+        id,
         headSha: parsed.headRefOid,
         baseSha: parsed.baseRefOid,
-        headRef: parsed.headRefName,
-        baseRef: parsed.baseRefName,
         title: parsed.title,
         description: parsed.body ?? "",
         url: parsed.url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${id}`,
@@ -288,10 +267,8 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
     };
   }
 
-  async getDiff(id: string): Promise<string>;
-  async getDiff(repo: RepositoryRef, number: number): Promise<string>;
-  async getDiff(repoOrId: string | RepositoryRef, number?: number): Promise<string> {
-    const { repo, id } = resolvePullLocator(repoOrId, number);
+  async getDiff(locator: ReviewLocator): Promise<string> {
+    const { repo, id } = resolvePullLocator(locator);
     return this.execGh(["pr", "diff", id, ...repoFlag(repo)]);
   }
 
@@ -340,13 +317,8 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
    * `null` here would cause upsertComment to CREATE a second comment
    * instead of editing the existing (malformed) one.
    */
-  async findBotComment(id: string): Promise<BotComment | null>;
-  async findBotComment(repo: RepositoryRef, number: number): Promise<BotComment | null>;
-  async findBotComment(
-    repoOrId: string | RepositoryRef,
-    number?: number,
-  ): Promise<BotComment | null> {
-    const { repo, id } = resolvePullLocator(repoOrId, number);
+  async findBotComment(locator: ReviewLocator): Promise<BotComment | null> {
+    const { repo, id } = resolvePullLocator(locator);
     const botLogin = await this.getBotLogin(repo);
     const out = await this.execGh([
       "api",
@@ -363,56 +335,65 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
     const comments = Array.isArray(parsed[0]) ? (parsed as GhIssueComment[][]).flat() : parsed as GhIssueComment[];
     for (const comment of comments) {
       if (comment.user?.login !== botLogin) continue;
-      if (!BOT_MARKER_PREFIX_RE.test(comment.body)) continue;
-      const match = BOT_MARKER_RE.exec(comment.body);
+      const marker = parseBotMarker(comment.body);
+      if (marker === null) continue;
       return {
         id: String(comment.id),
         body: comment.body,
-        lastReviewedSha: match?.[1] ?? "",
-        reviewedConfig: match?.[2] ?? "",
+        ...marker,
       };
     }
     return null;
   }
 
   /**
-   * AC-2.4: when `existing` is null, creates a new comment via
-   * `gh pr comment <id> --body-file -` (body piped via stdin) — never edits.
+   * AC-2.4: when `existing` is null, creates a new comment via the issue
+   * comments API with JSON piped through stdin. Unlike `gh pr comment`, this
+   * returns the authoritative created comment ID needed for a later exact edit.
    *
    * AC-2.5: when `existing` is a BotComment, edits that EXACT comment by id
    * via `gh api repos/{owner}/{repo}/issues/comments/{existing.id} -X PATCH
    * --input -` (JSON body piped via stdin) — never creates a second comment,
    * and never relies on `--edit-last` (which could target a human's comment
-   * posted after the bot's).
+   * posted after the bot's). Both paths validate and return the provider's
+   * response identity and body.
    */
-  async upsertComment(id: string, body: string, existing: BotComment | null): Promise<void>;
   async upsertComment(
-    repo: RepositoryRef,
-    number: number,
+    locator: ReviewLocator,
     body: string,
     existing: BotComment | null,
-  ): Promise<void>;
-  async upsertComment(
-    repoOrId: string | RepositoryRef,
-    numberOrBody: number | string,
-    bodyOrExisting: string | BotComment | null,
-    maybeExisting?: BotComment | null,
-  ): Promise<void> {
-    const explicit = isRepositoryRef(repoOrId);
-    const { repo, id } = resolvePullLocator(
-      repoOrId,
-      explicit ? (numberOrBody as number) : undefined,
+  ): Promise<BotComment> {
+    const { repo, id } = resolvePullLocator(locator);
+    const expectedId = existing === null ? undefined : validatedIssueCommentId(existing.id);
+    const out = await this.execGh(
+      existing === null
+        ? ["api", `${apiRepo(repo)}/issues/${id}/comments`, ...apiHost(repo), "-X", "POST", "--input", "-"]
+        : ["api", `${apiRepo(repo)}/issues/comments/${expectedId}`, ...apiHost(repo), "-X", "PATCH", "--input", "-"],
+      JSON.stringify({ body }),
     );
-    const body = explicit ? (bodyOrExisting as string) : (numberOrBody as string);
-    const existing = explicit ? (maybeExisting ?? null) : (bodyOrExisting as BotComment | null);
-    if (existing === null) {
-      await this.execGh(["pr", "comment", id, ...repoFlag(repo), "--body-file", "-"], body);
-    } else {
-      await this.execGh(
-        ["api", `${apiRepo(repo)}/issues/comments/${existing.id}`, ...apiHost(repo), "-X", "PATCH", "--input", "-"],
-        JSON.stringify({ body }),
-      );
+    let value: unknown;
+    try {
+      value = JSON.parse(out);
+    } catch (cause) {
+      throw new Error("Invalid GitHub comment write response: malformed JSON", { cause });
     }
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !Number.isSafeInteger((value as { id?: unknown }).id) ||
+      ((value as { id: number }).id <= 0) ||
+      typeof (value as { body?: unknown }).body !== "string" ||
+      (value as { body: string }).body !== body ||
+      (expectedId !== undefined && (value as { id: number }).id !== expectedId)
+    ) {
+      throw new Error("Invalid GitHub comment write response: malformed or mismatched id/body");
+    }
+    const writtenBody = (value as { body: string }).body;
+    return {
+      id: String((value as { id: number }).id),
+      body: writtenBody,
+      ...(parseBotMarker(writtenBody) ?? { lastReviewedSha: "", reviewedConfig: "" }),
+    };
   }
 
   /**
@@ -434,32 +415,13 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
    * markdown, and there is no shell involved (execFile with an array).
    */
   async createInlineReview(
-    id: string,
+    locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
-  ): Promise<void>;
-  async createInlineReview(
-    repo: RepositoryRef,
-    number: number,
-    headSha: string,
-    comments: InlineReviewComment[],
-  ): Promise<void>;
-  async createInlineReview(
-    repoOrId: string | RepositoryRef,
-    numberOrHeadSha: number | string,
-    headShaOrComments: string | InlineReviewComment[],
-    maybeComments?: InlineReviewComment[],
-  ): Promise<void> {
-    const explicit = isRepositoryRef(repoOrId);
-    const { repo, id } = resolvePullLocator(
-      repoOrId,
-      explicit ? (numberOrHeadSha as number) : undefined,
-    );
-    const headSha = explicit ? (headShaOrComments as string) : (numberOrHeadSha as string);
-    const comments = explicit
-      ? (maybeComments ?? [])
-      : (headShaOrComments as InlineReviewComment[]);
-    if (comments.length === 0) return;
+  ): Promise<InlinePublishOutcome[]> {
+    validateInlinePublishInputs(comments);
+    const { repo, id } = resolvePullLocator(locator);
+    if (comments.length === 0) return [];
 
     const payload = {
       commit_id: headSha,
@@ -477,10 +439,19 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
       })),
     };
 
-    await this.execGh(
-      ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"],
-      JSON.stringify(payload),
-    );
+    try {
+      await this.execGh(
+        ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"],
+        JSON.stringify(payload),
+      );
+      return comments.map(({ clientId }) => ({ clientId, status: "posted" }));
+    } catch {
+      return comments.map(({ clientId }) => ({
+        clientId,
+        status: "failed",
+        reason: "GitHub rejected the inline review",
+      }));
+    }
   }
 
   // Caches the resolved "owner/name" (same promise-caching pattern as
@@ -529,13 +500,8 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
    * discipline findBotComment uses. Mutations run sequentially — resolving is
    * cosmetic cleanup, so gentle pacing beats hammering the API concurrently.
    */
-  async resolveStaleReviewThreads(id: string): Promise<number>;
-  async resolveStaleReviewThreads(repo: RepositoryRef, number: number): Promise<number>;
-  async resolveStaleReviewThreads(
-    repoOrId: string | RepositoryRef,
-    number?: number,
-  ): Promise<number> {
-    const { repo, id } = resolvePullLocator(repoOrId, number);
+  async resolveStaleReviewThreads(locator: ReviewLocator): Promise<number> {
+    const { repo, id } = resolvePullLocator(locator);
     const [botLogin, { owner, name }] = await Promise.all([
       this.getBotLogin(repo),
       repo
@@ -640,21 +606,12 @@ export class GitHubAdapter implements VcsAdapter, RepositoryScopedVcsAdapter {
    * one extra `gh api` round trip per nested directory; neither is
    * necessary for v1's flat `.tgd-review/rules/*.md` layout.
    */
-  async getRuleFilesFromBase(baseSha: string, rulesDir: string): Promise<RuleFileContent[]>;
   async getRuleFilesFromBase(
-    repo: RepositoryRef,
+    locator: ReviewLocator,
     baseSha: string,
     rulesDir: string,
-  ): Promise<RuleFileContent[]>;
-  async getRuleFilesFromBase(
-    repoOrBaseSha: RepositoryRef | string,
-    baseShaOrRulesDir: string,
-    maybeRulesDir?: string,
   ): Promise<RuleFileContent[]> {
-    const explicit = isRepositoryRef(repoOrBaseSha);
-    const repo = explicit ? repoOrBaseSha : undefined;
-    const baseSha = explicit ? baseShaOrRulesDir : repoOrBaseSha;
-    const rulesDir = explicit ? (maybeRulesDir as string) : baseShaOrRulesDir;
+    const { repo } = resolvePullLocator(locator);
     let entries: GhContentsEntry[];
     try {
       const out = await this.execGh([

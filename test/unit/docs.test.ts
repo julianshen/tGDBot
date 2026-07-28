@@ -57,3 +57,62 @@ describe("direct workflow scheduling documentation", () => {
     expect(readme).toMatch(/`legacy` engine does not consume this plan yet/i);
   });
 });
+
+describe("GitLab review documentation", () => {
+  const gitLabHeading = /^### GitLab targets and authentication.*$/m;
+  const gitLabStart = readme.match(gitLabHeading);
+  const gitLabSection = (() => {
+    if (gitLabStart === null) return "";
+    const start = readme.indexOf(gitLabStart[0]);
+    const rest = readme.slice(start + gitLabStart[0].length);
+    const nextHeading = rest.match(/^#{1,3} .*$/m);
+    return nextHeading === null ? rest : rest.slice(0, nextHeading.index);
+  })();
+
+  it("documents GitLab CLI installation, authentication, and API transport", () => {
+    expect(gitLabStart).not.toBeNull();
+    expect(gitLabSection).toMatch(/install.*`glab`/i);
+    expect(gitLabSection).toContain("glab auth login --hostname");
+    expect(gitLabSection).toContain("glab api");
+  });
+
+  it("documents GitLab.com, self-managed, custom-port, and full-URL targets", () => {
+    expect(gitLabSection).toContain("--repo gitlab.com/group/project");
+    expect(gitLabSection).toContain("--pr 42");
+    expect(gitLabSection).toContain(
+      "--repo gitlab.example.com:8443/group/subgroup/project",
+    );
+    expect(gitLabSection).toContain(
+      "--pr https://gitlab.example.com/group/project/-/merge_requests/42",
+    );
+  });
+
+  it("documents a supported non-interactive custom API-port login", () => {
+    expect(gitLabSection).toMatch(
+      /glab auth login --hostname gitlab\.example\.com\s+\\\n\s+--api-host gitlab\.example\.com:8443\s+\\\n\s+--api-protocol https\s+\\\n\s+--git-protocol ssh\s+\\\n\s+--stdin < [^\s]+/,
+    );
+    expect(gitLabSection).toMatch(/token.*standard input/is);
+    expect(gitLabSection).toMatch(/not.*(?:argv|shell history)/i);
+  });
+
+  it("documents GitLab permissions, trusted rules, fallback, and dry-run behavior", () => {
+    expect(gitLabSection).toMatch(/project role/i);
+    expect(gitLabSection).toMatch(/token scopes?/i);
+    expect(gitLabSection).toMatch(/`api`.*`write_repository`/is);
+    expect(gitLabSection).toMatch(/`api` scope.*broad/is);
+    expect(gitLabSection).toMatch(/dedicated.*project account/i);
+    expect(gitLabSection).toMatch(/notes.*discussions/is);
+    expect(gitLabSection).toMatch(/repository files/i);
+    expect(gitLabSection).toMatch(/base branch.*trusted rules/is);
+    expect(gitLabSection).toMatch(
+      /inline.*partial.*fall(?:s|ing)?\s+back.*summary/is,
+    );
+    expect(gitLabSection).toContain("--dry-run");
+  });
+
+  it("documents opt-in GitLab smoke testing while preserving GitHub defaults", () => {
+    expect(gitLabSection).toMatch(/GitHub remains the default/i);
+    expect(readme).toMatch(/opt-in GitLab smoke test/i);
+    expect(readme).toMatch(/not part of the default test suite/i);
+  });
+});

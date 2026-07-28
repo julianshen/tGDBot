@@ -1,5 +1,5 @@
 // orchestrate: a deterministic dedupe/grouping safety net over a
-// DispatchResult, plus rendering the final PR comment Markdown. See
+// DispatchResult, plus rendering the final review comment Markdown. See
 // SPEC.md's "Boundaries" ("Never fail silently") and TASKS.md Task 7.
 //
 // This is a PURE, SYNCHRONOUS function — no LLM calls, no I/O. Any advisor
@@ -8,7 +8,14 @@
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
 import type { RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
-import { changedFiles, commentableLines, isCommentable, rangeIsCommentable } from "./diff-anchors.js";
+import {
+  changedFiles,
+  commentableLines,
+  diffPositionRange,
+  isCommentable,
+  parseDiffPositions,
+  rangeIsCommentable,
+} from "./diff-anchors.js";
 import type { DispatchResult, Finding } from "./types.js";
 
 export type { InlineComment } from "./comment-format.js";
@@ -27,6 +34,8 @@ export interface OrchestrationResult {
   findingsCount: number;
   rulesRun: string[];
   rulesFailed: string[];
+  findingByClientId: ReadonlyMap<string, Finding>;
+  readonly summaryInput: import("./comment-format.js").SummaryInput;
 }
 
 
@@ -48,8 +57,8 @@ function normalizeMessage(message: string): string {
 // encoding: it's provably collision-free (embedded characters are escaped
 // by JSON, unlike a literal separator character which could in principle
 // appear in a file path or message) and, unlike a NUL-byte-delimited
-// string, keeps this file plain text -- a NUL byte anywhere in the file
-// makes `git diff`/GitHub's PR view treat the whole file as binary.
+// string, keeps this file plain text -- a NUL byte anywhere in the file can
+// make diff tooling and review UIs treat the whole file as binary.
 function dedupeKey(finding: Finding): string {
   return JSON.stringify([finding.file, finding.line ?? null, normalizeMessage(finding.message)]);
 }
@@ -83,10 +92,10 @@ function dedupeFindings(findings: Finding[]): Finding[] {
  * Turns a DispatchResult into the two things a review writes: inline comments
  * anchored to the diff, and a summary comment for everything else.
  *
- * `diff` is what makes anchoring possible AND safe: GitHub 422s the entire
- * review if any comment targets a line outside the diff, so a finding is only
+ * `diff` is what makes anchoring possible and safe: providers accept inline
+ * comments only at valid diff positions, so a finding is only
  * anchored when the diff itself proves the line is addressable (see
- * diff-anchors). Anything else — no line number, a file not touched by this PR,
+ * diff-anchors). Anything else — no line number, a file not touched by this change,
  * a line outside every hunk — is rendered into the summary instead of being
  * silently dropped.
  *
@@ -103,12 +112,13 @@ function dedupeFindings(findings: Finding[]): Finding[] {
  * boundary. So the residual risk is real, and the right response is to cap the BLAST
  * RADIUS rather than pretend it is mitigated.
  *
- * These paths are where a single mistaken click stops being "bad code in a PR" and
- * becomes "arbitrary execution with repository secrets": CI workflow definitions run
- * on merge (and often on PR) with tokens in scope; package manifests and lockfiles
- * execute install scripts; container/build files execute at build time. A one-click
- * commit into any of them is a different category of harm from a one-click commit
- * into application code, which a human reviews and CI then tests.
+ * These paths are where a single mistaken click stops being "bad code in a
+ * change" and becomes "arbitrary execution with repository secrets": CI
+ * workflow definitions run on merge (and often while reviewing a change) with
+ * tokens in scope; package manifests and lockfiles execute install scripts;
+ * container/build files execute at build time. A one-click commit into any of
+ * them is a different category of harm from a one-click commit into application
+ * code, which a human reviews and CI then tests.
  *
  * Findings on these files are still reported in full — only the COMMIT BUTTON is
  * withheld. The fix is shown as a plain, non-committable block.
@@ -143,10 +153,13 @@ export function orchestrate(
   );
   const inlineEnabled = options.inline !== false && diff !== "";
 
-  const anchors = inlineEnabled ? commentableLines(diff) : new Map<string, Set<number>>();
+  const positions = inlineEnabled ? parseDiffPositions(diff) : undefined;
+  const anchors = positions ? commentableLines(positions) : new Map<string, Set<number>>();
 
   const inlineComments: InlineComment[] = [];
   const unanchored: Finding[] = [];
+  const findingByClientId = new Map<string, Finding>();
+  let nextClientId = 0;
   for (const finding of dedupedFindings) {
     if (!inlineEnabled || !isCommentable(anchors, finding.file, finding.line)) {
       unanchored.push(finding);
@@ -163,11 +176,11 @@ export function orchestrate(
     // Endpoint-only checking (the first draft, caught in review) is unsound:
     // `commentableLines` merges all of a file's hunks into one set, so a range
     // whose ends sit in DIFFERENT hunks passes while the lines between it are not
-    // in the diff at all. GitHub requires a multi-line comment's range to lie
-    // within a single hunk and 422s the ENTIRE review otherwise — killing every
-    // inline comment on the run. Because context lines are included in the anchor
-    // set, "every line in start..end is commentable" is exactly equivalent to
-    // "the range is inside one hunk", so this check is both sufficient and simple.
+    // in the diff at all. A multi-line comment's range must lie within a single
+    // hunk for provider-neutral position construction. Because context lines are
+    // included in the anchor set, "every line in start..end is commentable" is
+    // exactly equivalent to "the range is inside one hunk", so this check is both
+    // sufficient and simple.
     const wantsRange = Number.isInteger(endLine) && (endLine as number) > start;
     const rangeOk =
       wantsRange &&
@@ -208,17 +221,32 @@ export function orchestrate(
     // Only anchor across a range when a COMMITTABLE suggestion will actually use it —
     // otherwise it is a range that exists to serve nothing.
     const multiLine = committable && rangeOk;
+    const position = diffPositionRange(
+      positions!,
+      finding.file,
+      start,
+      multiLine ? (endLine as number) : start,
+    );
+    if (!position) {
+      unanchored.push(finding);
+      continue;
+    }
+    const clientId = `finding-${nextClientId}`;
+    nextClientId += 1;
+    findingByClientId.set(clientId, finding);
 
     inlineComments.push({
+      clientId,
       path: finding.file,
-      // GitHub anchors a multi-line comment with `line` = LAST and start_line = FIRST.
+      // Provider-neutral ranges use `line` = LAST and `startLine` = FIRST.
       line: multiLine ? (endLine as number) : start,
       ...(multiLine ? { startLine: start } : {}),
+      position,
       body: rendered,
     });
   }
 
-  const commentBody = renderSummaryComment({
+  const summaryInput = {
     allFindings: dedupedFindings,
     inlineCount: inlineComments.length,
     unanchored,
@@ -227,7 +255,8 @@ export function orchestrate(
     rulesFailed: dispatchResult.rulesFailed,
     ruleFailureReasons: dispatchResult.ruleFailureReasons,
     inlineUnavailable: !inlineEnabled && dedupedFindings.length > 0,
-  });
+  };
+  const commentBody = renderSummaryComment(summaryInput);
 
   return {
     commentBody,
@@ -235,5 +264,26 @@ export function orchestrate(
     findingsCount: dedupedFindings.length,
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
+    findingByClientId,
+    summaryInput,
   };
+}
+
+export function renderSummary(
+  presentation: OrchestrationResult,
+  failedIds: ReadonlySet<string>,
+): string {
+  const failed = [...failedIds].map((id) => {
+    const finding = presentation.findingByClientId.get(id);
+    if (!finding) throw new Error(`unknown inline finding clientId: ${id}`);
+    return finding;
+  });
+  return renderSummaryComment({
+    ...presentation.summaryInput,
+    inlineCount: presentation.inlineComments.length - failed.length,
+    unanchored: [...presentation.summaryInput.unanchored, ...failed].sort(
+      (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
+    ),
+    inlineUnavailable: presentation.summaryInput.inlineUnavailable,
+  });
 }

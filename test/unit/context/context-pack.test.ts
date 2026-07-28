@@ -10,6 +10,7 @@ import {
   MIN_CONTEXT_MAX_CHARS,
 } from "../../../src/context/context-pack.js";
 import type { ContextCacheKey, ContextManifest, ContextManifestInput } from "../../../src/context/types.js";
+import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 
 const createdAt = "2026-07-21T00:00:00.000Z";
 const key: ContextCacheKey = {
@@ -23,6 +24,14 @@ const key: ContextCacheKey = {
   policyVersion: "2026-07-21",
 };
 const roots: string[] = [];
+const gitlabRepo: GitLabRepositoryRef = {
+  provider: "gitlab",
+  host: "gitlab.example.com",
+  port: 8443,
+  namespace: ["group", "sub"],
+  repo: "project",
+  canonicalUrl: "https://gitlab.example.com:8443/group/sub/project",
+};
 
 function graphProject(description: string): Record<string, unknown> {
   return {
@@ -131,6 +140,7 @@ function manifestInput(
 }
 
 interface EntryOptions {
+  key?: ContextCacheKey;
   knowledge?: Record<string, unknown>;
   domain?: Record<string, unknown>;
   zeroDomains?: boolean;
@@ -174,9 +184,9 @@ async function createEntry(options: EntryOptions = {}): Promise<{ contextRoot: s
   const cache = new ContextCache(root);
   const manifest = await cache.promoteContext(
     staging,
-    manifestInput(options.zeroDomains, options.documents),
+    { ...manifestInput(options.zeroDomains, options.documents), key: options.key ?? key },
   );
-  return { contextRoot: cache.entryPath(key), manifest };
+  return { contextRoot: cache.entryPath(options.key ?? key), manifest };
 }
 
 afterEach(async () => {
@@ -184,6 +194,30 @@ afterEach(async () => {
 });
 
 describe("buildContextPack", () => {
+  it("renders the normalized GitLab repository identity", async () => {
+    const gitlabKey = {
+      provider: gitlabRepo.provider,
+      host: gitlabRepo.host,
+      port: gitlabRepo.port,
+      namespace: gitlabRepo.namespace,
+      repo: gitlabRepo.repo,
+      baseSha: key.baseSha,
+      schemaVersion: key.schemaVersion,
+      tgdVersion: key.tgdVersion,
+      policyVersion: key.policyVersion,
+    } as ContextCacheKey;
+    const { contextRoot, manifest } = await createEntry({ key: gitlabKey });
+
+    const result = await buildContextPack({
+      contextRoot,
+      manifest,
+      ruleName: "tgd-review",
+      changedFiles: ["src/index.ts"],
+    });
+
+    expect(result.text).toContain("Repository: gitlab.example.com:8443/group/sub/project");
+  });
+
   it("AC-1.1: emits an immutable trusted-base provenance header", async () => {
     const { contextRoot, manifest } = await createEntry();
 

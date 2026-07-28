@@ -1,4 +1,6 @@
-export interface ContextCacheKey {
+import type { RepositoryRef } from "../target/types.js";
+
+export interface GitHubContextCacheKey {
   provider: "github";
   host: string;
   owner: string;
@@ -7,6 +9,63 @@ export interface ContextCacheKey {
   schemaVersion: number;
   tgdVersion: string;
   policyVersion: string;
+}
+
+export interface GitLabContextCacheKey {
+  provider: "gitlab";
+  host: string;
+  port?: number;
+  namespace: readonly string[];
+  repo: string;
+  baseSha: string;
+  schemaVersion: number;
+  tgdVersion: string;
+  policyVersion: string;
+}
+
+export type ContextCacheKey = GitHubContextCacheKey | GitLabContextCacheKey;
+
+export type ContextCacheVersionIdentity = Pick<
+  ContextCacheKey,
+  "baseSha" | "schemaVersion" | "tgdVersion" | "policyVersion"
+>;
+
+type RepositoryLabelIdentity =
+  | Pick<Extract<RepositoryRef | ContextCacheKey, { provider: "github" }>, "provider" | "host" | "owner" | "repo">
+  | Pick<
+      Extract<RepositoryRef | ContextCacheKey, { provider: "gitlab" }>,
+      "provider" | "host" | "port" | "namespace" | "repo"
+    >;
+
+export function repositoryLabel(repository: RepositoryLabelIdentity): string {
+  if (repository.provider === "github") {
+    return `${repository.host}/${repository.owner}/${repository.repo}`;
+  }
+  const authority = repository.port === undefined ? repository.host : `${repository.host}:${repository.port}`;
+  return `${authority}/${[...repository.namespace, repository.repo].join("/")}`;
+}
+
+export function contextCacheKeyForRepository(
+  repository: RepositoryRef,
+  identity: ContextCacheVersionIdentity,
+): ContextCacheKey {
+  if (repository.provider === "github") {
+    return {
+      provider: repository.provider,
+      host: repository.host,
+      owner: repository.owner,
+      repo: repository.repo,
+      ...identity,
+    };
+  }
+  return {
+    provider: repository.provider,
+    host: repository.host,
+    ...(repository.port === undefined ? {} : { port: repository.port }),
+    namespace: repository.namespace,
+    repo: repository.repo,
+    ...identity,
+  };
 }
 
 export type ArtifactKind =

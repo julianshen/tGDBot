@@ -6,8 +6,24 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { selectBusinessReference } from "../../../src/context/business-reference.js";
 import { withRepositoryLock } from "../../../src/workspace/lock.js";
+import type { GitHubRepositoryRef, GitLabRepositoryRef } from "../../../src/target/types.js";
 
 const roots: string[] = [];
+const githubRepo: GitHubRepositoryRef = {
+  provider: "github",
+  host: "github.com",
+  owner: "octo-org",
+  repo: "octo-repo",
+  canonicalUrl: "https://github.com/octo-org/octo-repo",
+};
+const gitlabRepo: GitLabRepositoryRef = {
+  provider: "gitlab",
+  host: "gitlab.example.com",
+  port: 8443,
+  namespace: ["group", "sub"],
+  repo: "project",
+  canonicalUrl: "https://gitlab.example.com:8443/group/sub/project",
+};
 
 async function tempRoot(prefix: string): Promise<string> {
   const root = await mkdtemp(path.join(os.tmpdir(), prefix));
@@ -74,11 +90,13 @@ describe("selectBusinessReference", () => {
     const listTrackedFiles = vi.fn(async () => ["README.md"]);
 
     const first = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: ["notes/product.md"],
       generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
     }, { listTrackedFiles });
     const second = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: ["notes/product.md"],
       generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
@@ -101,6 +119,7 @@ describe("selectBusinessReference", () => {
     await write(sourceRoot, "notes/product.md", "Authoritative product behavior.\n");
 
     const result = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [
         "notes/product.md",
@@ -121,11 +140,13 @@ describe("selectBusinessReference", () => {
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
 
     const first = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [path.join(sourceRoot, "a.md"), "z.md"],
       generatedPath,
     });
     const second = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: ["a.md", path.join(sourceRoot, "z.md")],
       generatedPath,
@@ -143,6 +164,7 @@ describe("selectBusinessReference", () => {
     await write(sourceRoot, "notes/domain.md", adequateDoc());
 
     const result = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [],
       generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
@@ -168,6 +190,7 @@ describe("selectBusinessReference", () => {
     await writeFile(outsidePath, "sensitive outside content\n", "utf8");
 
     await expect(selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [outsidePath],
       generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
@@ -182,6 +205,7 @@ describe("selectBusinessReference", () => {
     await symlink(path.join(outsideRoot, "business.md"), path.join(sourceRoot, "business.md"));
 
     await expect(selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: ["business.md"],
       generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
@@ -196,6 +220,7 @@ describe("selectBusinessReference", () => {
       await write(sourceRoot, relativePath, "credential-bearing repository metadata\n");
 
       await expect(selectBusinessReference({
+      repository: githubRepo,
         sourceRoot,
         explicitPaths: [relativePath],
         generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
@@ -212,6 +237,7 @@ describe("selectBusinessReference", () => {
     const originalReadme = await readFile(path.join(sourceRoot, "README.md"), "utf8");
 
     const result = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [],
       generatedPath,
@@ -225,7 +251,7 @@ describe("selectBusinessReference", () => {
     expect(result.digest).toBe(sha256(generated));
     expect(generated).toContain("generated: true");
     expect(generated).toContain("provider: github");
-    expect(generated).toContain("repository: octo-repo");
+    expect(generated).toContain(`repository: ${githubRepo.canonicalUrl}`);
     expect(generated).toContain("base_sha: def4567890def4567890def4567890def4567890");
     expect(generated).toMatch(/source_sha256: [a-f0-9]{64}/);
     expect(generated).toContain("generated_at: 2026-07-20T00:00:00.000Z");
@@ -236,12 +262,33 @@ describe("selectBusinessReference", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
   });
 
+  it("generates GitLab provider and canonical repository frontmatter", async () => {
+    const sourceRoot = await tempRoot("business-reference-source-");
+    const cacheRoot = await tempRoot("business-reference-cache-");
+    const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
+    await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
+
+    await selectBusinessReference({
+      repository: gitlabRepo,
+      sourceRoot,
+      explicitPaths: [],
+      generatedPath,
+    }, {
+      listTrackedFiles: async () => [],
+      now: () => new Date("2026-07-20T00:00:00.000Z"),
+    });
+
+    const generated = await readFile(generatedPath, "utf8");
+    expect(generated).toContain("provider: gitlab");
+    expect(generated).toContain(`repository: ${gitlabRepo.canonicalUrl}`);
+  });
+
   it("AC-7.2: reuses generated context when graph provenance and abbreviated base SHA match", async () => {
     const sourceRoot = await tempRoot("business-reference-source-");
     const cacheRoot = await tempRoot("business-reference-cache-");
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
     await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
-    const input = { sourceRoot, explicitPaths: [], generatedPath };
+    const input = { repository: githubRepo, sourceRoot, explicitPaths: [], generatedPath };
 
     await selectBusinessReference(input, {
       listTrackedFiles: async () => [],
@@ -268,7 +315,7 @@ describe("selectBusinessReference", () => {
     const cacheRoot = await tempRoot("business-reference-cache-");
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
     await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
-    const input = { sourceRoot, explicitPaths: [], generatedPath };
+    const input = { repository: githubRepo, sourceRoot, explicitPaths: [], generatedPath };
     await selectBusinessReference(input, {
       listTrackedFiles: async () => [],
       now: () => new Date("2026-07-20T00:00:00.000Z"),
@@ -295,7 +342,7 @@ describe("selectBusinessReference", () => {
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
     const graphPath = ".understand-anything/domain-graph.json";
     await write(cacheRoot, graphPath, JSON.stringify(domainGraph()));
-    const input = { sourceRoot, explicitPaths: [], generatedPath };
+    const input = { repository: githubRepo, sourceRoot, explicitPaths: [], generatedPath };
     const first = await selectBusinessReference(input, {
       listTrackedFiles: async () => [],
       now: () => new Date("2026-07-20T00:00:00.000Z"),
@@ -322,7 +369,7 @@ describe("selectBusinessReference", () => {
     const cacheRoot = await tempRoot("business-reference-cache-");
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
     await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
-    const input = { sourceRoot, explicitPaths: [], generatedPath };
+    const input = { repository: githubRepo, sourceRoot, explicitPaths: [], generatedPath };
     await selectBusinessReference(input, {
       listTrackedFiles: async () => [],
       now: () => new Date("2026-07-20T00:00:00.000Z"),
@@ -348,6 +395,7 @@ describe("selectBusinessReference", () => {
     await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
 
     const results = await Promise.all(Array.from({ length: 12 }, (_, index) => selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [],
       generatedPath,
@@ -366,7 +414,7 @@ describe("selectBusinessReference", () => {
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
     const lockPath = path.join(cacheRoot, ".BUSINESS-CONTEXT.lock");
     await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
-    const input = { sourceRoot, explicitPaths: [], generatedPath };
+    const input = { repository: githubRepo, sourceRoot, explicitPaths: [], generatedPath };
     await selectBusinessReference(input, {
       listTrackedFiles: async () => [],
       now: () => new Date("2026-07-20T00:00:00.000Z"),
@@ -403,6 +451,7 @@ describe("selectBusinessReference", () => {
     await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
 
     await expect(selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [],
       generatedPath: path.join(cacheRoot, "BUSINESS-CONTEXT.md"),
@@ -428,7 +477,7 @@ describe("selectBusinessReference", () => {
     await write(cacheRoot, ".understand-anything/domain-graph.json", JSON.stringify(graph));
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
 
-    await selectBusinessReference({ sourceRoot, explicitPaths: [], generatedPath }, {
+    await selectBusinessReference({ repository: githubRepo, sourceRoot, explicitPaths: [], generatedPath }, {
       listTrackedFiles: async () => [],
       now: () => new Date("2026-07-20T00:00:00.000Z"),
     });
@@ -444,6 +493,7 @@ describe("selectBusinessReference", () => {
     const generatedPath = path.join(cacheRoot, "BUSINESS-CONTEXT.md");
 
     const result = await selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [],
       generatedPath,
@@ -458,6 +508,7 @@ describe("selectBusinessReference", () => {
     await write(sourceRoot, ".understand-anything/domain-graph.json", JSON.stringify(domainGraph()));
 
     await expect(selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [],
       generatedPath: path.join(sourceRoot, "BUSINESS-CONTEXT.md"),
@@ -472,6 +523,7 @@ describe("selectBusinessReference", () => {
     const missingRoot = path.join(cacheRoot, "missing");
 
     await expect(selectBusinessReference({
+      repository: githubRepo,
       sourceRoot,
       explicitPaths: [],
       generatedPath: path.join(missingRoot, "BUSINESS-CONTEXT.md"),

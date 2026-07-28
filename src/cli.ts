@@ -6,14 +6,21 @@ import { parseArgs as nodeParseArgs } from "node:util";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
+import {
+  formatPendingMarker,
+  replacePendingMarker,
+} from "./review/comment-marker.js";
+import type { TerminalReviewResult } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
-import { orchestrate as orchestrateReal } from "./review/orchestrate.js";
+import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
+import { validateInlinePublishOutcomes } from "./vcs/adapter.js";
+import { parseReviewTarget } from "./target/review-target.js";
 
 /**
  * Parsed configuration for the `review` command, per SPEC.md's API Contract.
@@ -21,6 +28,9 @@ import type { PullRequestInfo } from "./vcs/adapter.js";
 export interface CliArgs {
   pr: string;
   vcs: "github" | "gitlab";
+  /** Internal parse provenance used to distinguish the default from an explicit --vcs. */
+  vcsExplicit?: boolean;
+  repo?: string;
   /**
    * "<provider>/<model>" — the DEFAULT model (design-review #6). Runs the
    * ORCHESTRATING session and every rule that doesn't pin its own
@@ -87,7 +97,7 @@ const DEFAULTS = {
  *
  * `--rules-dir <path>` (default `.review/rules`): a REPO-RELATIVE path,
  * NOT a local filesystem path by default. `review()` passes it to
- * `vcsAdapter.getRuleFilesFromBase(pr.baseSha, rulesDir)`, which fetches
+ * `vcsAdapter.getRuleFilesFromBase(locator, pr.baseSha, rulesDir)`, which fetches
  * `<rulesDir>/*.md` as it exists on the PR's BASE branch via the VCS
  * provider's API (`gh api` for GitHub) — never from whatever happens to be
  * checked out locally. This is what closes the rule-file trust-boundary gap
@@ -115,6 +125,7 @@ export function parseArgs(argv: string[]): CliArgs {
     allowPositionals: true,
     options: {
       pr: { type: "string" },
+      repo: { type: "string" },
       vcs: { type: "string" },
       "rules-dir": { type: "string" },
       "disable-builtin-rule": { type: "boolean" },
@@ -142,9 +153,13 @@ export function parseArgs(argv: string[]): CliArgs {
   // any future path/query-string interpolation from accepting non-numeric
   // input.
   if (!/^\d+$/.test(values.pr as string)) {
-    throw new Error(
-      `Invalid --pr value: "${values.pr as string}" (expected a positive integer, e.g. --pr 42)`,
-    );
+    try {
+      parseReviewTarget(values.pr as string);
+    } catch {
+      throw new Error(
+        `Invalid --pr value: "${values.pr as string}" (expected a positive integer or complete GitHub/GitLab review URL)`,
+      );
+    }
   }
 
   const vcs = (values.vcs as string | undefined) ?? DEFAULTS.vcs;
@@ -197,8 +212,9 @@ export function parseArgs(argv: string[]): CliArgs {
     maxDiffChars = Number(maxDiffCharsRaw);
   }
 
-  return {
+  const result: CliArgs = {
     pr: values.pr as string,
+    repo: values.repo as string | undefined,
     vcs,
     model,
     maxDiffChars,
@@ -210,6 +226,11 @@ export function parseArgs(argv: string[]): CliArgs {
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
     trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,
   };
+  Object.defineProperty(result, "vcsExplicit", {
+    value: values.vcs !== undefined,
+    enumerable: false,
+  });
+  return result;
 }
 
 /**
@@ -273,6 +294,23 @@ const STATUS_LOG_PREFIX = "TGD_REVIEW_RESULT: ";
 
 function logStatus(log: StatusLog): void {
   console.log(`${STATUS_LOG_PREFIX}${JSON.stringify(log)}`);
+}
+
+function sameTerminalResult(
+  actual: TerminalReviewResult | undefined,
+  expected: TerminalReviewResult,
+): boolean {
+  return actual?.status === expected.status &&
+    actual.findingsCount === expected.findingsCount &&
+    actual.exitCode === expected.exitCode &&
+    actual.rulesRun.length === expected.rulesRun.length &&
+    actual.rulesRun.every((rule, index) => rule === expected.rulesRun[index]) &&
+    actual.rulesFailed.length === expected.rulesFailed.length &&
+    actual.rulesFailed.every((rule, index) => rule === expected.rulesFailed[index]) &&
+    (actual.loadErrors?.length ?? 0) === (expected.loadErrors?.length ?? 0) &&
+    (actual.loadErrors ?? []).every(
+      (error, index) => error === expected.loadErrors?.[index],
+    );
 }
 
 // Task 8 review fix #1: renders a visible section naming every rule file
@@ -350,7 +388,11 @@ async function loadRulesForReview(
     return loadRulesFn(config.rulesDir, includeBuiltin);
   }
 
-  const ruleFiles = await config.vcsAdapter.getRuleFilesFromBase(pr.baseSha, config.rulesDir);
+  const ruleFiles = await config.vcsAdapter.getRuleFilesFromBase(
+    config.locator,
+    pr.baseSha,
+    config.rulesDir,
+  );
   const tempRulesDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-rules-"));
   try {
     // Written concurrently; v1's rule files are always a flat listing (see
@@ -417,7 +459,7 @@ export async function review(
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
 
   const config = resolveConfigFn(args);
-  const pr = await config.vcsAdapter.getPullRequest(config.pr);
+  const pr = await config.vcsAdapter.getPullRequest(config.locator);
 
   // Design-review item #9: name the RESOLVED review target up front. The VCS
   // adapter infers owner/repo from ambient context (`gh`'s git-remote /
@@ -430,13 +472,83 @@ export async function review(
   // so log scrapers can pick the status line out regardless.)
   console.log(`tgd-review-agent: reviewing ${pr.url ?? `PR #${config.pr}`} (head ${pr.headSha})`);
 
-  const botComment = await config.vcsAdapter.findBotComment(config.pr);
+  const botComment = await config.vcsAdapter.findBotComment(config.locator);
 
   // Config-aware dedup: a run is skipped only when this exact head SHA was
   // already reviewed WITH THE SAME review configuration. Computed from CLI flags
   // alone (no rule fetch), so the skip decision stays as cheap as before — see
   // computeReviewConfigHash for what is and isn't captured.
   const configHash = computeReviewConfigHash(config);
+
+  if (botComment?.invalidPendingState === true) {
+    throw new Error(
+      "Invalid pending review recovery metadata; refusing to dispatch or write",
+    );
+  }
+
+  // A ready checkpoint means a previous process already made the conservative
+  // all-inline fallback durable before attempting any inline writes. If that
+  // process died during the final marker update, finalize the exact same note
+  // without dispatching again or risking duplicate inline POSTs.
+  const recovery = botComment?.pendingState;
+  // Only a ready checkpoint for this exact SHA/config can represent an
+  // interrupted current run. Once those two fields match, every remaining
+  // binding is mandatory and a mismatch is corruption, not permission to
+  // republish inline comments. A stale SHA/config intentionally falls through
+  // to the normal re-review path for the new revision/configuration.
+  if (
+    botComment !== null &&
+    recovery?.phase === "ready" &&
+    recovery.headSha === pr.headSha &&
+    recovery.configHash === configHash
+  ) {
+    if (
+      recovery.noteId !== botComment.id ||
+      recovery.terminalResult === undefined
+    ) {
+      throw new Error(
+        "Invalid current pending review recovery binding; refusing to dispatch or write",
+      );
+    }
+    if (config.dryRun) {
+      logStatus({
+        status: recovery.terminalResult.status,
+        findingsCount: recovery.terminalResult.findingsCount,
+        rulesRun: recovery.terminalResult.rulesRun,
+        rulesFailed: recovery.terminalResult.rulesFailed,
+        loadErrors: recovery.terminalResult.loadErrors,
+        reason: "recovered-pending-review-dry-run",
+      });
+      return recovery.terminalResult.exitCode;
+    }
+    const finalizedBody = replacePendingMarker(
+      botComment.body,
+      formatMarker(pr.headSha, configHash),
+    );
+    const finalized = await config.vcsAdapter.upsertComment(
+      config.locator,
+      finalizedBody,
+      botComment,
+    );
+    if (
+      finalized.id !== botComment.id ||
+      finalized.lastReviewedSha !== pr.headSha ||
+      finalized.reviewedConfig !== configHash
+    ) {
+      throw new Error(
+        "The VCS adapter could not confirm recovery of the exact completed summary note",
+      );
+    }
+    logStatus({
+      status: recovery.terminalResult.status,
+      findingsCount: recovery.terminalResult.findingsCount,
+      rulesRun: recovery.terminalResult.rulesRun,
+      rulesFailed: recovery.terminalResult.rulesFailed,
+      loadErrors: recovery.terminalResult.loadErrors,
+      reason: "recovered-pending-review",
+    });
+    return recovery.terminalResult.exitCode;
+  }
 
   // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
   if (decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
@@ -454,7 +566,7 @@ export async function review(
   // (the pre-existing behavior: the user asked for no ceiling).
   let diff: string;
   try {
-    diff = await config.vcsAdapter.getDiff(config.pr);
+    diff = await config.vcsAdapter.getDiff(config.locator);
   } catch (err) {
     if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
     console.warn(
@@ -527,12 +639,27 @@ export async function review(
   // Only an explicit "off" disables them — an absent value means the documented
   // default (on), never a silent downgrade.
   const renderOpts = { suggestions: config.suggestions !== "off" };
-  let orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
+  const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
+  const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
+  const terminalResult = {
+    status: hasFailure ? "partial" as const : "posted" as const,
+    findingsCount: orchestration.findingsCount,
+    rulesRun: orchestration.rulesRun,
+    rulesFailed: orchestration.rulesFailed,
+    ...(loadErrors.length === 0
+      ? {}
+      : { loadErrors: loadErrors.map((error) => `${error.sourcePath}: ${error.message}`) }),
+    exitCode: hasFailure ? EXIT_PARTIAL as 2 : EXIT_OK as 0,
+  };
 
-  const buildBody = (o: OrchestrationResult): string => {
-    const bodyParts = [o.commentBody];
+  const buildBody = (
+    o: OrchestrationResult,
+    commentBody = o.commentBody,
+    marker = formatMarker(pr.headSha, configHash),
+  ): string => {
+    const bodyParts = [commentBody];
     if (loadErrors.length > 0) bodyParts.push(renderLoadErrorsSection(loadErrors));
-    bodyParts.push(formatMarker(pr.headSha, configHash));
+    bodyParts.push(marker);
     return bodyParts.join("\n\n");
   };
 
@@ -547,29 +674,104 @@ export async function review(
     if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
     console.log(buildBody(orchestration));
   } else {
-    // ORDER MATTERS (review finding). Idempotency rests entirely on the SHA
-    // marker, which lives in the SUMMARY comment: decideDedup skips the whole run
-    // when the marker already names this head SHA. Inline review comments, by
-    // contrast, are append-only — there is no upsert for them.
+    // ORDER MATTERS. The summary is durable and updatable; inline comments are
+    // append-only.
     //
-    // So the marker is written FIRST. If the inline post then fails, we edit the
-    // summary to carry every finding. If we posted inline first and the summary
-    // write then threw, no marker would exist, and the next run on the same SHA
-    // would post every inline comment a SECOND time — a duplicate-comment storm
-    // strictly worse than the old behavior.
-    await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), botComment);
+    // Write an explicit PENDING marker first. It makes the durable summary
+    // rediscoverable without claiming this SHA/config is complete. Only after
+    // inline outcomes and selective fallback are settled do we replace it with
+    // the complete dedup marker, targeting the exact returned identity.
+    let conservativeRecoveryBody: string | undefined;
+    if (orchestration.inlineComments.length > 0) {
+      const allInlineIds = new Set(
+        orchestration.inlineComments.map((comment) => comment.clientId),
+      );
+      conservativeRecoveryBody = renderSummary(orchestration, allInlineIds);
+      // The provider assigns the real note identity on the first write, but
+      // every already-known recovery field must be representable before that
+      // write. A safe placeholder exercises the exact same bounded encoder.
+      formatPendingMarker({
+        phase: "ready",
+        headSha: pr.headSha,
+        configHash,
+        noteId: "preflight",
+        terminalResult,
+      });
+    }
+
+    const writtenSummary = await config.vcsAdapter.upsertComment(
+      config.locator,
+      buildBody(
+        orchestration,
+        orchestration.commentBody,
+        formatPendingMarker({
+          phase: "publishing",
+          headSha: pr.headSha,
+          configHash,
+        }),
+      ),
+      botComment,
+    );
+    if (
+      !writtenSummary ||
+      typeof writtenSummary.id !== "string" ||
+      writtenSummary.id.length === 0 ||
+      writtenSummary.lastReviewedSha !== "" ||
+      writtenSummary.reviewedConfig !== "" ||
+      writtenSummary.pendingState?.phase !== "publishing" ||
+      writtenSummary.pendingState.headSha !== pr.headSha ||
+      writtenSummary.pendingState.configHash !== configHash
+    ) {
+      throw new Error(
+        "The VCS adapter did not return the exact identity of the pending summary note",
+      );
+    }
+
+    let summaryIdentity = writtenSummary;
+    if (orchestration.inlineComments.length > 0) {
+      const checkpoint = await config.vcsAdapter.upsertComment(
+        config.locator,
+        buildBody(
+          orchestration,
+          conservativeRecoveryBody!,
+          formatPendingMarker({
+            phase: "ready",
+            headSha: pr.headSha,
+            configHash,
+            noteId: writtenSummary.id,
+            terminalResult,
+          }),
+        ),
+        writtenSummary,
+      );
+      if (
+        checkpoint.id !== writtenSummary.id ||
+        checkpoint.lastReviewedSha !== "" ||
+        checkpoint.reviewedConfig !== "" ||
+        checkpoint.pendingState?.phase !== "ready" ||
+        checkpoint.pendingState.headSha !== pr.headSha ||
+        checkpoint.pendingState.configHash !== configHash ||
+        checkpoint.pendingState.noteId !== writtenSummary.id ||
+        !sameTerminalResult(checkpoint.pendingState.terminalResult, terminalResult)
+      ) {
+        throw new Error(
+          "The VCS adapter could not confirm the exact ready recovery checkpoint",
+        );
+      }
+      summaryIdentity = checkpoint;
+    }
 
     // Design-review #10: collapse the PREVIOUS runs' inline threads before
     // posting this run's. Inline review comments are append-only, so without
     // this every past head SHA's comments accumulate uncollapsed forever.
     // Resolved threads stay visible as history — nothing is deleted, and only
-    // threads the bot itself started are touched. Runs AFTER the marker write
+    // threads the bot itself started are touched. Runs AFTER the pending write
     // (idempotency must never depend on cosmetic cleanup) and BEFORE the new
     // inline post (so this run's comments are the only unresolved ones left).
     // Strictly best-effort: a failure here must not abort or degrade the
     // review — warn and carry on.
     try {
-      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.pr);
+      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.locator);
       if (resolved > 0) {
         console.log(`tgd-review-agent: resolved ${resolved} stale inline comment thread(s) from previous runs`);
       }
@@ -580,30 +782,106 @@ export async function review(
       );
     }
 
+    let finalCommentBody = orchestration.commentBody;
     if (orchestration.inlineComments.length > 0) {
+      const allInlineIds = new Set(
+        orchestration.inlineComments.map((comment) => comment.clientId),
+      );
+      let fallbackIds: Set<string> | undefined;
       try {
-        await config.vcsAdapter.createInlineReview(
-          config.pr,
+        const outcomes = await config.vcsAdapter.createInlineReview(
+          config.locator,
           pr.headSha,
           orchestration.inlineComments,
         );
+        try {
+          const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
+            if (typeof outcome !== "object" || outcome === null) return false;
+            const candidate = outcome as Record<string, unknown>;
+            return typeof candidate.clientId === "string" &&
+              (candidate.status === "posted" || candidate.status === "failed") &&
+              (candidate.reason === undefined || typeof candidate.reason === "string");
+          });
+          if (!shapesValid) throw new Error("malformed inline publish outcome");
+          const validated = validateInlinePublishOutcomes(
+            orchestration.inlineComments,
+            outcomes,
+          );
+          fallbackIds = new Set(
+            validated
+              .filter((outcome) => outcome.status === "failed")
+              .map((outcome) => outcome.clientId),
+          );
+        } catch (err) {
+          console.warn(
+            `tgd-review-agent: inline review returned invalid outcomes (${(err as Error).message}); ` +
+              `rewriting the summary comment to carry every inline finding instead`,
+          );
+          fallbackIds = allInlineIds;
+        }
       } catch (err) {
-        // Recoverable by design: GitHub rejects the WHOLE review if any single
-        // anchor is off-diff. Rather than lose every finding to that, re-render
-        // the summary with all of them inline-in-body and edit it in place. A
-        // finding is only ever RELOCATED, never lost.
         console.warn(
           `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
             `rewriting the summary comment to carry every finding instead`,
         );
-        orchestration = orchestrateFn(dispatchResult, diff, { inline: false, ...renderOpts });
-        const existing = await config.vcsAdapter.findBotComment(config.pr);
-        await config.vcsAdapter.upsertComment(config.pr, buildBody(orchestration), existing);
+        fallbackIds = allInlineIds;
       }
+
+      if (fallbackIds.size > 0) {
+        finalCommentBody = renderSummary(orchestration, fallbackIds);
+      }
+
+      const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
+        config.locator,
+        buildBody(
+          orchestration,
+          finalCommentBody,
+          formatPendingMarker({
+            phase: "ready",
+            headSha: pr.headSha,
+            configHash,
+            noteId: summaryIdentity.id,
+            terminalResult,
+          }),
+        ),
+        summaryIdentity,
+      );
+      if (
+        selectiveCheckpoint.id !== summaryIdentity.id ||
+        selectiveCheckpoint.lastReviewedSha !== "" ||
+        selectiveCheckpoint.reviewedConfig !== "" ||
+        selectiveCheckpoint.pendingState?.phase !== "ready" ||
+        selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
+        selectiveCheckpoint.pendingState.configHash !== configHash ||
+        selectiveCheckpoint.pendingState.noteId !== summaryIdentity.id ||
+        !sameTerminalResult(
+          selectiveCheckpoint.pendingState.terminalResult,
+          terminalResult,
+        )
+      ) {
+        throw new Error(
+          "The VCS adapter could not confirm the exact selective recovery checkpoint",
+        );
+      }
+      summaryIdentity = selectiveCheckpoint;
+    }
+    const finalizedSummary = await config.vcsAdapter.upsertComment(
+      config.locator,
+      buildBody(orchestration, finalCommentBody),
+      summaryIdentity,
+    );
+    if (
+      !finalizedSummary ||
+      finalizedSummary.id !== summaryIdentity.id ||
+      finalizedSummary.lastReviewedSha !== pr.headSha ||
+      finalizedSummary.reviewedConfig !== configHash
+    ) {
+      throw new Error(
+        "The VCS adapter could not confirm finalization of the exact completed summary note",
+      );
     }
   }
 
-  const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
   logStatus({
     status: hasFailure ? "partial" : "posted",
     findingsCount: orchestration.findingsCount,

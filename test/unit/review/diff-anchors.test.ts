@@ -6,7 +6,12 @@
 // added (`+`) or context (` `) line. Removed (`-`) lines exist only on the LEFT
 // and cannot carry a RIGHT-side comment.
 import { describe, expect, it } from "vitest";
-import { commentableLines, isCommentable } from "../../../src/review/diff-anchors.js";
+import {
+  commentableLines,
+  diffPositionRange,
+  parseDiffPositions,
+  isCommentable,
+} from "../../../src/review/diff-anchors.js";
 
 const SIMPLE = `diff --git a/src/a.go b/src/a.go
 index 111..222 100644
@@ -88,7 +93,7 @@ diff --git a/y.ts b/y.ts
 --- a/z.ts
 +++ b/z.ts
 @@ -3 +4 @@
-+only
+ only
 `;
     expect([...(commentableLines(diff).get("z.ts") ?? [])]).toEqual([4]);
   });
@@ -102,6 +107,7 @@ new mode 100755
 --- a/m.ts
 +++ b/m.ts
 @@ -1,1 +1,1 @@
+-old
 +changed
 \\ No newline at end of file
 `;
@@ -112,6 +118,146 @@ new mode 100755
 
   it("returns an empty map for an empty diff, never throws", () => {
     expect(commentableLines("").size).toBe(0);
+  });
+});
+
+describe("diffPositionRange", () => {
+  const renamed = `diff --git a/src/old-name.ts b/src/new-name.ts
+similarity index 80%
+rename from src/old-name.ts
+rename to src/new-name.ts
+--- a/src/old-name.ts
++++ b/src/new-name.ts
+@@ -9,2 +9,4 @@
+ context
++added
++added two
+ tail
+@@ -30,1 +31,1 @@
+ later
+`;
+
+  it("retains provider-neutral paths, endpoint sides, line numbers, and hunk identity", () => {
+    expect(diffPositionRange(renamed, "src/new-name.ts", 10, 12)).toEqual({
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      start: { type: "new", oldLine: undefined, newLine: 10 },
+      end: { type: "old", oldLine: 10, newLine: 12 },
+      sameHunk: true,
+    });
+    expect(diffPositionRange(renamed, "src/new-name.ts", 12, 10)).toEqual({
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      start: { type: "old", oldLine: 10, newLine: 12 },
+      end: { type: "new", oldLine: undefined, newLine: 10 },
+      sameHunk: true,
+    });
+  });
+
+  it("reuses one parsed position index for commentability and range lookup", () => {
+    const positions = parseDiffPositions(renamed);
+    expect(commentableLines(positions).get("src/new-name.ts")?.has(10)).toBe(true);
+    expect(diffPositionRange(positions, "src/new-name.ts", 10, 12)).toMatchObject({
+      newPath: "src/new-name.ts",
+      start: { newLine: 10 },
+      end: { newLine: 12 },
+    });
+  });
+
+  it("represents added ranges and context endpoints exactly", () => {
+    const added = `diff --git a/src/new.ts b/src/new.ts
+--- /dev/null
++++ b/src/new.ts
+@@ -0,0 +10,3 @@
++one
++two
++three
+`;
+    expect(diffPositionRange(added, "src/new.ts", 10, 12)).toEqual({
+      oldPath: "src/new.ts",
+      newPath: "src/new.ts",
+      start: { type: "new", oldLine: undefined, newLine: 10 },
+      end: { type: "new", oldLine: undefined, newLine: 12 },
+      sameHunk: true,
+    });
+    expect(diffPositionRange(renamed, "src/new-name.ts", 9)).toMatchObject({
+      start: { type: "old", oldLine: 9, newLine: 9 },
+      end: { type: "old", oldLine: 9, newLine: 9 },
+    });
+  });
+
+  it("rejects cross-hunk, removed-side, cross-file, and missing endpoints", () => {
+    expect(diffPositionRange(renamed, "src/new-name.ts", 10, 31)).toBeUndefined();
+    expect(diffPositionRange(renamed, "src/old-name.ts", 10, 10)).toBeUndefined();
+    expect(diffPositionRange(renamed, "missing.ts", 1, 1)).toBeUndefined();
+  });
+
+  it("fails the whole hunk closed when '+' appears after the new-side count is exhausted", () => {
+    const malformed = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,1 +1,1 @@
+ context
++overflow
+`;
+    expect(diffPositionRange(malformed, "a.ts", 1)).toBeUndefined();
+    expect(commentableLines(malformed).get("a.ts")).toBeUndefined();
+  });
+
+  it("fails the whole hunk closed when '-' appears after the old-side count is exhausted", () => {
+    const malformed = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,0 +1,1 @@
+-overflow
++would-otherwise-leak
+`;
+    expect(diffPositionRange(malformed, "a.ts", 1)).toBeUndefined();
+    expect(commentableLines(malformed).get("a.ts")).toBeUndefined();
+  });
+
+  it.each([
+    ["an unknown marker after a valid prefix", "@@ -1,2 +1,2 @@\n context\n?invalid"],
+    ["impossible context with no old-side lines", "@@ -1,0 +1,1 @@\n context"],
+    ["premature EOF with positive counters", "@@ -1,2 +1,2 @@\n context\n"],
+  ])("transactionally discards %s in both anchor APIs", (_name, hunk) => {
+    const malformed = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+${hunk}`;
+    expect(diffPositionRange(malformed, "a.ts", 1)).toBeUndefined();
+    expect(commentableLines(malformed).get("a.ts")).toBeUndefined();
+  });
+
+  it("a later malformed overlapping hunk cannot delete or overwrite an earlier valid hunk", () => {
+    const diff = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,1 +1,1 @@
+ valid
+@@ -1,2 +1,2 @@
+ later-prefix
+?invalid
+`;
+    expect(diffPositionRange(diff, "a.ts", 1)).toMatchObject({
+      start: { type: "old", oldLine: 1, newLine: 1 },
+    });
+    expect([...(commentableLines(diff).get("a.ts") ?? [])]).toEqual([1]);
+  });
+
+  it("preserves the earlier position when two valid hunks overlap", () => {
+    const diff = `diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1,1 +1,1 @@
+ first
+@@ -9,1 +1,1 @@
+ second
+`;
+    expect(diffPositionRange(diff, "a.ts", 1)).toMatchObject({
+      start: { type: "old", oldLine: 1, newLine: 1 },
+    });
+    expect([...(commentableLines(diff).get("a.ts") ?? [])]).toEqual([1]);
   });
 });
 
@@ -180,7 +326,7 @@ diff --git a/victim.ts b/victim.ts
   });
 
   it("emits no phantom anchor past the end of the last hunk (trailing blank lines)", () => {
-    const diff = "diff --git a/t.ts b/t.ts\n--- a/t.ts\n+++ b/t.ts\n@@ -1,1 +1,1 @@\n+only\n\n\n";
+    const diff = "diff --git a/t.ts b/t.ts\n--- a/t.ts\n+++ b/t.ts\n@@ -1,0 +1,1 @@\n+only\n\n\n";
     // Line 2 does not exist in the hunk; anchoring there would 422 the review.
     expect([...(commentableLines(diff).get("t.ts") ?? [])]).toEqual([1]);
   });

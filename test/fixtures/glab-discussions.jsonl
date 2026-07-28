@@ -1,0 +1,5 @@
+{"id":"own-marked-one","notes":[{"id":701,"body":"review comment\n<!-- tgd-review-agent:inline -->","author":{"username":"review-bot"},"resolved":false}]}
+{"id":"own-manual","notes":[{"id":702,"body":"manual review","author":{"username":"review-bot"},"resolved":false}]}
+{"id":"other-marked","notes":[{"id":703,"body":"copied\n<!-- tgd-review-agent:inline -->","author":{"username":"someone-else"},"resolved":false}]}
+{"id":"already-resolved","notes":[{"id":704,"body":"old\n<!-- tgd-review-agent:inline -->","author":{"username":"review-bot"},"resolved":true}]}
+{"id":"own-marked.two","notes":[{"id":705,"body":"review comment\n<!-- tgd-review-agent:inline -->","author":{"username":"review-bot"},"resolved":false}]}

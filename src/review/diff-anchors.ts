@@ -1,11 +1,10 @@
-// Which (file, line) pairs in a PR's diff can carry an INLINE review comment.
+// Which (file, line) pairs in a code-review diff can carry an inline comment.
 //
-// This exists because of a hard GitHub constraint: `POST /pulls/{n}/reviews`
-// rejects the ENTIRE request with 422 if even one comment targets a line that
-// isn't part of the diff. One bad anchor loses every finding in the review. So
-// rather than post hopefully and handle failure, we decide up front — from the
-// same diff we already fetched — exactly which lines are addressable, and route
-// everything else to the summary comment instead.
+// Providers accept inline comments only at eligible diff positions, with
+// provider-specific batching and error behavior handled by their adapters.
+// Rather than post hopeful anchors, shared orchestration decides up front from
+// the fetched diff which lines are addressable and routes everything else to
+// the summary.
 //
 // "Addressable" means: present on the RIGHT (new-file) side of a hunk, i.e. an
 // added (`+`) or context (` `) line. A removed (`-`) line exists only on the
@@ -18,99 +17,45 @@
 /** file path (new-file, repo-relative) -> set of commentable NEW-file line numbers. */
 export type CommentableLines = Map<string, Set<number>>;
 
+export interface DiffPositionEndpoint {
+  readonly type: "old" | "new";
+  readonly oldLine?: number;
+  readonly newLine: number;
+}
+
+export interface DiffPositionRange {
+  readonly oldPath: string;
+  readonly newPath: string;
+  readonly start: DiffPositionEndpoint;
+  readonly end: DiffPositionEndpoint;
+  readonly sameHunk: true;
+}
+
+export interface PositionedLine {
+  endpoint: DiffPositionEndpoint;
+  hunk: number;
+  oldPath: string;
+  newPath: string;
+}
+
+/** Parsed diff positions, reusable across all findings in one orchestration. */
+export type DiffPositions = Map<string, Map<number, PositionedLine>>;
+
 // `@@ -oldStart[,oldCount] +newStart[,newCount] @@`. The counts are optional and
 // default to 1 when omitted (git emits `@@ -3 +4 @@` for single-line hunks).
 const HUNK_RE = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
-export function commentableLines(diff: string): CommentableLines {
+export function commentableLines(diff: string | DiffPositions): CommentableLines {
   const result: CommentableLines = new Map();
-
-  let currentFile: string | undefined;
-  let newLine = 0;
-  // Lines still expected in the current hunk, from the hunk header's own counts.
-  // Counting them out is what makes this parser safe against DIFF CONTENT that
-  // looks like diff SYNTAX: inside a hunk we consume exactly as many lines as the
-  // header declared, so an added line whose text happens to be `++ b/victim.ts`
-  // (raw line: `+++ b/victim.ts`) is treated as CONTENT, never as a file header.
-  // Without this bound, a PR that merely adds a diff fixture — this repo's own
-  // test files are that shape — could steer anchors onto a file it never touched,
-  // and GitHub 422s the ENTIRE review. It also stops the counter from running off
-  // the end of the last hunk into trailing blank lines.
-  let oldRemaining = 0;
-  let newRemaining = 0;
-
-  const inHunk = (): boolean => oldRemaining > 0 || newRemaining > 0;
-
-  for (const rawLine of diff.split("\n")) {
-    if (inHunk()) {
-      // Inside a hunk, the FIRST character is the only thing that matters. No
-      // header patterns are considered here — that is the whole point.
-      const marker = rawLine[0];
-      if (marker === "+") {
-        if (currentFile) addLine(result, currentFile, newLine);
-        newLine += 1;
-        newRemaining -= 1;
-      } else if (marker === "-") {
-        // Left side only: must NOT advance the new-file counter, or every
-        // subsequent anchor in this hunk is off by one.
-        oldRemaining -= 1;
-      } else if (marker === "\\") {
-        // `\ No newline at end of file` — metadata attached to the PREVIOUS line.
-        // It consumes no line from either side. (Routing it anywhere else would
-        // silently drop the rest of the hunk.)
-      } else if (marker === " " || rawLine === "") {
-        // Context: present on BOTH sides, so it needs a line remaining on each.
-        // An empty string is an unchanged empty line whose single leading space
-        // some producers strip — but it is ALSO what a trailing blank line looks
-        // like. Requiring both counters is what stops a hunk whose header lies
-        // (or a diff with trailing newlines) from emitting a phantom anchor one
-        // line past the hunk, which would 422 the whole review.
-        if (oldRemaining <= 0 || newRemaining <= 0) {
-          oldRemaining = 0;
-          newRemaining = 0;
-          continue;
-        }
-        if (currentFile) addLine(result, currentFile, newLine);
-        newLine += 1;
-        oldRemaining -= 1;
-        newRemaining -= 1;
-      } else {
-        // Malformed: the hunk claimed more lines than it delivered. Abandon it
-        // rather than mis-attribute anchors.
-        oldRemaining = 0;
-        newRemaining = 0;
-      }
-      continue;
-    }
-
-    // --- Outside a hunk: header territory. ---
-    if (rawLine.startsWith("diff --git ")) {
-      currentFile = undefined;
-      continue;
-    }
-
-    if (rawLine.startsWith("+++ ")) {
-      const target = rawLine.slice(4).trim();
-      currentFile = target === "/dev/null" ? undefined : stripDiffPathPrefix(target);
-      continue;
-    }
-
-    if (rawLine.startsWith("--- ")) continue; // old-side header
-
-    const hunk = HUNK_RE.exec(rawLine);
-    if (hunk) {
-      // `@@ -oldStart[,oldCount] +newStart[,newCount] @@`; an omitted count is 1.
-      oldRemaining = hunk[2] === undefined ? 1 : Number(hunk[2]);
-      newLine = Number(hunk[3]);
-      newRemaining = hunk[4] === undefined ? 1 : Number(hunk[4]);
-    }
+  const positions = typeof diff === "string" ? parseDiffPositions(diff) : diff;
+  for (const [file, lines] of positions) {
+    result.set(file, new Set(lines.keys()));
   }
-
   return result;
 }
 
 /**
- * True iff an inline comment on `file`:`line` would be accepted by GitHub.
+ * True iff `file`:`line` is a valid new-side inline anchor.
  *
  * A finding with no line (`line: null`, per the JSON contract) can never be
  * anchored — it belongs in the summary comment.
@@ -122,12 +67,6 @@ export function isCommentable(
 ): boolean {
   if (typeof line !== "number") return false;
   return map.get(file)?.has(line) ?? false;
-}
-
-function addLine(map: CommentableLines, file: string, line: number): void {
-  const existing = map.get(file);
-  if (existing) existing.add(line);
-  else map.set(file, new Set([line]));
 }
 
 // `+++ b/src/a.go` → `src/a.go`. git prefixes the new side with `b/` by default,
@@ -160,12 +99,11 @@ export function changedFiles(diff: string): string[] {
 /**
  * True iff EVERY line in `start`..`end` (inclusive) is commentable.
  *
- * ADR-007's committable suggestions replace a whole line range, and GitHub
- * requires that range to lie within a SINGLE hunk — it 422s the entire review
- * otherwise, killing every inline comment on the run. Checking only the endpoints
- * is unsound, because this module merges a file's hunks into one set: two lines in
- * DIFFERENT hunks would both pass while the lines between them are not in the diff
- * at all.
+ * ADR-007's committable suggestions replace a whole line range, which must lie
+ * within a SINGLE hunk for provider-neutral position construction. Checking
+ * only the endpoints is unsound, because this module merges a file's hunks into
+ * one set: two lines in DIFFERENT hunks would both pass while the lines between
+ * them are not in the diff at all.
  *
  * Because context lines are part of the anchor set, "every line in the range is
  * commentable" is exactly equivalent to "the range is inside one hunk".
@@ -183,4 +121,178 @@ export function rangeIsCommentable(
     if (!lines.has(line)) return false;
   }
   return true;
+}
+
+/**
+ * Resolves new-side finding lines into provider-neutral diff coordinates.
+ * Context lines deliberately use `type: "old"` while retaining both counters;
+ * added lines use `type: "new"` and have no old counter.
+ */
+export function diffPositionRange(
+  diff: string | DiffPositions,
+  file: string,
+  startLine: number,
+  endLine = startLine,
+): DiffPositionRange | undefined {
+  const positions =
+    (typeof diff === "string" ? parseDiffPositions(diff) : diff).get(file);
+  const start = positions?.get(startLine);
+  const end = positions?.get(endLine);
+  if (!start || !end || start.hunk !== end.hunk) return undefined;
+  return {
+    oldPath: start.oldPath,
+    newPath: start.newPath,
+    start: start.endpoint,
+    end: end.endpoint,
+    sameHunk: true,
+  };
+}
+
+export function parseDiffPositions(diff: string): DiffPositions {
+  const result: DiffPositions = new Map();
+  let oldPath: string | undefined;
+  let newPath: string | undefined;
+  let hunk = 0;
+  interface PendingHunk {
+    oldLine: number;
+    newLine: number;
+    oldRemaining: number;
+    newRemaining: number;
+    readonly oldPath: string;
+    readonly newPath: string;
+    readonly hunk: number;
+    readonly staged: Map<number, PositionedLine>;
+  }
+  let pending: PendingHunk | undefined;
+
+  const complete = (): boolean =>
+    pending !== undefined && pending.oldRemaining === 0 && pending.newRemaining === 0;
+  const commit = (): void => {
+    if (!pending || !complete()) {
+      pending = undefined;
+      return;
+    }
+    let fileLines = result.get(pending.newPath);
+    if (!fileLines) {
+      fileLines = new Map();
+      result.set(pending.newPath, fileLines);
+    }
+    // Earlier validated hunks win. A malformed or unusual later overlapping
+    // hunk can therefore never overwrite a known-good provider position.
+    for (const [line, position] of pending.staged) {
+      if (!fileLines.has(line)) fileLines.set(line, position);
+    }
+    pending = undefined;
+  };
+  const discard = (): void => {
+    pending = undefined;
+  };
+  const record = (endpoint: DiffPositionEndpoint): void => {
+    if (!pending) return;
+    pending.staged.set(endpoint.newLine, {
+      endpoint,
+      hunk: pending.hunk,
+      oldPath: pending.oldPath,
+      newPath: pending.newPath,
+    });
+  };
+  const prematureBoundary = (rawLine: string): boolean =>
+    rawLine.startsWith("diff --git ") ||
+    HUNK_RE.test(rawLine) ||
+    (rawLine.startsWith("--- ") && pending?.oldRemaining === 0) ||
+    (rawLine.startsWith("+++ ") && pending?.newRemaining === 0);
+
+  for (const rawLine of diff.split("\n")) {
+    if (pending && !complete() && prematureBoundary(rawLine)) {
+      // A new file/header/hunk before the declared counts are consumed makes
+      // the current hunk incomplete. Discard it, then parse the boundary.
+      discard();
+    }
+
+    if (pending && !complete()) {
+      const marker = rawLine[0];
+      if (marker === "+") {
+        if (pending.newRemaining <= 0) {
+          discard();
+          continue;
+        }
+        record({ type: "new", oldLine: undefined, newLine: pending.newLine });
+        pending.newLine += 1;
+        pending.newRemaining -= 1;
+      } else if (marker === "-") {
+        if (pending.oldRemaining <= 0) {
+          discard();
+          continue;
+        }
+        pending.oldLine += 1;
+        pending.oldRemaining -= 1;
+      } else if (marker === "\\") {
+        // `\ No newline at end of file` consumes neither side.
+      } else if (marker === " ") {
+        if (pending.oldRemaining <= 0 || pending.newRemaining <= 0) {
+          discard();
+          continue;
+        }
+        record({
+          type: "old",
+          oldLine: pending.oldLine,
+          newLine: pending.newLine,
+        });
+        pending.oldLine += 1;
+        pending.newLine += 1;
+        pending.oldRemaining -= 1;
+        pending.newRemaining -= 1;
+      } else {
+        discard();
+      }
+      continue;
+    }
+
+    if (pending && complete()) {
+      if (rawLine === "") continue;
+      if (rawLine.startsWith("\\")) continue;
+      if (rawLine.startsWith("+") || rawLine.startsWith("-") || rawLine.startsWith(" ")) {
+        // Extra diff content beyond the declared counts invalidates the hunk.
+        discard();
+        continue;
+      }
+      commit();
+    }
+
+    if (rawLine.startsWith("diff --git ")) {
+      oldPath = undefined;
+      newPath = undefined;
+      continue;
+    }
+    if (rawLine.startsWith("--- ")) {
+      const path = rawLine.slice(4).trim();
+      oldPath = path === "/dev/null" ? "/dev/null" : stripOldDiffPathPrefix(path);
+      continue;
+    }
+    if (rawLine.startsWith("+++ ")) {
+      const path = rawLine.slice(4).trim();
+      newPath = path === "/dev/null" ? undefined : stripDiffPathPrefix(path);
+      continue;
+    }
+    const match = HUNK_RE.exec(rawLine);
+    if (!match || !oldPath || !newPath) continue;
+    hunk += 1;
+    pending = {
+      oldLine: Number(match[1]),
+      oldRemaining: match[2] === undefined ? 1 : Number(match[2]),
+      newLine: Number(match[3]),
+      newRemaining: match[4] === undefined ? 1 : Number(match[4]),
+      oldPath: oldPath === "/dev/null" ? newPath : oldPath,
+      newPath,
+      hunk,
+      staged: new Map(),
+    };
+  }
+  if (complete()) commit();
+  else discard();
+  return result;
+}
+
+function stripOldDiffPathPrefix(target: string): string {
+  return target.startsWith("a/") ? target.slice(2) : target;
 }

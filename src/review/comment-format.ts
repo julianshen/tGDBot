@@ -11,10 +11,11 @@ import type { Finding } from "./types.js";
 
 /**
  * Machine-detectable tag appended to every inline comment THIS TOOL posts
- * (Codex review, PR #6). Stale-thread cleanup must not treat "authored by the
- * same account" as "posted by this tool": a developer running the CLI under
- * their personal `gh` login also writes MANUAL review comments as that same
- * identity, and those must never be auto-resolved. resolveStaleReviewThreads
+ * (caught during an earlier review). Stale-thread cleanup must not treat
+ * "authored by the same account" as "posted by this tool": a developer running
+ * the CLI under their personal provider login also writes MANUAL review
+ * comments as that same identity, and those must never be auto-resolved.
+ * resolveStaleReviewThreads
  * therefore requires BOTH the verified author match AND this marker in the
  * thread's first comment. Unforgeable from finding content: sanitizeText
  * defangs `<!--` in all finding-derived text, so a crafted diff cannot make a
@@ -23,16 +24,18 @@ import type { Finding } from "./types.js";
 export const INLINE_COMMENT_MARKER = "<!-- tgd-review-agent:inline -->";
 
 export interface InlineComment {
+  clientId: string;
   /** Repo-relative path, as it appears on the NEW side of the diff. */
   path: string;
   /**
    * NEW-file line number the comment anchors to. For a multi-line committable
-   * suggestion this is the LAST line of the range (GitHub's convention), with
+   * suggestion this is the LAST line of the provider-neutral range, with
    * `startLine` carrying the first. Guaranteed commentable (see diff-anchors).
    */
   line: number;
   /** First line of a multi-line range (ADR-007). Omitted for a single line. */
   startLine?: number;
+  position: import("./diff-anchors.js").DiffPositionRange;
   body: string;
 }
 
@@ -70,20 +73,22 @@ function categoryBadge(category: string): string {
 //   <attacker code>
 //   ```
 //
-// GitHub renders that as a COMMITTABLE SUGGESTION with a one-click "Commit
-// suggestion" button — but ONLY inside a review comment on a diff. In the issue
-// comment this tool used to post, the same fence was inert. So moving to inline
-// comments would have turned a prompt-injected finding into one click from
-// committing attacker-chosen code into the PR branch. Neutralising the
-// `suggestion` info-string is therefore not hardening-in-general; it closes a hole
-// this very change would otherwise have opened.
+// Review providers can render that as a committable suggestion with a one-click
+// commit action when it appears in an inline diff comment. On a summary surface
+// the same fence may be inert, but the shared formatter never relies on that.
+// Moving untrusted finding text inline could otherwise turn prompt injection
+// into one click from committing attacker-chosen code into the change branch.
+// Neutralising the `suggestion` info-string is therefore not
+// hardening-in-general; it closes a hole this very change would otherwise have
+// opened.
 //
 // Code fences themselves are KEPT — findings legitimately contain ```go blocks and
 // they are genuinely useful. Only the `suggestion` (and `suggestions`) info-string
-// is defanged, and only GitHub treats that one as committable.
+// is defanged. Provider adapters remain responsible for their exact suggestion
+// and position constraints.
 // The prefix class covers blockquote/list markers too: a fence nested in `> ` or
 // `- ` must be defanged as well — guarantee 1 is load-bearing enough that it must
-// not rest on an unverified detail of how GitHub parses nested fences.
+// not rest on an unverified detail of how a provider parses nested fences.
 const SUGGESTION_FENCE_RE = /^([ \t>*+\-]*(?:`{3,}|~{3,})[ \t]*)suggestions?\b/gim;
 
 function sanitizeText(text: string): string {
@@ -159,7 +164,7 @@ function splitHeadline(message: string): { headline: string; body: string } {
   const rest = sentence?.[2]?.trim() ?? "";
 
   // A headline is a single bold LINE: newlines and list markup inside it produce
-  // literal `**` and a mangled list on GitHub.
+  // literal `**` and a mangled list on common review renderers.
   const oneLine = first.replace(/\s+/g, " ").trim();
 
   // Too long to be a title? Then there IS no title. Truncating it and printing the
@@ -242,8 +247,7 @@ export interface RenderOptions {
 }
 
 /**
- * ADR-007: a GitHub COMMITTABLE SUGGESTION — a one-click "Commit suggestion"
- * button on the anchored line range.
+ * ADR-007: a provider-native committable suggestion on the anchored line range.
  *
  * THE SECURITY BOUNDARY. ADR-006 deliberately defangs any ```suggestion fence
  * appearing in free-text `message`, because that text is LLM output over an
@@ -255,8 +259,8 @@ export interface RenderOptions {
  *    the content cannot close it early and inject markdown/HTML around the block;
  *  - the content is emitted verbatim and never sanitized, because it is CODE
  *    destined for the file — escaping it would corrupt what gets committed. It is
- *    inert: everything between the fences is literal, and GitHub scopes the commit
- *    to the anchored line range;
+ *    inert: everything between the fences is literal, and the Git provider/UI
+ *    applies it to the anchored line range according to provider constraints;
  *  - the explicit warning below is not decoration. A suggestion is the one thing
  *    this tool emits that a human can accept without reading the reasoning.
  */
@@ -292,9 +296,9 @@ function renderSuggestionBlock(suggestion: string, committable: boolean): string
   ].join("\n");
 }
 
-// GitHub caps a comment body at 65,536 characters. An unbounded suggestion would
-// blow past it and make createInlineReview fail — which loses EVERY inline comment
-// on the run, not just this one. Cap it and say so, rather than gamble the review.
+// Providers cap comment bodies. An unbounded suggestion can make inline
+// publishing fail and force findings back to the summary. Cap it rather than
+// gamble the review.
 const SUGGESTION_MAX = 8000;
 function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
