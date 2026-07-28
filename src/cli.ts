@@ -306,7 +306,11 @@ function sameTerminalResult(
     actual.rulesRun.length === expected.rulesRun.length &&
     actual.rulesRun.every((rule, index) => rule === expected.rulesRun[index]) &&
     actual.rulesFailed.length === expected.rulesFailed.length &&
-    actual.rulesFailed.every((rule, index) => rule === expected.rulesFailed[index]);
+    actual.rulesFailed.every((rule, index) => rule === expected.rulesFailed[index]) &&
+    (actual.loadErrors?.length ?? 0) === (expected.loadErrors?.length ?? 0) &&
+    (actual.loadErrors ?? []).every(
+      (error, index) => error === expected.loadErrors?.[index],
+    );
 }
 
 // Task 8 review fix #1: renders a visible section naming every rule file
@@ -512,6 +516,7 @@ export async function review(
         findingsCount: recovery.terminalResult.findingsCount,
         rulesRun: recovery.terminalResult.rulesRun,
         rulesFailed: recovery.terminalResult.rulesFailed,
+        loadErrors: recovery.terminalResult.loadErrors,
         reason: "recovered-pending-review-dry-run",
       });
       return recovery.terminalResult.exitCode;
@@ -539,6 +544,7 @@ export async function review(
       findingsCount: recovery.terminalResult.findingsCount,
       rulesRun: recovery.terminalResult.rulesRun,
       rulesFailed: recovery.terminalResult.rulesFailed,
+      loadErrors: recovery.terminalResult.loadErrors,
       reason: "recovered-pending-review",
     });
     return recovery.terminalResult.exitCode;
@@ -640,6 +646,9 @@ export async function review(
     findingsCount: orchestration.findingsCount,
     rulesRun: orchestration.rulesRun,
     rulesFailed: orchestration.rulesFailed,
+    ...(loadErrors.length === 0
+      ? {}
+      : { loadErrors: loadErrors.map((error) => `${error.sourcePath}: ${error.message}`) }),
     exitCode: hasFailure ? EXIT_PARTIAL as 2 : EXIT_OK as 0,
   };
 
