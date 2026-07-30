@@ -300,6 +300,7 @@ function renderSuggestionBlock(suggestion: string, committable: boolean): string
 // publishing fail and force findings back to the summary. Cap it rather than
 // gamble the review.
 const SUGGESTION_MAX = 8000;
+const FALLBACK_SUGGESTIONS_MAX = 48_000;
 function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
@@ -323,7 +324,7 @@ export interface SummaryInput {
   inlineUnavailable?: boolean;
 }
 
-function renderUnanchoredFinding(finding: Finding): string {
+function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): string {
   const file = sanitizeInline(finding.file);
   const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
   const full = sanitizeText(finding.message);
@@ -338,7 +339,12 @@ function renderUnanchoredFinding(finding: Finding): string {
   }
   const suggestion = finding.suggestion?.trim() ? capSuggestion(finding.suggestion) : undefined;
   if (suggestion) {
-    parts.push("", renderSuggestionBlock(suggestion, false));
+    parts.push(
+      "",
+      includeSuggestion
+        ? renderSuggestionBlock(suggestion, false)
+        : "> Proposed fix omitted because the summary size budget was exhausted.",
+    );
   }
   return parts.join("\n");
 }
@@ -391,8 +397,19 @@ export function renderSummaryComment(input: SummaryInput): string {
     const note = input.inlineUnavailable
       ? ""
       : "\n_These couldn't be anchored to a line in the diff (no line number, or the line isn't part of this PR's changes)._\n";
+    let suggestionChars = 0;
+    const findings = input.unanchored.map((finding) => {
+      const suggestion = finding.suggestion?.trim()
+        ? capSuggestion(finding.suggestion)
+        : undefined;
+      const includeSuggestion =
+        suggestion === undefined ||
+        suggestionChars + suggestion.length <= FALLBACK_SUGGESTIONS_MAX;
+      if (suggestion !== undefined && includeSuggestion) suggestionChars += suggestion.length;
+      return renderUnanchoredFinding(finding, includeSuggestion);
+    });
     parts.push(
-      `${heading}${note}\n\n${input.unanchored.map(renderUnanchoredFinding).join("\n\n---\n\n")}`,
+      `${heading}${note}\n\n${findings.join("\n\n---\n\n")}`,
     );
   }
 
