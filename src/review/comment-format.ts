@@ -365,7 +365,10 @@ function detailsBlock(summary: string, lines: string[]): string {
   return ["<details>", `<summary>${summary}</summary>`, "", ...lines, "", "</details>"].join("\n");
 }
 
-export function renderSummaryComment(input: SummaryInput): string {
+export function renderSummaryComment(
+  input: SummaryInput,
+  maxLength = SUMMARY_COMMENT_MAX,
+): string {
   const suggestionChars = input.unanchored.reduce((total, finding) => {
     const suggestion = finding.suggestion?.trim()
       ? capSuggestion(finding.suggestion)
@@ -375,11 +378,12 @@ export function renderSummaryComment(input: SummaryInput): string {
   let low = 0;
   let high = suggestionChars;
   let best = renderSummaryCommentWithSuggestionBudget(input, 0);
+  if (best.length > maxLength) return renderCompactSummary(input, maxLength);
 
   while (low <= high) {
     const budget = Math.floor((low + high) / 2);
     const candidate = renderSummaryCommentWithSuggestionBudget(input, budget);
-    if (candidate.length <= SUMMARY_COMMENT_MAX) {
+    if (candidate.length <= maxLength) {
       best = candidate;
       low = budget + 1;
     } else {
@@ -387,6 +391,36 @@ export function renderSummaryComment(input: SummaryInput): string {
     }
   }
   return best;
+}
+
+function renderCompactSummary(input: SummaryInput, maxLength: number): string {
+  const header =
+    `**Actionable comments posted: ${input.inlineCount + input.unanchored.length}**` +
+    `${severityCounts(input)}`;
+  const notice =
+    "> [!WARNING]\n" +
+    "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+  const findings = input.unanchored.map((finding) => {
+    const file = truncate(sanitizeInline(finding.file), 160);
+    const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
+    const rule = truncate(sanitizeInline(finding.ruleName), 80);
+    const message = sanitizeInline(finding.message);
+    return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
+  });
+  const fixed = [header, notice, ...findings.map(({ prefix }) => prefix)].join("\n\n");
+  const available = Math.max(0, maxLength - fixed.length);
+  const perFinding = findings.length === 0 ? 0 : Math.floor(available / findings.length);
+  const body = [
+    header,
+    notice,
+    ...findings.map(({ prefix, message }) => `${prefix}${truncate(message, perFinding)}`),
+  ].join("\n\n");
+
+  if (body.length <= maxLength) return body;
+  return truncate(
+    `${header}\n\n${notice}\n\n${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+    maxLength,
+  );
 }
 
 function renderSummaryCommentWithSuggestionBudget(
