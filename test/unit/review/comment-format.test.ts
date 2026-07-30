@@ -193,7 +193,7 @@ describe("renderSummaryComment", () => {
     const findings = Array.from({ length: 9 }, (_, index) =>
       makeFinding({
         file: `src/file-${index}.ts`,
-        message: `Problem ${index}.`,
+        message: `Problem ${index}. ${"m".repeat(1_988)}`,
         suggestion: `// fix ${index}\n${"x".repeat(7_980)}`,
       }),
     );
@@ -206,7 +206,9 @@ describe("renderSummaryComment", () => {
     expect(body.length).toBeLessThanOrEqual(60_000);
     expect(body).toContain("// fix 0");
     expect(body).toContain("Proposed fix omitted because the summary size budget was exhausted.");
-    for (const finding of findings) expect(body).toContain(finding.message);
+    for (let index = 0; index < findings.length; index += 1) {
+      expect(body).toContain(`Problem ${index}.`);
+    }
   });
 
   it("lists failed rules with their reasons", () => {
