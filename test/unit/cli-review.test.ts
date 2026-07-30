@@ -1260,6 +1260,50 @@ describe("inline review comments", () => {
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
   });
 
+  it("budgets the final provider body including load errors and the ready marker", async () => {
+    const findings = Array.from({ length: 6 }, (_, index) => ({
+      ...singleFinding,
+      line: index + 1,
+      message: `finding ${index}. ${"m".repeat(1_980)}`,
+      suggestion: `// fix ${index}\n${"x".repeat(7_980)}`,
+    }));
+    const presentation: OrchestrationResult = {
+      commentBody: "**Actionable comments posted: 6**",
+      inlineComments: findings.map((finding, index) => ({
+        clientId: `finding-${index}`,
+        path: "x.ts",
+        line: 2,
+        position: withInline.inlineComments[0]!.position,
+        body: `finding ${index}`,
+      })),
+      findingsCount: findings.length,
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+      findingByClientId: new Map(
+        findings.map((finding, index) => [`finding-${index}`, finding]),
+      ),
+      summaryInput: {
+        allFindings: findings,
+        inlineCount: findings.length,
+        unanchored: [],
+        filesReviewed: ["x.ts"],
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+      },
+    };
+    const h = inlineHarness(presentation);
+    h.loadRules.mockResolvedValue({
+      rules: [makeRule()],
+      errors: [{ sourcePath: "/rules/bad.md", message: "e".repeat(20_000) }],
+    });
+
+    await review(h.args, depsFrom(h));
+
+    for (const [, body] of h.vcsAdapter.upsertComment.mock.calls) {
+      expect(String(body).length).toBeLessThanOrEqual(65_536);
+    }
+  });
+
   it("posts the inline comments via createInlineReview, pinned to the head SHA", async () => {
     const h = inlineHarness(withInline);
 
