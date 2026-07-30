@@ -211,6 +211,26 @@ describe("renderSummaryComment", () => {
     }
   });
 
+  it("compacts an oversized zero-suggestion baseline below the limit", () => {
+    const findings = Array.from({ length: 40 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Baseline problem ${index}. ${"m".repeat(1_980)}`,
+      }),
+    );
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+    });
+
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("compacted to fit the provider limit");
+    for (let index = 0; index < findings.length; index += 1) {
+      expect(body).toContain(`Baseline problem ${index}.`);
+    }
+  });
+
   it("lists failed rules with their reasons", () => {
     const body = renderSummaryComment({
       ...base,
