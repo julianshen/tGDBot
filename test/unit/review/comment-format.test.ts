@@ -189,6 +189,26 @@ describe("renderSummaryComment", () => {
     expect(body).not.toMatch(/^`{3,}suggestion$/m);
   });
 
+  it("keeps aggregate fallback suggestions below the provider comment limit", () => {
+    const findings = Array.from({ length: 9 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Problem ${index}.`,
+        suggestion: `// fix ${index}\n${"x".repeat(7_980)}`,
+      }),
+    );
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+    });
+
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("// fix 0");
+    expect(body).toContain("Proposed fix omitted because the summary size budget was exhausted.");
+    for (const finding of findings) expect(body).toContain(finding.message);
+  });
+
   it("lists failed rules with their reasons", () => {
     const body = renderSummaryComment({
       ...base,
