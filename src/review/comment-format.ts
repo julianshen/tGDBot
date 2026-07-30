@@ -300,7 +300,7 @@ function renderSuggestionBlock(suggestion: string, committable: boolean): string
 // publishing fail and force findings back to the summary. Cap it rather than
 // gamble the review.
 const SUGGESTION_MAX = 8000;
-const FALLBACK_SUGGESTIONS_MAX = 48_000;
+const SUMMARY_COMMENT_MAX = 60_000;
 function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
@@ -366,6 +366,33 @@ function detailsBlock(summary: string, lines: string[]): string {
 }
 
 export function renderSummaryComment(input: SummaryInput): string {
+  const suggestionChars = input.unanchored.reduce((total, finding) => {
+    const suggestion = finding.suggestion?.trim()
+      ? capSuggestion(finding.suggestion)
+      : undefined;
+    return total + (suggestion?.length ?? 0);
+  }, 0);
+  let low = 0;
+  let high = suggestionChars;
+  let best = renderSummaryCommentWithSuggestionBudget(input, 0);
+
+  while (low <= high) {
+    const budget = Math.floor((low + high) / 2);
+    const candidate = renderSummaryCommentWithSuggestionBudget(input, budget);
+    if (candidate.length <= SUMMARY_COMMENT_MAX) {
+      best = candidate;
+      low = budget + 1;
+    } else {
+      high = budget - 1;
+    }
+  }
+  return best;
+}
+
+function renderSummaryCommentWithSuggestionBudget(
+  input: SummaryInput,
+  suggestionBudget: number,
+): string {
   const total = input.inlineCount + input.unanchored.length;
   const parts: string[] = [];
 
@@ -404,7 +431,7 @@ export function renderSummaryComment(input: SummaryInput): string {
         : undefined;
       const includeSuggestion =
         suggestion === undefined ||
-        suggestionChars + suggestion.length <= FALLBACK_SUGGESTIONS_MAX;
+        suggestionChars + suggestion.length <= suggestionBudget;
       if (suggestion !== undefined && includeSuggestion) suggestionChars += suggestion.length;
       return renderUnanchoredFinding(finding, includeSuggestion);
     });
