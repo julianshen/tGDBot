@@ -153,6 +153,7 @@ function normalizeForCompare(text: string): string {
 }
 
 function truncate(text: string, max: number): string {
+  if (max <= 0) return "";
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
@@ -400,6 +401,11 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   const notice =
     "> [!WARNING]\n" +
     "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+  const failedRules = input.rulesFailed.length > 0
+    ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
+        .map((name) => `* \`${truncate(sanitizeInline(name), 80)}\``)
+        .join("\n")}`
+    : undefined;
   const findings = input.unanchored.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
@@ -407,18 +413,28 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const message = sanitizeInline(finding.message);
     return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
   });
-  const fixed = [header, notice, ...findings.map(({ prefix }) => prefix)].join("\n\n");
+  const fixed = [header, notice, failedRules, ...findings.map(({ prefix }) => prefix)]
+    .filter((part): part is string => part !== undefined)
+    .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
   const perFinding = findings.length === 0 ? 0 : Math.floor(available / findings.length);
   const body = [
     header,
     notice,
+    failedRules,
     ...findings.map(({ prefix, message }) => `${prefix}${truncate(message, perFinding)}`),
-  ].join("\n\n");
+  ].filter((part): part is string => part !== undefined).join("\n\n");
 
   if (body.length <= maxLength) return body;
   return truncate(
-    `${header}\n\n${notice}\n\n${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+    [
+      header,
+      notice,
+      input.rulesFailed.length > 0
+        ? `${input.rulesFailed.length} rule(s) failed to run.`
+        : undefined,
+      `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+    ].filter((part): part is string => part !== undefined).join("\n\n"),
     maxLength,
   );
 }
