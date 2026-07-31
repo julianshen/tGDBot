@@ -231,6 +231,50 @@ describe("renderSummaryComment", () => {
     }
   });
 
+  it("retains failed-rule status when an oversized summary is compacted", () => {
+    const findings = Array.from({ length: 40 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Baseline problem ${index}. ${"m".repeat(1_980)}`,
+      }),
+    );
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+      rulesFailed: ["tgd-review"],
+    });
+
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("Rules that failed (1)");
+    expect(body).toContain("`tgd-review`");
+  });
+
+  it("keeps compact finding prefixes when no message characters fit", () => {
+    const findings = Array.from({ length: 2 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        ruleName: `rule-${index}`,
+        message: "m".repeat(2_000),
+      }),
+    );
+    const header = "**Actionable comments posted: 2** — 🟠 2 warning";
+    const notice =
+      "> [!WARNING]\n" +
+      "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+    const prefixes = findings.map(
+      (_, index) => `- 🟠 Warning \`src/file-${index}.ts:12\` (\`rule-${index}\`): `,
+    );
+    const prefixOnlyBody = [header, notice, ...prefixes].join("\n\n");
+
+    const body = renderSummaryComment(
+      { ...base, allFindings: findings, unanchored: findings },
+      prefixOnlyBody.length,
+    );
+
+    expect(body).toBe(prefixOnlyBody);
+  });
+
   it("lists failed rules with their reasons", () => {
     const body = renderSummaryComment({
       ...base,
