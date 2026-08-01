@@ -656,20 +656,21 @@ export async function review(
     o: OrchestrationResult,
     failedIds: ReadonlySet<string>,
     marker = formatMarker(pr.headSha, configHash),
+    providerLimit = true,
   ): string => {
     const suffixParts: string[] = [];
     if (loadErrors.length > 0) suffixParts.push(renderLoadErrorsSection(loadErrors));
     suffixParts.push(marker);
     const suffix = `\n\n${suffixParts.join("\n\n")}`;
-    const maxSummaryLength = 65_536 - suffix.length;
-    if (maxSummaryLength <= 0) {
+    const maxSummaryLength = providerLimit ? 65_536 - suffix.length : undefined;
+    if (maxSummaryLength !== undefined && maxSummaryLength <= 0) {
       throw new Error("Review metadata is too large for a provider comment");
     }
     const commentBody = o.summaryInput
       ? renderSummary(o, failedIds, maxSummaryLength)
       : o.commentBody;
     const body = `${commentBody}${suffix}`;
-    if (body.length > 65_536) {
+    if (providerLimit && body.length > 65_536) {
       throw new Error("Review comment exceeds the provider size limit");
     }
     return body;
@@ -685,7 +686,7 @@ export async function review(
       console.log(comment.body);
     }
     if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
-    console.log(buildBody(orchestration, noFallbackIds));
+    console.log(buildBody(orchestration, noFallbackIds, undefined, false));
   } else {
     // ORDER MATTERS. The summary is durable and updatable; inline comments are
     // append-only.
