@@ -662,8 +662,8 @@ export async function review(
     if (loadErrors.length > 0) suffixParts.push(renderLoadErrorsSection(loadErrors));
     suffixParts.push(marker);
     const suffix = `\n\n${suffixParts.join("\n\n")}`;
-    const maxSummaryLength = providerLimit ? 65_536 - suffix.length : undefined;
-    if (maxSummaryLength !== undefined && maxSummaryLength <= 0) {
+    const maxSummaryLength = providerLimit ? 65_536 - suffix.length : Number.MAX_SAFE_INTEGER;
+    if (providerLimit && maxSummaryLength <= 0) {
       throw new Error("Review metadata is too large for a provider comment");
     }
     const commentBody = o.summaryInput
