@@ -211,6 +211,34 @@ describe("renderSummaryComment", () => {
     }
   });
 
+  it("keeps a large suggestion when its actual rendered body fits", () => {
+    const findings = [100, 49, 49].map((length, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Problem ${index}.`,
+        suggestion: `S${index}${"x".repeat(length - 2)}`,
+      }),
+    );
+    const input = { ...base, allFindings: findings, unanchored: findings };
+    const full = renderSummaryComment(input, Number.MAX_SAFE_INTEGER);
+    const blocks = [...full.matchAll(
+      /<details>\n<summary>💡 Proposed fix \(not committable\)<\/summary>[\s\S]*?<\/details>/g,
+    )];
+    expect(blocks).toHaveLength(3);
+    let firstOnly = full;
+    for (const block of blocks.slice(1)) {
+      firstOnly = firstOnly.replace(
+        block[0],
+        "> Proposed fix omitted because the summary size budget was exhausted.",
+      );
+    }
+
+    const body = renderSummaryComment(input, firstOnly.length);
+
+    expect(body.length).toBeLessThanOrEqual(firstOnly.length);
+    expect(body).toContain("S0");
+  });
+
   it("compacts an oversized zero-suggestion baseline below the limit", () => {
     const findings = Array.from({ length: 40 }, (_, index) =>
       makeFinding({
@@ -273,6 +301,22 @@ describe("renderSummaryComment", () => {
     );
 
     expect(body).toBe(prefixOnlyBody);
+  });
+
+  it("redistributes unused compact-message space to longer findings", () => {
+    const findings = [
+      makeFinding({ file: "src/short.ts", message: "short" }),
+      makeFinding({ file: "src/long.ts", message: `Long detail ${"m".repeat(3_000)}` }),
+    ];
+
+    const body = renderSummaryComment(
+      { ...base, allFindings: findings, unanchored: findings },
+      1_000,
+    );
+
+    expect(body.length).toBeLessThanOrEqual(1_000);
+    expect(body.length).toBeGreaterThan(900);
+    expect(body).toContain("short");
   });
 
   it("lists failed rules with their reasons", () => {
