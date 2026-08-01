@@ -1304,6 +1304,27 @@ describe("inline review comments", () => {
     }
   });
 
+  it("prints complete oversized review metadata during dry runs", async () => {
+    const h = inlineHarness(withInline, true);
+    const oversizedError = "e".repeat(70_000);
+    h.loadRules.mockResolvedValue({
+      rules: [makeRule()],
+      errors: [{ sourcePath: "/rules/bad.md", message: oversizedError }],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(2);
+    const output = logSpy.mock.calls.map(([value]) => String(value)).join("\n");
+    expect(output).toContain(oversizedError);
+    expect(output.length).toBeGreaterThan(65_536);
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
   it("posts the inline comments via createInlineReview, pinned to the head SHA", async () => {
     const h = inlineHarness(withInline);
 
