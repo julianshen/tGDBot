@@ -370,25 +370,18 @@ export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
 ): string {
-  const suggestionChars = input.unanchored.reduce((total, finding) => {
-    const suggestion = finding.suggestion?.trim()
-      ? capSuggestion(finding.suggestion)
-      : undefined;
-    return total + (suggestion?.length ?? 0);
-  }, 0);
-  let low = 0;
-  let high = suggestionChars;
-  let best = renderSummaryCommentWithSuggestionBudget(input, 0);
+  const includedSuggestions = new Set<number>();
+  let best = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
   if (best.length > maxLength) return renderCompactSummary(input, maxLength);
 
-  while (low <= high) {
-    const budget = Math.floor((low + high) / 2);
-    const candidate = renderSummaryCommentWithSuggestionBudget(input, budget);
+  for (const [index, finding] of input.unanchored.entries()) {
+    if (!finding.suggestion?.trim() || !capSuggestion(finding.suggestion)) continue;
+    includedSuggestions.add(index);
+    const candidate = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
     if (candidate.length <= maxLength) {
       best = candidate;
-      low = budget + 1;
     } else {
-      high = budget - 1;
+      includedSuggestions.delete(index);
     }
   }
   return best;
@@ -417,12 +410,17 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
-  const perFinding = findings.length === 0 ? 0 : Math.floor(available / findings.length);
+  const messageBudgets = allocateCompactMessageBudgets(
+    findings.map(({ message }) => message.length),
+    available,
+  );
   const body = [
     header,
     notice,
     failedRules,
-    ...findings.map(({ prefix, message }) => `${prefix}${truncate(message, perFinding)}`),
+    ...findings.map(
+      ({ prefix, message }, index) => `${prefix}${truncate(message, messageBudgets[index] ?? 0)}`,
+    ),
   ].filter((part): part is string => part !== undefined).join("\n\n");
 
   if (body.length <= maxLength) return body;
@@ -439,9 +437,32 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   );
 }
 
-function renderSummaryCommentWithSuggestionBudget(
+function allocateCompactMessageBudgets(lengths: number[], available: number): number[] {
+  const budgets = lengths.map(() => 0);
+  let remaining = available;
+  let active = lengths.map((_, index) => index);
+
+  while (active.length > 0 && remaining > 0) {
+    const share = Math.floor(remaining / active.length);
+    const settled = active.filter((index) => lengths[index]! <= share);
+    if (settled.length === 0) {
+      for (const [position, index] of active.entries()) {
+        budgets[index] = share + (position < remaining % active.length ? 1 : 0);
+      }
+      break;
+    }
+    for (const index of settled) {
+      budgets[index] = lengths[index]!;
+      remaining -= lengths[index]!;
+    }
+    active = active.filter((index) => !settled.includes(index));
+  }
+  return budgets;
+}
+
+function renderSummaryCommentWithIncludedSuggestions(
   input: SummaryInput,
-  suggestionBudget: number,
+  includedSuggestions: ReadonlySet<number>,
 ): string {
   const total = input.inlineCount + input.unanchored.length;
   const parts: string[] = [];
@@ -474,15 +495,11 @@ function renderSummaryCommentWithSuggestionBudget(
     const note = input.inlineUnavailable
       ? ""
       : "\n_These couldn't be anchored to a line in the diff (no line number, or the line isn't part of this PR's changes)._\n";
-    let suggestionChars = 0;
-    const findings = input.unanchored.map((finding) => {
+    const findings = input.unanchored.map((finding, index) => {
       const suggestion = finding.suggestion?.trim()
         ? capSuggestion(finding.suggestion)
         : undefined;
-      const includeSuggestion =
-        suggestion === undefined ||
-        suggestionChars + suggestion.length <= suggestionBudget;
-      if (suggestion !== undefined && includeSuggestion) suggestionChars += suggestion.length;
+      const includeSuggestion = suggestion === undefined || includedSuggestions.has(index);
       return renderUnanchoredFinding(finding, includeSuggestion);
     });
     parts.push(
