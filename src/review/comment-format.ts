@@ -396,7 +396,13 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
   const failedRules = input.rulesFailed.length > 0
     ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
-        .map((name) => `* \`${truncate(sanitizeInline(name), 80)}\``)
+        .map((name) => {
+          const label = `* \`${truncate(sanitizeInline(name), 80)}\``;
+          const reason = input.ruleFailureReasons?.[name];
+          return reason
+            ? `${label} — ${truncate(sanitizeInline(reason), 240)}`
+            : label;
+        })
         .join("\n")}`
     : undefined;
   const findings = input.unanchored.map((finding) => {
