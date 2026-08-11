@@ -1354,7 +1354,7 @@ describe("inline review comments", () => {
 
     expect(exitCode).toBe(0);
     const output = logSpy.mock.calls.map(([value]) => String(value)).join("\n");
-    expect(output).toContain("END_OF_FINDING");
+    expect(output).toContain(finding.message);
     expect(output.length).toBeGreaterThan(65_536);
     vi.restoreAllMocks();
   });
