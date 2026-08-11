@@ -180,6 +180,149 @@ describe("renderSummaryComment", () => {
     expect(body).toMatch(/couldn't be anchored/i);
   });
 
+  it("preserves a failed inline suggestion as a non-committable block", () => {
+    const f = makeFinding({ suggestion: "const fixed = true;" });
+    const body = renderSummaryComment({ ...base, allFindings: [f], unanchored: [f] });
+
+    expect(body).toContain("💡 Proposed fix (not committable)");
+    expect(body).toContain("const fixed = true;");
+    expect(body).not.toMatch(/^`{3,}suggestion$/m);
+  });
+
+  it("keeps aggregate fallback suggestions below the provider comment limit", () => {
+    const findings = Array.from({ length: 9 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Problem ${index}. ${"m".repeat(1_988)}`,
+        suggestion: `// fix ${index}\n${"x".repeat(7_980)}`,
+      }),
+    );
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+    });
+
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("// fix 0");
+    expect(body).toContain("Proposed fix omitted because the summary size budget was exhausted.");
+    for (let index = 0; index < findings.length; index += 1) {
+      expect(body).toContain(`Problem ${index}.`);
+    }
+  });
+
+  it("keeps a large suggestion when its actual rendered body fits", () => {
+    const findings = [100, 49, 49].map((length, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Problem ${index}.`,
+        suggestion: `S${index}${"x".repeat(length - 2)}`,
+      }),
+    );
+    const input = { ...base, allFindings: findings, unanchored: findings };
+    const full = renderSummaryComment(input, Number.MAX_SAFE_INTEGER);
+    const blocks = [...full.matchAll(
+      /<details>\n<summary>💡 Proposed fix \(not committable\)<\/summary>[\s\S]*?<\/details>/g,
+    )];
+    expect(blocks).toHaveLength(3);
+    let firstOnly = full;
+    for (const block of blocks.slice(1)) {
+      firstOnly = firstOnly.replace(
+        block[0],
+        "> Proposed fix omitted because the summary size budget was exhausted.",
+      );
+    }
+
+    const body = renderSummaryComment(input, firstOnly.length);
+
+    expect(body.length).toBeLessThanOrEqual(firstOnly.length);
+    expect(body).toContain("S0");
+  });
+
+  it("compacts an oversized zero-suggestion baseline below the limit", () => {
+    const findings = Array.from({ length: 40 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Baseline problem ${index}. ${"m".repeat(1_980)}`,
+      }),
+    );
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+    });
+
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("compacted to fit the provider limit");
+    for (let index = 0; index < findings.length; index += 1) {
+      expect(body).toContain(`Baseline problem ${index}.`);
+    }
+  });
+
+  it("retains failed-rule status when an oversized summary is compacted", () => {
+    const findings = Array.from({ length: 40 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        message: `Baseline problem ${index}. ${"m".repeat(1_980)}`,
+      }),
+    );
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+      rulesFailed: ["tgd-review"],
+      ruleFailureReasons: {
+        "tgd-review": "provider credentials expired; refresh the deployment secret",
+      },
+    });
+
+    expect(body.length).toBeLessThanOrEqual(60_000);
+    expect(body).toContain("Rules that failed (1)");
+    expect(body).toContain("`tgd-review`");
+    expect(body).toContain("provider credentials expired");
+  });
+
+  it("keeps compact finding prefixes when no message characters fit", () => {
+    const findings = Array.from({ length: 2 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        ruleName: `rule-${index}`,
+        message: "m".repeat(2_000),
+      }),
+    );
+    const header = "**Actionable comments posted: 2** — 🟠 2 warning";
+    const notice =
+      "> [!WARNING]\n" +
+      "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+    const prefixes = findings.map(
+      (_, index) => `- 🟠 Warning \`src/file-${index}.ts:12\` (\`rule-${index}\`): `,
+    );
+    const prefixOnlyBody = [header, notice, ...prefixes].join("\n\n");
+
+    const body = renderSummaryComment(
+      { ...base, allFindings: findings, unanchored: findings },
+      prefixOnlyBody.length,
+    );
+
+    expect(body).toBe(prefixOnlyBody);
+  });
+
+  it("redistributes unused compact-message space to longer findings", () => {
+    const findings = [
+      makeFinding({ file: "src/short.ts", message: "short" }),
+      makeFinding({ file: "src/long.ts", message: `Long detail ${"m".repeat(3_000)}` }),
+    ];
+
+    const body = renderSummaryComment(
+      { ...base, allFindings: findings, unanchored: findings },
+      1_000,
+    );
+
+    expect(body.length).toBeLessThanOrEqual(1_000);
+    expect(body.length).toBeGreaterThan(900);
+    expect(body).toContain("short");
+  });
+
   it("lists failed rules with their reasons", () => {
     const body = renderSummaryComment({
       ...base,

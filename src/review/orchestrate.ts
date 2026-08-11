@@ -272,6 +272,7 @@ export function orchestrate(
 export function renderSummary(
   presentation: OrchestrationResult,
   failedIds: ReadonlySet<string>,
+  maxLength?: number,
 ): string {
   const failed = [...failedIds].map((id) => {
     const finding = presentation.findingByClientId.get(id);
@@ -285,5 +286,5 @@ export function renderSummary(
       (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
     ),
     inlineUnavailable: presentation.summaryInput.inlineUnavailable,
-  });
+  }, maxLength);
 }

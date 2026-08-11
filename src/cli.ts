@@ -654,14 +654,28 @@ export async function review(
 
   const buildBody = (
     o: OrchestrationResult,
-    commentBody = o.commentBody,
+    failedIds: ReadonlySet<string>,
     marker = formatMarker(pr.headSha, configHash),
+    providerLimit = true,
   ): string => {
-    const bodyParts = [commentBody];
-    if (loadErrors.length > 0) bodyParts.push(renderLoadErrorsSection(loadErrors));
-    bodyParts.push(marker);
-    return bodyParts.join("\n\n");
+    const suffixParts: string[] = [];
+    if (loadErrors.length > 0) suffixParts.push(renderLoadErrorsSection(loadErrors));
+    suffixParts.push(marker);
+    const suffix = `\n\n${suffixParts.join("\n\n")}`;
+    const maxSummaryLength = providerLimit ? 65_536 - suffix.length : Number.MAX_SAFE_INTEGER;
+    if (providerLimit && maxSummaryLength <= 0) {
+      throw new Error("Review metadata is too large for a provider comment");
+    }
+    const commentBody = o.summaryInput
+      ? renderSummary(o, failedIds, maxSummaryLength)
+      : o.commentBody;
+    const body = `${commentBody}${suffix}`;
+    if (providerLimit && body.length > 65_536) {
+      throw new Error("Review comment exceeds the provider size limit");
+    }
+    return body;
   };
+  const noFallbackIds = new Set<string>();
 
   // AC-8.4: --dry-run prints instead of writing to the VCS — including a preview
   // of the inline comments it WOULD have posted, so a dry run shows the whole
@@ -672,7 +686,7 @@ export async function review(
       console.log(comment.body);
     }
     if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
-    console.log(buildBody(orchestration));
+    console.log(buildBody(orchestration, noFallbackIds, undefined, false));
   } else {
     // ORDER MATTERS. The summary is durable and updatable; inline comments are
     // append-only.
@@ -681,12 +695,11 @@ export async function review(
     // rediscoverable without claiming this SHA/config is complete. Only after
     // inline outcomes and selective fallback are settled do we replace it with
     // the complete dedup marker, targeting the exact returned identity.
-    let conservativeRecoveryBody: string | undefined;
+    let allInlineIds: Set<string> | undefined;
     if (orchestration.inlineComments.length > 0) {
-      const allInlineIds = new Set(
+      allInlineIds = new Set(
         orchestration.inlineComments.map((comment) => comment.clientId),
       );
-      conservativeRecoveryBody = renderSummary(orchestration, allInlineIds);
       // The provider assigns the real note identity on the first write, but
       // every already-known recovery field must be representable before that
       // write. A safe placeholder exercises the exact same bounded encoder.
@@ -703,7 +716,7 @@ export async function review(
       config.locator,
       buildBody(
         orchestration,
-        orchestration.commentBody,
+        noFallbackIds,
         formatPendingMarker({
           phase: "publishing",
           headSha: pr.headSha,
@@ -733,7 +746,7 @@ export async function review(
         config.locator,
         buildBody(
           orchestration,
-          conservativeRecoveryBody!,
+          allInlineIds!,
           formatPendingMarker({
             phase: "ready",
             headSha: pr.headSha,
@@ -782,11 +795,8 @@ export async function review(
       );
     }
 
-    let finalCommentBody = orchestration.commentBody;
+    let finalFallbackIds = noFallbackIds;
     if (orchestration.inlineComments.length > 0) {
-      const allInlineIds = new Set(
-        orchestration.inlineComments.map((comment) => comment.clientId),
-      );
       let fallbackIds: Set<string> | undefined;
       try {
         const outcomes = await config.vcsAdapter.createInlineReview(
@@ -827,15 +837,15 @@ export async function review(
         fallbackIds = allInlineIds;
       }
 
-      if (fallbackIds.size > 0) {
-        finalCommentBody = renderSummary(orchestration, fallbackIds);
+      if (fallbackIds && fallbackIds.size > 0) {
+        finalFallbackIds = fallbackIds;
       }
 
       const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
         config.locator,
         buildBody(
           orchestration,
-          finalCommentBody,
+          finalFallbackIds,
           formatPendingMarker({
             phase: "ready",
             headSha: pr.headSha,
@@ -867,7 +877,7 @@ export async function review(
     }
     const finalizedSummary = await config.vcsAdapter.upsertComment(
       config.locator,
-      buildBody(orchestration, finalCommentBody),
+      buildBody(orchestration, finalFallbackIds),
       summaryIdentity,
     );
     if (

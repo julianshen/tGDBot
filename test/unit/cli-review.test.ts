@@ -1260,6 +1260,105 @@ describe("inline review comments", () => {
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
   });
 
+  it("budgets the final provider body including load errors and the ready marker", async () => {
+    const findings = Array.from({ length: 6 }, (_, index) => ({
+      ...singleFinding,
+      line: index + 1,
+      message: `finding ${index}. ${"m".repeat(1_980)}`,
+      suggestion: `// fix ${index}\n${"x".repeat(7_980)}`,
+    }));
+    const presentation: OrchestrationResult = {
+      commentBody: "**Actionable comments posted: 6**",
+      inlineComments: findings.map((finding, index) => ({
+        clientId: `finding-${index}`,
+        path: "x.ts",
+        line: 2,
+        position: withInline.inlineComments[0]!.position,
+        body: `finding ${index}`,
+      })),
+      findingsCount: findings.length,
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+      findingByClientId: new Map(
+        findings.map((finding, index) => [`finding-${index}`, finding]),
+      ),
+      summaryInput: {
+        allFindings: findings,
+        inlineCount: findings.length,
+        unanchored: [],
+        filesReviewed: ["x.ts"],
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+      },
+    };
+    const h = inlineHarness(presentation);
+    h.loadRules.mockResolvedValue({
+      rules: [makeRule()],
+      errors: [{ sourcePath: "/rules/bad.md", message: "e".repeat(20_000) }],
+    });
+
+    await review(h.args, depsFrom(h));
+
+    for (const [, body] of h.vcsAdapter.upsertComment.mock.calls) {
+      expect(String(body).length).toBeLessThanOrEqual(65_536);
+    }
+  });
+
+  it("prints complete oversized review metadata during dry runs", async () => {
+    const h = inlineHarness(withInline, true);
+    const oversizedError = "e".repeat(70_000);
+    h.loadRules.mockResolvedValue({
+      rules: [makeRule()],
+      errors: [{ sourcePath: "/rules/bad.md", message: oversizedError }],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(2);
+    const output = logSpy.mock.calls.map(([value]) => String(value)).join("\n");
+    expect(output).toContain(oversizedError);
+    expect(output.length).toBeGreaterThan(65_536);
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
+  it("prints complete oversized finding text during dry runs", async () => {
+    const finding = {
+      ...singleFinding,
+      line: undefined,
+      message: `${"m".repeat(70_000)} END_OF_FINDING`,
+    };
+    const presentation: OrchestrationResult = {
+      commentBody: "unused",
+      inlineComments: [],
+      findingsCount: 1,
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+      findingByClientId: new Map(),
+      summaryInput: {
+        allFindings: [finding],
+        inlineCount: 0,
+        unanchored: [finding],
+        filesReviewed: ["x.ts"],
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+      },
+    };
+    const h = inlineHarness(presentation, true);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    const output = logSpy.mock.calls.map(([value]) => String(value)).join("\n");
+    expect(output).toContain(finding.message);
+    expect(output.length).toBeGreaterThan(65_536);
+    vi.restoreAllMocks();
+  });
+
   it("posts the inline comments via createInlineReview, pinned to the head SHA", async () => {
     const h = inlineHarness(withInline);
 

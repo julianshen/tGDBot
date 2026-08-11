@@ -153,6 +153,7 @@ function normalizeForCompare(text: string): string {
 }
 
 function truncate(text: string, max: number): string {
+  if (max <= 0) return "";
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
@@ -300,6 +301,7 @@ function renderSuggestionBlock(suggestion: string, committable: boolean): string
 // publishing fail and force findings back to the summary. Cap it rather than
 // gamble the review.
 const SUGGESTION_MAX = 8000;
+const SUMMARY_COMMENT_MAX = 60_000;
 function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
@@ -323,7 +325,7 @@ export interface SummaryInput {
   inlineUnavailable?: boolean;
 }
 
-function renderUnanchoredFinding(finding: Finding): string {
+function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): string {
   const file = sanitizeInline(finding.file);
   const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
   const full = sanitizeText(finding.message);
@@ -335,6 +337,15 @@ function renderUnanchoredFinding(finding: Finding): string {
     if (body) parts.push("", body);
   } else {
     parts.push(full);
+  }
+  const suggestion = finding.suggestion?.trim() ? capSuggestion(finding.suggestion) : undefined;
+  if (suggestion) {
+    parts.push(
+      "",
+      includeSuggestion
+        ? renderSuggestionBlock(suggestion, false)
+        : "> Proposed fix omitted because the summary size budget was exhausted.",
+    );
   }
   return parts.join("\n");
 }
@@ -355,7 +366,110 @@ function detailsBlock(summary: string, lines: string[]): string {
   return ["<details>", `<summary>${summary}</summary>`, "", ...lines, "", "</details>"].join("\n");
 }
 
-export function renderSummaryComment(input: SummaryInput): string {
+export function renderSummaryComment(
+  input: SummaryInput,
+  maxLength = SUMMARY_COMMENT_MAX,
+): string {
+  const includedSuggestions = new Set<number>();
+  let best = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
+  if (best.length > maxLength) return renderCompactSummary(input, maxLength);
+
+  for (const [index, finding] of input.unanchored.entries()) {
+    if (!finding.suggestion?.trim() || !capSuggestion(finding.suggestion)) continue;
+    includedSuggestions.add(index);
+    const candidate = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
+    if (candidate.length <= maxLength) {
+      best = candidate;
+    } else {
+      includedSuggestions.delete(index);
+    }
+  }
+  return best;
+}
+
+function renderCompactSummary(input: SummaryInput, maxLength: number): string {
+  const header =
+    `**Actionable comments posted: ${input.inlineCount + input.unanchored.length}**` +
+    `${severityCounts(input)}`;
+  const notice =
+    "> [!WARNING]\n" +
+    "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+  const failedRules = input.rulesFailed.length > 0
+    ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
+        .map((name) => {
+          const label = `* \`${truncate(sanitizeInline(name), 80)}\``;
+          const reason = input.ruleFailureReasons?.[name];
+          return reason
+            ? `${label} — ${truncate(sanitizeInline(reason), 240)}`
+            : label;
+        })
+        .join("\n")}`
+    : undefined;
+  const findings = input.unanchored.map((finding) => {
+    const file = truncate(sanitizeInline(finding.file), 160);
+    const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
+    const rule = truncate(sanitizeInline(finding.ruleName), 80);
+    const message = sanitizeInline(finding.message);
+    return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
+  });
+  const fixed = [header, notice, failedRules, ...findings.map(({ prefix }) => prefix)]
+    .filter((part): part is string => part !== undefined)
+    .join("\n\n");
+  const available = Math.max(0, maxLength - fixed.length);
+  const messageBudgets = allocateCompactMessageBudgets(
+    findings.map(({ message }) => message.length),
+    available,
+  );
+  const body = [
+    header,
+    notice,
+    failedRules,
+    ...findings.map(
+      ({ prefix, message }, index) => `${prefix}${truncate(message, messageBudgets[index] ?? 0)}`,
+    ),
+  ].filter((part): part is string => part !== undefined).join("\n\n");
+
+  if (body.length <= maxLength) return body;
+  return truncate(
+    [
+      header,
+      notice,
+      input.rulesFailed.length > 0
+        ? `${input.rulesFailed.length} rule(s) failed to run.`
+        : undefined,
+      `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+    ].filter((part): part is string => part !== undefined).join("\n\n"),
+    maxLength,
+  );
+}
+
+function allocateCompactMessageBudgets(lengths: number[], available: number): number[] {
+  const budgets = lengths.map(() => 0);
+  let remaining = available;
+  let active = lengths.map((_, index) => index);
+
+  while (active.length > 0 && remaining > 0) {
+    const share = Math.floor(remaining / active.length);
+    const settled = active.filter((index) => lengths[index]! <= share);
+    if (settled.length === 0) {
+      for (const [position, index] of active.entries()) {
+        budgets[index] = share + (position < remaining % active.length ? 1 : 0);
+      }
+      break;
+    }
+    for (const index of settled) {
+      budgets[index] = lengths[index]!;
+      remaining -= lengths[index]!;
+    }
+    active = active.filter((index) => !settled.includes(index));
+  }
+  return budgets;
+}
+
+function renderSummaryCommentWithIncludedSuggestions(
+  input: SummaryInput,
+  includedSuggestions: ReadonlySet<number>,
+): string {
   const total = input.inlineCount + input.unanchored.length;
   const parts: string[] = [];
 
@@ -387,8 +501,15 @@ export function renderSummaryComment(input: SummaryInput): string {
     const note = input.inlineUnavailable
       ? ""
       : "\n_These couldn't be anchored to a line in the diff (no line number, or the line isn't part of this PR's changes)._\n";
+    const findings = input.unanchored.map((finding, index) => {
+      const suggestion = finding.suggestion?.trim()
+        ? capSuggestion(finding.suggestion)
+        : undefined;
+      const includeSuggestion = suggestion === undefined || includedSuggestions.has(index);
+      return renderUnanchoredFinding(finding, includeSuggestion);
+    });
     parts.push(
-      `${heading}${note}\n\n${input.unanchored.map(renderUnanchoredFinding).join("\n\n---\n\n")}`,
+      `${heading}${note}\n\n${findings.join("\n\n---\n\n")}`,
     );
   }
 
