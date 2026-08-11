@@ -271,11 +271,15 @@ describe("renderSummaryComment", () => {
       allFindings: findings,
       unanchored: findings,
       rulesFailed: ["tgd-review"],
+      ruleFailureReasons: {
+        "tgd-review": "provider credentials expired; refresh the deployment secret",
+      },
     });
 
     expect(body.length).toBeLessThanOrEqual(60_000);
     expect(body).toContain("Rules that failed (1)");
     expect(body).toContain("`tgd-review`");
+    expect(body).toContain("provider credentials expired");
   });
 
   it("keeps compact finding prefixes when no message characters fit", () => {
