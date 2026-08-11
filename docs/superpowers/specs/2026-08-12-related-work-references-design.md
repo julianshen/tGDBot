@@ -61,11 +61,13 @@ GitHub number syntax is ambiguous between issues and pull requests. Resolution t
 
 Nested GitLab group paths are supported.
 
+The active review host defines the allowed host. This includes GitHub Enterprise and self-managed GitLab: shorthand references resolve on the active host, and full URLs are accepted only when their normalized host and port match that host. URLs for another host or the other provider are ignored. Cross-project support does not imply cross-host lookup.
+
 ### Parsing rules
 
 - Ignore references inside fenced code blocks and inline code spans.
 - Exclude a reference to the current PR/MR itself.
-- Deduplicate by provider, canonical project identity, item kind when known, and number.
+- Deduplicate GitHub references by provider, normalized host/project, and number; the issue/PR kind is metadata, not identity. Deduplicate GitLab references by provider, normalized host/project, syntax-derived kind, and number because `#123` and `!123` are distinct items.
 - Preserve first-seen order across title followed by description.
 - Resolve at most the first 10 unique references.
 - Ignore additional references and emit a diagnostic log entry with the omitted count.
@@ -88,12 +90,12 @@ Extraction is deterministic and performs no external calls.
 
 Extend the existing VCS adapter contract with a best-effort related-item resolution operation. Each provider implementation invokes its own CLI with structured argument arrays:
 
-- GitHub uses `gh` to distinguish issues from pull requests and retrieve title, state, and URL.
-- GitLab uses `glab` to retrieve issue or MR title, state, and URL according to the syntax-derived kind.
+- GitHub uses `gh api repos/{owner}/{repo}/issues/{number}` with an explicit hostname to retrieve the common issue record and uses the presence of its `pull_request` field for classification. For a pull request it then uses `gh pr view --json title,state,url` to obtain the PR-specific state, including `MERGED`. A failure of the initial lookup is a lookup failure, not evidence of either kind; a failure of the second lookup yields an unresolved PR and never falls back to treating it as an issue.
+- GitLab uses `glab issue view` or `glab mr view`, selected from the unambiguous `#` or `!` syntax, with explicit hostname/project arguments and structured output to retrieve title, state, and URL.
 
 Cross-project lookups pass an explicit repository/project selector to the CLI. Implementations must not construct shell command strings from PR/MR content.
 
-Resolution may be performed with bounded concurrency, but output order must match extraction order. Every lookup has a timeout, and individual failures are returned as unresolved entries rather than failing the review.
+Resolution may be performed with bounded concurrency, but output order must match extraction order. Every lookup has a timeout, and individual failures are returned as unresolved entries rather than failing the review. CLI-returned metadata is accepted only after it matches the requested host, project, number, and resolved kind.
 
 ### Review integration
 
@@ -103,9 +105,13 @@ Reference titles and descriptions are never included in the LLM reviewer prompt.
 
 ### Rendering
 
-The shared comment formatter renders `Related work` only when at least one parsed reference exists. Resolved entries include kind, qualified identifier when cross-project, escaped title, state, and canonical link. Unresolved entries include only the normalized identifier and safe link available from parsing.
+The shared comment formatter renders `Related work` only when at least one parsed reference exists. It appears after all full finding and rule-failure sections and immediately before the collapsed `Files reviewed` / `Rules run` details, remaining inside the existing managed summary body. Resolved entries include kind, qualified identifier when cross-project, sanitized title, normalized state, and validated canonical link.
 
-All platform-provided strings are escaped for Markdown. The new section must not alter existing findings, summaries, or marker comments used to update prior reviews.
+States are normalized for display as `open`, `closed`, or `merged`; unknown or missing values are omitted. GitHub PR `MERGED` and GitLab MR `merged` map to `merged`, provider open/opened values map to `open`, and closed values map to `closed`.
+
+For an unresolved GitHub shorthand or cross-repository number, use the canonical `/issues/{number}` URL on the validated host; GitHub routes pull request numbers through this issue URL as well. Unresolved GitLab references use the syntax-known `/-/issues/{number}` or `/-/merge_requests/{number}` URL. A full URL is retained only if it passed the host, project, number, kind, scheme, and port validation rules. Otherwise render the normalized identifier without a link.
+
+All platform-provided strings are treated as untrusted. Titles are flattened to one line, stripped of control characters, length-bounded, and escaped for Markdown. URLs must use `https`, match the active normalized host and port, and match the requested project, number, and kind before rendering. The new section must not alter existing findings, summaries, or marker comments used to update prior reviews.
 
 ## Failure handling
 
@@ -119,7 +125,8 @@ All platform-provided strings are escaped for Markdown. The new section must not
 
 - Pass CLI arguments as arrays; never interpolate untrusted content into a shell command.
 - Do not fetch referenced descriptions, comments, diffs, or other prompt-bearing content.
-- Escape titles and identifiers before Markdown rendering.
+- Flatten, control-character-strip, length-bound, and Markdown-escape titles and identifiers before rendering.
+- Accept only validated `https` URLs on the active review host and port whose path matches the requested project, item number, and kind.
 - Limit resolution to 10 unique references per review.
 - Apply a timeout to each CLI lookup and use bounded concurrency.
 - Treat all resolved metadata as display-only, untrusted data.
@@ -132,19 +139,23 @@ All platform-provided strings are escaped for Markdown. The new section must not
 - GitLab issue/MR shorthand, nested cross-project syntax, and full URLs.
 - Mixed title and description ordering.
 - Deduplication across alternate forms of the same reference.
+- GitHub shorthand and a PR URL for the same number deduplicate before lookup.
 - Current-change self-reference removal.
 - Fenced and inline code exclusion.
-- Ten-item limit and omitted-count diagnostics.
-- Lookalike text that must not be parsed.
+- Ten-item limit and omitted-count diagnostics; duplicates after the tenth textual occurrence do not consume a slot, and the omitted count is the number of additional unique references.
+- Markdown links, trailing punctuation, unclosed code fences, email addresses, versions, similar domains, and other lookalike text that must not be parsed.
 
 ### Adapter tests
 
 - Correct `gh` and `glab` argument construction for local and cross-project items.
 - GitHub issue-versus-PR classification.
+- Initial GitHub lookup failures are not retried as another item kind, and PR-detail failures do not fall back to issue rendering.
 - GitLab issue-versus-MR selection.
 - Successful structured metadata parsing.
 - Missing authentication, not found, timeout, and malformed output behavior.
 - Partial success while preserving input order.
+- GitHub PR and GitLab MR merged-state normalization, plus open, closed, and unknown states.
+- Rejection of mismatched host, port, project, number, kind, non-HTTPS URL, malformed URL, embedded newlines, and control characters in returned metadata.
 
 ### Formatter and integration tests
 
@@ -152,6 +163,7 @@ All platform-provided strings are escaped for Markdown. The new section must not
 - Unresolved fallback rendering.
 - Cross-project qualification.
 - Section omission when no references exist.
+- Exact section placement before collapsed execution details and within the managed summary body.
 - Existing review formatting and managed-comment markers remain unchanged.
 - End-to-end GitHub and GitLab review flows continue when all lookups fail.
 
