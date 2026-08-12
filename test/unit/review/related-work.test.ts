@@ -4,6 +4,7 @@ import {
   extractRelatedWork,
   normalizeRelatedWorkState,
   relatedWorkIdentity,
+  relatedWorkFingerprint,
   reconcileRelatedWork,
   sanitizeRelatedWorkTitle,
   validateResolvedRelatedWork,
@@ -183,6 +184,15 @@ describe("extractRelatedWork", () => {
     const result = extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/Acme/App/pull/9", title: "#9 acme/app#7 ACME/APP#7 https://github.com/aCmE/aPp/issues/7", description: "" });
     expect(result.references).toHaveLength(1);
     expect(result.references[0]).toEqual(expect.objectContaining({ projectPath: "Acme/App", number: 7, identifier: "#7" }));
+  });
+
+  it("fingerprints only the rendered first ten and distinguishes GitHub pull fallback semantics", () => {
+    const input = (title: string) => extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/Acme/App/pull/99", title, description: "" });
+    const ten = Array.from({ length: 10 }, (_, i) => `#${i + 1}`).join(" ");
+    expect(relatedWorkFingerprint(input(`${ten} #11`))).toBe(relatedWorkFingerprint(input(`${ten} #12`)));
+    expect(relatedWorkFingerprint(input("#3"))).not.toBe(relatedWorkFingerprint(input("https://github.com/acme/app/pull/3")));
+    expect(relatedWorkFingerprint(input("https://github.com/acme/app/issues/3"))).not.toBe(relatedWorkFingerprint(input("https://github.com/acme/app/pull/3")));
+    expect(relatedWorkFingerprint(input("https://github.com/ACME/APP/pull/3"))).toBe(relatedWorkFingerprint(input("https://github.com/acme/app/pull/3")));
   });
 });
 

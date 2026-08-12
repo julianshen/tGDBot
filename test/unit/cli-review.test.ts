@@ -12,7 +12,7 @@ import { describe, expect, it, vi } from "vitest";
 import { parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { computeReviewConfigHash, formatMarker } from "../../src/review/dedup.js";
-import { relatedWorkFingerprint } from "../../src/review/related-work.js";
+import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
 import { formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import { resolveReviewLocator } from "../../src/config.js";
@@ -311,7 +311,7 @@ describe("review", () => {
   it("re-reviews the same SHA only when normalized related references change", async () => {
     const url = "https://github.com/acme/app/pull/42";
     const priorInput = { provider: "github" as const, reviewUrl: url, title: "Fixes #7", description: "notes" };
-    const cfg = computeReviewConfigHash(makeArgs(), relatedWorkFingerprint(priorInput));
+    const cfg = computeReviewConfigHash(makeArgs(), relatedWorkFingerprint(extractRelatedWork(priorInput)));
     const botComment: BotComment = { id: "999", body: formatMarker("cafef00d", cfg), lastReviewedSha: "cafef00d", reviewedConfig: cfg };
 
     const unchanged = makeHarness({ botComment, pr: makePr({ url, title: "Fixes #7", description: "unrelated wording changed" }) });
@@ -326,6 +326,30 @@ describe("review", () => {
       if (title.includes("#")) expect(changed.vcsAdapter.resolveRelatedWork).toHaveBeenCalledOnce();
       else expect(changed.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     }
+  });
+
+  it("ignores changes beyond the first ten references but re-reviews shorthand changed to an explicit pull", async () => {
+    const url = "https://github.com/acme/app/pull/42";
+    const ten = Array.from({ length: 10 }, (_, i) => `#${i + 1}`).join(" ");
+    const configFor = (title: string) => computeReviewConfigHash(makeArgs(), relatedWorkFingerprint(extractRelatedWork({ provider: "github", reviewUrl: url, title, description: "" })));
+    const cappedCfg = configFor(`${ten} #11`);
+    const cappedComment: BotComment = { id: "999", body: formatMarker("cafef00d", cappedCfg), lastReviewedSha: "cafef00d", reviewedConfig: cappedCfg };
+    const eleventhChanged = makeHarness({ botComment: cappedComment, pr: makePr({ url, title: `${ten} #12`, description: "" }) });
+    await review(eleventhChanged.args, depsFrom(eleventhChanged));
+    expect(eleventhChanged.dispatchRules).not.toHaveBeenCalled();
+    expect(eleventhChanged.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+
+    const shorthandCfg = configFor("#3");
+    const shorthandComment: BotComment = { id: "999", body: formatMarker("cafef00d", shorthandCfg), lastReviewedSha: "cafef00d", reviewedConfig: shorthandCfg };
+    const explicitPull = makeHarness({ botComment: shorthandComment, pr: makePr({ url, title: "https://github.com/acme/app/pull/3", description: "" }) });
+    explicitPull.vcsAdapter.resolveRelatedWork.mockRejectedValue(new Error("lookup failed"));
+    explicitPull.orchestrate.mockImplementation(buildPresentation);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await review(explicitPull.args, depsFrom(explicitPull));
+    expect(explicitPull.dispatchRules).toHaveBeenCalledOnce();
+    expect(explicitPull.vcsAdapter.resolveRelatedWork).toHaveBeenCalledOnce();
+    expect(String(explicitPull.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1])).toContain("/pull/3");
+    vi.restoreAllMocks();
   });
 
   it("fails closed before dispatch or writes for malformed ready recovery metadata", async () => {
@@ -1873,7 +1897,7 @@ describe("inline review comments", () => {
     const args = makeArgs({ dryRun });
     const pr = makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" });
     const h = makeHarness({ args, botComment: null, pr });
-    const fingerprint = relatedWorkFingerprint({ provider: "github", reviewUrl: pr.url!, title: pr.title, description: pr.description });
+    const fingerprint = relatedWorkFingerprint(extractRelatedWork({ provider: "github", reviewUrl: pr.url!, title: pr.title, description: pr.description }));
     const body = formatPendingMarker({ phase: "ready", headSha: "cafef00d", configHash: computeReviewConfigHash(h.config, fingerprint), noteId: "written-777", terminalResult: { status: "posted", findingsCount: 0, rulesRun: ["rule-a"], rulesFailed: [], exitCode: 0 } });
     h.vcsAdapter.findBotComment.mockResolvedValue({ id: "written-777", body, ...parseBotMarker(body)! });
     vi.spyOn(console, "log").mockImplementation(() => {});

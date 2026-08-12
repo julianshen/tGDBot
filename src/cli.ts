@@ -490,7 +490,7 @@ export async function review(
   // already reviewed WITH THE SAME review configuration. Computed from CLI flags
   // alone (no rule fetch), so the skip decision stays as cheap as before — see
   // computeReviewConfigHash for what is and isn't captured.
-  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(relatedWorkInput));
+  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted));
 
   if (botComment?.invalidPendingState === true) {
     throw new Error(

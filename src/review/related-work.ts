@@ -249,18 +249,18 @@ export function extractRelatedWork(input: { provider: "github" | "gitlab"; revie
   return { references: unique.slice(0, 10), omittedCount: Math.max(0, unique.length - 10) };
 }
 
-export function relatedWorkFingerprint(input: { provider: "github" | "gitlab"; reviewUrl: string; title: string; description: string }): string | undefined {
-  const context = parseReview(input);
-  if (!context) return undefined;
-  const identities: string[] = [];
-  const seen = new Set<string>();
-  for (const value of [input.title, input.description]) for (const { reference } of candidates(value, context)) {
-    const sameProject = context.provider === "github" ? reference.projectPath.toLowerCase() === context.projectPath.toLowerCase() : reference.projectPath === context.projectPath;
-    const isSelf = sameProject && reference.number === context.number && (context.provider === "github" || reference.kindHint === "merge_request");
-    const identity = relatedWorkIdentity(reference);
-    if (!isSelf && !seen.has(identity)) { seen.add(identity); identities.push(identity); }
-  }
-  return identities.length > 0 ? identities.join("\n") : undefined;
+export function relatedWorkFingerprint(result: ExtractRelatedWorkResult): string | undefined {
+  if (result.references.length === 0) return undefined;
+  return result.references.map((reference) => {
+    // GitHub's canonical identity intentionally unifies issues and pull
+    // requests by number, but an explicit pull URL renders a different safe
+    // fallback than ambiguous shorthand. Include that normalized semantic,
+    // never caller-controlled spelling or raw source text.
+    const fallbackKind = reference.provider === "github"
+      ? reference.kindHint === "pull_request" ? "pull_request" : "issue"
+      : reference.kindHint ?? "issue";
+    return `${relatedWorkIdentity(reference)}|${fallbackKind}`;
+  }).join("\n");
 }
 
 export function normalizeRelatedWorkState(kind: RelatedWorkKind, value: unknown): RelatedWorkState | undefined {

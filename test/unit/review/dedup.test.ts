@@ -120,7 +120,7 @@ describe("computeReviewConfigHash", () => {
     expect(computeReviewConfigHash(makeConfig())).toBe(computeReviewConfigHash(makeConfig()));
   });
 
-  it("changes only when the normalized related-reference fingerprint changes", () => {
+  it("changes only when the supplied normalized related-reference fingerprint changes", () => {
     const base = computeReviewConfigHash(makeConfig(), "github|github.com|443|a/b|7");
     expect(computeReviewConfigHash(makeConfig(), "github|github.com|443|a/b|7")).toBe(base);
     expect(computeReviewConfigHash(makeConfig(), "github|github.com|443|a/b|8")).not.toBe(base);
