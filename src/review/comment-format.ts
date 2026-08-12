@@ -8,6 +8,12 @@
 //
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
+import {
+  validateResolvedRelatedWork,
+  type RelatedWorkItem,
+  type RelatedWorkKind,
+  type RelatedWorkReference,
+} from "./related-work.js";
 
 /**
  * Machine-detectable tag appended to every inline comment THIS TOOL posts
@@ -317,12 +323,76 @@ export interface SummaryInput {
   rulesRun: string[];
   rulesFailed: string[];
   ruleFailureReasons?: Record<string, string>;
+  relatedWork?: readonly RelatedWorkItem[];
   /**
    * True when inline posting was unavailable (e.g. the reviews API call failed).
    * The summary then carries EVERY finding, so a finding is never lost — it is
    * only ever relocated.
    */
   inlineUnavailable?: boolean;
+}
+
+const PROJECT_PATH_RE = /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/;
+
+function canonicalRelatedWorkReference(value: unknown): RelatedWorkReference | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  const provider = item.provider;
+  const host = item.host;
+  const projectPath = item.projectPath;
+  const number = item.number;
+  const kindHint = item.kindHint;
+  if ((provider !== "github" && provider !== "gitlab") || typeof host !== "string" ||
+      typeof projectPath !== "string" || !PROJECT_PATH_RE.test(projectPath) ||
+      typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) return undefined;
+  if (kindHint !== undefined && kindHint !== "issue" && kindHint !== "pull_request" && kindHint !== "merge_request") return undefined;
+  if ((provider === "github" && kindHint === "merge_request") || (provider === "gitlab" && kindHint === "pull_request")) return undefined;
+  let authority: URL;
+  try { authority = new URL(`https://${host}${typeof item.port === "string" ? `:${item.port}` : ""}/`); } catch { return undefined; }
+  if (authority.hostname.toLowerCase() !== host.toLowerCase() || authority.username || authority.password) return undefined;
+  const sigil = kindHint === "merge_request" ? "!" : "#";
+  const localIdentifier = `${sigil}${number}`;
+  const crossIdentifier = `${projectPath}${sigil}${number}`;
+  if (item.identifier !== localIdentifier && item.identifier !== crossIdentifier) return undefined;
+  return {
+    provider, host: host.toLowerCase(),
+    ...(typeof item.port === "string" && item.port ? { port: item.port } : {}),
+    projectPath, number, ...(kindHint ? { kindHint } : {}), sourceText: "", identifier: item.identifier,
+    ...(typeof item.fallbackUrl === "string" ? { fallbackUrl: item.fallbackUrl } : {}),
+  };
+}
+
+function escapeMarkdownText(value: string): string {
+  return sanitizeText(value).replace(/([\\`*_[\]{}()<>#+|~])/g, "\\$1");
+}
+
+function kindLabel(kind: RelatedWorkKind): string {
+  return kind === "issue" ? "Issue" : kind === "pull_request" ? "PR" : "MR";
+}
+
+function renderRelatedWorkItem(value: unknown): string | undefined {
+  const reference = canonicalRelatedWorkReference(value);
+  if (!reference) return undefined;
+  const validated = validateResolvedRelatedWork(reference, value);
+  const resolved = validated.url && validated.kind ? validated : undefined;
+  const fallbackKind = reference.kindHint ?? "issue";
+  const fallback = reference.fallbackUrl
+    ? validateResolvedRelatedWork(reference, { kind: fallbackKind, url: reference.fallbackUrl }).url
+    : undefined;
+  const url = resolved?.url ?? fallback;
+  const identifier = reference.identifier;
+  const label = resolved ? `${kindLabel(resolved.kind!)} ${identifier}` : identifier;
+  const main = url ? `[${label}](${url})` : escapeMarkdownText(label);
+  if (!resolved?.title) return main;
+  const state = resolved.state ? ` (${resolved.state})` : "";
+  return `${main} — ${escapeMarkdownText(resolved.title)}${state}`;
+}
+
+export function normalizeRelatedWorkForRender(items: readonly unknown[]): string[] {
+  return items.flatMap((item) => {
+    const rendered = renderRelatedWorkItem(item);
+    return rendered ? [rendered] : [];
+  });
 }
 
 function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): string {
@@ -521,6 +591,11 @@ function renderSummaryCommentWithIncludedSuggestions(
     parts.push(
       `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${items.join("\n")}`,
     );
+  }
+
+  const relatedWork = normalizeRelatedWorkForRender(input.relatedWork ?? []);
+  if (relatedWork.length > 0) {
+    parts.push(`### Related work\n\n${relatedWork.map((item) => `- ${item}`).join("\n")}`);
   }
 
   const collapsed: string[] = [];

@@ -17,6 +17,7 @@ import {
   rangeIsCommentable,
 } from "./diff-anchors.js";
 import type { DispatchResult, Finding } from "./types.js";
+import type { RelatedWorkItem } from "./related-work.js";
 
 export type { InlineComment } from "./comment-format.js";
 
@@ -141,7 +142,7 @@ export function isSuggestionAllowedForPath(file: string): boolean {
 export function orchestrate(
   dispatchResult: DispatchResult,
   diff = "",
-  options: { inline?: boolean } & RenderOptions = {},
+  options: { inline?: boolean; relatedWork?: readonly RelatedWorkItem[] } & RenderOptions = {},
 ): OrchestrationResult {
   // Severity order is load-bearing, not cosmetic: a reader must meet the
   // blocking findings before the nits, whether they're reading the summary or
@@ -254,6 +255,7 @@ export function orchestrate(
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
     ruleFailureReasons: dispatchResult.ruleFailureReasons,
+    relatedWork: options.relatedWork,
     inlineUnavailable: !inlineEnabled && dedupedFindings.length > 0,
   };
   const commentBody = renderSummaryComment(summaryInput);

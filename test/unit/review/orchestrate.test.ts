@@ -26,6 +26,18 @@ function makeDispatchResult(overrides: Partial<DispatchResult> = {}): DispatchRe
 }
 
 describe("orchestrate", () => {
+  it("preserves related work exactly once in initial and inline fallback summaries", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -9,1 +9,2 @@\n context\n+added\n`;
+    const relatedWork = [{ provider: "github" as const, host: "github.com", projectPath: "acme/app", number: 42, kindHint: "issue" as const, sourceText: "#42", identifier: "#42", fallbackUrl: "https://github.com/acme/app/issues/42", kind: "issue" as const, title: "Fix login", state: "open" as const, url: "https://github.com/acme/app/issues/42" }];
+    const presentation = orchestrate(makeDispatchResult({ findings: [makeFinding({ line: 10 })] }), diff, { relatedWork });
+    const section = "### Related work\n\n- [Issue #42](https://github.com/acme/app/issues/42) — Fix login (open)";
+    expect(presentation.commentBody).toContain(section);
+    const fallback = renderSummary(presentation, new Set(["finding-0"]));
+    expect(fallback).toContain(section);
+    expect(fallback.match(/^### Related work$/gm)).toHaveLength(1);
+    expect(presentation.summaryInput.relatedWork).toBe(relatedWork);
+  });
+
   it("assigns stable IDs, maps every inline candidate, and selectively falls back", () => {
     const diff = `diff --git a/src/foo.ts b/src/foo.ts
 --- a/src/foo.ts
