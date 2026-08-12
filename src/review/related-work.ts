@@ -84,23 +84,27 @@ function parseReview(input: { provider: "github" | "gitlab"; reviewUrl: string }
 
 function visibleMarkdown(value: string): string {
   let output = "";
-  let fence: { char: string; length: number } | undefined;
+  let fence: { char: string; length: number; container: string } | undefined;
   let inline = 0;
   for (let index = 0; index < value.length;) {
     const atLineStart = index === 0 || value[index - 1] === "\n";
-    if (atLineStart) {
+    if (atLineStart && inline === 0) {
       // A fence may be nested under one or more blockquote markers and/or a
       // list marker. These container prefixes are Markdown structure, not
       // fence indentation, so recognize them before applying the usual
       // zero-to-three-space fence rule.
-      const fenceMatch = /^(?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|[1-9][0-9]*[.)])[ \t]+))* {0,3}(`{3,}|~{3,})/.exec(value.slice(index));
+      const fenceMatch = /^((?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|[1-9][0-9]*[.)])[ \t]+))* {0,3})(`{3,}|~{3,})/.exec(value.slice(index));
       if (fenceMatch) {
-        const marker = fenceMatch[1]!;
+        const container = fenceMatch[1]!.replace(
+          / {0,3}(?:[-+*]|[1-9][0-9]*[.)])[ \t]+/g,
+          (prefix) => " ".repeat(prefix.length),
+        );
+        const marker = fenceMatch[2]!;
         const lineEnd = value.indexOf("\n", index);
         const contentEnd = lineEnd < 0 ? value.length : value[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
         const remainder = value.slice(index + fenceMatch[0].length, contentEnd);
-        const closes = fence && marker[0] === fence.char && marker.length >= fence.length && /^[ \t]*$/.test(remainder);
-        if (!fence) fence = { char: marker[0]!, length: marker.length };
+        const closes = fence && container === fence.container && marker[0] === fence.char && marker.length >= fence.length && /^[ \t]*$/.test(remainder);
+        if (!fence) fence = { char: marker[0]!, length: marker.length, container };
         else if (closes) fence = undefined;
         const end = lineEnd < 0 ? value.length : lineEnd + 1;
         output += " ".repeat(end - index);
@@ -268,6 +272,12 @@ function candidates(text: string, context: ReviewContext): Array<{ index: number
     if (!project || number === undefined) continue;
     const kind: RelatedWorkKind = pathMatch[2] === "issues" ? "issue" : context.provider === "github" ? "pull_request" : "merge_request";
     found.push({ index: match.index!, reference: makeReference(context, project, number, kind, sourceText) });
+  }
+  // A fragment in an inline-link destination is navigation, not an issue
+  // shorthand. Full related-work URLs have already been collected above.
+  const linkDestinationPattern = /\]\((?:\\.|[^()\\\n]|\([^()\\\n]*\))*\)/g;
+  for (const match of visible.matchAll(linkDestinationPattern)) {
+    occupied.push([match.index! + 2, match.index! + match[0].length - 1]);
   }
   const shorthand = context.provider === "github"
     ? /(?<![A-Za-z0-9_.@/-])(?:(?<project>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#(?<number>[1-9][0-9]*)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_])/g

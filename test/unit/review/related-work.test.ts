@@ -120,6 +120,39 @@ describe("extractRelatedWork", () => {
     expect(result.references.map((reference) => reference.identifier)).toEqual(["#44"]);
   });
 
+  it("does not let a differently nested fence close the active fenced block", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "",
+      description: [
+        "```text",
+        "> ```",
+        "Still code #42",
+        "```",
+        "Visible #43",
+      ].join("\n"),
+    });
+
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#43"]);
+  });
+
+  it("does not start a fence inside a multiline inline-code span", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "",
+      description: [
+        "`inline code",
+        "```",
+        "hidden #42",
+        "` visible #43",
+      ].join("\n"),
+    });
+
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#43"]);
+  });
+
   it("does not mask references after an unmatched inline-code delimiter", () => {
     const result = extractRelatedWork({
       provider: "github",
@@ -173,6 +206,17 @@ describe("extractRelatedWork", () => {
 
     expect(github.references.map((reference) => reference.identifier)).toEqual(["#42"]);
     expect(gitlab.references.map((reference) => reference.identifier)).toEqual(["!19", "#20"]);
+  });
+
+  it("ignores shorthand in Markdown link destinations while retaining full related URLs", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "See [details](#42) and #43",
+      description: "Track [the issue](https://github.com/a/b/issues/44)",
+    });
+
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#43", "#44"]);
   });
 
   it("accepts Markdown URL punctuation but not numeric-path prefixes", () => {
