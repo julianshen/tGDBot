@@ -101,6 +101,25 @@ describe("extractRelatedWork", () => {
     expect(result.references.map((reference) => reference.identifier)).toEqual(["#44"]);
   });
 
+  it("masks fences when list and blockquote container markers are interleaved", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "",
+      description: [
+        "- > ```text",
+        "  > Example #42",
+        "  > ```",
+        "> - ~~~text",
+        ">   Example #43",
+        ">   ~~~",
+        "Visible #44",
+      ].join("\n"),
+    });
+
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#44"]);
+  });
+
   it("does not mask references after an unmatched inline-code delimiter", () => {
     const result = extractRelatedWork({
       provider: "github",
@@ -136,6 +155,24 @@ describe("extractRelatedWork", () => {
     }
     expect(extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/a/b/issues/9", title: "#1", description: "" }).references).toEqual([]);
     expect(extractRelatedWork({ provider: "gitlab", reviewUrl: "https://gitlab.com/a/-/merge_requests/9", title: "#1", description: "" }).references).toEqual([]);
+  });
+
+  it("accepts sentence-final shorthand periods but rejects decimal continuations", () => {
+    const github = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "Fixes #42. Not #1.2.",
+      description: "",
+    });
+    const gitlab = extractRelatedWork({
+      provider: "gitlab",
+      reviewUrl: "https://gitlab.com/a/b/-/merge_requests/9",
+      title: "Follows !19. Closes #20. Not !2.3.",
+      description: "",
+    });
+
+    expect(github.references.map((reference) => reference.identifier)).toEqual(["#42"]);
+    expect(gitlab.references.map((reference) => reference.identifier)).toEqual(["!19", "#20"]);
   });
 
   it("accepts Markdown URL punctuation but not numeric-path prefixes", () => {

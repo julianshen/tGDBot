@@ -93,7 +93,7 @@ function visibleMarkdown(value: string): string {
       // list marker. These container prefixes are Markdown structure, not
       // fence indentation, so recognize them before applying the usual
       // zero-to-three-space fence rule.
-      const fenceMatch = /^(?:(?: {0,3}>[ \t]?)+)?(?: {0,3}(?:[-+*]|[1-9][0-9]*[.)])[ \t]+)? {0,3}(`{3,}|~{3,})/.exec(value.slice(index));
+      const fenceMatch = /^(?:(?: {0,3}>[ \t]?)|(?: {0,3}(?:[-+*]|[1-9][0-9]*[.)])[ \t]+))* {0,3}(`{3,}|~{3,})/.exec(value.slice(index));
       if (fenceMatch) {
         const marker = fenceMatch[1]!;
         const lineEnd = value.indexOf("\n", index);
@@ -270,8 +270,8 @@ function candidates(text: string, context: ReviewContext): Array<{ index: number
     found.push({ index: match.index!, reference: makeReference(context, project, number, kind, sourceText) });
   }
   const shorthand = context.provider === "github"
-    ? /(?<![A-Za-z0-9_.@/-])(?:(?<project>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#(?<number>[1-9][0-9]*)(?![A-Za-z0-9_.-])/g
-    : /(?<![A-Za-z0-9_.@/-])(?:(?<project>[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+))?(?<sigil>[#!])(?<number>[1-9][0-9]*)(?![A-Za-z0-9_.-])/g;
+    ? /(?<![A-Za-z0-9_.@/-])(?:(?<project>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#(?<number>[1-9][0-9]*)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_])/g
+    : /(?<![A-Za-z0-9_.@/-])(?:(?<project>[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+))?(?<sigil>[#!])(?<number>[1-9][0-9]*)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_])/g;
   for (const match of visible.matchAll(shorthand)) {
     if (occupied.some(([start, end]) => match.index! >= start && match.index! < end)) continue;
     const project = match.groups?.project ? decodeProject(match.groups.project, context.provider) : context.projectPath;
