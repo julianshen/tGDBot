@@ -9,6 +9,7 @@
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
 import {
+  isValidRelatedWorkProjectPath,
   validateResolvedRelatedWork,
   type RelatedWorkItem,
   type RelatedWorkKind,
@@ -332,8 +333,6 @@ export interface SummaryInput {
   inlineUnavailable?: boolean;
 }
 
-const PROJECT_PATH_RE = /^[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+$/;
-
 function canonicalRelatedWorkReference(value: unknown): RelatedWorkReference | undefined {
   if (!value || typeof value !== "object") return undefined;
   const item = value as Record<string, unknown>;
@@ -343,7 +342,7 @@ function canonicalRelatedWorkReference(value: unknown): RelatedWorkReference | u
   const number = item.number;
   const kindHint = item.kindHint;
   if ((provider !== "github" && provider !== "gitlab") || typeof host !== "string" ||
-      typeof projectPath !== "string" || !PROJECT_PATH_RE.test(projectPath) ||
+      typeof projectPath !== "string" || !isValidRelatedWorkProjectPath(provider, projectPath) ||
       typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) return undefined;
   if (kindHint !== undefined && kindHint !== "issue" && kindHint !== "pull_request" && kindHint !== "merge_request") return undefined;
   if ((provider === "github" && kindHint === "merge_request") || (provider === "gitlab" && kindHint === "pull_request")) return undefined;

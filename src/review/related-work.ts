@@ -37,6 +37,15 @@ interface ReviewContext {
 const SEGMENT = /^[A-Za-z0-9_.-]+$/;
 const NUMBER = /^[1-9][0-9]*$/;
 
+export function isValidRelatedWorkProjectPath(
+  provider: "github" | "gitlab",
+  projectPath: string,
+): boolean {
+  const segments = projectPath.split("/");
+  return (provider === "github" ? segments.length === 2 : segments.length >= 2) &&
+    segments.every((part) => part !== "." && part !== ".." && SEGMENT.test(part));
+}
+
 function parseNumber(value: string): number | undefined {
   if (!NUMBER.test(value)) return undefined;
   const number = Number(value);
@@ -47,10 +56,8 @@ function decodeProject(raw: string, provider: "github" | "gitlab"): string | und
   if (/%(?:2f|5c)/i.test(raw) || raw.includes("\\")) return undefined;
   let decoded: string;
   try { decoded = decodeURIComponent(raw); } catch { return undefined; }
-  const segments = decoded.split("/");
-  if ((provider === "github" && segments.length !== 2) || (provider === "gitlab" && segments.length < 2)) return undefined;
-  if (segments.some((part) => !part || part === "." || part === ".." || !SEGMENT.test(part))) return undefined;
-  return segments.join("/");
+  if (!isValidRelatedWorkProjectPath(provider, decoded)) return undefined;
+  return decoded;
 }
 
 function parseReview(input: { provider: "github" | "gitlab"; reviewUrl: string }): ReviewContext | undefined {

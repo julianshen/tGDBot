@@ -365,9 +365,24 @@ describe("renderSummaryComment", () => {
   });
 
   it("omits the related-work heading when every entry is invalid", () => {
-    const relatedWork = [{ sourceText: "#1" }] as unknown as RelatedWorkItem[];
+    const relatedWork = [
+      { provider: "github", host: "github.com", projectPath: "acme/app/extra", number: 1, sourceText: "bad", identifier: "#1" },
+      { provider: "github", host: "github.com", projectPath: "acme/../app", number: 2, sourceText: "bad", identifier: "#2" },
+      { provider: "gitlab", host: "gitlab.com", projectPath: "group/./app", number: 3, sourceText: "bad", identifier: "#3" },
+    ] as unknown as RelatedWorkItem[];
     expect(renderSummaryComment({ ...base, relatedWork })).not.toContain("Related work");
     expect(renderSummaryComment({ ...base, relatedWork: [] })).not.toContain("Related work");
+  });
+
+  it("keeps valid entries while omitting invalid project identities", () => {
+    const relatedWork = [
+      { provider: "github", host: "github.com", projectPath: "acme/app/extra", number: 1, sourceText: "bad", identifier: "#1" },
+      { provider: "gitlab", host: "gitlab.com", projectPath: "group/platform", number: 2, sourceText: "good", identifier: "#2" },
+    ] as unknown as RelatedWorkItem[];
+    const body = renderSummaryComment({ ...base, relatedWork });
+    expect(body).not.toContain("#1");
+    expect(body).toContain("- \\#2");
+    expect(body.match(/^### Related work$/gm)).toHaveLength(1);
   });
 });
 

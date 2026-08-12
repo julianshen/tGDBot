@@ -26,15 +26,25 @@ function makeDispatchResult(overrides: Partial<DispatchResult> = {}): DispatchRe
 }
 
 describe("orchestrate", () => {
-  it("preserves related work exactly once in initial and inline fallback summaries", () => {
+  it("preserves related work exactly once and unchanged through every inline fallback mode", () => {
     const diff = `diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -9,1 +9,2 @@\n context\n+added\n`;
     const relatedWork = [{ provider: "github" as const, host: "github.com", projectPath: "acme/app", number: 42, kindHint: "issue" as const, sourceText: "#42", identifier: "#42", fallbackUrl: "https://github.com/acme/app/issues/42", kind: "issue" as const, title: "Fix login", state: "open" as const, url: "https://github.com/acme/app/issues/42" }];
-    const presentation = orchestrate(makeDispatchResult({ findings: [makeFinding({ line: 10 })] }), diff, { relatedWork });
+    const presentation = orchestrate(makeDispatchResult({ findings: [
+      makeFinding({ line: 9, message: "first" }),
+      makeFinding({ line: 10, message: "second" }),
+    ] }), diff, { relatedWork });
     const section = "### Related work\n\n- [Issue #42](https://github.com/acme/app/issues/42) — Fix login (open)";
-    expect(presentation.commentBody).toContain(section);
-    const fallback = renderSummary(presentation, new Set(["finding-0"]));
-    expect(fallback).toContain(section);
-    expect(fallback.match(/^### Related work$/gm)).toHaveLength(1);
+    const summaries = [
+      presentation.commentBody,
+      renderSummary(presentation, new Set()),
+      renderSummary(presentation, new Set(["finding-0", "finding-1"])),
+      renderSummary(presentation, new Set(["finding-1"])),
+    ];
+    for (const body of summaries) {
+      expect(body).toContain(section);
+      expect(body.match(/^### Related work$/gm)).toHaveLength(1);
+      expect(body.slice(body.indexOf("### Related work"), body.indexOf("<details>"))).toBe(`${section}\n\n`);
+    }
     expect(presentation.summaryInput.relatedWork).toBe(relatedWork);
   });
 
