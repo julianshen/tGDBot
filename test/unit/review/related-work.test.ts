@@ -59,6 +59,17 @@ describe("extractRelatedWork", () => {
     expect(extractRelatedWork({ provider: "gitlab", reviewUrl: "https://git.example.com/a/b/-/merge_requests/1", title: "", description }).references).toEqual([]);
   });
 
+  it("does not close a fenced block when text follows the closing marker", () => {
+    const description = ["```js", "```not-a-close", "#7", "```"].join("\n");
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "",
+      description,
+    });
+    expect(result.references).toEqual([]);
+  });
+
   it("limits after deduplication and reports only extra unique references", () => {
     const title = Array.from({ length: 12 }, (_, index) => `#${index + 1}`).join(" ") + " #1 #2";
     const result = extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/a/b/pull/99", title, description: "" });

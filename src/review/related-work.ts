@@ -78,11 +78,13 @@ function visibleMarkdown(value: string): string {
       const fenceMatch = /^( {0,3})(`{3,}|~{3,})/.exec(value.slice(index));
       if (fenceMatch) {
         const marker = fenceMatch[2]!;
-        const closes = fence && marker[0] === fence.char && marker.length >= fence.length;
+        const lineEnd = value.indexOf("\n", index);
+        const contentEnd = lineEnd < 0 ? value.length : lineEnd;
+        const remainder = value.slice(index + fenceMatch[0].length, contentEnd);
+        const closes = fence && marker[0] === fence.char && marker.length >= fence.length && /^[ \t]*$/.test(remainder);
         if (!fence) fence = { char: marker[0]!, length: marker.length };
         else if (closes) fence = undefined;
-        const newline = value.indexOf("\n", index);
-        const end = newline < 0 ? value.length : newline + 1;
+        const end = lineEnd < 0 ? value.length : lineEnd + 1;
         output += " ".repeat(end - index);
         index = end;
         continue;
