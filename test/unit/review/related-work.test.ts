@@ -111,6 +111,23 @@ describe("extractRelatedWork", () => {
     expect(github.references).toEqual([]);
     expect(gitlab.references).toEqual([]);
   });
+
+  it("rejects full URLs with query or fragment suffixes", () => {
+    const github = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "https://github.com/a/b/issues/3?view=1 https://github.com/a/b/pull/4#discussion",
+      description: "",
+    });
+    const gitlab = extractRelatedWork({
+      provider: "gitlab",
+      reviewUrl: "https://gitlab.com/a/b/-/merge_requests/9",
+      title: "https://gitlab.com/a/b/-/issues/3?view=1 https://gitlab.com/a/b/-/merge_requests/4#note_1",
+      description: "",
+    });
+    expect(github.references).toEqual([]);
+    expect(gitlab.references).toEqual([]);
+  });
 });
 
 describe("metadata safety", () => {
