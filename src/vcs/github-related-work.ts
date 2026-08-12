@@ -13,7 +13,13 @@ function authority(reference: RelatedWorkReference): string {
 }
 
 function diagnosticIdentifier(reference: RelatedWorkReference): string {
-  return `${reference.projectPath}#${reference.number}`;
+  const segments = reference.projectPath.split("/");
+  const validProject = segments.length === 2 && segments.every((segment) =>
+    segment !== "." && segment !== ".." && /^[A-Za-z0-9_.-]+$/.test(segment));
+  const number = Number.isSafeInteger(reference.number) && reference.number > 0
+    ? String(reference.number)
+    : "?";
+  return `${validProject ? reference.projectPath : "[invalid]"}#${number}`;
 }
 
 function normalizedState(value: unknown): RelatedWorkState | undefined {

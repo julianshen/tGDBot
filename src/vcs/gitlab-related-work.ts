@@ -50,7 +50,7 @@ async function resolveOne(reference: RelatedWorkReference, execGlab: ExecGlab): 
     const command = reference.kindHint === "issue" ? "issue" : "mr";
     const output = await execGlab([
       command, "view", String(reference.number), "--repo", projectUrl,
-      "--hostname", host, "--output", "json",
+      "--output", "json",
     ], undefined, LOOKUP_OPTIONS);
     const record = parseRecord(output);
     if (!record) return reference;

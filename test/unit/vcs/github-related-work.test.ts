@@ -165,6 +165,15 @@ describe("resolveGitHubRelatedWork", () => {
     warn.mockRestore();
   });
 
+  it("uses a safe placeholder when a direct caller supplies a hostile project path", async () => {
+    const ref = reference(15, { projectPath: "other/project\nTOKEN=secret", identifier: "also private" });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await resolveGitHubRelatedWork([ref], vi.fn().mockRejectedValue(new Error("stderr credential")));
+    expect(warn).toHaveBeenCalledWith("Failed to resolve github related work [invalid]#15");
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/TOKEN|secret|other|private|stderr|credential/i);
+    warn.mockRestore();
+  });
+
   it.each([
     ["authentication rejection", new Error("authentication failed")],
     ["not-found rejection", new Error("HTTP 404")],

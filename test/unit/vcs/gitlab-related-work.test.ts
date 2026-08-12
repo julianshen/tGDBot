@@ -22,7 +22,7 @@ describe("resolveGitLabRelatedWork", () => {
       expect.objectContaining({ kind, title: "Fix it", state: expected }),
     ]);
     expect(execGlab).toHaveBeenCalledWith(
-      [command, "view", "12", "--repo", "https://gitlab.com/group/project", "--hostname", "gitlab.com", "--output", "json"],
+      [command, "view", "12", "--repo", "https://gitlab.com/group/project", "--output", "json"],
       undefined, { timeoutMs: 5_000 },
     );
   });
@@ -32,7 +32,7 @@ describe("resolveGitLabRelatedWork", () => {
     const execGlab = vi.fn().mockResolvedValue(JSON.stringify({ title: "Ship", state: "open", url: "https://gitlab.example.com:8443/org/team/app/-/merge_requests/8" }));
     await resolveGitLabRelatedWork([ref], execGlab);
     expect(execGlab).toHaveBeenCalledWith(
-      ["mr", "view", "8", "--repo", "https://gitlab.example.com:8443/org/team/app", "--hostname", "gitlab.example.com:8443", "--output", "json"],
+      ["mr", "view", "8", "--repo", "https://gitlab.example.com:8443/org/team/app", "--output", "json"],
       undefined, { timeoutMs: 5_000 },
     );
   });
@@ -43,7 +43,10 @@ describe("resolveGitLabRelatedWork", () => {
     await expect(resolveGitLabRelatedWork([ref], execGlab)).resolves.toEqual([
       expect.objectContaining({ title: "A", state: "open", url: "https://gitlab.com/group/project/-/issues/3" }),
     ]);
-    expect(execGlab).toHaveBeenCalledWith(expect.arrayContaining(["--repo", "https://gitlab.com/group/project", "--hostname", "gitlab.com"]), undefined, { timeoutMs: 5_000 });
+    expect(execGlab).toHaveBeenCalledWith(
+      ["issue", "view", "3", "--repo", "https://gitlab.com/group/project", "--output", "json"],
+      undefined, { timeoutMs: 5_000 },
+    );
   });
 
   it.each(["not json", "42", "{}"])("returns malformed or incomplete output unresolved", async (output) => {
