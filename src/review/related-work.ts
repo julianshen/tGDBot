@@ -89,9 +89,13 @@ function visibleMarkdown(value: string): string {
   for (let index = 0; index < value.length;) {
     const atLineStart = index === 0 || value[index - 1] === "\n";
     if (atLineStart) {
-      const fenceMatch = /^( {0,3})(`{3,}|~{3,})/.exec(value.slice(index));
+      // A fence may be nested under one or more blockquote markers and/or a
+      // list marker. These container prefixes are Markdown structure, not
+      // fence indentation, so recognize them before applying the usual
+      // zero-to-three-space fence rule.
+      const fenceMatch = /^(?:(?: {0,3}>[ \t]?)+)?(?: {0,3}(?:[-+*]|[1-9][0-9]*[.)])[ \t]+)? {0,3}(`{3,}|~{3,})/.exec(value.slice(index));
       if (fenceMatch) {
-        const marker = fenceMatch[2]!;
+        const marker = fenceMatch[1]!;
         const lineEnd = value.indexOf("\n", index);
         const contentEnd = lineEnd < 0 ? value.length : value[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
         const remainder = value.slice(index + fenceMatch[0].length, contentEnd);

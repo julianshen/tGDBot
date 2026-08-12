@@ -82,6 +82,25 @@ describe("extractRelatedWork", () => {
     expect(result.references.map((reference) => reference.identifier)).toEqual(["#2"]);
   });
 
+  it("masks fenced code nested in blockquotes and list containers", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "",
+      description: [
+        "> ```text",
+        "> Related example #42",
+        "> ```",
+        "- ~~~text",
+        "  List example #43",
+        "  ~~~",
+        "Visible #44",
+      ].join("\n"),
+    });
+
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#44"]);
+  });
+
   it("does not mask references after an unmatched inline-code delimiter", () => {
     const result = extractRelatedWork({
       provider: "github",
