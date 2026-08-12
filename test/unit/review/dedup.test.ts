@@ -120,6 +120,13 @@ describe("computeReviewConfigHash", () => {
     expect(computeReviewConfigHash(makeConfig())).toBe(computeReviewConfigHash(makeConfig()));
   });
 
+  it("changes only when the normalized related-reference fingerprint changes", () => {
+    const base = computeReviewConfigHash(makeConfig(), "github|github.com|443|a/b|7");
+    expect(computeReviewConfigHash(makeConfig(), "github|github.com|443|a/b|7")).toBe(base);
+    expect(computeReviewConfigHash(makeConfig(), "github|github.com|443|a/b|8")).not.toBe(base);
+    expect(computeReviewConfigHash(makeConfig())).not.toBe(base);
+  });
+
   it("changes when any output-affecting flag changes", () => {
     const base = computeReviewConfigHash(makeConfig());
     expect(computeReviewConfigHash(makeConfig({ advisor: "off" }))).not.toBe(base);

@@ -11,7 +11,8 @@ import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
-import { computeReviewConfigHash } from "../../src/review/dedup.js";
+import { computeReviewConfigHash, formatMarker } from "../../src/review/dedup.js";
+import { relatedWorkFingerprint } from "../../src/review/related-work.js";
 import { formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import { resolveReviewLocator } from "../../src/config.js";
@@ -305,6 +306,26 @@ describe("review", () => {
     await expect(review(changed.args, depsFrom(changed))).resolves.toBe(0);
     expect(changed.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
     vi.restoreAllMocks();
+  });
+
+  it("re-reviews the same SHA only when normalized related references change", async () => {
+    const url = "https://github.com/acme/app/pull/42";
+    const priorInput = { provider: "github" as const, reviewUrl: url, title: "Fixes #7", description: "notes" };
+    const cfg = computeReviewConfigHash(makeArgs(), relatedWorkFingerprint(priorInput));
+    const botComment: BotComment = { id: "999", body: formatMarker("cafef00d", cfg), lastReviewedSha: "cafef00d", reviewedConfig: cfg };
+
+    const unchanged = makeHarness({ botComment, pr: makePr({ url, title: "Fixes #7", description: "unrelated wording changed" }) });
+    await review(unchanged.args, depsFrom(unchanged));
+    expect(unchanged.dispatchRules).not.toHaveBeenCalled();
+    expect(unchanged.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+
+    for (const title of ["Fixes #8", "No related work"]) {
+      const changed = makeHarness({ botComment, pr: makePr({ url, title, description: "unrelated wording changed" }) });
+      await review(changed.args, depsFrom(changed));
+      expect(changed.dispatchRules).toHaveBeenCalledOnce();
+      if (title.includes("#")) expect(changed.vcsAdapter.resolveRelatedWork).toHaveBeenCalledOnce();
+      else expect(changed.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+    }
   });
 
   it("fails closed before dispatch or writes for malformed ready recovery metadata", async () => {
@@ -1806,6 +1827,19 @@ describe("inline review comments", () => {
     warn.mockRestore();
   });
 
+  it("renders an unresolved full GitHub pull link as a pull URL after lookup rejection", async () => {
+    const pullUrl = "https://github.com/acme/app/pull/7";
+    const h = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42", title: `See ${pullUrl}` }) });
+    h.vcsAdapter.resolveRelatedWork.mockRejectedValue(new Error("private response body"));
+    h.orchestrate.mockImplementation(buildPresentation);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await review(h.args, depsFrom(h));
+    const finalBody = String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    expect(finalBody).toContain(`](${pullUrl})`);
+    expect(finalBody).not.toContain("/issues/7");
+    vi.restoreAllMocks();
+  });
+
   it("does not resolve without references or when dispatch rejects", async () => {
     const none = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42" }) });
     await review(none.args, depsFrom(none));
@@ -1837,8 +1871,10 @@ describe("inline review comments", () => {
 
   it.each([false, true])("does not resolve current ready recovery references (dryRun=%s)", async (dryRun) => {
     const args = makeArgs({ dryRun });
-    const h = makeHarness({ args, botComment: null, pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" }) });
-    const body = formatPendingMarker({ phase: "ready", headSha: "cafef00d", configHash: computeReviewConfigHash(h.config), noteId: "written-777", terminalResult: { status: "posted", findingsCount: 0, rulesRun: ["rule-a"], rulesFailed: [], exitCode: 0 } });
+    const pr = makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" });
+    const h = makeHarness({ args, botComment: null, pr });
+    const fingerprint = relatedWorkFingerprint({ provider: "github", reviewUrl: pr.url!, title: pr.title, description: pr.description });
+    const body = formatPendingMarker({ phase: "ready", headSha: "cafef00d", configHash: computeReviewConfigHash(h.config, fingerprint), noteId: "written-777", terminalResult: { status: "posted", findingsCount: 0, rulesRun: ["rule-a"], rulesFailed: [], exitCode: 0 } });
     h.vcsAdapter.findBotComment.mockResolvedValue({ id: "written-777", body, ...parseBotMarker(body)! });
     vi.spyOn(console, "log").mockImplementation(() => {});
     await review(h.args, depsFrom(h));

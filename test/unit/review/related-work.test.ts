@@ -169,6 +169,21 @@ describe("extractRelatedWork", () => {
       "https://github.com/a/b/pull/3",
     ]);
   });
+
+  it("keeps exact GitHub pull URLs for unresolved full links while shorthand remains ambiguous", () => {
+    const result = extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/a/b/pull/9", title: "https://github.com/A/B/pull/3 https://github.com/a/b/issues/4 #5", description: "" });
+    expect(result.references.map(({ number, fallbackUrl }) => [number, fallbackUrl])).toEqual([
+      [3, "https://github.com/A/B/pull/3"],
+      [4, "https://github.com/a/b/issues/4"],
+      [5, "https://github.com/a/b/issues/5"],
+    ]);
+  });
+
+  it("treats GitHub project identity case-insensitively for self, local, and dedup", () => {
+    const result = extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/Acme/App/pull/9", title: "#9 acme/app#7 ACME/APP#7 https://github.com/aCmE/aPp/issues/7", description: "" });
+    expect(result.references).toHaveLength(1);
+    expect(result.references[0]).toEqual(expect.objectContaining({ projectPath: "Acme/App", number: 7, identifier: "#7" }));
+  });
 });
 
 describe("metadata safety", () => {
@@ -214,6 +229,11 @@ describe("metadata safety", () => {
     const hostile = Object.defineProperty({}, "kind", { get() { throw new Error("hostile getter"); } });
     expect(() => validateResolvedRelatedWork(reference, hostile)).not.toThrow();
     expect(validateResolvedRelatedWork(reference, hostile)).toBe(reference);
+  });
+
+  it("accepts canonical GitHub URL casing from the resolver", () => {
+    expect(validateResolvedRelatedWork(reference, { kind: "pull_request", url: "https://github.example.com/A/B/pull/4" }))
+      .toEqual(expect.objectContaining({ kind: "pull_request", url: "https://github.example.com/A/B/pull/4" }));
   });
 
   it("exposes canonical provider identity", () => {

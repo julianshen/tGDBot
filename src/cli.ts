@@ -16,7 +16,7 @@ import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
-import { extractRelatedWork, reconcileRelatedWork, safeRelatedWorkIdentifier } from "./review/related-work.js";
+import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
@@ -462,6 +462,16 @@ export async function review(
 
   const config = resolveConfigFn(args);
   const pr = await config.vcsAdapter.getPullRequest(config.locator);
+  const provider = config.locator.kind === "ambient"
+    ? config.locator.provider
+    : config.locator.repo.provider;
+  const relatedWorkInput = {
+    provider,
+    reviewUrl: pr.url ?? "",
+    title: pr.title,
+    description: pr.description,
+  };
+  const extracted = extractRelatedWork(relatedWorkInput);
 
   // Design-review item #9: name the RESOLVED review target up front. The VCS
   // adapter infers owner/repo from ambient context (`gh`'s git-remote /
@@ -480,7 +490,7 @@ export async function review(
   // already reviewed WITH THE SAME review configuration. Computed from CLI flags
   // alone (no rule fetch), so the skip decision stays as cheap as before — see
   // computeReviewConfigHash for what is and isn't captured.
-  const configHash = computeReviewConfigHash(config);
+  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(relatedWorkInput));
 
   if (botComment?.invalidPendingState === true) {
     throw new Error(
@@ -634,15 +644,6 @@ export async function review(
     orchestratorModel: config.model,
   });
 
-  const provider = config.locator.kind === "ambient"
-    ? config.locator.provider
-    : config.locator.repo.provider;
-  const extracted = extractRelatedWork({
-    provider,
-    reviewUrl: pr.url ?? "",
-    title: pr.title,
-    description: pr.description,
-  });
   if (extracted.omittedCount > 0) {
     console.warn(`tgd-review-agent: ${Math.min(extracted.omittedCount, Number.MAX_SAFE_INTEGER)} additional related-work reference(s) omitted`);
   }

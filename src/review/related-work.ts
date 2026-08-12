@@ -118,17 +118,26 @@ function visibleMarkdown(value: string): string {
 }
 
 function makeReference(context: ReviewContext, projectPath: string, number: number, kindHint: RelatedWorkKind | undefined, sourceText: string): RelatedWorkReference {
-  const local = projectPath === context.projectPath;
+  const local = context.provider === "github"
+    ? projectPath.toLowerCase() === context.projectPath.toLowerCase()
+    : projectPath === context.projectPath;
+  if (local) projectPath = context.projectPath;
   const sigil = kindHint === "merge_request" ? "!" : "#";
   const identifier = `${local ? "" : projectPath}${sigil}${number}`;
-  const fallbackPath = context.provider === "github" ? `issues/${number}` : `-/${kindHint === "merge_request" ? "merge_requests" : "issues"}/${number}`;
-  return { provider: context.provider, host: context.host, ...(context.port ? { port: context.port } : {}), projectPath, number, ...(kindHint ? { kindHint } : {}), sourceText, identifier, fallbackUrl: `https://${context.authority}/${projectPath}/${fallbackPath}` };
+  const fallbackPath = context.provider === "github"
+    ? `${kindHint === "pull_request" ? "pull" : "issues"}/${number}`
+    : `-/${kindHint === "merge_request" ? "merge_requests" : "issues"}/${number}`;
+  const fallbackUrl = kindHint && sourceText.startsWith("https://")
+    ? sourceText
+    : `https://${context.authority}/${projectPath}/${fallbackPath}`;
+  return { provider: context.provider, host: context.host, ...(context.port ? { port: context.port } : {}), projectPath, number, ...(kindHint ? { kindHint } : {}), sourceText, identifier, fallbackUrl };
 }
 
 export function relatedWorkIdentity(reference: RelatedWorkReference): string {
   const authorityPort = reference.port ?? "443";
   const kind = reference.provider === "gitlab" ? `|${reference.kindHint ?? "issue"}` : "";
-  return `${reference.provider}|${reference.host.toLowerCase()}|${authorityPort}|${reference.projectPath}|${reference.number}${kind}`;
+  const projectPath = reference.provider === "github" ? reference.projectPath.toLowerCase() : reference.projectPath;
+  return `${reference.provider}|${reference.host.toLowerCase()}|${authorityPort}|${projectPath}|${reference.number}${kind}`;
 }
 
 export function safeRelatedWorkIdentifier(reference: RelatedWorkReference): string {
@@ -229,12 +238,29 @@ export function extractRelatedWork(input: { provider: "github" | "gitlab"; revie
   const unique: RelatedWorkReference[] = [];
   const identities = new Set<string>();
   for (const value of [input.title, input.description]) for (const { reference } of candidates(value, context)) {
-    const isSelf = reference.projectPath === context.projectPath && reference.number === context.number &&
+    const sameProject = context.provider === "github"
+      ? reference.projectPath.toLowerCase() === context.projectPath.toLowerCase()
+      : reference.projectPath === context.projectPath;
+    const isSelf = sameProject && reference.number === context.number &&
       (context.provider === "github" || reference.kindHint === "merge_request");
     const identity = relatedWorkIdentity(reference);
     if (!isSelf && !identities.has(identity)) { identities.add(identity); unique.push(reference); }
   }
   return { references: unique.slice(0, 10), omittedCount: Math.max(0, unique.length - 10) };
+}
+
+export function relatedWorkFingerprint(input: { provider: "github" | "gitlab"; reviewUrl: string; title: string; description: string }): string | undefined {
+  const context = parseReview(input);
+  if (!context) return undefined;
+  const identities: string[] = [];
+  const seen = new Set<string>();
+  for (const value of [input.title, input.description]) for (const { reference } of candidates(value, context)) {
+    const sameProject = context.provider === "github" ? reference.projectPath.toLowerCase() === context.projectPath.toLowerCase() : reference.projectPath === context.projectPath;
+    const isSelf = sameProject && reference.number === context.number && (context.provider === "github" || reference.kindHint === "merge_request");
+    const identity = relatedWorkIdentity(reference);
+    if (!isSelf && !seen.has(identity)) { seen.add(identity); identities.push(identity); }
+  }
+  return identities.length > 0 ? identities.join("\n") : undefined;
 }
 
 export function normalizeRelatedWorkState(kind: RelatedWorkKind, value: unknown): RelatedWorkState | undefined {
@@ -261,7 +287,10 @@ function exactCandidateUrl(reference: RelatedWorkReference, kind: RelatedWorkKin
   const path = reference.provider === "github"
     ? `/${reference.projectPath}/${kind === "issue" ? "issues" : "pull"}/${reference.number}`
     : `/${reference.projectPath}/-/${kind === "issue" ? "issues" : "merge_requests"}/${reference.number}`;
-  return url.pathname === path ? url.href.replace(/\/$/, "") : undefined;
+  const matches = reference.provider === "github"
+    ? url.pathname.toLowerCase() === path.toLowerCase()
+    : url.pathname === path;
+  return matches ? url.href.replace(/\/$/, "") : undefined;
 }
 
 export function validateResolvedRelatedWork(reference: RelatedWorkReference, candidate: unknown): RelatedWorkItem {
