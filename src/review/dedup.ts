@@ -68,6 +68,8 @@ export function computeReviewConfigHash(config: ReviewConfigForDedup, relatedWor
     config.rulesDir.replace(/\\/g, "/"),
     config.model ?? null,
     config.dispatch,
+    // Appending this field intentionally changes every legacy config hash:
+    // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);

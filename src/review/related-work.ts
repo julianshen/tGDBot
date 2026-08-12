@@ -43,6 +43,7 @@ interface ReviewContext {
 const SEGMENT = /^[A-Za-z0-9_.-]+$/;
 const NUMBER = /^[1-9][0-9]*$/;
 
+/** Validates a provider-specific owner/repository or group/project path. */
 export function isValidRelatedWorkProjectPath(
   provider: "github" | "gitlab",
   projectPath: string,
@@ -133,6 +134,7 @@ function makeReference(context: ReviewContext, projectPath: string, number: numb
   return { provider: context.provider, host: context.host, ...(context.port ? { port: context.port } : {}), projectPath, number, ...(kindHint ? { kindHint } : {}), sourceText, identifier, fallbackUrl };
 }
 
+/** Returns the canonical provider/host/project/number identity used for deduplication. */
 export function relatedWorkIdentity(reference: RelatedWorkReference): string {
   const authorityPort = reference.port ?? "443";
   const kind = reference.provider === "gitlab" ? `|${reference.kindHint ?? "issue"}` : "";
@@ -140,6 +142,7 @@ export function relatedWorkIdentity(reference: RelatedWorkReference): string {
   return `${reference.provider}|${reference.host.toLowerCase()}|${authorityPort}|${projectPath}|${reference.number}${kind}`;
 }
 
+/** Rebuilds a log-safe qualified identifier without trusting display text. */
 export function safeRelatedWorkIdentifier(reference: RelatedWorkReference): string {
   const sigil = reference.provider === "gitlab" && reference.kindHint === "merge_request" ? "!" : "#";
   return `${reference.projectPath}${sigil}${reference.number}`;
@@ -165,16 +168,28 @@ function candidateIdentity(candidate: unknown): string | undefined {
   }
 }
 
+/** Reconciles untrusted resolver output to the extracted references in stable order. */
 export function reconcileRelatedWork(
   references: readonly RelatedWorkReference[],
   output: unknown,
 ): readonly RelatedWorkItem[] {
+  // Callers normally pass extractRelatedWork().references, which is unique by
+  // identity. Preserve a deterministic safe fallback for other exported-API
+  // callers too: a duplicated expected identity is ambiguous, so none of its
+  // candidates may be trusted as the unique resolution for either entry.
   try {
     if (!Array.isArray(output)) return [...references];
   } catch {
     return [...references];
   }
-  const expected = new Set(references.map(relatedWorkIdentity));
+  const expectedCounts = new Map<string, number>();
+  for (const reference of references) {
+    const key = relatedWorkIdentity(reference);
+    expectedCounts.set(key, (expectedCounts.get(key) ?? 0) + 1);
+  }
+  const expected = new Set(
+    [...expectedCounts].filter(([, count]) => count === 1).map(([key]) => key),
+  );
   const candidates = new Map<string, unknown[]>();
   let length: number;
   try { length = output.length; } catch { return [...references]; }
@@ -232,6 +247,7 @@ function candidates(text: string, context: ReviewContext): Array<{ index: number
   return found.sort((a, b) => a.index - b.index);
 }
 
+/** Extracts at most ten explicit references from a review title and description. */
 export function extractRelatedWork(input: { provider: "github" | "gitlab"; reviewUrl: string; title: string; description: string }): ExtractRelatedWorkResult {
   const context = parseReview(input);
   if (!context) return { references: [], omittedCount: 0 };
@@ -249,6 +265,7 @@ export function extractRelatedWork(input: { provider: "github" | "gitlab"; revie
   return { references: unique.slice(0, 10), omittedCount: Math.max(0, unique.length - 10) };
 }
 
+/** Fingerprints the capped, render-relevant reference set for same-SHA deduplication. */
 export function relatedWorkFingerprint(result: ExtractRelatedWorkResult): string | undefined {
   if (result.references.length === 0) return undefined;
   return result.references.map((reference) => {
@@ -263,6 +280,7 @@ export function relatedWorkFingerprint(result: ExtractRelatedWorkResult): string
   }).join("\n");
 }
 
+/** Normalizes provider-specific state spellings to the shared display states. */
 export function normalizeRelatedWorkState(kind: RelatedWorkKind, value: unknown): RelatedWorkState | undefined {
   if (value === "open" || value === "opened") return "open";
   if (value === "closed") return "closed";
@@ -270,6 +288,7 @@ export function normalizeRelatedWorkState(kind: RelatedWorkKind, value: unknown)
   return undefined;
 }
 
+/** Flattens and bounds an untrusted provider title for Markdown rendering. */
 export function sanitizeRelatedWorkTitle(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   const clean = value.replace(/[\r\n]+/g, " ").replace(/[\u0000-\u001F\u007F-\u009F]/g, "").replace(/\s+/g, " ").trim();
@@ -293,6 +312,7 @@ function exactCandidateUrl(reference: RelatedWorkReference, kind: RelatedWorkKin
   return matches ? url.href.replace(/\/$/, "") : undefined;
 }
 
+/** Accepts resolved metadata only when its URL and identity match the trusted reference. */
 export function validateResolvedRelatedWork(reference: RelatedWorkReference, candidate: unknown): RelatedWorkItem {
   if (!candidate || typeof candidate !== "object") return reference;
   try {

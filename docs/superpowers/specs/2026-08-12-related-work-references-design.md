@@ -30,11 +30,11 @@ When the PR/MR title or description contains supported explicit references, the 
 Examples:
 
 ```markdown
-## Related work
+### Related work
 
 - Issue #42 — Fix login timeout (open)
 - PR owner/service#51 — Refactor authentication (merged)
-- MR group/project!19 — Add session rotation (opened)
+- MR group/project!19 — Add session rotation (open)
 ```
 
 If metadata lookup fails, the entry uses the original normalized reference and a link when one can be constructed, without inventing a title, type, or state. If no references are found, the section is omitted.

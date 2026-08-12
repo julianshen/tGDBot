@@ -97,7 +97,7 @@ export type RelatedWorkState = "open" | "closed" | "merged";
 export interface RelatedWorkReference {
   readonly provider: "github" | "gitlab";
   readonly host: string;
-  readonly port?: number;
+  readonly port?: string;
   readonly projectPath: string;
   readonly number: number;
   readonly kindHint?: RelatedWorkKind;
@@ -259,12 +259,11 @@ Test issues and MRs in current and nested cross-project paths. Assert the exact 
 expect(execGlab).toHaveBeenCalledWith([
   "mr", "view", "19",
   "--repo", "https://gitlab.example.com:8443/group/subgroup/project",
-  "--hostname", "gitlab.example.com",
   "--output", "json",
 ], undefined, { timeoutMs: 5_000 });
 ```
 
-Add a second assertion for `https://gitlab.example.com/group/project`: its `--repo` value omits `:443`, while `--hostname` remains `gitlab.example.com`. As with GitHub, separately test real-executor timeout option forwarding and resolver recovery from an injected timeout rejection.
+Add a second assertion for `https://gitlab.example.com/group/project`: its `--repo` value omits `:443`. As with GitHub, separately test real-executor timeout option forwarding and resolver recovery from an injected timeout rejection.
 
 - [ ] **Step 2: Run the GitLab adapter tests and verify they fail**
 
@@ -274,7 +273,7 @@ Expected: FAIL because the GitLab resolver is not implemented.
 
 - [ ] **Step 3: Implement GitLab resolution**
 
-Use `glab issue view` for `issue` references and `glab mr view` for `merge_request` references, with both the explicit canonical project URL (including a validated non-default port) and explicit hostname. Implement this in `src/vcs/gitlab-related-work.ts`; keep the adapter method a thin delegate. Extend `realExecGlab` to map the optional timeout to `execFile({ timeout })` and preserve its existing single-settlement/stdin cleanup behavior when the timed-out child reports an error. Keep the same bounded, order-preserving, per-item recovery behavior as GitHub. Validate all parsed JSON through the shared metadata policy, emit only provider plus canonical identifier in warnings, and never fetch descriptions, notes, or diffs.
+Use `glab issue view` for `issue` references and `glab mr view` for `merge_request` references, with the explicit canonical project URL (including a validated non-default port); `--repo` selects the GitLab host because these view commands do not support `--hostname`. Implement this in `src/vcs/gitlab-related-work.ts`; keep the adapter method a thin delegate. Extend `realExecGlab` to map the optional timeout to `execFile({ timeout })` and preserve its existing single-settlement/stdin cleanup behavior when the timed-out child reports an error. Keep the same bounded, order-preserving, per-item recovery behavior as GitHub. Validate all parsed JSON through the shared metadata policy, emit only provider plus canonical identifier in warnings, and never fetch descriptions, notes, or diffs.
 
 - [ ] **Step 4: Run focused VCS tests and verify they pass**
 

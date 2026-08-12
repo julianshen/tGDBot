@@ -260,6 +260,38 @@ describe("renderSummaryComment", () => {
     }
   });
 
+  it("preserves related work and charges it against the compact-summary budget", () => {
+    const findings = Array.from({ length: 30 }, (_, index) =>
+      makeFinding({ file: `src/large-${index}.ts`, message: `Problem ${index}. ${"x".repeat(500)}` }),
+    );
+    const relatedWork = [{
+      provider: "github" as const,
+      host: "github.com",
+      projectPath: "acme/app",
+      number: 42,
+      kindHint: "issue" as const,
+      sourceText: "#42",
+      identifier: "#42",
+      fallbackUrl: "https://github.com/acme/app/issues/42",
+      kind: "issue" as const,
+      title: "Related incident",
+      state: "open" as const,
+      url: "https://github.com/acme/app/issues/42",
+    }];
+
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+      relatedWork,
+    }, 4_000);
+
+    expect(body.length).toBeLessThanOrEqual(4_000);
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("### Related work");
+    expect(body).toContain("Related incident");
+  });
+
   it("retains failed-rule status when an oversized summary is compacted", () => {
     const findings = Array.from({ length: 40 }, (_, index) =>
       makeFinding({

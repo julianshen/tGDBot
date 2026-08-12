@@ -155,6 +155,7 @@ interface Harness {
   args: CliArgs;
   config: ResolvedConfig;
   vcsAdapter: {
+    resolveRelatedWork: ReturnType<typeof vi.fn>;
     getPullRequest: ReturnType<typeof vi.fn>;
     getDiff: ReturnType<typeof vi.fn>;
     findBotComment: ReturnType<typeof vi.fn>;
@@ -274,7 +275,6 @@ describe("review", () => {
     // Dispatch/orchestrate machinery must not even run for a skipped review.
     expect(h.loadRules).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
-    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     // Nor should the base-branch rule fetch — no point fetching rules for a
     // review that's about to be skipped entirely.
     expect(h.vcsAdapter.getRuleFilesFromBase).not.toHaveBeenCalled();

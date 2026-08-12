@@ -645,7 +645,7 @@ export async function review(
   });
 
   if (extracted.omittedCount > 0) {
-    console.warn(`tgd-review-agent: ${Math.min(extracted.omittedCount, Number.MAX_SAFE_INTEGER)} additional related-work reference(s) omitted`);
+    console.warn(`tgd-review-agent: ${extracted.omittedCount} additional related-work reference(s) omitted`);
   }
   let relatedWork: readonly RelatedWorkItem[] = extracted.references;
   if (extracted.references.length > 0) {

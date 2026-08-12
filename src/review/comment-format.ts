@@ -439,6 +439,13 @@ function detailsBlock(summary: string, lines: string[]): string {
   return ["<details>", `<summary>${summary}</summary>`, "", ...lines, "", "</details>"].join("\n");
 }
 
+function renderRelatedWorkSection(input: SummaryInput): string | undefined {
+  const relatedWork = normalizeRelatedWorkForRender(input.relatedWork ?? []);
+  return relatedWork.length > 0
+    ? `### Related work\n\n${relatedWork.map((item) => `- ${item}`).join("\n")}`
+    : undefined;
+}
+
 export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
@@ -478,6 +485,10 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
         })
         .join("\n")}`
     : undefined;
+  // Related work is review context, not optional detail. Keep its already
+  // bounded/sanitized representation in compact summaries and charge it
+  // against the same provider-size budget as failed rules and finding labels.
+  const relatedWork = renderRelatedWorkSection(input);
   const findings = input.unanchored.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
@@ -485,7 +496,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const message = sanitizeInline(finding.message);
     return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
   });
-  const fixed = [header, notice, failedRules, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -497,6 +508,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     header,
     notice,
     failedRules,
+    relatedWork,
     ...findings.map(
       ({ prefix, message }, index) => `${prefix}${truncate(message, messageBudgets[index] ?? 0)}`,
     ),
@@ -507,6 +519,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     [
       header,
       notice,
+      relatedWork,
       input.rulesFailed.length > 0
         ? `${input.rulesFailed.length} rule(s) failed to run.`
         : undefined,
@@ -596,10 +609,8 @@ function renderSummaryCommentWithIncludedSuggestions(
     );
   }
 
-  const relatedWork = normalizeRelatedWorkForRender(input.relatedWork ?? []);
-  if (relatedWork.length > 0) {
-    parts.push(`### Related work\n\n${relatedWork.map((item) => `- ${item}`).join("\n")}`);
-  }
+  const relatedWork = renderRelatedWorkSection(input);
+  if (relatedWork) parts.push(relatedWork);
 
   const collapsed: string[] = [];
   if (input.filesReviewed.length > 0) {

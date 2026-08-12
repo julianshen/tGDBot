@@ -282,3 +282,29 @@ describe("metadata safety", () => {
     },
   );
 });
+
+describe("reconcileRelatedWork", () => {
+  it("falls back deterministically when callers provide duplicate expected identities", () => {
+    const reference: RelatedWorkReference = {
+      provider: "github",
+      host: "github.com",
+      projectPath: "acme/app",
+      number: 3,
+      sourceText: "#3",
+      identifier: "#3",
+      fallbackUrl: "https://github.com/acme/app/issues/3",
+    };
+    const resolved = {
+      ...reference,
+      kind: "issue" as const,
+      title: "Resolved title",
+      state: "open" as const,
+      url: "https://github.com/acme/app/issues/3",
+    };
+
+    expect(reconcileRelatedWork([reference, { ...reference }], [resolved])).toEqual([
+      reference,
+      reference,
+    ]);
+  });
+});

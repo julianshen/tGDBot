@@ -4,6 +4,7 @@
 // AC-5.1 and is cheap to verify directly against the real installed
 // pi-subagents package.
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -14,6 +15,10 @@ import {
 
 describe("resolvePiSubagentsExtensionPath", () => {
   it("resolves to pi-subagents' real extension entry point on disk", () => {
+    const require = createRequire(import.meta.url);
+    expect(() => require.resolve("pi-subagents/package.json")).toThrow(
+      expect.objectContaining({ code: "ERR_PACKAGE_PATH_NOT_EXPORTED" }),
+    );
     const resolved = resolvePiSubagentsExtensionPath();
 
     expect(path.isAbsolute(resolved)).toBe(true);
