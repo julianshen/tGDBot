@@ -128,6 +128,36 @@ describe("extractRelatedWork", () => {
     expect(github.references).toEqual([]);
     expect(gitlab.references).toEqual([]);
   });
+
+  it("validates complete URL tokens instead of accepting prefixes before RFC path characters", () => {
+    const github = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "https://github.com/a/b/issues/3:evil https://github.com/a/b/pull/4;evil https://github.com/a/b/issues/5@evil",
+      description: "",
+    });
+    const gitlab = extractRelatedWork({
+      provider: "gitlab",
+      reviewUrl: "https://gitlab.com/a/b/-/merge_requests/9",
+      title: "https://gitlab.com/a/b/-/issues/3:evil https://gitlab.com/a/b/-/merge_requests/4;evil https://gitlab.com/a/b/-/issues/5@evil",
+      description: "",
+    });
+    expect(github.references).toEqual([]);
+    expect(gitlab.references).toEqual([]);
+  });
+
+  it("strips only supported sentence and Markdown punctuation from exact URL source text", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "[issue](https://github.com/a/b/issues/2), then https://github.com/a/b/pull/3.",
+      description: "",
+    });
+    expect(result.references.map((reference) => reference.sourceText)).toEqual([
+      "https://github.com/a/b/issues/2",
+      "https://github.com/a/b/pull/3",
+    ]);
+  });
 });
 
 describe("metadata safety", () => {

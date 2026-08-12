@@ -122,11 +122,11 @@ function candidates(text: string, context: ReviewContext): Array<{ index: number
   const visible = visibleMarkdown(text);
   const found: Array<{ index: number; reference: RelatedWorkReference }> = [];
   const occupied: Array<[number, number]> = [];
-  const urlPattern = context.provider === "github"
-    ? /https:\/\/[^\s<>()\]]+\/[A-Za-z0-9_.%/-]+\/(?:issues|pull)\/[1-9][0-9]*(?![A-Za-z0-9_/%?#-]|\.[A-Za-z0-9])/g
-    : /https:\/\/[^\s<>()\]]+\/[A-Za-z0-9_.%/-]+\/-\/(?:issues|merge_requests)\/[1-9][0-9]*(?![A-Za-z0-9_/%?#-]|\.[A-Za-z0-9])/g;
+  const urlPattern = /https:\/\/[^\s<>()\]]+/g;
   for (const match of visible.matchAll(urlPattern)) {
-    const sourceText = match[0];
+    const rawToken = match[0];
+    const sourceText = rawToken.replace(/[.,]+$/, "");
+    occupied.push([match.index!, match.index! + rawToken.length]);
     let url: URL;
     try { url = new URL(sourceText); } catch { continue; }
     if (url.protocol !== "https:" || url.host.toLowerCase() !== context.authority || url.search || url.hash) continue;
@@ -139,7 +139,6 @@ function candidates(text: string, context: ReviewContext): Array<{ index: number
     if (!project || number === undefined) continue;
     const kind: RelatedWorkKind = pathMatch[2] === "issues" ? "issue" : context.provider === "github" ? "pull_request" : "merge_request";
     found.push({ index: match.index!, reference: makeReference(context, project, number, kind, sourceText) });
-    occupied.push([match.index!, match.index! + sourceText.length]);
   }
   const shorthand = context.provider === "github"
     ? /(?<![A-Za-z0-9_.@/-])(?:(?<project>[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#(?<number>[1-9][0-9]*)(?![A-Za-z0-9_.-])/g
