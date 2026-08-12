@@ -273,9 +273,11 @@ describe("review", () => {
     // Dispatch/orchestrate machinery must not even run for a skipped review.
     expect(h.loadRules).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     // Nor should the base-branch rule fetch — no point fetching rules for a
     // review that's about to be skipped entirely.
     expect(h.vcsAdapter.getRuleFilesFromBase).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
 
     logSpy.mockRestore();
   });
@@ -322,6 +324,7 @@ describe("review", () => {
     expect(h.dispatchRules).not.toHaveBeenCalled();
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
   });
 
   it("fails closed for a current ready recovery note with the wrong exact note binding", async () => {
@@ -352,6 +355,7 @@ describe("review", () => {
     expect(h.dispatchRules).not.toHaveBeenCalled();
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
   });
 
   it("fails closed for a dry-run current ready recovery note with the wrong binding", async () => {
@@ -383,6 +387,7 @@ describe("review", () => {
 
     expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
   });
@@ -514,6 +519,7 @@ describe("review", () => {
     expect(exitCode).toBe(0);
     expect(h.loadRules).not.toHaveBeenCalled();
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     expect(logSpy).toHaveBeenCalledWith(
       `TGD_REVIEW_RESULT: ${JSON.stringify({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [], reason: "diff-too-large" })}`,
     );
@@ -531,6 +537,7 @@ describe("review", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/maxBuffer/);
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
 
     vi.restoreAllMocks();
   });
@@ -713,6 +720,7 @@ describe("review", () => {
     expect(exitCode).toBe(1);
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
 
     vi.restoreAllMocks();
   });
@@ -886,6 +894,7 @@ describe("review", () => {
 
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
     expect(h.loadRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
 
     vi.restoreAllMocks();
   });
@@ -1805,5 +1814,110 @@ describe("inline review comments", () => {
     failed.dispatchRules.mockRejectedValue(new Error("dispatch failed"));
     await expect(review(failed.args, depsFrom(failed))).rejects.toThrow("dispatch failed");
     expect(failed.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+  });
+
+  it("wires GitLab references through resolution and renders the related-work section", async () => {
+    const args = makeArgs({ pr: "https://gitlab.com/group/app/-/merge_requests/42", vcs: "gitlab" });
+    const h = makeHarness({ args, pr: makePr({ url: args.pr, title: "Tracks !7", description: "and #8" }) });
+    h.vcsAdapter.resolveRelatedWork.mockImplementation((refs) => Promise.resolve(refs.map((ref: Record<string, unknown>) => ({
+      ...ref,
+      kind: ref.kindHint,
+      title: `Work ${ref.number}`,
+      state: "open",
+      url: `https://gitlab.com/group/app/-/${ref.kindHint === "merge_request" ? "merge_requests" : "issues"}/${ref.number}`,
+    }))));
+    h.orchestrate.mockImplementation(buildPresentation);
+    await review(h.args, depsFrom(h));
+    const refs = h.vcsAdapter.resolveRelatedWork.mock.calls[0]?.[0];
+    expect(refs).toEqual([expect.objectContaining({ provider: "gitlab", number: 7, kindHint: "merge_request" }), expect.objectContaining({ provider: "gitlab", number: 8, kindHint: "issue" })]);
+    const finalBody = String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    expect(finalBody).toContain("### Related work");
+    expect(finalBody).toContain("Work 7");
+  });
+
+  it.each([false, true])("does not resolve current ready recovery references (dryRun=%s)", async (dryRun) => {
+    const args = makeArgs({ dryRun });
+    const h = makeHarness({ args, botComment: null, pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" }) });
+    const body = formatPendingMarker({ phase: "ready", headSha: "cafef00d", configHash: computeReviewConfigHash(h.config), noteId: "written-777", terminalResult: { status: "posted", findingsCount: 0, rulesRun: ["rule-a"], rulesFailed: [], exitCode: 0 } });
+    h.vcsAdapter.findBotComment.mockResolvedValue({ id: "written-777", body, ...parseBotMarker(body)! });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await review(h.args, depsFrom(h));
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
+  it("caps resolver input at ten unique references after dedup and warns without title/body data", async () => {
+    const description = `secret-body ${Array.from({ length: 12 }, (_, i) => `#${i + 1}`).join(" ")} #1`;
+    const h = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "secret-title #1", description }) });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await review(h.args, depsFrom(h));
+    const refs = h.vcsAdapter.resolveRelatedWork.mock.calls[0]?.[0];
+    expect(refs).toHaveLength(10);
+    expect(refs.map((ref: { number: number }) => ref.number)).toEqual([1,2,3,4,5,6,7,8,9,10]);
+    const warning = warn.mock.calls.flat().join("\n");
+    expect(warning).toContain("2 additional related-work reference(s) omitted");
+    expect(warning).not.toContain("secret-title");
+    expect(warning).not.toContain("secret-body");
+    warn.mockRestore();
+  });
+
+  it.each([
+    ["non-array", { unexpected: true }],
+    ["throwing array length", new Proxy([], { get(target, key, receiver) { if (key === "length") throw new Error("length secret"); return Reflect.get(target, key, receiver); } })],
+    ["throwing element getter", new Proxy([{}], { get(target, key, receiver) { if (key === "0") throw new Error("element secret"); return Reflect.get(target, key, receiver); } })],
+    ["malformed unique candidate", [{ provider: "github", host: "github.com", projectPath: "acme/app", number: 7, kind: "issue", url: "https://evil.test/steal" }]],
+  ])("safely falls back for hostile resolver output: %s", async (_name, output) => {
+    const h = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" }) });
+    h.vcsAdapter.resolveRelatedWork.mockResolvedValue(output);
+    await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+    const fallback = h.orchestrate.mock.calls[0]?.[2]?.relatedWork;
+    expect(fallback).toEqual([expect.objectContaining({ number: 7 })]);
+    expect(fallback?.[0]).not.toHaveProperty("kind");
+  });
+
+  const resolvedItem = (number: number, title: string) => ({ provider: "github", host: "github.com", projectPath: "acme/app", number, sourceText: `#${number}`, identifier: `#${number}`, kind: "issue", title, state: "open", url: `https://github.com/acme/app/issues/${number}` });
+
+  it.each([
+    ["reordered valid output", [resolvedItem(8, "Eight"), resolvedItem(7, "Seven")], ["Seven", "Eight"]],
+    ["partial output", [resolvedItem(8, "Eight")], [undefined, "Eight"]],
+    ["foreign output", [resolvedItem(99, "Foreign"), resolvedItem(7, "Seven")], ["Seven", undefined]],
+    ["duplicate identity", [resolvedItem(7, "Seven"), resolvedItem(7, "Duplicate"), resolvedItem(8, "Eight")], [undefined, "Eight"]],
+  ])("reconciles %s without degrading other identities", async (_name, output, expectedTitles) => {
+    const h = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "#7 #8" }) });
+    h.vcsAdapter.resolveRelatedWork.mockResolvedValue(output);
+    await review(h.args, depsFrom(h));
+    const reconciled = h.orchestrate.mock.calls[0]?.[2]?.relatedWork;
+    expect(reconciled?.map((item: { number: number }) => item.number)).toEqual([7, 8]);
+    expect(reconciled?.map((item: { title?: string }) => item.title)).toEqual(expectedTitles);
+  });
+
+  it("retains one related-work section in dry-run, pending, conservative, selective, and final summaries", async () => {
+    const diff = "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -0,0 +1,2 @@\n+one\n+two\n";
+    const findings: DispatchResult = { findings: [1, 2].map((line, i) => ({ ruleName: "rule-a", severity: "warning", category: "correctness", file: "x.ts", line, message: `finding ${i}` })), rulesRun: ["rule-a"], rulesFailed: [] };
+    const setup = (dryRun = false) => {
+      const h = makeHarness({ args: makeArgs({ dryRun }), pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" }), dispatchResult: findings });
+      h.vcsAdapter.getDiff.mockResolvedValue(diff);
+      h.orchestrate.mockImplementation(buildPresentation);
+      return h;
+    };
+    const count = (body: string) => body.split("### Related work").length - 1;
+
+    const dry = setup(true);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    await review(dry.args, depsFrom(dry));
+    expect(count(log.mock.calls.flat().join("\n"))).toBe(1);
+    log.mockRestore();
+
+    const selective = setup();
+    selective.vcsAdapter.createInlineReview.mockResolvedValue([{ clientId: "finding-0", status: "posted" }, { clientId: "finding-1", status: "failed" }]);
+    await review(selective.args, depsFrom(selective));
+    for (const call of selective.vcsAdapter.upsertComment.mock.calls) expect(count(String(call[1]))).toBe(1);
+
+    const conservative = setup();
+    conservative.vcsAdapter.createInlineReview.mockRejectedValue(new Error("inline failure"));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await review(conservative.args, depsFrom(conservative));
+    for (const call of conservative.vcsAdapter.upsertComment.mock.calls) expect(count(String(call[1]))).toBe(1);
+    vi.restoreAllMocks();
   });
 });
