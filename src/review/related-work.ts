@@ -79,7 +79,7 @@ function visibleMarkdown(value: string): string {
       if (fenceMatch) {
         const marker = fenceMatch[2]!;
         const lineEnd = value.indexOf("\n", index);
-        const contentEnd = lineEnd < 0 ? value.length : lineEnd;
+        const contentEnd = lineEnd < 0 ? value.length : value[lineEnd - 1] === "\r" ? lineEnd - 1 : lineEnd;
         const remainder = value.slice(index + fenceMatch[0].length, contentEnd);
         const closes = fence && marker[0] === fence.char && marker.length >= fence.length && /^[ \t]*$/.test(remainder);
         if (!fence) fence = { char: marker[0]!, length: marker.length };

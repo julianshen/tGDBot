@@ -70,6 +70,16 @@ describe("extractRelatedWork", () => {
     expect(result.references).toEqual([]);
   });
 
+  it("closes fenced blocks with CRLF line endings", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "",
+      description: "```js\r\n#1\r\n```\r\n#2",
+    });
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#2"]);
+  });
+
   it("limits after deduplication and reports only extra unique references", () => {
     const title = Array.from({ length: 12 }, (_, index) => `#${index + 1}`).join(" ") + " #1 #2";
     const result = extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/a/b/pull/99", title, description: "" });
