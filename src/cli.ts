@@ -16,6 +16,8 @@ import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
+import { extractRelatedWork, reconcileRelatedWork, safeRelatedWorkIdentifier } from "./review/related-work.js";
+import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
@@ -247,7 +249,7 @@ export interface ReviewDependencies {
   orchestrate: (
     dispatchResult: DispatchResult,
     diff?: string,
-    options?: { inline?: boolean; suggestions?: boolean },
+    options?: { inline?: boolean; suggestions?: boolean; relatedWork?: readonly RelatedWorkItem[] },
   ) => OrchestrationResult;
 }
 
@@ -632,6 +634,30 @@ export async function review(
     orchestratorModel: config.model,
   });
 
+  const provider = config.locator.kind === "ambient"
+    ? config.locator.provider
+    : config.locator.repo.provider;
+  const extracted = extractRelatedWork({
+    provider,
+    reviewUrl: pr.url ?? "",
+    title: pr.title,
+    description: pr.description,
+  });
+  if (extracted.omittedCount > 0) {
+    console.warn(`tgd-review-agent: ${Math.min(extracted.omittedCount, Number.MAX_SAFE_INTEGER)} additional related-work reference(s) omitted`);
+  }
+  let relatedWork: readonly RelatedWorkItem[] = extracted.references;
+  if (extracted.references.length > 0) {
+    try {
+      const output: unknown = await config.vcsAdapter.resolveRelatedWork(extracted.references);
+      relatedWork = reconcileRelatedWork(extracted.references, output);
+    } catch {
+      for (const reference of extracted.references) {
+        console.warn(`tgd-review-agent: related-work lookup failed for ${provider} ${safeRelatedWorkIdentifier(reference)}; using unresolved reference`);
+      }
+    }
+  }
+
   // Findings are anchored to the diff and posted as INLINE review comments; only
   // what can't be anchored (no line number, or a line outside this PR's hunks)
   // goes in the summary body. Passing the diff is what makes that decision safe —
@@ -639,7 +665,7 @@ export async function review(
   // Only an explicit "off" disables them — an absent value means the documented
   // default (on), never a silent downgrade.
   const renderOpts = { suggestions: config.suggestions !== "off" };
-  const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts });
+  const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts, relatedWork });
   const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
   const terminalResult = {
     status: hasFailure ? "partial" as const : "posted" as const,

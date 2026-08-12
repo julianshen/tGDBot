@@ -4,6 +4,7 @@ import {
   extractRelatedWork,
   normalizeRelatedWorkState,
   relatedWorkIdentity,
+  reconcileRelatedWork,
   sanitizeRelatedWorkTitle,
   validateResolvedRelatedWork,
   type RelatedWorkReference,
@@ -217,5 +218,21 @@ describe("metadata safety", () => {
 
   it("exposes canonical provider identity", () => {
     expect(relatedWorkIdentity(reference)).toBe("github|github.example.com|443|a/b|4");
+  });
+
+  it("reconciles untrusted output by canonical identity and restores extraction order", () => {
+    const second = { ...reference, number: 5, identifier: "#5", sourceText: "#5", fallbackUrl: "https://github.example.com/a/b/issues/5" };
+    const resolvedFirst = { ...reference, kind: "pull_request" as const, title: "Four", state: "open" as const, url: "https://github.example.com/a/b/pull/4" };
+    const resolvedSecond = { ...second, kind: "pull_request" as const, title: "Five", state: "closed" as const, url: "https://github.example.com/a/b/pull/5" };
+    expect(reconcileRelatedWork([reference, second], [resolvedSecond, resolvedFirst]))
+      .toEqual([resolvedFirst, resolvedSecond]);
+  });
+
+  it("falls back for duplicates and missing entries while ignoring foreign and hostile values", () => {
+    const duplicate = { ...reference, kind: "pull_request" as const, url: "https://github.example.com/a/b/pull/4" };
+    const hostile = new Proxy({}, { get() { throw new Error("secret token"); } });
+    expect(() => reconcileRelatedWork([reference], [duplicate, duplicate, { ...duplicate, number: 99 }, hostile])).not.toThrow();
+    expect(reconcileRelatedWork([reference], [duplicate, duplicate, { ...duplicate, number: 99 }, hostile])).toEqual([reference]);
+    expect(reconcileRelatedWork([reference], null)).toEqual([reference]);
   });
 });

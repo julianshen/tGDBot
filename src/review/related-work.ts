@@ -125,6 +125,59 @@ export function relatedWorkIdentity(reference: RelatedWorkReference): string {
   return `${reference.provider}|${reference.host.toLowerCase()}|${authorityPort}|${reference.projectPath}|${reference.number}${kind}`;
 }
 
+export function safeRelatedWorkIdentifier(reference: RelatedWorkReference): string {
+  const sigil = reference.provider === "gitlab" && reference.kindHint === "merge_request" ? "!" : "#";
+  return `${reference.projectPath}${sigil}${reference.number}`;
+}
+
+function candidateIdentity(candidate: unknown): string | undefined {
+  if (!candidate || typeof candidate !== "object") return undefined;
+  try {
+    const record = candidate as Record<string, unknown>;
+    const provider = record.provider;
+    const host = record.host;
+    const port = record.port;
+    const projectPath = record.projectPath;
+    const number = record.number;
+    const kindHint = record.kindHint;
+    if ((provider !== "github" && provider !== "gitlab") || typeof host !== "string" ||
+      typeof projectPath !== "string" || typeof number !== "number" || !Number.isSafeInteger(number) || number < 1 ||
+      (port !== undefined && typeof port !== "string") ||
+      (kindHint !== undefined && kindHint !== "issue" && kindHint !== "pull_request" && kindHint !== "merge_request")) return undefined;
+    return relatedWorkIdentity({ provider, host, ...(port === undefined ? {} : { port }), projectPath, number, ...(kindHint === undefined ? {} : { kindHint }), sourceText: "", identifier: "" });
+  } catch {
+    return undefined;
+  }
+}
+
+export function reconcileRelatedWork(
+  references: readonly RelatedWorkReference[],
+  output: unknown,
+): readonly RelatedWorkItem[] {
+  try {
+    if (!Array.isArray(output)) return [...references];
+  } catch {
+    return [...references];
+  }
+  const expected = new Set(references.map(relatedWorkIdentity));
+  const candidates = new Map<string, unknown[]>();
+  let length: number;
+  try { length = output.length; } catch { return [...references]; }
+  for (let index = 0; index < length; index++) {
+    let candidate: unknown;
+    try { candidate = output[index]; } catch { continue; }
+    const key = candidateIdentity(candidate);
+    if (!key || !expected.has(key)) continue;
+    const values = candidates.get(key);
+    if (values) values.push(candidate);
+    else candidates.set(key, [candidate]);
+  }
+  return references.map((reference) => {
+    const values = candidates.get(relatedWorkIdentity(reference));
+    return values?.length === 1 ? validateResolvedRelatedWork(reference, values[0]) : reference;
+  });
+}
+
 function candidates(text: string, context: ReviewContext): Array<{ index: number; reference: RelatedWorkReference }> {
   const visible = visibleMarkdown(text);
   const found: Array<{ index: number; reference: RelatedWorkReference }> = [];

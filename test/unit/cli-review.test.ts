@@ -1769,6 +1769,41 @@ describe("inline review comments", () => {
     await review(h.args, depsFrom(h));
 
     expect(h.orchestrate.mock.calls[0]?.[1]).toBe(DIFF);
-    expect(h.orchestrate.mock.calls[0]?.[2]).toEqual({ inline: true, suggestions: true });
+    expect(h.orchestrate.mock.calls[0]?.[2]).toEqual({ inline: true, suggestions: true, relatedWork: [] });
+  });
+
+  it("extracts and resolves GitHub related work after dispatch, then passes it only to presentation", async () => {
+    const h = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7", description: "See #8" }) });
+    const resolved = { provider: "github", host: "github.com", projectPath: "acme/app", number: 7, sourceText: "#7", identifier: "#7", kind: "issue", title: "Seven", state: "open", url: "https://github.com/acme/app/issues/7" };
+    h.vcsAdapter.resolveRelatedWork.mockResolvedValue([resolved]);
+    await review(h.args, depsFrom(h));
+    expect(h.vcsAdapter.resolveRelatedWork).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.resolveRelatedWork.mock.calls[0]?.[0]).toHaveLength(2);
+    expect(h.dispatchRules.mock.calls[0]?.[0]).not.toHaveProperty("relatedWork");
+    expect(h.orchestrate.mock.calls[0]?.[2]?.relatedWork).toEqual([expect.objectContaining(resolved), expect.objectContaining({ number: 8 })]);
+  });
+
+  it("falls back per reference on resolver rejection without leaking the error", async () => {
+    const args = makeArgs({ pr: "https://gitlab.com/group/app/-/merge_requests/42", vcs: "gitlab" });
+    const h = makeHarness({ args, pr: makePr({ url: "https://gitlab.com/group/app/-/merge_requests/42", title: "Relates to !7 and #8" }) });
+    h.vcsAdapter.resolveRelatedWork.mockRejectedValue(new Error("token=super-secret body payload"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await review(h.args, depsFrom(h));
+    expect(warn).toHaveBeenCalledTimes(2);
+    const text = warn.mock.calls.flat().join("\n");
+    expect(text).toContain("gitlab group/app!7");
+    expect(text).not.toContain("super-secret");
+    expect(h.orchestrate.mock.calls[0]?.[2]?.relatedWork).toHaveLength(2);
+    warn.mockRestore();
+  });
+
+  it("does not resolve without references or when dispatch rejects", async () => {
+    const none = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42" }) });
+    await review(none.args, depsFrom(none));
+    expect(none.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+    const failed = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" }) });
+    failed.dispatchRules.mockRejectedValue(new Error("dispatch failed"));
+    await expect(review(failed.args, depsFrom(failed))).rejects.toThrow("dispatch failed");
+    expect(failed.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
   });
 });
