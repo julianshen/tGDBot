@@ -8,7 +8,7 @@
 // (confirmed against the installed pi-subagents@0.34.0:
 // "./src/extension/index.ts" and @juicesharp/rpiv-advisor@1.20.0:
 // "./index.ts").
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 
@@ -54,7 +54,35 @@ export function extractPiExtensionEntry(
 // their own package.json, so the same require.resolve + "pi.extensions[0]"
 // read applies to either.
 function resolvePiExtensionEntryPath(packageName: string): string {
-  const packageJsonPath = require.resolve(`${packageName}/package.json`);
+  let packageJsonPath: string;
+  try {
+    packageJsonPath = require.resolve(`${packageName}/package.json`);
+  } catch (error) {
+    // Newer extension packages may export their entry point while deliberately
+    // hiding package.json. Resolve the public entry and walk upward to the
+    // package root instead; this retains compatibility with older packages
+    // whose manifests remain directly resolvable.
+    if (
+      !(error instanceof Error) ||
+      !("code" in error) ||
+      error.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED"
+    ) {
+      throw error;
+    }
+    let directory = path.dirname(require.resolve(packageName));
+    while (true) {
+      const candidate = path.join(directory, "package.json");
+      if (existsSync(candidate)) {
+        packageJsonPath = candidate;
+        break;
+      }
+      const parent = path.dirname(directory);
+      if (parent === directory) {
+        throw new Error(`Could not locate ${packageName} package.json from its exported entry`);
+      }
+      directory = parent;
+    }
+  }
   const packageRoot = path.dirname(packageJsonPath);
 
   const pkg = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as PiPackageJson;

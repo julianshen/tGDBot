@@ -17,7 +17,7 @@ describe("resolvePiSubagentsExtensionPath", () => {
     const resolved = resolvePiSubagentsExtensionPath();
 
     expect(path.isAbsolute(resolved)).toBe(true);
-    expect(resolved.endsWith(path.join("pi-subagents", "src", "extension", "index.ts"))).toBe(true);
+    expect(resolved.endsWith(path.join("pi-subagents", "index.ts"))).toBe(true);
     expect(existsSync(resolved)).toBe(true);
   });
 });
