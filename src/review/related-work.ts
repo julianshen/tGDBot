@@ -123,8 +123,8 @@ function candidates(text: string, context: ReviewContext): Array<{ index: number
   const found: Array<{ index: number; reference: RelatedWorkReference }> = [];
   const occupied: Array<[number, number]> = [];
   const urlPattern = context.provider === "github"
-    ? /https:\/\/[^\s<>()\]]+\/[A-Za-z0-9_.%/-]+\/(?:issues|pull)\/[1-9][0-9]*(?![A-Za-z0-9_-]|\.[A-Za-z0-9])/g
-    : /https:\/\/[^\s<>()\]]+\/[A-Za-z0-9_.%/-]+\/-\/(?:issues|merge_requests)\/[1-9][0-9]*(?![A-Za-z0-9_-]|\.[A-Za-z0-9])/g;
+    ? /https:\/\/[^\s<>()\]]+\/[A-Za-z0-9_.%/-]+\/(?:issues|pull)\/[1-9][0-9]*(?![A-Za-z0-9_/%-]|\.[A-Za-z0-9])/g
+    : /https:\/\/[^\s<>()\]]+\/[A-Za-z0-9_.%/-]+\/-\/(?:issues|merge_requests)\/[1-9][0-9]*(?![A-Za-z0-9_/%-]|\.[A-Za-z0-9])/g;
   for (const match of visible.matchAll(urlPattern)) {
     const sourceText = match[0];
     let url: URL;

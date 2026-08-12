@@ -94,6 +94,23 @@ describe("extractRelatedWork", () => {
     });
     expect(result.references.map((reference) => reference.number)).toEqual([2]);
   });
+
+  it("rejects noncanonical full URLs instead of accepting valid path prefixes", () => {
+    const github = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "https://github.com/a/b/issues/3/evil https://github.com/a/b/pull/4%2Fevil",
+      description: "",
+    });
+    const gitlab = extractRelatedWork({
+      provider: "gitlab",
+      reviewUrl: "https://gitlab.com/a/b/-/merge_requests/9",
+      title: "https://gitlab.com/a/b/-/issues/3/evil https://gitlab.com/a/b/-/merge_requests/4%2Fevil",
+      description: "",
+    });
+    expect(github.references).toEqual([]);
+    expect(gitlab.references).toEqual([]);
+  });
 });
 
 describe("metadata safety", () => {
