@@ -28,6 +28,19 @@ describe("resolveGitHubRelatedWork", () => {
     );
   });
 
+  it("uses the referenced cross-repository project in the exact github.com arguments", async () => {
+    const ref = reference(21, { projectPath: "other/project", identifier: "other/project#21" });
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      title: "Cross repo", state: "OPEN", html_url: "https://github.com/other/project/issues/21",
+    }));
+    await resolveGitHubRelatedWork([ref], execGh);
+    expect(execGh).toHaveBeenCalledWith(
+      ["api", "-X", "GET", "repos/other/project/issues/21", "--hostname", "github.com"],
+      undefined,
+      { timeoutMs: 5_000 },
+    );
+  });
+
   it("uses pr view for pull-request state and supports enterprise ports", async () => {
     const ref = reference(7, { host: "git.example.com", port: "8443", projectPath: "team/app" });
     const execGh = vi.fn()
@@ -49,6 +62,53 @@ describe("resolveGitHubRelatedWork", () => {
       .mockResolvedValueOnce(JSON.stringify({ title: "C", state: "mystery", html_url: "https://github.com/octo/repo/issues/3" }));
     const result = await resolveGitHubRelatedWork([reference(1), reference(2), reference(3)], execGh);
     expect(result.map(({ state }) => state)).toEqual(["open", "closed", undefined]);
+  });
+
+  it("does not accept the semantically impossible merged state for an issue", async () => {
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      title: "Issue", state: "MERGED", html_url: "https://github.com/octo/repo/issues/4",
+    }));
+    const [result] = await resolveGitHubRelatedWork([reference(4)], execGh);
+    expect(result).toMatchObject({ kind: "issue", title: "Issue" });
+    expect(result?.state).toBeUndefined();
+  });
+
+  it.each([
+    ["OPEN", "open"],
+    ["closed", "closed"],
+    ["MERGED", "merged"],
+    ["unknown", undefined],
+  ] as const)("normalizes pull-request state %s to %s", async (providerState, expected) => {
+    const ref = reference(6);
+    const execGh = vi.fn()
+      .mockResolvedValueOnce(JSON.stringify({ pull_request: {} }))
+      .mockResolvedValueOnce(JSON.stringify({
+        title: "PR", state: providerState, url: "https://github.com/octo/repo/pull/6",
+      }));
+    const [result] = await resolveGitHubRelatedWork([ref], execGh);
+    expect(result).toMatchObject({ kind: "pull_request", title: "PR" });
+    expect(result?.state).toBe(expected);
+  });
+
+  it.each([
+    ["host", "https://evil.example/octo/repo/issues/10", {}],
+    ["normalized port", "https://github.com:8443/octo/repo/issues/10", {}],
+    ["project", "https://github.com/octo/other/issues/10", {}],
+    ["number", "https://github.com/octo/repo/issues/11", {}],
+    ["kind", "https://github.com/octo/repo/issues/10", { kindHint: "pull_request" as const }],
+  ])("rejects metadata with a mismatched %s", async (_boundary, url, overrides) => {
+    const ref = reference(10, overrides);
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({ title: "Wrong", state: "open", html_url: url }));
+    expect(await resolveGitHubRelatedWork([ref], execGh)).toEqual([ref]);
+  });
+
+  it("accepts an explicitly written default HTTPS port after URL normalization", async () => {
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      title: "Normalized", state: "open", html_url: "https://github.com:443/octo/repo/issues/10",
+    }));
+    await expect(resolveGitHubRelatedWork([reference(10)], execGh)).resolves.toEqual([
+      expect.objectContaining({ title: "Normalized", url: "https://github.com/octo/repo/issues/10" }),
+    ]);
   });
 
   it("returns malformed, mismatched, and hostile metadata unresolved", async () => {
@@ -89,6 +149,24 @@ describe("resolveGitHubRelatedWork", () => {
     expect(await resolveGitHubRelatedWork([ref], execGh)).toEqual([ref]);
     expect(execGh).toHaveBeenCalledTimes(2);
     expect(warn).toHaveBeenCalledWith("Failed to resolve github related work #9");
+    warn.mockRestore();
+  });
+
+  it.each([
+    ["authentication rejection", new Error("authentication failed")],
+    ["not-found rejection", new Error("HTTP 404")],
+    ["timeout rejection", new Error("timed out")],
+  ])("does not try PR lookup or issue fallback after an initial %s", async (_case, failure) => {
+    const ref = reference(13);
+    const execGh = vi.fn().mockRejectedValue(failure);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    expect(await resolveGitHubRelatedWork([ref], execGh)).toEqual([ref]);
+    expect(execGh).toHaveBeenCalledTimes(1);
+    expect(execGh).toHaveBeenNthCalledWith(1,
+      ["api", "-X", "GET", "repos/octo/repo/issues/13", "--hostname", "github.com"],
+      undefined,
+      { timeoutMs: 5_000 },
+    );
     warn.mockRestore();
   });
 
