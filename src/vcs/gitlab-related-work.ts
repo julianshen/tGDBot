@@ -25,6 +25,10 @@ function authority(reference: RelatedWorkReference): string {
   return `${reference.host}${reference.port && reference.port !== "443" ? `:${reference.port}` : ""}`;
 }
 
+function diagnosticIdentifier(reference: RelatedWorkReference): string {
+  return `${reference.projectPath}${reference.kindHint === "merge_request" ? "!" : "#"}${reference.number}`;
+}
+
 function parseRecord(output: string): Record<string, unknown> | undefined {
   try {
     const parsed: unknown = JSON.parse(output);
@@ -57,7 +61,7 @@ async function resolveOne(reference: RelatedWorkReference, execGlab: ExecGlab): 
       url: record.web_url ?? record.url,
     });
   } catch {
-    console.warn(`Failed to resolve gitlab related work ${reference.identifier}`);
+    console.warn(`Failed to resolve gitlab related work ${diagnosticIdentifier(reference)}`);
     return reference;
   }
 }

@@ -187,7 +187,7 @@ function exactCandidateUrl(reference: RelatedWorkReference, kind: RelatedWorkKin
   if (typeof value !== "string") return undefined;
   let url: URL;
   try { url = new URL(value); } catch { return undefined; }
-  const expectedPort = reference.port ?? "";
+  const expectedPort = reference.port === undefined || reference.port === "443" ? "" : reference.port;
   if (url.protocol !== "https:" || url.hostname.toLowerCase() !== reference.host.toLowerCase() || url.port !== expectedPort || url.search || url.hash || url.username || url.password) return undefined;
   const path = reference.provider === "github"
     ? `/${reference.projectPath}/${kind === "issue" ? "issues" : "pull"}/${reference.number}`

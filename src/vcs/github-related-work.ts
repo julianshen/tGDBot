@@ -12,6 +12,10 @@ function authority(reference: RelatedWorkReference): string {
   return `${reference.host}${reference.port ? `:${reference.port}` : ""}`;
 }
 
+function diagnosticIdentifier(reference: RelatedWorkReference): string {
+  return `${reference.projectPath}#${reference.number}`;
+}
+
 function normalizedState(value: unknown): RelatedWorkState | undefined {
   if (typeof value !== "string") return undefined;
   const state = value.toLowerCase();
@@ -53,7 +57,7 @@ async function resolveOne(reference: RelatedWorkReference, execGh: ExecGh): Prom
       kind: "pull_request", title: pull.title, state: normalizedState(pull.state), url: pull.url,
     });
   } catch {
-    console.warn(`Failed to resolve github related work ${reference.identifier}`);
+    console.warn(`Failed to resolve github related work ${diagnosticIdentifier(reference)}`);
     return reference;
   }
 }

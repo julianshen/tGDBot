@@ -40,7 +40,9 @@ describe("resolveGitLabRelatedWork", () => {
   it("omits an explicit standard HTTPS port from canonical arguments", async () => {
     const ref = reference(3, { port: "443" });
     const execGlab = vi.fn().mockResolvedValue(JSON.stringify({ title: "A", state: "open", web_url: "https://gitlab.com/group/project/-/issues/3" }));
-    await resolveGitLabRelatedWork([ref], execGlab);
+    await expect(resolveGitLabRelatedWork([ref], execGlab)).resolves.toEqual([
+      expect.objectContaining({ title: "A", state: "open", url: "https://gitlab.com/group/project/-/issues/3" }),
+    ]);
     expect(execGlab).toHaveBeenCalledWith(expect.arrayContaining(["--repo", "https://gitlab.com/group/project", "--hostname", "gitlab.com"]), undefined, { timeoutMs: 5_000 });
   });
 
@@ -71,7 +73,7 @@ describe("resolveGitLabRelatedWork", () => {
     const result = await resolveGitLabRelatedWork(refs, execGlab);
     expect(result.map(({ title }) => title)).toEqual([undefined, undefined, undefined, "Safe"]);
     expect(result[3]?.state).toBeUndefined();
-    expect(warn).toHaveBeenCalledWith("Failed to resolve gitlab related work #1");
+    expect(warn).toHaveBeenCalledWith("Failed to resolve gitlab related work group/project#1");
     expect(JSON.stringify(warn.mock.calls)).not.toMatch(/secret|credential|body/i);
     warn.mockRestore();
   });
@@ -87,6 +89,20 @@ describe("resolveGitLabRelatedWork", () => {
       refs[0], expect.objectContaining({ title: "Sibling" }),
     ]);
     expect(execGlab).toHaveBeenNthCalledWith(1, expect.any(Array), undefined, { timeoutMs: 5_000 });
+    warn.mockRestore();
+  });
+
+  it("reconstructs a safe canonical warning instead of logging caller-controlled fields", async () => {
+    const ref = reference(11, {
+      projectPath: "group/subgroup/project",
+      kindHint: "merge_request",
+      identifier: "TOKEN=secret\nforged",
+      sourceText: "private body",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await resolveGitLabRelatedWork([ref], vi.fn().mockRejectedValue(new Error("stderr credential")));
+    expect(warn).toHaveBeenCalledWith("Failed to resolve gitlab related work group/subgroup/project!11");
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/TOKEN|secret|forged|private body|stderr|credential/i);
     warn.mockRestore();
   });
 

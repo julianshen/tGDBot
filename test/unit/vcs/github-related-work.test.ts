@@ -135,7 +135,7 @@ describe("resolveGitHubRelatedWork", () => {
     const result = await resolveGitHubRelatedWork(refs, execGh);
     expect(result.map(({ title }) => title)).toEqual(["Issue 1", undefined, "Issue 3"]);
     expect(execGh).toHaveBeenCalledTimes(3);
-    expect(warn).toHaveBeenCalledWith("Failed to resolve github related work #2");
+    expect(warn).toHaveBeenCalledWith("Failed to resolve github related work octo/repo#2");
     expect(JSON.stringify(warn.mock.calls)).not.toMatch(/secret|credential|body/i);
     warn.mockRestore();
   });
@@ -148,7 +148,20 @@ describe("resolveGitHubRelatedWork", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     expect(await resolveGitHubRelatedWork([ref], execGh)).toEqual([ref]);
     expect(execGh).toHaveBeenCalledTimes(2);
-    expect(warn).toHaveBeenCalledWith("Failed to resolve github related work #9");
+    expect(warn).toHaveBeenCalledWith("Failed to resolve github related work octo/repo#9");
+    warn.mockRestore();
+  });
+
+  it("reconstructs a safe canonical warning instead of logging caller-controlled fields", async () => {
+    const ref = reference(14, {
+      projectPath: "other/project",
+      identifier: "TOKEN=secret\nforged",
+      sourceText: "private body",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await resolveGitHubRelatedWork([ref], vi.fn().mockRejectedValue(new Error("stderr credential")));
+    expect(warn).toHaveBeenCalledWith("Failed to resolve github related work other/project#14");
+    expect(JSON.stringify(warn.mock.calls)).not.toMatch(/TOKEN|secret|forged|private body|stderr|credential/i);
     warn.mockRestore();
   });
 
