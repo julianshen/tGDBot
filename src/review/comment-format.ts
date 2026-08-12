@@ -370,21 +370,25 @@ function kindLabel(kind: RelatedWorkKind): string {
 }
 
 function renderRelatedWorkItem(value: unknown): string | undefined {
-  const reference = canonicalRelatedWorkReference(value);
-  if (!reference) return undefined;
-  const validated = validateResolvedRelatedWork(reference, value);
-  const resolved = validated.url && validated.kind ? validated : undefined;
-  const fallbackKind = reference.kindHint ?? "issue";
-  const fallback = reference.fallbackUrl
-    ? validateResolvedRelatedWork(reference, { kind: fallbackKind, url: reference.fallbackUrl }).url
-    : undefined;
-  const url = resolved?.url ?? fallback;
-  const identifier = reference.identifier;
-  const label = resolved ? `${kindLabel(resolved.kind!)} ${identifier}` : identifier;
-  const main = url ? `[${label}](${url})` : escapeMarkdownText(label);
-  if (!resolved?.title) return main;
-  const state = resolved.state ? ` (${resolved.state})` : "";
-  return `${main} — ${escapeMarkdownText(resolved.title)}${state}`;
+  try {
+    const reference = canonicalRelatedWorkReference(value);
+    if (!reference) return undefined;
+    const validated = validateResolvedRelatedWork(reference, value);
+    const resolved = validated.url && validated.kind ? validated : undefined;
+    const fallbackKind = reference.kindHint ?? "issue";
+    const fallback = reference.fallbackUrl
+      ? validateResolvedRelatedWork(reference, { kind: fallbackKind, url: reference.fallbackUrl }).url
+      : undefined;
+    const url = resolved?.url ?? fallback;
+    const identifier = reference.identifier;
+    const label = resolved ? `${kindLabel(resolved.kind!)} ${identifier}` : identifier;
+    const main = url ? `[${label}](${url})` : escapeMarkdownText(label);
+    if (!resolved?.title) return main;
+    const state = resolved.state ? ` (${resolved.state})` : "";
+    return `${main} — ${escapeMarkdownText(resolved.title)}${state}`;
+  } catch {
+    return undefined;
+  }
 }
 
 export function normalizeRelatedWorkForRender(items: readonly unknown[]): string[] {

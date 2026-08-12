@@ -384,6 +384,29 @@ describe("renderSummaryComment", () => {
     expect(body).toContain("- \\#2");
     expect(body.match(/^### Related work$/gm)).toHaveLength(1);
   });
+
+  it("contains hostile property access while retaining valid related work", () => {
+    const throwingGetter = Object.defineProperty({}, "provider", {
+      get() { throw new Error("getter trap"); },
+    });
+    const throwingProxy = new Proxy({}, {
+      get() { throw new Error("proxy trap"); },
+    });
+    const valid = { provider: "gitlab", host: "gitlab.com", projectPath: "group/platform", number: 2, sourceText: "good", identifier: "#2" };
+    const relatedWork = [throwingGetter, valid, throwingProxy] as unknown as RelatedWorkItem[];
+
+    expect(() => renderSummaryComment({ ...base, relatedWork })).not.toThrow();
+    const body = renderSummaryComment({ ...base, relatedWork });
+    expect(body).toContain("- \\#2");
+    expect(body.match(/^### Related work$/gm)).toHaveLength(1);
+  });
+
+  it("omits the heading when all related-work entries throw on access", () => {
+    const hostile = new Proxy({}, { get() { throw new Error("proxy trap"); } });
+    const relatedWork = [hostile] as unknown as RelatedWorkItem[];
+    expect(() => renderSummaryComment({ ...base, relatedWork })).not.toThrow();
+    expect(renderSummaryComment({ ...base, relatedWork })).not.toContain("Related work");
+  });
 });
 
 // ADR-007: committable suggestions. THE SECURITY BOUNDARY of this feature.
