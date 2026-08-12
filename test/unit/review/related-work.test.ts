@@ -235,4 +235,20 @@ describe("metadata safety", () => {
     expect(reconcileRelatedWork([reference], [duplicate, duplicate, { ...duplicate, number: 99 }, hostile])).toEqual([reference]);
     expect(reconcileRelatedWork([reference], null)).toEqual([reference]);
   });
+
+  it.each([Infinity, Number.MAX_SAFE_INTEGER, 101, -1, 1.5])(
+    "falls back without iterating an unsafe adapter array length of %s",
+    (length) => {
+      let elementReads = 0;
+      const hostile = new Proxy([], {
+        get(target, key, receiver) {
+          if (key === "length") return length;
+          if (typeof key === "string" && /^\d+$/.test(key)) elementReads++;
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      expect(reconcileRelatedWork([reference], hostile)).toEqual([reference]);
+      expect(elementReads).toBe(0);
+    },
+  );
 });

@@ -25,6 +25,12 @@ export interface ExtractRelatedWorkResult {
   readonly omittedCount: number;
 }
 
+// Extraction emits at most ten references. Resolver output is allowed ample
+// room for duplicates and foreign entries, but remains bounded because even an
+// Array Proxy can lie about length (including Infinity) and otherwise trap the
+// reconciliation loop in unbounded work.
+const MAX_RESOLVER_CANDIDATES = 100;
+
 interface ReviewContext {
   provider: "github" | "gitlab";
   host: string;
@@ -163,6 +169,9 @@ export function reconcileRelatedWork(
   const candidates = new Map<string, unknown[]>();
   let length: number;
   try { length = output.length; } catch { return [...references]; }
+  if (!Number.isSafeInteger(length) || length < 0 || length > MAX_RESOLVER_CANDIDATES) {
+    return [...references];
+  }
   for (let index = 0; index < length; index++) {
     let candidate: unknown;
     try { candidate = output[index]; } catch { continue; }
