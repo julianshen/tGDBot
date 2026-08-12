@@ -93,6 +93,17 @@ describe("extractRelatedWork", () => {
     expect(result.references.map((reference) => reference.identifier)).toEqual(["#42", "#43"]);
   });
 
+  it("treats backslash-escaped backticks as visible punctuation", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "Document \\`option #42\\` and `hide #43`",
+      description: "Escaped \\\`literal #44\\\` remains visible",
+    });
+
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#42", "#44"]);
+  });
+
   it("limits after deduplication and reports only extra unique references", () => {
     const title = Array.from({ length: 12 }, (_, index) => `#${index + 1}`).join(" ") + " #1 #2";
     const result = extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/a/b/pull/99", title, description: "" });

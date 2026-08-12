@@ -515,18 +515,22 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   ].filter((part): part is string => part !== undefined).join("\n\n");
 
   if (body.length <= maxLength) return body;
-  return truncate(
-    [
-      header,
-      notice,
-      relatedWork,
-      input.rulesFailed.length > 0
-        ? `${input.rulesFailed.length} rule(s) failed to run.`
-        : undefined,
-      `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
-    ].filter((part): part is string => part !== undefined).join("\n\n"),
-    maxLength,
-  );
+  const compactStatus = [
+    header,
+    notice,
+    input.rulesFailed.length > 0
+      ? `${input.rulesFailed.length} rule(s) failed to run.`
+      : undefined,
+    `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+  ].filter((part): part is string => part !== undefined);
+  const withRelatedWork = relatedWork
+    ? [...compactStatus.slice(0, 2), relatedWork, ...compactStatus.slice(2)].join("\n\n")
+    : compactStatus.join("\n\n");
+  if (withRelatedWork.length <= maxLength) return withRelatedWork;
+  // Related-work entries contain Markdown links and are already atomic. When
+  // the final emergency representation cannot fit them whole, omit the entire
+  // section instead of slicing through a label or URL.
+  return truncate(compactStatus.join("\n\n"), maxLength);
 }
 
 function allocateCompactMessageBudgets(lengths: number[], available: number): number[] {

@@ -106,6 +106,15 @@ function visibleMarkdown(value: string): string {
     }
     if (fence) { output += value[index] === "\n" ? "\n" : " "; index++; continue; }
     if (value[index] === "`") {
+      let backslashes = 0;
+      for (let cursor = index - 1; cursor >= 0 && value[cursor] === "\\"; cursor--) {
+        backslashes++;
+      }
+      if (backslashes % 2 === 1) {
+        output += "`";
+        index++;
+        continue;
+      }
       let count = 1;
       while (value[index + count] === "`") count++;
       if (!inline) {
@@ -115,7 +124,13 @@ function visibleMarkdown(value: string): string {
         let closing = value.indexOf(delimiter, index + count);
         while (
           closing >= 0 &&
-          (value[closing - 1] === "`" || value[closing + count] === "`")
+          (() => {
+            let escapedBy = 0;
+            for (let cursor = closing - 1; cursor >= 0 && value[cursor] === "\\"; cursor--) {
+              escapedBy++;
+            }
+            return escapedBy % 2 === 1 || value[closing - 1] === "`" || value[closing + count] === "`";
+          })()
         ) {
           closing = value.indexOf(delimiter, closing + count);
         }

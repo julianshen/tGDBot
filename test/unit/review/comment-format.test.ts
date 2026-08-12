@@ -292,6 +292,43 @@ describe("renderSummaryComment", () => {
     expect(body).toContain("Related incident");
   });
 
+  it("never truncates compact related-work Markdown inside a link", () => {
+    const finding = makeFinding({ message: "x".repeat(2_000) });
+    const relatedWork = [{
+      provider: "github" as const,
+      host: "github.com",
+      projectPath: "acme/app",
+      number: 77,
+      kindHint: "issue" as const,
+      sourceText: "#77",
+      identifier: "#77",
+      fallbackUrl: "https://github.com/acme/app/issues/77",
+      kind: "issue" as const,
+      title: "Related incident",
+      state: "open" as const,
+      url: "https://github.com/acme/app/issues/77",
+    }];
+    const full = renderSummaryComment({
+      ...base,
+      allFindings: [finding],
+      unanchored: [finding],
+      relatedWork,
+    }, Number.MAX_SAFE_INTEGER);
+    const url = "https://github.com/acme/app/issues/77";
+    const unsafeBoundary = full.indexOf(url) + Math.floor(url.length / 2);
+
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: [finding],
+      unanchored: [finding],
+      relatedWork,
+    }, unsafeBoundary);
+
+    expect(body.length).toBeLessThanOrEqual(unsafeBoundary);
+    expect(body).not.toMatch(/\[[^\]]*\]\([^)]*$/m);
+    expect(body.includes(url)).toBe(body.includes("### Related work"));
+  });
+
   it("retains failed-rule status when an oversized summary is compacted", () => {
     const findings = Array.from({ length: 40 }, (_, index) =>
       makeFinding({
