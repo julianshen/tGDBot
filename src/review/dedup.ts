@@ -51,7 +51,7 @@ export interface ReviewConfigForDedup {
  * The exact hash value is not a stable contract — it only needs to be
  * deterministic within a version and to change when any hashed field changes.
  */
-export function computeReviewConfigHash(config: ReviewConfigForDedup): string {
+export function computeReviewConfigHash(config: ReviewConfigForDedup, relatedWorkFingerprint?: string): string {
   // A positional array (not an object) so the serialization can't drift on key
   // ordering; every field that affects review output is included explicitly.
   // rulesDir separators are normalized to POSIX `/` so the SAME logical rules
@@ -68,6 +68,9 @@ export function computeReviewConfigHash(config: ReviewConfigForDedup): string {
     config.rulesDir.replace(/\\/g, "/"),
     config.model ?? null,
     config.dispatch,
+    // Appending this field intentionally changes every legacy config hash:
+    // each open review runs once after upgrade, then remains stable again.
+    relatedWorkFingerprint ?? null,
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
 }

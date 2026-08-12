@@ -12,6 +12,8 @@ import type {
   VcsAdapter,
 } from "./adapter.js";
 import type { GitHubRepositoryRef } from "../target/types.js";
+import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
+import { resolveGitHubRelatedWork } from "./github-related-work.js";
 
 /**
  * Seam for shelling out to the `gh` CLI. GitHubAdapter accepts an ExecGh
@@ -22,9 +24,14 @@ import type { GitHubRepositoryRef } from "../target/types.js";
  *
  * `stdin`, when provided, is piped to the child process (used for
  * `--body-file -` / `--input -` invocations so comment bodies never have to
- * be embedded in a shell-quoted argument).
+ * be embedded in a shell-quoted argument). `options.timeoutMs` bounds focused
+ * metadata lookups without changing existing callers' process behavior.
  */
-export type ExecGh = (args: string[], stdin?: string) => Promise<string>;
+export type ExecGh = (
+  args: string[],
+  stdin?: string,
+  options?: { timeoutMs?: number },
+) => Promise<string>;
 
 /**
  * Real implementation: shells out to the actual `gh` CLI via `execFile` (no
@@ -32,12 +39,15 @@ export type ExecGh = (args: string[], stdin?: string) => Promise<string>;
  * support piping stdin, so this wraps the callback form directly and writes
  * `stdin` to the child process before awaiting completion.
  */
-export const realExecGh: ExecGh = (args, stdin) =>
+export const realExecGh: ExecGh = (args, stdin, options) =>
   new Promise((resolve, reject) => {
     const child = execFile(
       "gh",
       args,
-      { maxBuffer: 10 * 1024 * 1024 },
+      {
+        maxBuffer: 10 * 1024 * 1024,
+        ...(options?.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
+      },
       (error, stdout) => {
         if (error) {
           reject(error);
@@ -195,6 +205,10 @@ function apiHost(repo?: GitHubRepositoryRef): string[] {
  */
 export class GitHubAdapter implements VcsAdapter {
   constructor(private readonly execGh: ExecGh = realExecGh) {}
+
+  resolveRelatedWork(references: readonly RelatedWorkReference[]): Promise<readonly RelatedWorkItem[]> {
+    return resolveGitHubRelatedWork(references, this.execGh);
+  }
 
   // Caches the resolved bot login (the currently-authenticated `gh` identity)
   // across calls within an adapter instance, so `gh api user` is only ever

@@ -2,7 +2,9 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { parseBotMarker } from "../review/comment-marker.js";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
+import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import type { GitLabRepositoryRef } from "../target/types.js";
+import { resolveGitLabRelatedWork } from "./gitlab-related-work.js";
 import {
   validateInlinePublishInputs,
   validateInlinePublishOutcomes,
@@ -26,6 +28,7 @@ const HTTP_DIAGNOSTIC_RE =
 export type ExecGlab = (
   args: readonly string[],
   stdin?: string,
+  options?: { readonly timeoutMs?: number },
 ) => Promise<string>;
 
 export class GlabCommandError extends Error {
@@ -88,7 +91,7 @@ function apiHttpStatus(args: readonly string[], stderr: string): number | undefi
   return status === undefined ? undefined : Number(status);
 }
 
-export const realExecGlab: ExecGlab = (args, stdin) =>
+export const realExecGlab: ExecGlab = (args, stdin, options) =>
   new Promise((resolve, reject) => {
     let settled = false;
     let processFinished = false;
@@ -126,6 +129,7 @@ export const realExecGlab: ExecGlab = (args, stdin) =>
       [...args],
       {
         maxBuffer: MAX_BUFFER_BYTES,
+        ...(options?.timeoutMs === undefined ? {} : { timeout: options.timeoutMs }),
         env: {
           ...process.env,
           GLAB_PROMPT_DISABLED: "true",
@@ -589,6 +593,12 @@ function downgradeGitLabRangeSuggestion(body: string): string {
 
 export class GitLabAdapter implements VcsAdapter {
   constructor(private readonly execGlab: ExecGlab = realExecGlab) {}
+
+  resolveRelatedWork(
+    references: readonly RelatedWorkReference[],
+  ): Promise<readonly RelatedWorkItem[]> {
+    return resolveGitLabRelatedWork(references, this.execGlab);
+  }
 
   private readonly usernamePromises = new Map<string, Promise<string>>();
 

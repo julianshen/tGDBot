@@ -8,6 +8,7 @@ import {
   renderSummaryComment,
 } from "../../../src/review/comment-format.js";
 import type { Finding } from "../../../src/review/types.js";
+import type { RelatedWorkItem } from "../../../src/review/related-work.js";
 
 // Every inline body ends with the tool's trailing marker (what stale-thread
 // resolution keys on); assertions about "the body proper" strip it first.
@@ -259,6 +260,75 @@ describe("renderSummaryComment", () => {
     }
   });
 
+  it("preserves related work and charges it against the compact-summary budget", () => {
+    const findings = Array.from({ length: 30 }, (_, index) =>
+      makeFinding({ file: `src/large-${index}.ts`, message: `Problem ${index}. ${"x".repeat(500)}` }),
+    );
+    const relatedWork = [{
+      provider: "github" as const,
+      host: "github.com",
+      projectPath: "acme/app",
+      number: 42,
+      kindHint: "issue" as const,
+      sourceText: "#42",
+      identifier: "#42",
+      fallbackUrl: "https://github.com/acme/app/issues/42",
+      kind: "issue" as const,
+      title: "Related incident",
+      state: "open" as const,
+      url: "https://github.com/acme/app/issues/42",
+    }];
+
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: findings,
+      unanchored: findings,
+      relatedWork,
+    }, 4_000);
+
+    expect(body.length).toBeLessThanOrEqual(4_000);
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("### Related work");
+    expect(body).toContain("Related incident");
+  });
+
+  it("never truncates compact related-work Markdown inside a link", () => {
+    const finding = makeFinding({ message: "x".repeat(2_000) });
+    const relatedWork = [{
+      provider: "github" as const,
+      host: "github.com",
+      projectPath: "acme/app",
+      number: 77,
+      kindHint: "issue" as const,
+      sourceText: "#77",
+      identifier: "#77",
+      fallbackUrl: "https://github.com/acme/app/issues/77",
+      kind: "issue" as const,
+      title: "Related incident",
+      state: "open" as const,
+      url: "https://github.com/acme/app/issues/77",
+    }];
+    const full = renderSummaryComment({
+      ...base,
+      allFindings: [finding],
+      unanchored: [finding],
+      relatedWork,
+    }, Number.MAX_SAFE_INTEGER);
+    const url = "https://github.com/acme/app/issues/77";
+    const unsafeBoundary = full.indexOf(url) + Math.floor(url.length / 2);
+
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: [finding],
+      unanchored: [finding],
+      relatedWork,
+    }, unsafeBoundary);
+
+    expect(body.length).toBeLessThanOrEqual(unsafeBoundary);
+    expect(body).not.toMatch(/\[[^\]]*\]\([^)]*$/m);
+    expect(body.includes(url)).toBe(body.includes("### Related work"));
+  });
+
   it("retains failed-rule status when an oversized summary is compacted", () => {
     const findings = Array.from({ length: 40 }, (_, index) =>
       makeFinding({
@@ -330,6 +400,81 @@ describe("renderSummaryComment", () => {
       ruleFailureReasons: { "tgd-review": "no working credentials for provider `anthropic`" },
     });
     expect(body).toContain("`tgd-review` — no working credentials");
+  });
+
+  it("renders safe related work after findings and failed rules, before details", () => {
+    const relatedWork: RelatedWorkItem[] = [
+      { provider: "github", host: "github.com", projectPath: "acme/app", number: 42, kindHint: "issue", sourceText: "unsafe", identifier: "#42", fallbackUrl: "https://github.com/acme/app/issues/42", kind: "issue", title: "Fix [login](bad) <!-- timeout", state: "open", url: "https://github.com/acme/app/issues/42" },
+      { provider: "github", host: "github.com", projectPath: "acme/api", number: 51, kindHint: "pull_request", sourceText: "unsafe", identifier: "acme/api#51", fallbackUrl: "https://github.com/acme/api/issues/51", kind: "pull_request", title: "Refactor auth", state: "merged", url: "https://github.com/acme/api/pull/51" },
+      { provider: "gitlab", host: "gitlab.com", projectPath: "group/platform", number: 19, kindHint: "merge_request", sourceText: "unsafe", identifier: "group/platform!19", fallbackUrl: "https://gitlab.com/group/platform/-/merge_requests/19", kind: "merge_request", title: "Rotate sessions", state: "open", url: "https://gitlab.com/group/platform/-/merge_requests/19" },
+    ];
+    const body = renderSummaryComment({ ...base, rulesFailed: ["broken"], relatedWork });
+    expect(body).toContain("- [Issue #42](https://github.com/acme/app/issues/42) — Fix \\[login\\]\\(bad\\) &lt;!-- timeout (open)");
+    expect(body).toContain("- [PR acme/api#51](https://github.com/acme/api/pull/51) — Refactor auth (merged)");
+    expect(body).toContain("- [MR group/platform!19](https://gitlab.com/group/platform/-/merge_requests/19) — Rotate sessions (open)");
+    expect(body.indexOf("### ⚠️")).toBeLessThan(body.indexOf("### Related work"));
+    expect(body.indexOf("### Related work")).toBeLessThan(body.indexOf("<details>"));
+  });
+
+  it("renders unresolved references safely and omits invalid runtime entries", () => {
+    const relatedWork = [
+      { provider: "github", host: "github.com", projectPath: "acme/app", number: 77, sourceText: "NEVER", identifier: "#77", fallbackUrl: "https://github.com/acme/app/issues/77", title: "Optional title", state: "unknown" },
+      { provider: "gitlab", host: "gitlab.com", projectPath: "group/app", number: 8, kindHint: "merge_request", sourceText: "NEVER", identifier: "!8" },
+      { provider: "github", host: "github.com", projectPath: "acme/app", number: 9, sourceText: "FORGED", identifier: "#999", fallbackUrl: "https://evil.example/" },
+      { sourceText: "raw attacker text" },
+    ] as unknown as RelatedWorkItem[];
+    const body = renderSummaryComment({ ...base, relatedWork });
+    expect(body).toContain("- [#77](https://github.com/acme/app/issues/77)");
+    expect(body).not.toContain("Optional title");
+    expect(body).toContain("- !8");
+    expect(body).not.toContain("(unknown)");
+    expect(body).not.toContain("FORGED");
+    expect(body).not.toContain("raw attacker");
+    expect(body.match(/^### Related work$/gm)).toHaveLength(1);
+  });
+
+  it("omits the related-work heading when every entry is invalid", () => {
+    const relatedWork = [
+      { provider: "github", host: "github.com", projectPath: "acme/app/extra", number: 1, sourceText: "bad", identifier: "#1" },
+      { provider: "github", host: "github.com", projectPath: "acme/../app", number: 2, sourceText: "bad", identifier: "#2" },
+      { provider: "gitlab", host: "gitlab.com", projectPath: "group/./app", number: 3, sourceText: "bad", identifier: "#3" },
+    ] as unknown as RelatedWorkItem[];
+    expect(renderSummaryComment({ ...base, relatedWork })).not.toContain("Related work");
+    expect(renderSummaryComment({ ...base, relatedWork: [] })).not.toContain("Related work");
+  });
+
+  it("keeps valid entries while omitting invalid project identities", () => {
+    const relatedWork = [
+      { provider: "github", host: "github.com", projectPath: "acme/app/extra", number: 1, sourceText: "bad", identifier: "#1" },
+      { provider: "gitlab", host: "gitlab.com", projectPath: "group/platform", number: 2, sourceText: "good", identifier: "#2" },
+    ] as unknown as RelatedWorkItem[];
+    const body = renderSummaryComment({ ...base, relatedWork });
+    expect(body).not.toContain("#1");
+    expect(body).toContain("- \\#2");
+    expect(body.match(/^### Related work$/gm)).toHaveLength(1);
+  });
+
+  it("contains hostile property access while retaining valid related work", () => {
+    const throwingGetter = Object.defineProperty({}, "provider", {
+      get() { throw new Error("getter trap"); },
+    });
+    const throwingProxy = new Proxy({}, {
+      get() { throw new Error("proxy trap"); },
+    });
+    const valid = { provider: "gitlab", host: "gitlab.com", projectPath: "group/platform", number: 2, sourceText: "good", identifier: "#2" };
+    const relatedWork = [throwingGetter, valid, throwingProxy] as unknown as RelatedWorkItem[];
+
+    expect(() => renderSummaryComment({ ...base, relatedWork })).not.toThrow();
+    const body = renderSummaryComment({ ...base, relatedWork });
+    expect(body).toContain("- \\#2");
+    expect(body.match(/^### Related work$/gm)).toHaveLength(1);
+  });
+
+  it("omits the heading when all related-work entries throw on access", () => {
+    const hostile = new Proxy({}, { get() { throw new Error("proxy trap"); } });
+    const relatedWork = [hostile] as unknown as RelatedWorkItem[];
+    expect(() => renderSummaryComment({ ...base, relatedWork })).not.toThrow();
+    expect(renderSummaryComment({ ...base, relatedWork })).not.toContain("Related work");
   });
 });
 

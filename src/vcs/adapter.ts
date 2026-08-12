@@ -2,6 +2,7 @@ import type {
   RepositoryRef as ProviderNeutralRepositoryRef,
 } from "../target/types.js";
 import type { DiffPositionRange } from "../review/diff-anchors.js";
+import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 
 export type ReviewLocator =
   | {
@@ -18,6 +19,14 @@ export type ReviewLocator =
 // Provider-neutral interface for fetching review metadata, diffs, rules, and
 // comments, then publishing the review through `gh` or `glab`.
 export interface VcsAdapter {
+  /**
+   * Best-effort metadata lookup for references extracted from the review title
+   * and description. Implementations return one item per input, in input order,
+   * and preserve an unresolved reference when its lookup fails. Callers still
+   * reconcile by canonical identity and treat whole-operation rejection as
+   * non-fatal, so metadata resolution can never prevent the main review.
+   */
+  resolveRelatedWork(references: readonly RelatedWorkReference[]): Promise<readonly RelatedWorkItem[]>;
   getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo>;
   getDiff(locator: ReviewLocator): Promise<string>;
   findBotComment(locator: ReviewLocator): Promise<BotComment | null>;

@@ -22,6 +22,7 @@ const hoisted = vi.hoisted(() => ({
   getRuleFilesFromBase: vi.fn(),
   createInlineReview: vi.fn(),
   resolveStaleReviewThreads: vi.fn(),
+  resolveRelatedWork: vi.fn(),
   gitLabConstructed: vi.fn(),
 }));
 
@@ -34,6 +35,7 @@ vi.mock("../../src/vcs/github-adapter.js", () => ({
     upsertComment = hoisted.upsertComment;
     getRuleFilesFromBase = hoisted.getRuleFilesFromBase;
     resolveStaleReviewThreads = hoisted.resolveStaleReviewThreads;
+    resolveRelatedWork = hoisted.resolveRelatedWork;
   },
   realExecGh: vi.fn(),
 }));
@@ -50,6 +52,7 @@ vi.mock("../../src/vcs/gitlab-adapter.js", () => ({
     upsertComment = hoisted.upsertComment;
     getRuleFilesFromBase = hoisted.getRuleFilesFromBase;
     resolveStaleReviewThreads = hoisted.resolveStaleReviewThreads;
+    resolveRelatedWork = hoisted.resolveRelatedWork;
   },
   realExecGlab: vi.fn(),
 }));

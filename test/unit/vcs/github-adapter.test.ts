@@ -50,6 +50,29 @@ describe("GitHubAdapter", () => {
     number: 42,
   };
 
+  it("delegates related-work resolution through its injected executor", async () => {
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      title: "Linked issue", state: "open", html_url: "https://github.com/octo/repo/issues/8",
+    }));
+    const adapter = new GitHubAdapter(execGh);
+    const reference = {
+      provider: "github" as const,
+      host: "github.com",
+      projectPath: "octo/repo",
+      number: 8,
+      sourceText: "#8",
+      identifier: "#8",
+    };
+    await expect(adapter.resolveRelatedWork([reference])).resolves.toEqual([
+      expect.objectContaining({ title: "Linked issue", kind: "issue" }),
+    ]);
+    expect(execGh).toHaveBeenCalledWith(
+      ["api", "-X", "GET", "repos/octo/repo/issues/8", "--hostname", "github.com"],
+      undefined,
+      { timeoutMs: 5_000 },
+    );
+  });
+
   it("AC-2.1: scopes PR metadata and diff calls to the explicit repository", async () => {
     const execGh = vi.fn(async (args: string[]) => {
       if (args[1] === "view") {
@@ -725,6 +748,18 @@ describe("GitHubAdapter", () => {
         { maxBuffer: 10 * 1024 * 1024 },
         expect.any(Function),
       );
+    });
+
+    it("forwards a requested timeout to execFile", async () => {
+      const execFileMock = vi.fn((_cmd, _args, _opts, callback) => {
+        callback(null, "ok", "");
+        return { stdin: { end: vi.fn() } };
+      });
+      vi.doMock("node:child_process", () => ({ execFile: execFileMock }));
+      const { realExecGh } = await import("../../../src/vcs/github-adapter.js");
+      await realExecGh(["api", "user"], undefined, { timeoutMs: 5_000 });
+      expect(execFileMock).toHaveBeenCalledWith("gh", ["api", "user"],
+        { maxBuffer: 10 * 1024 * 1024, timeout: 5_000 }, expect.any(Function));
     });
 
     it("test gap fix: realExecGh pipes stdin to the child process for --body-file -/--input - invocations", async () => {

@@ -8,6 +8,13 @@
 //
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
+import {
+  isValidRelatedWorkProjectPath,
+  validateResolvedRelatedWork,
+  type RelatedWorkItem,
+  type RelatedWorkKind,
+  type RelatedWorkReference,
+} from "./related-work.js";
 
 /**
  * Machine-detectable tag appended to every inline comment THIS TOOL posts
@@ -317,12 +324,78 @@ export interface SummaryInput {
   rulesRun: string[];
   rulesFailed: string[];
   ruleFailureReasons?: Record<string, string>;
+  relatedWork?: readonly RelatedWorkItem[];
   /**
    * True when inline posting was unavailable (e.g. the reviews API call failed).
    * The summary then carries EVERY finding, so a finding is never lost — it is
    * only ever relocated.
    */
   inlineUnavailable?: boolean;
+}
+
+function canonicalRelatedWorkReference(value: unknown): RelatedWorkReference | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const item = value as Record<string, unknown>;
+  const provider = item.provider;
+  const host = item.host;
+  const projectPath = item.projectPath;
+  const number = item.number;
+  const kindHint = item.kindHint;
+  if ((provider !== "github" && provider !== "gitlab") || typeof host !== "string" ||
+      typeof projectPath !== "string" || !isValidRelatedWorkProjectPath(provider, projectPath) ||
+      typeof number !== "number" || !Number.isSafeInteger(number) || number < 1) return undefined;
+  if (kindHint !== undefined && kindHint !== "issue" && kindHint !== "pull_request" && kindHint !== "merge_request") return undefined;
+  if ((provider === "github" && kindHint === "merge_request") || (provider === "gitlab" && kindHint === "pull_request")) return undefined;
+  let authority: URL;
+  try { authority = new URL(`https://${host}${typeof item.port === "string" ? `:${item.port}` : ""}/`); } catch { return undefined; }
+  if (authority.hostname.toLowerCase() !== host.toLowerCase() || authority.username || authority.password) return undefined;
+  const sigil = kindHint === "merge_request" ? "!" : "#";
+  const localIdentifier = `${sigil}${number}`;
+  const crossIdentifier = `${projectPath}${sigil}${number}`;
+  if (item.identifier !== localIdentifier && item.identifier !== crossIdentifier) return undefined;
+  return {
+    provider, host: host.toLowerCase(),
+    ...(typeof item.port === "string" && item.port ? { port: item.port } : {}),
+    projectPath, number, ...(kindHint ? { kindHint } : {}), sourceText: "", identifier: item.identifier,
+    ...(typeof item.fallbackUrl === "string" ? { fallbackUrl: item.fallbackUrl } : {}),
+  };
+}
+
+function escapeMarkdownText(value: string): string {
+  return sanitizeText(value).replace(/([\\`*_[\]{}()<>#+|~])/g, "\\$1");
+}
+
+function kindLabel(kind: RelatedWorkKind): string {
+  return kind === "issue" ? "Issue" : kind === "pull_request" ? "PR" : "MR";
+}
+
+function renderRelatedWorkItem(value: unknown): string | undefined {
+  try {
+    const reference = canonicalRelatedWorkReference(value);
+    if (!reference) return undefined;
+    const validated = validateResolvedRelatedWork(reference, value);
+    const resolved = validated.url && validated.kind ? validated : undefined;
+    const fallbackKind = reference.kindHint ?? "issue";
+    const fallback = reference.fallbackUrl
+      ? validateResolvedRelatedWork(reference, { kind: fallbackKind, url: reference.fallbackUrl }).url
+      : undefined;
+    const url = resolved?.url ?? fallback;
+    const identifier = reference.identifier;
+    const label = resolved ? `${kindLabel(resolved.kind!)} ${identifier}` : identifier;
+    const main = url ? `[${label}](${url})` : escapeMarkdownText(label);
+    if (!resolved?.title) return main;
+    const state = resolved.state ? ` (${resolved.state})` : "";
+    return `${main} — ${escapeMarkdownText(resolved.title)}${state}`;
+  } catch {
+    return undefined;
+  }
+}
+
+export function normalizeRelatedWorkForRender(items: readonly unknown[]): string[] {
+  return items.flatMap((item) => {
+    const rendered = renderRelatedWorkItem(item);
+    return rendered ? [rendered] : [];
+  });
 }
 
 function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): string {
@@ -366,6 +439,13 @@ function detailsBlock(summary: string, lines: string[]): string {
   return ["<details>", `<summary>${summary}</summary>`, "", ...lines, "", "</details>"].join("\n");
 }
 
+function renderRelatedWorkSection(input: SummaryInput): string | undefined {
+  const relatedWork = normalizeRelatedWorkForRender(input.relatedWork ?? []);
+  return relatedWork.length > 0
+    ? `### Related work\n\n${relatedWork.map((item) => `- ${item}`).join("\n")}`
+    : undefined;
+}
+
 export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
@@ -405,6 +485,10 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
         })
         .join("\n")}`
     : undefined;
+  // Related work is review context, not optional detail. Keep its already
+  // bounded/sanitized representation in compact summaries and charge it
+  // against the same provider-size budget as failed rules and finding labels.
+  const relatedWork = renderRelatedWorkSection(input);
   const findings = input.unanchored.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
@@ -412,7 +496,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const message = sanitizeInline(finding.message);
     return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
   });
-  const fixed = [header, notice, failedRules, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -424,23 +508,29 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     header,
     notice,
     failedRules,
+    relatedWork,
     ...findings.map(
       ({ prefix, message }, index) => `${prefix}${truncate(message, messageBudgets[index] ?? 0)}`,
     ),
   ].filter((part): part is string => part !== undefined).join("\n\n");
 
   if (body.length <= maxLength) return body;
-  return truncate(
-    [
-      header,
-      notice,
-      input.rulesFailed.length > 0
-        ? `${input.rulesFailed.length} rule(s) failed to run.`
-        : undefined,
-      `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
-    ].filter((part): part is string => part !== undefined).join("\n\n"),
-    maxLength,
-  );
+  const compactStatus = [
+    header,
+    notice,
+    input.rulesFailed.length > 0
+      ? `${input.rulesFailed.length} rule(s) failed to run.`
+      : undefined,
+    `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+  ].filter((part): part is string => part !== undefined);
+  const withRelatedWork = relatedWork
+    ? [...compactStatus.slice(0, 2), relatedWork, ...compactStatus.slice(2)].join("\n\n")
+    : compactStatus.join("\n\n");
+  if (withRelatedWork.length <= maxLength) return withRelatedWork;
+  // Related-work entries contain Markdown links and are already atomic. When
+  // the final emergency representation cannot fit them whole, omit the entire
+  // section instead of slicing through a label or URL.
+  return truncate(compactStatus.join("\n\n"), maxLength);
 }
 
 function allocateCompactMessageBudgets(lengths: number[], available: number): number[] {
@@ -522,6 +612,9 @@ function renderSummaryCommentWithIncludedSuggestions(
       `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${items.join("\n")}`,
     );
   }
+
+  const relatedWork = renderRelatedWorkSection(input);
+  if (relatedWork) parts.push(relatedWork);
 
   const collapsed: string[] = [];
   if (input.filesReviewed.length > 0) {

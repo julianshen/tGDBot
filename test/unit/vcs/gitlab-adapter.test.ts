@@ -1106,6 +1106,14 @@ describe("GitLab adapter helpers", () => {
 });
 
 describe("realExecGlab", () => {
+  it("forwards an optional timeout to execFile", async () => {
+    vi.mocked(execFile).mockImplementation(((_file, _args, options, callback) => {
+      expect(options).toMatchObject({ timeout: 5_000 });
+      queueMicrotask(() => callback(null, "ok", ""));
+      return { stdin: new Writable() };
+    }) as typeof execFile);
+    await expect(realExecGlab(["issue", "view", "1"], undefined, { timeoutMs: 5_000 })).resolves.toBe("ok");
+  });
   it("uses execFile argv, a 10 MiB buffer, non-interactive environment, and optional stdin", async () => {
     const stdin = new Writable({
       write(_chunk, _encoding, callback) {
