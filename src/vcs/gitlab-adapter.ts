@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { parseBotMarker } from "../review/comment-marker.js";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
+import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import type { GitLabRepositoryRef } from "../target/types.js";
 import {
   validateInlinePublishInputs,
@@ -589,6 +590,12 @@ function downgradeGitLabRangeSuggestion(body: string): string {
 
 export class GitLabAdapter implements VcsAdapter {
   constructor(private readonly execGlab: ExecGlab = realExecGlab) {}
+
+  resolveRelatedWork(
+    references: readonly RelatedWorkReference[],
+  ): Promise<readonly RelatedWorkItem[]> {
+    return Promise.resolve(references);
+  }
 
   private readonly usernamePromises = new Map<string, Promise<string>>();
 

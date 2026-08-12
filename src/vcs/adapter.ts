@@ -2,6 +2,7 @@ import type {
   RepositoryRef as ProviderNeutralRepositoryRef,
 } from "../target/types.js";
 import type { DiffPositionRange } from "../review/diff-anchors.js";
+import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 
 export type ReviewLocator =
   | {
@@ -18,6 +19,7 @@ export type ReviewLocator =
 // Provider-neutral interface for fetching review metadata, diffs, rules, and
 // comments, then publishing the review through `gh` or `glab`.
 export interface VcsAdapter {
+  resolveRelatedWork(references: readonly RelatedWorkReference[]): Promise<readonly RelatedWorkItem[]>;
   getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo>;
   getDiff(locator: ReviewLocator): Promise<string>;
   findBotComment(locator: ReviewLocator): Promise<BotComment | null>;

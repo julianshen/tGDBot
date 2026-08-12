@@ -196,6 +196,7 @@ function makeHarness(options: {
   const ruleFilesFromBase = options.ruleFilesFromBase ?? [];
 
   const vcsAdapter = {
+    resolveRelatedWork: vi.fn().mockImplementation((references) => Promise.resolve(references)),
     getPullRequest: vi.fn().mockResolvedValue(pr),
     getDiff: vi.fn().mockResolvedValue("diff --git a/x b/x"),
     findBotComment: vi.fn().mockResolvedValue(botComment),
