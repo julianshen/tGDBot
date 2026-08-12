@@ -82,6 +82,17 @@ describe("extractRelatedWork", () => {
     expect(result.references.map((reference) => reference.identifier)).toEqual(["#2"]);
   });
 
+  it("does not mask references after an unmatched inline-code delimiter", () => {
+    const result = extractRelatedWork({
+      provider: "github",
+      reviewUrl: "https://github.com/a/b/pull/9",
+      title: "Document `option and follow up in #42",
+      description: "Keep ``another typo and #43 visible",
+    });
+
+    expect(result.references.map((reference) => reference.identifier)).toEqual(["#42", "#43"]);
+  });
+
   it("limits after deduplication and reports only extra unique references", () => {
     const title = Array.from({ length: 12 }, (_, index) => `#${index + 1}`).join(" ") + " #1 #2";
     const result = extractRelatedWork({ provider: "github", reviewUrl: "https://github.com/a/b/pull/99", title, description: "" });

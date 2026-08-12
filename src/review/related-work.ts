@@ -108,7 +108,24 @@ function visibleMarkdown(value: string): string {
     if (value[index] === "`") {
       let count = 1;
       while (value[index + count] === "`") count++;
-      if (!inline) inline = count;
+      if (!inline) {
+        // A delimiter without a matching run is ordinary punctuation, not an
+        // inline-code span. Do not let a typo hide every later reference.
+        const delimiter = "`".repeat(count);
+        let closing = value.indexOf(delimiter, index + count);
+        while (
+          closing >= 0 &&
+          (value[closing - 1] === "`" || value[closing + count] === "`")
+        ) {
+          closing = value.indexOf(delimiter, closing + count);
+        }
+        if (closing < 0) {
+          output += delimiter;
+          index += count;
+          continue;
+        }
+        inline = count;
+      }
       else if (count === inline) inline = 0;
       output += " ".repeat(count); index += count; continue;
     }
