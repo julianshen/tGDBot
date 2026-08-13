@@ -119,6 +119,11 @@ import {
   resolvePiSubagentsExtensionPath,
   resolveRpivAdvisorExtensionPath,
 } from "../../../src/review/extensions.js";
+import {
+  MAX_FINDING_QUESTION_CHARS,
+  parseDispatchResult,
+  parseFindingsFromFinalOutput,
+} from "../../../src/review/dispatch-results.js";
 
 function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
   return {
@@ -288,7 +293,10 @@ describe("dispatchRules", () => {
 
     const result = await dispatchRules([makeRule()], "diff --git a/x b/x", false, async () => stub.session);
 
-    expect(result).toEqual(wellFormed);
+    expect(result).toEqual({
+      ...wellFormed,
+      findings: [{ ...wellFormed.findings[0], decision: "new" }],
+    });
   });
 
   // AC-5.3 (fence variant): the same well-formed JSON wrapped in markdown
@@ -823,7 +831,7 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
     const result = await dispatchRules(twoRules(), "diff", false, async () => session);
 
     expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
-    expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review" });
+    expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review", decision: "new" });
   });
 
   it("with advisor ON, does NOT recover a dropped rule's raw findings (recovering would undo the advisor's false-positive filtering) — but still corrects accounting", async () => {
@@ -865,7 +873,7 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
 
     const result = await dispatchRules(rules, "diff", false, async () => session);
 
-    expect(result.findings).toEqual([advisorKept]);
+    expect(result.findings).toEqual([{ ...advisorKept, decision: "new" }]);
   });
 
   it("marks a genuinely failed task (exit != 0) as rulesFailed and drops any findings the orchestrator attributed to it", async () => {
@@ -1100,7 +1108,7 @@ describe("dispatchRules recovery tolerates preamble/trailing prose around the fi
 
     expect(result.rulesRun).toEqual(["grok-review"]);
     expect(result.rulesFailed).toEqual([]);
-    expect(result.findings).toContainEqual({ ...finding, ruleName: "grok-review" });
+    expect(result.findings).toContainEqual({ ...finding, ruleName: "grok-review", decision: "new" });
   });
 
   // Gemini review (PR #6): trailing prose can itself contain a `]` (e.g. a
@@ -1116,7 +1124,7 @@ describe("dispatchRules recovery tolerates preamble/trailing prose around the fi
 
     const result = await dispatchRules(rules, "diff", false, async () => session);
 
-    expect(result.findings).toContainEqual({ ...finding, ruleName: "grok-review" });
+    expect(result.findings).toContainEqual({ ...finding, ruleName: "grok-review", decision: "new" });
   });
 
   it("returns no recovered findings when finalOutput is pure prose with no JSON array at all", async () => {
@@ -2161,5 +2169,129 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
     );
 
     expect(stub.prompts[0]).toContain(conversationContext.text);
+  });
+});
+
+const coreFinding = {
+  file: "a.ts",
+  line: 5,
+  severity: "blocking" as const,
+  category: "correctness",
+  message: "This is a real, blocking finding.",
+  ruleName: "rule-a",
+};
+
+function dispatchJson(findings: unknown[]) {
+  return JSON.stringify({ findings, rulesRun: ["rule-a"], rulesFailed: [] });
+}
+
+describe("finding decision contract", () => {
+  it("defaults a missing decision to new and keeps old reviewer output compatible", () => {
+    const parsed = parseDispatchResult(dispatchJson([coreFinding]), [makeRule()]);
+    const recovered = parseFindingsFromFinalOutput(JSON.stringify([coreFinding]), "rule-a");
+
+    expect(parsed.findings[0]).toMatchObject({ ...coreFinding, decision: "new" });
+    expect(parsed.findings[0]?.question).toBeUndefined();
+    expect(recovered[0]).toMatchObject({ ...coreFinding, decision: "new" });
+  });
+
+  it("treats a null decision as new and a null question as absent", () => {
+    const raw = { ...coreFinding, decision: null, question: null };
+    const parsed = parseDispatchResult(dispatchJson([raw]), [makeRule()]);
+
+    expect(parsed.findings).toEqual([{ ...coreFinding, decision: "new" }]);
+  });
+
+  it("requires a bounded question only for needs-clarification", () => {
+    const valid = parseDispatchResult(
+      dispatchJson([{ ...coreFinding, decision: "needs-clarification", question: "Is this intentional?" }]),
+      [makeRule()],
+    );
+    const missing = parseDispatchResult(
+      dispatchJson([{ ...coreFinding, decision: "needs-clarification" }]),
+      [makeRule()],
+    );
+    const empty = parseDispatchResult(
+      dispatchJson([{ ...coreFinding, decision: "needs-clarification", question: "   " }]),
+      [makeRule()],
+    );
+    const oversized = parseDispatchResult(
+      dispatchJson([{
+        ...coreFinding,
+        decision: "needs-clarification",
+        question: "x".repeat(MAX_FINDING_QUESTION_CHARS + 1),
+      }]),
+      [makeRule()],
+    );
+    const exact = parseDispatchResult(
+      dispatchJson([{
+        ...coreFinding,
+        decision: "needs-clarification",
+        question: "q".repeat(MAX_FINDING_QUESTION_CHARS),
+      }]),
+      [makeRule()],
+    );
+
+    expect(valid.findings[0]).toMatchObject({
+      decision: "needs-clarification",
+      question: "Is this intentional?",
+    });
+    expect(missing.findings).toEqual([]);
+    expect(missing.rulesFailed).toEqual(["rule-a"]);
+    expect(empty.findings).toEqual([]);
+    expect(oversized.findings).toEqual([]);
+    expect(exact.findings[0]?.question).toHaveLength(MAX_FINDING_QUESTION_CHARS);
+    expect(parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, decision: "needs-clarification" }]),
+      "rule-a",
+    )).toEqual([]);
+  });
+
+  it("forbids a question on every state except needs-clarification", () => {
+    for (const decision of ["new", "still-valid", "addressed", "disputed"] as const) {
+      const parsed = parseDispatchResult(
+        dispatchJson([{ ...coreFinding, decision, question: "why?" }]),
+        [makeRule()],
+      );
+      const recovered = parseFindingsFromFinalOutput(
+        JSON.stringify([{ ...coreFinding, decision, question: "why?" }]),
+        "rule-a",
+      );
+      expect(parsed.findings, decision).toEqual([]);
+      expect(parsed.rulesFailed, decision).toEqual(["rule-a"]);
+      expect(recovered, decision).toEqual([]);
+    }
+  });
+
+  it("rejects a malformed decision state", () => {
+    for (const decision of ["waived", "NEW", "", 1, {}]) {
+      const parsed = parseDispatchResult(dispatchJson([{ ...coreFinding, decision }]), [makeRule()]);
+      expect(parsed.findings, String(decision)).toEqual([]);
+      expect(parsed.rulesFailed, String(decision)).toEqual(["rule-a"]);
+    }
+  });
+
+  it("preserves decision state through advisor-off recovery reconciliation", async () => {
+    const recoveredFinding = {
+      file: "a.ts",
+      line: 5,
+      severity: "warning",
+      category: "correctness",
+      message: "still discussed",
+      decision: "disputed",
+    };
+    const session = makeSubscribableSession(
+      [{ model: "anthropic/claude-opus-4-5:high", exitCode: 0, finalOutput: JSON.stringify([recoveredFinding]) }],
+      JSON.stringify({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] }),
+    );
+
+    const result = await dispatchRules([makeRule()], "diff", false, async () => session);
+
+    expect(result.rulesRun).toEqual(["rule-a"]);
+    expect(result.findings[0]).toMatchObject({
+      ...recoveredFinding,
+      ruleName: "rule-a",
+      decision: "disputed",
+    });
   });
 });

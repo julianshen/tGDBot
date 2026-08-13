@@ -5,7 +5,7 @@
 // classification. Split out of dispatch.ts (design-review #8) — pure and
 // synchronous, no SDK, no I/O beyond console.warn.
 import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
-import type { DispatchResult, Finding } from "./types.js";
+import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 
 // One dispatched task's structured outcome, read from the subagent tool's
 // details.results[i] (order = dispatch order = rule order). `model` is
@@ -33,62 +33,86 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 const VALID_SEVERITIES = new Set(["blocking", "warning", "suggestion"]);
+export const FINDING_DECISIONS = [
+  "new",
+  "still-valid",
+  "addressed",
+  "disputed",
+  "needs-clarification",
+] as const satisfies readonly FindingDecision[];
+export const MAX_FINDING_QUESTION_CHARS = 500;
 
-// Validates a single Finding's required fields/types. `line` is optional/
-// nullable (per the JSON contract, `number | null`) so it's checked only
-// when present. If any element of `findings` fails this check, the whole
-// response is treated as malformed (see dispatch.ts's caller) rather than
-// silently keeping the well-formed findings and dropping the bad ones —
-// a response that gets the shape wrong for one finding is not trustworthy
-// for the others either.
-// The optional ADR-007/ADR-008 fields. Kept LENIENT on purpose: a rule that emits
-// a malformed `title`/`suggestion`/`endLine` should lose that ENRICHMENT, not have
-// its whole finding (or its rule's whole run) thrown away — the finding's core
-// (file/line/severity/message) is still worth posting. So these are validated
-// where they are USED, and simply dropped when wrong, rather than failing the
-// finding here.
+const FINDING_DECISION_SET = new Set<string>(FINDING_DECISIONS);
 
-function isValidFinding(value: unknown): value is Finding {
-  if (!value || typeof value !== "object") return false;
+/**
+ * Shared decision/question contract for both dispatch engines.
+ * Missing/null decision defaults to `new`. Inconsistent shapes reject.
+ */
+export function readFindingDecision(
+  raw: Record<string, unknown>,
+): { ok: true; decision: FindingDecision; question?: string } | { ok: false } {
+  const decisionRaw = raw.decision;
+  const questionRaw = raw.question;
+  const decision = decisionRaw === undefined || decisionRaw === null ? "new" : decisionRaw;
+  if (typeof decision !== "string" || !FINDING_DECISION_SET.has(decision)) return { ok: false };
+
+  const hasQuestion = questionRaw !== undefined && questionRaw !== null;
+  if (decision === "needs-clarification") {
+    if (typeof questionRaw !== "string") return { ok: false };
+    const question = questionRaw.trim();
+    if (question.length === 0 || question.length > MAX_FINDING_QUESTION_CHARS) return { ok: false };
+    return { ok: true, decision, question };
+  }
+  if (hasQuestion) return { ok: false };
+  return { ok: true, decision };
+}
+
+/**
+ * Shared finding validator/normalizer. Direct dispatch parses task arrays
+ * through this; the legacy orchestrator path uses it for the merged result.
+ * Title/suggestion/endLine stay lenient optional enrichment.
+ */
+export function normalizeUnknownFinding(value: unknown, ruleName?: string): Finding | undefined {
+  if (!value || typeof value !== "object") return undefined;
   const candidate = value as Record<string, unknown>;
-  if (typeof candidate.file !== "string") return false;
-  if (!VALID_SEVERITIES.has(candidate.severity as string)) return false;
-  if (typeof candidate.category !== "string") return false;
-  if (typeof candidate.message !== "string") return false;
-  if (typeof candidate.ruleName !== "string") return false;
+  if (typeof candidate.file !== "string") return undefined;
+  if (!VALID_SEVERITIES.has(candidate.severity as string)) return undefined;
+  if (typeof candidate.category !== "string") return undefined;
+  if (typeof candidate.message !== "string") return undefined;
+  const resolvedRuleName = typeof candidate.ruleName === "string" ? candidate.ruleName : ruleName;
+  if (typeof resolvedRuleName !== "string") return undefined;
   if (
     candidate.line !== undefined &&
     candidate.line !== null &&
     typeof candidate.line !== "number"
   ) {
-    return false;
+    return undefined;
   }
-  // NOTE: title/suggestion/endLine are deliberately NOT validated here. They are
-  // OPTIONAL ENRICHMENT, and rejecting a finding over one would be catastrophic:
-  // isValidFinding feeds looksLikeDispatchResult, which is all-or-nothing — a
-  // single bad field on a single finding would discard the ENTIRE orchestrator
-  // result, and (with the advisor on, the default) recovery is disabled, so the
-  // comment would announce "✅ No actionable comments" on a review that found
-  // blocking issues. `"endLine": "12"` — a number emitted as a string — is a
-  // routine LLM slip, and these are three brand-new model-authored fields. They
-  // are stripped in normalizeFinding() instead. Found in review; the first draft
-  // shipped exactly this kill switch.
-  return true;
+  const contract = readFindingDecision(candidate);
+  if (!contract.ok) return undefined;
+
+  const finding: Finding = {
+    file: candidate.file,
+    ...(typeof candidate.line === "number" ? { line: candidate.line } : {}),
+    severity: candidate.severity as Finding["severity"],
+    category: candidate.category,
+    message: candidate.message,
+    ruleName: resolvedRuleName,
+    decision: contract.decision,
+  };
+  if (typeof candidate.title === "string") finding.title = candidate.title;
+  if (typeof candidate.suggestion === "string") finding.suggestion = candidate.suggestion;
+  if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;
+  if (contract.question !== undefined) finding.question = contract.question;
+  return finding;
 }
 
-/**
- * Drops any optional enrichment that is the wrong type, keeping the finding.
- * The core (file/line/severity/category/message/ruleName) is already validated;
- * a malformed title/suggestion/endLine costs only itself.
- */
+function isValidFinding(value: unknown): value is Finding {
+  return normalizeUnknownFinding(value) !== undefined;
+}
+
 function normalizeFinding(finding: Finding): Finding {
-  const raw = finding as unknown as Record<string, unknown>;
-  return {
-    ...finding,
-    title: typeof raw.title === "string" ? raw.title : undefined,
-    suggestion: typeof raw.suggestion === "string" ? raw.suggestion : undefined,
-    endLine: Number.isInteger(raw.endLine) ? (raw.endLine as number) : undefined,
-  };
+  return normalizeUnknownFinding(finding) ?? finding;
 }
 
 function looksLikeDispatchResult(value: unknown): value is DispatchResult {
@@ -145,17 +169,8 @@ export function parseDispatchResult(text: string | undefined, rules: RuleDefinit
 // message}]`), which has no ruleName (the orchestrator adds it during merge;
 // when we recover a dropped task's findings we stamp it ourselves).
 function isValidRawFinding(value: unknown): boolean {
-  if (!value || typeof value !== "object") return false;
-  const c = value as Record<string, unknown>;
-  if (typeof c.file !== "string") return false;
-  if (!VALID_SEVERITIES.has(c.severity as string)) return false;
-  if (typeof c.category !== "string") return false;
-  if (typeof c.message !== "string") return false;
-  if (c.line !== undefined && c.line !== null && typeof c.line !== "number") return false;
-  // Same rule as isValidFinding: optional enrichment must never invalidate a
-  // finding. extractFindingsArray uses `p.every(isValidRawFinding)`, so a bad
-  // `title` here would lose ALL of that rule's recovered findings.
-  return true;
+  // Dummy ruleName: task arrays omit it; the same decision contract still applies.
+  return normalizeUnknownFinding(value, "raw") !== undefined;
 }
 
 // Extracts a findings JSON array from a task's finalOutput, tolerating a model
@@ -199,24 +214,9 @@ export function extractFindingsArray(text: string): unknown[] | undefined {
 export function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
   const parsed = extractFindingsArray(text);
   if (!parsed) return [];
-  return parsed.map((f) => {
-    const c = f as Record<string, unknown>;
-    return {
-      file: c.file as string,
-      // The contract allows `number | null`; Finding.line is `number?`, so a
-      // null (or absent) line becomes undefined rather than being kept as null.
-      line: typeof c.line === "number" ? c.line : undefined,
-      severity: c.severity as Finding["severity"],
-      category: c.category as string,
-      message: c.message as string,
-      ruleName,
-      // ADR-007/008 enrichment. Carried through the RECOVERY path too — a rule
-      // whose findings had to be recovered from its raw output must not silently
-      // lose its titles and suggestions.
-      title: typeof c.title === "string" ? c.title : undefined,
-      suggestion: typeof c.suggestion === "string" ? c.suggestion : undefined,
-      endLine: typeof c.endLine === "number" ? c.endLine : undefined,
-    };
+  return parsed.flatMap((value) => {
+    const finding = normalizeUnknownFinding(value, ruleName);
+    return finding === undefined ? [] : [finding];
   });
 }
 

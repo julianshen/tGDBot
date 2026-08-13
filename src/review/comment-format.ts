@@ -313,6 +313,12 @@ function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
 
+export interface ClarificationPresentation {
+  readonly id: string;
+  readonly question: string;
+  readonly finding: Finding;
+}
+
 export interface SummaryInput {
   /** Every deduped finding (inline + unanchored) — used for the severity counts. */
   allFindings: Finding[];
@@ -331,6 +337,14 @@ export interface SummaryInput {
    * only ever relocated.
    */
   inlineUnavailable?: boolean;
+  /** The single active clarification question, if any. Not a defect. */
+  clarification?: ClarificationPresentation;
+  /** Other clarification candidates held back for later. */
+  deferredClarificationCount?: number;
+  /** Non-actionable discussion status. */
+  disputed?: readonly Finding[];
+  /** Optional labels such as "discussion" or "memory". */
+  contextUnavailable?: readonly string[];
 }
 
 function canonicalRelatedWorkReference(value: unknown): RelatedWorkReference | undefined {
@@ -446,6 +460,53 @@ function renderRelatedWorkSection(input: SummaryInput): string | undefined {
     : undefined;
 }
 
+function renderContextUnavailable(input: SummaryInput): string | undefined {
+  const labels = input.contextUnavailable ?? [];
+  const notes = [
+    labels.includes("discussion")
+      ? "> Discussion context was unavailable for this run. The review used the diff and trusted rules only."
+      : undefined,
+    labels.includes("memory")
+      ? "> Memory context was unavailable for this run."
+      : undefined,
+  ].filter((note): note is string => note !== undefined);
+  if (notes.length === 0) return undefined;
+  return `> [!NOTE]\n${notes.join("\n")}`;
+}
+
+function renderClarificationSection(input: SummaryInput): string | undefined {
+  if (input.clarification === undefined) return undefined;
+  const question = sanitizeText(input.clarification.question);
+  const id = sanitizeInline(input.clarification.id);
+  const deferred = input.deferredClarificationCount ?? 0;
+  const deferredLine =
+    deferred === 1
+      ? "_1 additional clarification deferred._"
+      : deferred > 1
+        ? `_${deferred} additional clarifications deferred._`
+        : undefined;
+  return [
+    "### Needs clarification",
+    "",
+    question,
+    "",
+    `\`${id}\``,
+    ...(deferredLine === undefined ? [] : ["", deferredLine]),
+  ].join("\n");
+}
+
+function renderDisputedSection(input: SummaryInput): string | undefined {
+  const disputed = input.disputed ?? [];
+  if (disputed.length === 0) return undefined;
+  const items = disputed.map((finding) => {
+    const file = sanitizeInline(finding.file);
+    const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
+    const message = sanitizeText(finding.message);
+    return `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`;
+  });
+  return `### Disputed\n\n${items.join("\n")}`;
+}
+
 export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
@@ -474,6 +535,9 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   const notice =
     "> [!WARNING]\n" +
     "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+  const contextUnavailable = renderContextUnavailable(input);
+  const clarification = renderClarificationSection(input);
+  const disputed = renderDisputedSection(input);
   const failedRules = input.rulesFailed.length > 0
     ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
         .map((name) => {
@@ -496,7 +560,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const message = sanitizeInline(finding.message);
     return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
   });
-  const fixed = [header, notice, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, contextUnavailable, clarification, disputed, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -507,6 +571,9 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   const body = [
     header,
     notice,
+    contextUnavailable,
+    clarification,
+    disputed,
     failedRules,
     relatedWork,
     ...findings.map(
@@ -582,6 +649,9 @@ function renderSummaryCommentWithIncludedSuggestions(
     );
   }
 
+  const contextUnavailable = renderContextUnavailable(input);
+  if (contextUnavailable) parts.push(contextUnavailable);
+
   // Findings that have no home on the diff still have to be SEEN. This is the
   // section that guarantees the inline path can never silently drop a finding.
   if (input.unanchored.length > 0) {
@@ -602,6 +672,11 @@ function renderSummaryCommentWithIncludedSuggestions(
       `${heading}${note}\n\n${findings.join("\n\n---\n\n")}`,
     );
   }
+
+  const clarification = renderClarificationSection(input);
+  if (clarification) parts.push(clarification);
+  const disputed = renderDisputedSection(input);
+  if (disputed) parts.push(disputed);
 
   if (input.rulesFailed.length > 0) {
     const items = input.rulesFailed.map((name) => {

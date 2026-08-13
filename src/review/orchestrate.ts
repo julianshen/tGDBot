@@ -5,6 +5,7 @@
 // This is a PURE, SYNCHRONOUS function — no LLM calls, no I/O. Any advisor
 // second-opinion pass already happened inside dispatchRules (Task 6); this
 // module is a plain formatting/safety-net layer on top of its output.
+import { selectClarification } from "../conversation/clarification.js";
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
 import type { RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
@@ -16,7 +17,7 @@ import {
   parseDiffPositions,
   rangeIsCommentable,
 } from "./diff-anchors.js";
-import type { DispatchResult, Finding } from "./types.js";
+import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
 
 export type { InlineComment } from "./comment-format.js";
@@ -45,6 +46,28 @@ const SEVERITY_RANK: Record<Finding["severity"], number> = {
   warning: 1,
   suggestion: 2,
 };
+
+export interface ReviewBindingOptions {
+  readonly repositoryDigest: string;
+  readonly reviewNumber: number;
+  readonly headSha: string;
+}
+
+export type OrchestrateOptions = {
+  inline?: boolean;
+  relatedWork?: readonly RelatedWorkItem[];
+  ruleOrder?: readonly string[];
+  reviewBinding?: ReviewBindingOptions;
+  contextUnavailable?: readonly string[];
+} & RenderOptions;
+
+function decisionOf(finding: Finding): FindingDecision {
+  return finding.decision ?? "new";
+}
+
+function isActionableDecision(decision: FindingDecision): boolean {
+  return decision === "new" || decision === "still-valid";
+}
 
 
 // Trimmed, case-insensitive, whitespace-collapsed — so cosmetic differences
@@ -142,14 +165,31 @@ export function isSuggestionAllowedForPath(file: string): boolean {
 export function orchestrate(
   dispatchResult: DispatchResult,
   diff = "",
-  options: { inline?: boolean; relatedWork?: readonly RelatedWorkItem[] } & RenderOptions = {},
+  options: OrchestrateOptions = {},
 ): OrchestrationResult {
+  // Addressed findings are removed before ordinary dedup, and their keys
+  // suppress a repeated new/still-valid copy of the same issue.
+  const addressedKeys = new Set(
+    dispatchResult.findings.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
+  );
+  const actionable = dispatchResult.findings.filter(
+    (finding) => isActionableDecision(decisionOf(finding)) && !addressedKeys.has(dedupeKey(finding)),
+  );
+  const disputed = dispatchResult.findings.filter((finding) => decisionOf(finding) === "disputed");
+  const clarification = selectClarification({
+    repositoryDigest: options.reviewBinding?.repositoryDigest ?? "0".repeat(64),
+    reviewNumber: options.reviewBinding?.reviewNumber ?? 1,
+    headSha: options.reviewBinding?.headSha ?? "0".repeat(40),
+    findings: dispatchResult.findings,
+    ruleOrder: options.ruleOrder ?? dispatchResult.rulesRun,
+  });
+
   // Severity order is load-bearing, not cosmetic: a reader must meet the
   // blocking findings before the nits, whether they're reading the summary or
   // scanning the inline comments. dedupeFindings preserves insertion order, so
   // sort explicitly. (The old severity-grouped renderer got this for free; the
   // regression it would otherwise have introduced was caught by AC-7.2.)
-  const dedupedFindings = dedupeFindings(dispatchResult.findings).sort(
+  const dedupedFindings = dedupeFindings(actionable).sort(
     (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
   );
   const inlineEnabled = options.inline !== false && diff !== "";
@@ -257,6 +297,10 @@ export function orchestrate(
     ruleFailureReasons: dispatchResult.ruleFailureReasons,
     relatedWork: options.relatedWork,
     inlineUnavailable: !inlineEnabled && dedupedFindings.length > 0,
+    ...(clarification.selected === undefined ? {} : { clarification: clarification.selected }),
+    ...(clarification.deferredCount > 0 ? { deferredClarificationCount: clarification.deferredCount } : {}),
+    ...(disputed.length > 0 ? { disputed } : {}),
+    ...(options.contextUnavailable === undefined ? {} : { contextUnavailable: options.contextUnavailable }),
   };
   const commentBody = renderSummaryComment(summaryInput);
 

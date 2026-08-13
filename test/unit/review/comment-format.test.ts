@@ -476,6 +476,56 @@ describe("renderSummaryComment", () => {
     expect(() => renderSummaryComment({ ...base, relatedWork })).not.toThrow();
     expect(renderSummaryComment({ ...base, relatedWork })).not.toContain("Related work");
   });
+
+  it("keeps the actionable count unchanged and renders singular clarification plus status", () => {
+    const actionable = makeFinding({ message: "A real defect." });
+    const disputed = makeFinding({ message: "Still argued.", decision: "disputed" });
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: [actionable],
+      inlineCount: 1,
+      disputed: [disputed],
+      clarification: {
+        id: `clar_${"a".repeat(32)}`,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({
+          decision: "needs-clarification",
+          question: "Is the fallback path intentional?",
+        }),
+      },
+      deferredClarificationCount: 2,
+      contextUnavailable: ["discussion", "memory"],
+    });
+
+    expect(body).toContain("**Actionable comments posted: 1**");
+    expect(body).toContain("### Needs clarification");
+    expect(body).not.toMatch(/Needs clarifications/i);
+    expect(body).toContain("Is the fallback path intentional?");
+    expect(body).toContain(`clar_${"a".repeat(32)}`);
+    expect(body).toMatch(/2 additional (?:questions|clarifications) deferred/i);
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("Still argued.");
+    expect(body).toMatch(/discussion context was unavailable/i);
+    expect(body).toMatch(/memory context was unavailable/i);
+    expect(body).not.toMatch(/Needs clarification[\s\S]*🔴|Needs clarification[\s\S]*Blocking/i);
+  });
+
+  it("does not treat a pending question as a defect when nothing is actionable", () => {
+    const body = renderSummaryComment({
+      ...base,
+      clarification: {
+        id: `clar_${"b".repeat(32)}`,
+        question: "Should this stay?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Should this stay?" }),
+      },
+    });
+
+    expect(body).toContain("**No actionable comments.** ✅");
+    expect(body).toContain("### Needs clarification");
+    expect(body).toContain("Should this stay?");
+    expect(body).not.toContain("**Actionable comments posted:");
+    expect(body).not.toContain("Additional comments");
+  });
 });
 
 // ADR-007: committable suggestions. THE SECURITY BOUNDARY of this feature.

@@ -4,6 +4,13 @@ import type { RuleDefinition } from "../rules/types.js";
 // Finding/DispatchResult: the shape produced by dispatching every loaded rule
 // through the orchestrating AgentSession's `subagent` tool call and parsing
 // its final JSON message. See SPEC.md "Data Models" and TASKS.md Task 5.
+export type FindingDecision =
+  | "new"
+  | "still-valid"
+  | "addressed"
+  | "disputed"
+  | "needs-clarification";
+
 export interface Finding {
   file: string;
   line?: number;
@@ -11,6 +18,16 @@ export interface Finding {
   category: string;
   message: string;
   ruleName: string;
+  /**
+   * Reviewer judgment relative to prior discussion. Omitted on older reviewer
+   * output and treated as `new`.
+   */
+  decision?: FindingDecision;
+  /**
+   * One short, answerable question. Present only when `decision` is
+   * `needs-clarification`.
+   */
+  question?: string;
 
   /**
    * ADR-008: a short, AUTHORED headline (<= 80 chars, one line).

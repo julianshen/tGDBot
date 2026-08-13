@@ -162,3 +162,22 @@ describe("buildTaskText conversation context", () => {
     expect(buildTaskText(rule, "initial diff", context, colliding)).toBe(rerendered);
   });
 });
+
+describe("finding decision contract", () => {
+  it("names optional decision and question fields on both reviewer and orchestrator shapes", () => {
+    const rule = makeRule();
+    const task = buildTaskText(rule, "diff");
+    const orchestrator = buildDispatchPrompt([rule], "diff", false);
+
+    for (const prompt of [task, orchestrator]) {
+      expect(prompt).toContain('"decision"');
+      expect(prompt).toContain('"question"');
+      expect(prompt).toContain("new");
+      expect(prompt).toContain("still-valid");
+      expect(prompt).toContain("addressed");
+      expect(prompt).toContain("disputed");
+      expect(prompt).toContain("needs-clarification");
+    }
+    expect(orchestrator).toMatch(/copy each finding's.*"decision".*"question"/i);
+  });
+});
