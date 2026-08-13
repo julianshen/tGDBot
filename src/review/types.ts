@@ -76,6 +76,12 @@ export interface DispatchResult {
 
 export type RuleContextPacks = Readonly<Record<string, ContextPackResult>>;
 
+/** Provider-neutral discussion/memory text already bounded by conversation/context.ts. */
+export interface ReviewConversationContext {
+  readonly text: string;
+  readonly digest: string;
+}
+
 /** Runtime dispatch data shared by the direct and legacy engines. */
 export interface ReviewDispatchInput {
   rules: RuleDefinition[];
@@ -83,4 +89,5 @@ export interface ReviewDispatchInput {
   useAdvisor: boolean;
   contextPacks?: RuleContextPacks;
   orchestratorModel?: string;
+  conversationContext?: ReviewConversationContext;
 }

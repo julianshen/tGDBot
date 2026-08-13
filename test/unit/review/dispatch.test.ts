@@ -2141,4 +2141,25 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
 
     expect(stub.prompts[0]).toContain('model: "xai/grok-4.5"');
   });
+
+  it("embeds the same conversation context the direct path receives", async () => {
+    const stub = createPiSessionStub(
+      JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+    );
+    const conversationContext = {
+      text: "UNTRUSTED_REVIEW_DISCUSSION legacy-context-xyz",
+      digest: "a".repeat(64),
+    };
+
+    await dispatchRules(
+      [makeRule({ name: "rule-a" })],
+      "diff",
+      false,
+      async () => stub.session,
+      undefined,
+      conversationContext,
+    );
+
+    expect(stub.prompts[0]).toContain(conversationContext.text);
+  });
 });

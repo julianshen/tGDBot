@@ -684,6 +684,28 @@ describe("dispatchRulesDirect", () => {
   });
 });
 
+describe("dispatchRulesDirect conversation context", () => {
+  it("embeds ReviewDispatchInput.conversationContext in each rule prompt", async () => {
+    const { factory, prompts } = makeFactory({ "rule-a": "[]" });
+    const conversationContext = {
+      text: "ADVISORY_LOCAL_MEMORY unique-direct-xyz",
+      digest: "b".repeat(64),
+    };
+
+    await dispatchRulesDirectObject(
+      {
+        rules: [makeRule()],
+        diff: "diff",
+        useAdvisor: false,
+        conversationContext,
+      },
+      { createSession: factory },
+    );
+
+    expect(prompts["rule-a"]).toContain(conversationContext.text);
+  });
+});
+
 describe("parseAdvisorDropList", () => {
   it("parses a clean drop object", () => {
     expect(parseAdvisorDropList('{"drop": [0, 2]}')).toEqual([0, 2]);

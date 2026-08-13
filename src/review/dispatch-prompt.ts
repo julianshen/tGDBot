@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import type { ContextPackResult } from "../context/context-pack.js";
 import type { EffectiveRule } from "../rules/types.js";
+import type { ReviewConversationContext } from "./types.js";
 
 // Appended to every rule's task automatically — rule authors never write
 // this themselves (TASKS.md Task 5 technical design).
@@ -117,18 +118,22 @@ function taskBoundaryToken(
   rule: EffectiveRule,
   diff: string,
   contextPack: ContextPackResult | undefined,
+  conversationContext?: ReviewConversationContext,
 ): string {
   const contextText = contextPack?.text ?? "";
-  const enclosed = [rule.body, contextText, FINDING_JSON_CONTRACT, diff];
+  const conversationText = conversationContext?.text ?? "";
+  const enclosed = [rule.body, contextText, FINDING_JSON_CONTRACT, diff, conversationText];
 
   for (let counter = 0; ; counter += 1) {
     const hash = createHash("sha256");
     for (const value of [
       rule.name,
       contextPack?.manifestHash ?? "context-free",
+      conversationContext?.digest ?? "conversation-free",
       rule.body,
       contextText,
       diff,
+      conversationText,
       String(counter),
     ]) {
       updateLengthPrefixed(hash, value);
@@ -146,8 +151,9 @@ export function buildTaskText(
   rule: EffectiveRule,
   diff: string,
   contextPack?: ContextPackResult,
+  conversationContext?: ReviewConversationContext,
 ): string {
-  const token = taskBoundaryToken(rule, diff, contextPack);
+  const token = taskBoundaryToken(rule, diff, contextPack, conversationContext);
   const parts = [
     `${TRUST_BOUNDARY_INSTRUCTION}\n${READ_ONLY_INSTRUCTION}`,
     section("TRUSTED_RULE", token, rule.body),
@@ -159,6 +165,9 @@ export function buildTaskText(
     section("FINDING_CONTRACT", token, FINDING_JSON_CONTRACT),
     section("UNTRUSTED_DIFF", token, diff),
   );
+  if (conversationContext !== undefined && conversationContext.text.length > 0) {
+    parts.push(conversationContext.text);
+  }
   return parts.join("\n\n");
 }
 
@@ -171,6 +180,7 @@ export function buildDispatchPrompt(
   rules: EffectiveRule[],
   diff: string,
   useAdvisor: boolean,
+  conversationContext?: ReviewConversationContext,
 ): string {
   warnIfDiffCostRisk(rules, diff);
 
@@ -184,7 +194,7 @@ export function buildDispatchPrompt(
         `  agent: "reviewer"`,
         `  model: "${modelRef}"`,
         `  task: """`,
-        buildTaskText(rule, diff),
+        buildTaskText(rule, diff, undefined, conversationContext),
         `  """`,
       ].join("\n");
     })
