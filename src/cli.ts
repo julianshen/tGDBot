@@ -7,6 +7,7 @@ import { parseCommandArgs } from "./cli-args.js";
 import type { PollArgs, ReviewArgs } from "./cli-args.js";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
+import { poll } from "./poll/poll.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
 import {
   formatPendingMarker,
@@ -858,22 +859,10 @@ export async function review(
 
 /**
  * Entry point. Parses argv, dispatches `review` or `poll`, and exits with the
- * command's returned code. Poll currently uses an injectable seam whose
- * default throws PollNotImplementedError until its runtime is implemented.
- * Parse errors and unrecovered command errors are logged and exit 1.
+ * command's returned code. `poll` defaults to the classification-only runtime
+ * and remains injectable for tests. Parse errors and unrecovered command
+ * errors are logged and exit 1.
  */
-export class PollNotImplementedError extends Error {
-  constructor() {
-    super("The poll command runtime is not implemented");
-    this.name = "PollNotImplementedError";
-  }
-}
-
-async function runPollNotImplemented(args: PollArgs): Promise<number> {
-  void args;
-  throw new PollNotImplementedError();
-}
-
 export interface MainDependencies {
   runPoll?: (args: PollArgs) => Promise<number>;
 }
@@ -886,12 +875,10 @@ export async function main(
     const args = parseCommandArgs(argv);
     const exitCode = args.command === "review"
       ? await review(args)
-      : await (dependencies.runPoll ?? runPollNotImplemented)(args);
+      : await (dependencies.runPoll ?? poll)(args);
     process.exit(exitCode);
   } catch (err) {
-    const message = err instanceof PollNotImplementedError
-      ? `${err.name}: ${err.message}`
-      : err instanceof Error ? err.message : String(err);
+    const message = err instanceof Error ? err.message : String(err);
     console.error(`tgd-review-agent: ${message}`);
     process.exit(EXIT_FATAL);
   }

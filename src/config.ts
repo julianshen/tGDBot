@@ -7,6 +7,7 @@ import type { ReviewArgs } from "./cli-args.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
 import type { RepositoryRef } from "./target/types.js";
 import type { ReviewLocator, VcsAdapter } from "./vcs/adapter.js";
+import type { ConversationAdapter } from "./vcs/conversation-adapter.js";
 import { GitHubAdapter } from "./vcs/github-adapter.js";
 import { GitLabAdapter } from "./vcs/gitlab-adapter.js";
 
@@ -61,20 +62,17 @@ export function resolveReviewLocator(args: ReviewConfigArgs): ReviewLocator {
   return { kind: "repository", repo: target.repo, number: target.number };
 }
 
+export function createProviderAdapter(repository: RepositoryRef): VcsAdapter & ConversationAdapter {
+  if (repository.provider === "gitlab") {
+    return new GitLabAdapter(undefined, repository);
+  }
+  return new GitHubAdapter(undefined, repository);
+}
+
 export function resolveConfig(args: ReviewConfigArgs): ResolvedConfig {
   const locator = resolveReviewLocator(args);
-  const provider = locator.kind === "ambient" ? locator.provider : locator.repo.provider;
-  if (provider === "gitlab") {
-    return { ...args, locator, vcsAdapter: new GitLabAdapter() };
+  if (locator.kind === "ambient") {
+    return { ...args, locator, vcsAdapter: new GitHubAdapter() };
   }
-
-  // GitHubAdapter defaults to the real `gh`-backed executor.
-  return {
-    ...args,
-    locator,
-    vcsAdapter: new GitHubAdapter(
-      undefined,
-      locator.kind === "repository" && locator.repo.provider === "github" ? locator.repo : undefined,
-    ),
-  };
+  return { ...args, locator, vcsAdapter: createProviderAdapter(locator.repo) };
 }

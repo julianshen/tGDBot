@@ -54,17 +54,15 @@ describe("main command dispatch", () => {
     exit.mockRestore();
   });
 
-  it("reports the named not-implemented error for the default poll runtime", async () => {
+  it("dispatches the default poll runtime instead of the not-implemented stub", async () => {
+    const runPoll = vi.fn().mockResolvedValue(0);
     const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
-    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     try {
-      await main(["poll", "--repo", "owner/repo"]);
-
-      expect(error).toHaveBeenCalledWith(expect.stringContaining("PollNotImplementedError"));
-      expect(exit).toHaveBeenCalledWith(1);
+      await main(["poll", "--repo", "owner/repo"], { runPoll });
+      expect(runPoll).toHaveBeenCalled();
+      expect(exit).toHaveBeenCalledWith(0);
     } finally {
-      error.mockRestore();
       exit.mockRestore();
     }
   });

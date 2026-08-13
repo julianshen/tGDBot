@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { parseArgs } from "../../src/cli.js";
+import { describe, expect, it, vi } from "vitest";
+import { main, parseArgs } from "../../src/cli.js";
 import { parseCommandArgs } from "../../src/cli-args.js";
 
 describe("parseCommandArgs", () => {
@@ -243,5 +243,44 @@ describe("parseArgs", () => {
 
   it("rejects a nonnumeric --pr that is not a complete PR or MR URL", () => {
     expect(() => parseArgs(["review", "--pr", "group/project!42"])).toThrow(/--pr/);
+  });
+});
+
+describe("main poll exit codes", () => {
+  it("exits 0 for clean, bootstrap, and more-remains poll results", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    try {
+      await main(["poll", "--repo", "owner/repo"], { runPoll: async () => 0 });
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      exit.mockRestore();
+    }
+  });
+
+  it("exits 1 for a pre-write fatal or transient poll failure", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await main(["poll", "--repo", "owner/repo"], {
+        runPoll: async () => {
+          throw new Error("discovery page 2 failed");
+        },
+      });
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("discovery page 2 failed"));
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      error.mockRestore();
+      exit.mockRestore();
+    }
+  });
+
+  it("exits 2 only after a provider write occurred with a partial result", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    try {
+      await main(["poll", "--repo", "owner/repo"], { runPoll: async () => 2 });
+      expect(exit).toHaveBeenCalledWith(2);
+    } finally {
+      exit.mockRestore();
+    }
   });
 });
