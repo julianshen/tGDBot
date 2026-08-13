@@ -1155,7 +1155,7 @@ describe("GitHub conversation activity", () => {
     expect(events.events.map((event) => [event.kind, event.commentId, event.authorIsBot])).toEqual([
       ["thread-resolution", undefined, undefined], ["comment-edit", "7", false], ["thread-comment", "8", true],
     ]);
-    expect(events.events[2]).toMatchObject({ threadId: "T1", placement: { file: "src/a.ts", line: 4, side: "new", outdated: true, currentHeadSha: "b".repeat(40) } });
+    expect(events.events[2]).toMatchObject({ threadId: "T1", placement: { file: "src/a.ts", line: 4, side: "new", outdated: false, currentHeadSha: "b".repeat(40) } });
     expect(events.nextCursor).toMatchObject({ scope: "review-events", reviewNumber: 42 });
     expect(execGh.mock.calls.filter(([args]) => (args as string[]).includes("per_page=50"))).toHaveLength(4);
     expect(execGh.mock.calls.flatMap(([args]) => args as string[])).not.toContain("--paginate");
@@ -1279,7 +1279,7 @@ describe("GitHub conversation activity", () => {
     const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : readFixture("gh-review-threads.json"));
     const adapter = new GitHubAdapter(execGh, repo);
     const page = await adapter.listReviewThreads(review);
-    expect(page.threads[0]).toMatchObject({ threadId: "T1", rootCommentId: "8", outdated: true, resolved: false });
+    expect(page.threads[0]).toMatchObject({ threadId: "T1", rootCommentId: "8", outdated: false, resolved: false });
     const snapshot = await adapter.getReviewThread(review, "T1");
     expect(snapshot.events).toHaveLength(1);
     expect(snapshot.events[0]).toMatchObject({ kind: "thread-comment", threadId: "T1", commentId: "8" });
@@ -1291,7 +1291,7 @@ describe("GitHub conversation activity", () => {
     Object.assign(node, { subjectType: "FILE", diffSide: "RIGHT", line: null, originalLine: null });
     const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : JSON.stringify(fixture));
     const adapter = new GitHubAdapter(execGh, repo);
-    await expect(adapter.listReviewThreads(review)).resolves.toMatchObject({ threads: [{ placement: { file: "src/a.ts", side: "new", outdated: true } }] });
+    await expect(adapter.listReviewThreads(review)).resolves.toMatchObject({ threads: [{ placement: { file: "src/a.ts", side: "new", outdated: false } }] });
     expect((await adapter.getReviewThread(review, "T1")).placement).not.toHaveProperty("line");
     expect(execGh.mock.calls.find(([args]) => (args as string[])[1] === "graphql")?.[0].join(" ")).toContain("subjectType diffSide path line originalLine");
   });

@@ -823,6 +823,7 @@ interface ConversationNote {
   readonly type: string | null;
   readonly system: boolean;
   readonly resolved?: boolean;
+  readonly outdated?: boolean;
   readonly position?: {
     readonly file: string;
     readonly line?: number;
@@ -835,6 +836,7 @@ interface ConversationNote {
 interface ConversationDiscussion {
   readonly id: string;
   readonly individualNote: boolean;
+  readonly outdated?: boolean;
   readonly notes: readonly ConversationNote[];
 }
 
@@ -860,6 +862,7 @@ function parseConversationNote(value: unknown): ConversationNote {
   const author = conversationRecord(row.author, "note author");
   const type = row.type === undefined || row.type === null ? null : conversationText(row.type, "note type");
   const position = parseConversationPosition(row.position);
+  const outdatedFlag = conversationOutdatedFlag(row);
   return {
     id: conversationProviderId(row.id, "note id"),
     body: typeof row.body === "string" ? row.body : (() => { throw new GlabOutputError("Invalid glab note body"); })(),
@@ -869,6 +872,7 @@ function parseConversationNote(value: unknown): ConversationNote {
     type,
     system: row.system === true,
     ...(typeof row.resolved === "boolean" ? { resolved: row.resolved } : {}),
+    ...(outdatedFlag === undefined ? {} : { outdated: outdatedFlag }),
     ...(position ? { position } : {}),
   };
 }
@@ -886,7 +890,9 @@ function parseConversationPosition(value: unknown): ConversationNote["position"]
     throw new GlabOutputError("Invalid glab note line");
   }
   if (positionType === "file" && line !== undefined) throw new GlabOutputError("Invalid glab file-level note line");
-  const side = position.new_line != null ? "new" as const : position.old_line != null ? "old" as const : undefined;
+  const side = positionType === "file"
+    ? (typeof position.new_path === "string" && position.new_path.length > 0 ? "new" as const : "old" as const)
+    : position.new_line != null ? "new" as const : position.old_line != null ? "old" as const : undefined;
   return {
     file,
     ...(positionType === "file" || line === undefined ? {} : { line }),
@@ -899,11 +905,20 @@ function parseConversationPosition(value: unknown): ConversationNote["position"]
 function parseConversationDiscussion(value: unknown): ConversationDiscussion {
   const row = conversationRecord(value, "discussion");
   if (!Array.isArray(row.notes) || row.notes.length === 0) throw new GlabOutputError("Invalid glab discussion response");
+  const outdatedFlag = conversationOutdatedFlag(row);
   return {
     id: conversationDiscussionId(row.id),
     individualNote: row.individual_note === true,
+    ...(outdatedFlag === undefined ? {} : { outdated: outdatedFlag }),
     notes: row.notes.map(parseConversationNote),
   };
+}
+
+function conversationOutdatedFlag(row: Record<string, unknown>): boolean | undefined {
+  if (typeof row.outdated === "boolean") return row.outdated;
+  if (typeof row.stale === "boolean") return row.stale;
+  if (typeof row.active === "boolean") return row.active === false;
+  return undefined;
 }
 
 function isGeneralNote(note: ConversationNote): boolean {
@@ -1540,7 +1555,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     const binding = { provider: "gitlab" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
     const root = discussion.notes[0]!;
     if (discussion.notes.length > MAX_THREAD_SNAPSHOT_NOTES) throw new GlabOutputError("GitLab review thread exceeds the 10,000-note atomic snapshot limit");
-    const placement = this.discussionPlacement(root, mr.headSha);
+    const placement = this.discussionPlacement(root, mr.headSha, discussion.outdated);
     const resolvedFlag = root.resolved === true;
     const outdated = placement?.outdated === true;
     const updatedAt = discussion.notes.map((note) => note.updatedAt).sort().at(-1)!;
@@ -1597,10 +1612,15 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     return { events, resolution, summary, resolutionObservedAt };
   }
 
-  private discussionPlacement(root: ConversationNote, currentHeadSha: string): ReviewThreadSummary["placement"] | undefined {
+  private discussionPlacement(
+    root: ConversationNote,
+    currentHeadSha: string,
+    discussionOutdated?: boolean,
+  ): ReviewThreadSummary["placement"] | undefined {
     if (!root.position) return undefined;
     const originalHeadSha = root.position.headSha;
-    const outdated = originalHeadSha !== undefined && originalHeadSha !== currentHeadSha;
+    // Outdated means the provider marked the anchor stale, not that HEAD moved.
+    const outdated = root.outdated === true || discussionOutdated === true;
     return {
       file: root.position.file,
       ...(root.position.line === undefined ? {} : { line: root.position.line }),

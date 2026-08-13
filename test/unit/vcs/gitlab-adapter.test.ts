@@ -1564,7 +1564,7 @@ describe("GitLab conversation activity", () => {
     ]);
     expect(events.events[2]).toMatchObject({
       threadId: "T1",
-      placement: { file: "src/a.ts", line: 4, side: "new", outdated: true, currentHeadSha: HEAD_B },
+      placement: { file: "src/a.ts", line: 4, side: "new", outdated: false, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B },
     });
     expect(events.nextCursor).toMatchObject({ scope: "review-events", reviewNumber: 42 });
     expect(execGlab.mock.calls.filter(([args]) => args.includes("per_page=50"))).toHaveLength(2);
@@ -1703,10 +1703,33 @@ describe("GitLab conversation activity", () => {
     const execGlab = activityExec();
     const adapter = new GitLabAdapter(execGlab, repo);
     const page = await adapter.listReviewThreads(review);
-    expect(page.threads[0]).toMatchObject({ threadId: "T1", rootCommentId: "8", outdated: true, resolved: false });
+    expect(page.threads[0]).toMatchObject({
+      threadId: "T1", rootCommentId: "8", outdated: false, resolved: false,
+      placement: { file: "src/a.ts", line: 4, side: "new", outdated: false, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B },
+    });
     const snapshot = await adapter.getReviewThread(review, "T1");
     expect(snapshot.events).toHaveLength(1);
     expect(snapshot.events[0]).toMatchObject({ kind: "thread-comment", threadId: "T1", commentId: "8" });
+  });
+
+  it("keeps a still-applicable thread current when only the review head moved", async () => {
+    const execGlab = activityExec();
+    const page = await new GitLabAdapter(execGlab, repo).listReviewThreads(review);
+    expect(page.threads[0]!.outdated).toBe(false);
+    expect(page.threads[0]!.placement).toMatchObject({
+      file: "src/a.ts", line: 4, side: "new", outdated: false, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B,
+    });
+    expect(HEAD_A).not.toBe(HEAD_B);
+  });
+
+  it("honors an explicit GitLab outdated flag independently of head SHAs", async () => {
+    const discussions = activityDiscussions();
+    const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    note.outdated = true;
+    const execGlab = activityExec(activityNotes(), discussions);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).resolves.toMatchObject({
+      threads: [{ outdated: true, placement: { outdated: true, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B } }],
+    });
   });
 
   it("normalizes a nullable FILE discussion without a line", async () => {
@@ -1719,7 +1742,7 @@ describe("GitLab conversation activity", () => {
     const execGlab = activityExec(activityNotes(), discussions);
     const adapter = new GitLabAdapter(execGlab, repo);
     await expect(adapter.listReviewThreads(review)).resolves.toMatchObject({
-      threads: [{ placement: { file: "src/a.ts", outdated: true } }],
+      threads: [{ placement: { file: "src/a.ts", side: "new", outdated: false } }],
     });
     expect((await adapter.getReviewThread(review, "T1")).placement).not.toHaveProperty("line");
   });
@@ -1847,7 +1870,7 @@ describe("GitLab conversation activity", () => {
     const gitlabPage = await new GitLabAdapter(activityExec(), repo).listReviewEvents(review);
     const core = (event: ReviewActivityEvent) => ({
       kind: event.kind,
-      ...(event.kind === "thread-resolution" ? {} : { createdAt: event.createdAt }),
+      createdAt: event.createdAt,
       updatedAt: event.updatedAt,
       body: event.body,
       authorIsBot: event.authorIsBot,
@@ -1856,6 +1879,9 @@ describe("GitLab conversation activity", () => {
       placement: event.placement === undefined ? undefined : {
         file: event.placement.file,
         line: event.placement.line,
+        side: event.placement.side,
+        originalHeadSha: event.placement.originalHeadSha,
+        currentHeadSha: event.placement.currentHeadSha,
         outdated: event.placement.outdated,
       },
     });
