@@ -1309,6 +1309,104 @@ describe("GitHub conversation activity", () => {
       .not.toBe(computeRepositoryDigest("github", canonical.canonicalUrl));
   });
 
+  it("loads threads and child markers when GraphQL/REST keep mixed-case GitHub URLs", async () => {
+    const mixed = parseRepositoryRef("Azure/sdk", "github");
+    const canonical = parseRepositoryRef("azure/sdk", "github");
+    const mixedReview: ReviewIdentity = {
+      provider: "github",
+      repositoryDigest: computeRepositoryDigest("github", canonical.canonicalUrl),
+      reviewNumber: 42,
+      reviewId: "PR_kwDOAzureSdk",
+      url: `${canonical.canonicalUrl}/pull/42`,
+    };
+    const displayUrl = "https://github.com/Azure/sdk/pull/42";
+    expect(mixedReview.url).toBe("https://github.com/azure/sdk/pull/42");
+    expect(displayUrl).not.toBe(mixedReview.url);
+    const visibleBody = "trusted finding";
+    const contentDigest = computeContentDigest(visibleBody);
+    const marker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `finding_${"b".repeat(32)}`,
+      repositoryDigest: mixedReview.repositoryDigest,
+      reviewNumber: 42,
+      contentDigest,
+    });
+    const head = "b".repeat(40);
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") {
+        return JSON.stringify({
+          data: {
+            repository: {
+              pullRequest: {
+                id: mixedReview.reviewId,
+                url: displayUrl,
+                headRefOid: head,
+                updatedAt: "2026-08-01T00:00:00Z",
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [{
+                    id: "T1",
+                    isResolved: false,
+                    isOutdated: false,
+                    subjectType: "LINE",
+                    diffSide: "RIGHT",
+                    path: "src/a.ts",
+                    line: 4,
+                    originalLine: 3,
+                    comments: {
+                      pageInfo: { hasNextPage: false, endCursor: null },
+                      nodes: [{
+                        databaseId: 8,
+                        body: `${visibleBody}\n${marker}`,
+                        author: { login: "octo-bot" },
+                        createdAt: "2026-08-02T00:00:00Z",
+                        updatedAt: "2026-08-02T00:00:00Z",
+                        url: `${displayUrl}#discussion_r8`,
+                        commit: { oid: "a".repeat(40) },
+                        originalCommit: { oid: "a".repeat(40) },
+                        replyTo: null,
+                      }],
+                    },
+                  }],
+                },
+              },
+            },
+          },
+        });
+      }
+      if (args.some((arg) => String(arg).includes("issues/42/comments"))) return "[]";
+      if (args.some((arg) => String(arg).includes("pulls/42/comments"))) {
+        return JSON.stringify([{
+          id: 8,
+          body: `${visibleBody}\n${marker}`,
+          user: { login: "octo-bot" },
+          html_url: `${displayUrl}#discussion_r8`,
+          pull_request_url: "https://api.github.com/repos/Azure/sdk/pulls/42",
+          path: "src/a.ts",
+          line: 4,
+          side: "RIGHT",
+          commit_id: head,
+        }]);
+      }
+      return "[]";
+    });
+    const adapter = new GitHubAdapter(execGh, mixed);
+    await expect(adapter.listReviewThreads(mixedReview)).resolves.toMatchObject({
+      threads: [{ threadId: "T1", rootCommentId: "8" }],
+    });
+    await expect(adapter.findBotChildMarker(mixedReview, {
+      provider: "github",
+      repositoryDigest: mixedReview.repositoryDigest,
+      reviewNumber: 42,
+      kind: "finding",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `finding_${"b".repeat(32)}`,
+      contentDigest,
+    })).resolves.toMatchObject({ commentId: "8", threadId: "T1" });
+  });
+
   it("pages GraphQL thread summaries and can fetch a complete addressed thread", async () => {
     const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : readFixture("gh-review-threads.json"));
     const adapter = new GitHubAdapter(execGh, repo);

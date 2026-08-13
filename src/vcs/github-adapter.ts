@@ -168,6 +168,19 @@ function sameGitHubRepository(left: GitHubRepositoryRef, right: GitHubRepository
   return canonicalGitHubRepository(left).canonicalUrl === canonicalGitHubRepository(right).canonicalUrl;
 }
 
+function sameGitHubBinding(actual: unknown, expected: string): boolean {
+  return typeof actual === "string" && actual.toLowerCase() === expected.toLowerCase();
+}
+
+function boundGitHubCommentUrl(url: string, review: ReviewIdentity): string {
+  if (url.length < review.url.length || !sameGitHubBinding(url.slice(0, review.url.length), review.url)) {
+    throw new Error("Invalid GitHub comment URL binding");
+  }
+  const suffix = url.slice(review.url.length);
+  if (suffix !== "" && !suffix.startsWith("#")) throw new Error("Invalid GitHub comment URL binding");
+  return `${review.url}${suffix}`;
+}
+
 function providerId(value: unknown, label: string): string {
   const id = typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? String(value) : value;
   if (typeof id !== "string" || !PROVIDER_ID_RE.test(id)) throw new Error(`Invalid GitHub ${label}`);
@@ -495,8 +508,8 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     const parsed = object(JSON.parse(await this.execGh(["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `owner=${repo.owner}`, "-F", `name=${repo.repo}`, "-F", `number=${reviewNumber}`])), "pull request identity");
     const pull = object(object(object(parsed.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");
     const url = textField(pull.url, "GraphQL pull request URL");
-    if (url.toLowerCase() !== `${canonical.canonicalUrl}/pull/${reviewNumber}` &&
-      url.toLowerCase() !== `${repo.canonicalUrl}/pull/${reviewNumber}`.toLowerCase()) {
+    if (!sameGitHubBinding(url, `${canonical.canonicalUrl}/pull/${reviewNumber}`) &&
+      !sameGitHubBinding(url, `${repo.canonicalUrl}/pull/${reviewNumber}`)) {
       throw new Error("GitHub GraphQL pull request URL binding mismatch");
     }
     return {
@@ -669,7 +682,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       const root = object(JSON.parse(raw) as unknown, "targeted thread comment page");
       const node = object(object(root.data, "targeted thread GraphQL data").node, "targeted thread GraphQL node");
       const pull = object(node.pullRequest, "targeted thread pull request");
-      if (node.id !== threadId || pull.id !== review.reviewId || pull.number !== review.reviewNumber || pull.url !== review.url || object(pull.repository, "targeted thread repository").nameWithOwner !== `${repo.owner}/${repo.repo}`) throw new Error("GitHub targeted thread review binding mismatch");
+      if (node.id !== threadId || pull.id !== review.reviewId || pull.number !== review.reviewNumber || !sameGitHubBinding(pull.url, review.url) || !sameGitHubBinding(object(pull.repository, "targeted thread repository").nameWithOwner, `${repo.owner}/${repo.repo}`)) throw new Error("GitHub targeted thread review binding mismatch");
       const comments = object(node.comments, "targeted thread comments");
       if (!Array.isArray(comments.nodes)) throw new Error("Invalid GitHub targeted thread comment nodes");
       for (const entry of comments.nodes) {
@@ -763,12 +776,12 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       const createdAt = timestamp(row.created_at, "comment created timestamp");
       const url = textField(row.html_url, "comment URL");
       const expectedFragment = candidate.inline ? `#discussion_r${id}` : `#issuecomment-${id}`;
-      if (url !== `${review.url}${expectedFragment}`) throw new Error("Invalid GitHub comment URL binding");
+      if (!sameGitHubBinding(url, `${review.url}${expectedFragment}`)) throw new Error("Invalid GitHub comment URL binding");
       const edited = candidate.updatedAt !== createdAt;
       if (!candidate.inline) return { ...binding, kind: edited ? "comment-edit" : "general-comment", eventId: `issue-comment:${id}`, revisionId: candidate.revisionId,
         ...(edited ? { editedRevisionId: candidate.revisionId } : {}), orderKey: candidate.orderKey, authorLogin, authorIsBot: authorLogin === bot,
-        createdAt, updatedAt: candidate.updatedAt, body, url, commentId: id } as ReviewActivityEvent;
-      if (row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`) throw new Error("Invalid GitHub review comment pull request binding");
+        createdAt, updatedAt: candidate.updatedAt, body, url: boundGitHubCommentUrl(url, review), commentId: id } as ReviewActivityEvent;
+      if (!sameGitHubBinding(row.pull_request_url, `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`)) throw new Error("Invalid GitHub review comment pull request binding");
       const metadata = threadMetadata.get(id);
       if (!metadata) throw new Error("GitHub review comment is missing its GraphQL thread binding");
       const file = textField(row.path, "review comment path");
@@ -833,7 +846,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     const data = object(response.data, "GraphQL data");
     const repository = object(data.repository, "GraphQL repository");
     const pull = object(repository.pullRequest, "GraphQL pull request");
-    if (pull.id !== review.reviewId || pull.url !== review.url) throw new Error("GitHub GraphQL review binding mismatch");
+    if (pull.id !== review.reviewId || !sameGitHubBinding(pull.url, review.url)) throw new Error("GitHub GraphQL review binding mismatch");
     return object(pull.reviewThreads, "GraphQL review threads");
   }
 
@@ -847,7 +860,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     const root = nodes[0]!;
     const rootCommentId = providerId(root.databaseId, "review thread root comment id");
     const url = textField(root.url, "review thread URL");
-    if (url !== `${review.url}#discussion_r${rootCommentId}`) throw new Error("Invalid GitHub review thread URL binding");
+    if (!sameGitHubBinding(url, `${review.url}#discussion_r${rootCommentId}`)) throw new Error("Invalid GitHub review thread URL binding");
     const updatedAt = nodes.map((node) => timestamp(node.updatedAt, "review thread updated timestamp")).sort().at(-1)!;
     const subjectType = row.subjectType ?? "LINE";
     if (subjectType !== "LINE" && subjectType !== "FILE") throw new Error("Invalid GitHub review thread subject type");
@@ -883,7 +896,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       const root = object(JSON.parse(raw) as unknown, "thread comment page");
       const node = object(object(root.data, "thread comment GraphQL data").node, "thread comment GraphQL node");
       const pull = object(node.pullRequest, "thread comment pull request");
-      if (node.id !== threadId || pull.id !== review.reviewId || pull.number !== review.reviewNumber || pull.url !== review.url || object(pull.repository, "thread comment repository").nameWithOwner !== `${repo.owner}/${repo.repo}`) {
+      if (node.id !== threadId || pull.id !== review.reviewId || pull.number !== review.reviewNumber || !sameGitHubBinding(pull.url, review.url) || !sameGitHubBinding(object(pull.repository, "thread comment repository").nameWithOwner, `${repo.owner}/${repo.repo}`)) {
         throw new Error("GitHub addressed thread review binding mismatch");
       }
       const comments = object(node.comments, "thread comment connection");
@@ -964,7 +977,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       const body = typeof node.body === "string" ? node.body : (() => { throw new Error("Invalid GitHub review thread comment body"); })();
       const revisionId = digest(`${commentId}\0${updatedAt}\0${body}`);
       const eventUrl = textField(node.url, "review thread comment URL");
-      if (eventUrl !== `${review.url}#discussion_r${commentId}`) throw new Error("Invalid GitHub review thread comment URL binding");
+      if (!sameGitHubBinding(eventUrl, `${review.url}#discussion_r${commentId}`)) throw new Error("Invalid GitHub review thread comment URL binding");
       if (!LOGIN_RE.test(authorLogin)) throw new Error("Invalid GitHub review thread comment author login");
       return { provider: "github" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber,
         kind: updatedAt === createdAt ? "thread-comment" as const : "comment-edit" as const,
@@ -1000,13 +1013,13 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     if (row.body !== body || textField(object(row.user, "reply author").login, "reply author login").toLowerCase() !== bot) {
       throw new Error("GitHub reply response body/author mismatch");
     }
-    if (threadId && row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`) {
+    if (threadId && !sameGitHubBinding(row.pull_request_url, `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`)) {
       throw new Error("GitHub thread reply review binding mismatch");
     }
     if (parentCommentId !== undefined && providerId(row.in_reply_to_id, "reply parent id") !== parentCommentId) {
       throw new Error("GitHub thread reply parent mismatch");
     }
-    return validateConversationItemIdentity({ provider: "github", commentId: id, ...(threadId ? { threadId } : {}), url: textField(row.html_url, "reply URL") }, { repo, reviewNumber: review.reviewNumber });
+    return validateConversationItemIdentity({ provider: "github", commentId: id, ...(threadId ? { threadId } : {}), url: boundGitHubCommentUrl(textField(row.html_url, "reply URL"), review) }, { repo, reviewNumber: review.reviewNumber });
   }
 
   async postGeneralReply(review: ReviewIdentity, input: GeneralReplyInput): Promise<ConversationItemIdentity> {
@@ -1071,12 +1084,12 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         const inlineMetadata = stream === "inline" ? await this.threadMetadataForCommentIds(review, new Set(matchingRows.map((row) => providerId(row.id, "marker comment id")))) : undefined;
         for (const row of matchingRows) {
         const id = providerId(row.id, "marker comment id");
-        if (stream === "inline" && row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`) throw new Error("GitHub marker review binding mismatch");
+        if (stream === "inline" && !sameGitHubBinding(row.pull_request_url, `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`)) throw new Error("GitHub marker review binding mismatch");
         const threadId = stream === "inline" ? inlineMetadata!.get(id)?.threadId : undefined;
         if (stream === "inline" && !threadId) throw new Error("GitHub marker comment is missing its GraphQL thread binding");
         matches.push(validateConversationItemIdentity({ provider: "github", commentId: id,
           ...(threadId ? { threadId } : {}),
-          url: textField(row.html_url, "marker comment URL") }, { repo, reviewNumber: review.reviewNumber }));
+          url: boundGitHubCommentUrl(textField(row.html_url, "marker comment URL"), review) }, { repo, reviewNumber: review.reviewNumber }));
           if (matches.length > 1) throw new Error("Multiple authenticated GitHub child marker matches");
         }
         page += 1;
@@ -1367,7 +1380,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         const row = matches[0];
         if (!row) return null;
         providerId(row.id, "inline recovery comment id");
-        if (row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${resolved.id}`) throw new AmbiguousInlinePublishError("Recovered inline comment belongs to another review");
+        if (!sameGitHubBinding(row.pull_request_url, `https://api.github.com/${apiRepo(repo)}/pulls/${resolved.id}`)) throw new AmbiguousInlinePublishError("Recovered inline comment belongs to another review");
         if (row.path !== expected.path || row.line !== expected.line || row.side !== "RIGHT" || (row.start_line ?? null) !== (expected.startLine ?? null) || (row.start_side ?? null) !== (expected.startLine === undefined ? null : "RIGHT")) throw new AmbiguousInlinePublishError("Recovered inline comment placement mismatch");
         if (row.commit_id !== headSha) throw new AmbiguousInlinePublishError("Recovered inline comment head mismatch");
         return row;
@@ -1386,7 +1399,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         const threadId = metadata.threadId;
         if (!threadId) throw new AmbiguousInlinePublishError("Recovered inline comment has no GraphQL thread identity");
         return validateConversationItemIdentity({ provider: "github", commentId: id, threadId,
-          url: textField(row.html_url, "inline recovery comment URL") }, { repo, reviewNumber: Number(resolved.id) });
+          url: boundGitHubCommentUrl(textField(row.html_url, "inline recovery comment URL"), review) }, { repo, reviewNumber: Number(resolved.id) });
       });
     };
     const existing = await recover();
@@ -1449,7 +1462,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       if (typeof login !== "string" || login.toLowerCase() !== bot || typeof row.body !== "string") continue;
       const marker = row.body.split(/\r?\n/u).at(-1) ?? "";
       if (!counts.has(marker)) continue;
-      if (row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${resolved.id}`) return "ambiguous";
+      if (!sameGitHubBinding(row.pull_request_url, `https://api.github.com/${apiRepo(repo)}/pulls/${resolved.id}`)) return "ambiguous";
       const child = validated.children.find((candidate) => candidate.marker === marker)!;
       const canonicalBody = canonicalInlineBody(row.body);
       const suffix = `\n${INLINE_COMMENT_MARKER}\n${marker}`;
