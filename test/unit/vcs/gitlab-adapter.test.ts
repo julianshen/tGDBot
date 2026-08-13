@@ -1699,6 +1699,20 @@ describe("GitLab conversation activity", () => {
     await expect(adapter.listReviewEvents(review, terminal)).resolves.toMatchObject({ events: [] });
   });
 
+  it("resolves the merge request database id as reviewId", async () => {
+    const execGlab = vi.fn().mockResolvedValue(conversationMr());
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.resolveReviewIdentity(repo, 42)).resolves.toEqual({
+      provider: "gitlab",
+      repositoryDigest,
+      reviewNumber: 42,
+      reviewId: "4200",
+      url: review.url,
+    });
+    expect("4200").not.toBe("42");
+    expect(repositoryDigest).toBe(computeRepositoryDigest("gitlab", repo.canonicalUrl));
+  });
+
   it("pages discussion thread summaries and can fetch a complete addressed thread", async () => {
     const execGlab = activityExec();
     const adapter = new GitLabAdapter(execGlab, repo);

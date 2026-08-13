@@ -1275,6 +1275,22 @@ describe("GitHub conversation activity", () => {
     await expect(adapter.listReviewEvents(review, terminal)).resolves.toMatchObject({ events: [] });
   });
 
+  it("resolves the GraphQL pull request node id as reviewId", async () => {
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      data: { repository: { pullRequest: { id: "PR_kwDO42", url: review.url } } },
+    }));
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.resolveReviewIdentity(repo, 42)).resolves.toEqual({
+      provider: "github",
+      repositoryDigest,
+      reviewNumber: 42,
+      reviewId: "PR_kwDO42",
+      url: review.url,
+    });
+    expect("PR_kwDO42").not.toBe("42");
+    expect(repositoryDigest).toBe(computeRepositoryDigest("github", repo.canonicalUrl));
+  });
+
   it("pages GraphQL thread summaries and can fetch a complete addressed thread", async () => {
     const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : readFixture("gh-review-threads.json"));
     const adapter = new GitHubAdapter(execGh, repo);

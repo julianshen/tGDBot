@@ -19,7 +19,7 @@ import type {
   RuleFileContent,
   VcsAdapter,
 } from "./adapter.js";
-import type { GitHubRepositoryRef } from "../target/types.js";
+import type { GitHubRepositoryRef, RepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
 import { computeContentDigest, computeRepositoryDigest, parseChildMarker, verifyChildMarkerBinding } from "../conversation/markers.js";
@@ -469,7 +469,13 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     return repo;
   }
 
-  private async resolveReviewIdentity(repo: GitHubRepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
+  async resolveReviewIdentity(repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
+    if (repository.provider !== "github") throw new Error("GitHub review identity requires a GitHub repository");
+    if (!Number.isSafeInteger(reviewNumber) || reviewNumber <= 0) throw new Error("Invalid GitHub review binding");
+    if (this.repository && this.repository.canonicalUrl !== repository.canonicalUrl) {
+      throw new Error("GitHub configured repository binding mismatch");
+    }
+    const repo = repository;
     const query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id url}}}";
     const parsed = object(JSON.parse(await this.execGh(["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `owner=${repo.owner}`, "-F", `name=${repo.repo}`, "-F", `number=${reviewNumber}`])), "pull request identity");
     const pull = object(object(object(parsed.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");

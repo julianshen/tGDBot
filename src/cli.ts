@@ -31,7 +31,8 @@ import {
   MAX_REVIEW_CONTEXT_PAGES,
   rethrowIfIntegrityFailure,
 } from "./conversation/context.js";
-import type { ConversationAdapter, ReviewIdentity, ReviewThreadSnapshot } from "./vcs/conversation-adapter.js";
+import type { ReviewIdentity } from "./conversation/types.js";
+import type { ConversationAdapter, ReviewThreadSnapshot } from "./vcs/conversation-adapter.js";
 import { selectConversationStateRoot } from "./conversation/state-paths.js";
 import {
   createConversationStateStore,
@@ -176,11 +177,27 @@ function reviewIdentityFor(repository: RepositoryRef, pr: PullRequestInfo): Revi
   const provider = repository.provider;
   return {
     provider,
-    repositoryDigest: repositoryDigestOf(repository),
+    repositoryDigest: computeRepositoryDigest(provider, repository.canonicalUrl),
     reviewNumber: Number(pr.id),
-    reviewId: String(pr.id),
+    reviewId: pr.reviewId ?? String(pr.id),
     url: pr.url ?? `${repository.canonicalUrl}${provider === "gitlab" ? "/-/merge_requests/" : "/pull/"}${Number(pr.id)}`,
   };
+}
+
+async function resolveConversationIdentity(
+  adapter: Partial<ConversationAdapter>,
+  repository: RepositoryRef,
+  pr: PullRequestInfo,
+): Promise<{ identity?: ReviewIdentity; unavailable?: "discussion" }> {
+  if (typeof adapter.resolveReviewIdentity === "function") {
+    try {
+      return { identity: await adapter.resolveReviewIdentity(repository, Number(pr.id)) };
+    } catch (error) {
+      rethrowIfIntegrityFailure(error);
+      return { unavailable: "discussion" };
+    }
+  }
+  return { identity: reviewIdentityFor(repository, pr) };
 }
 
 function reviewOptionsSnapshot(config: ResolvedConfig): FindingReviewOptions {
@@ -270,9 +287,12 @@ async function loadOptionalReviewContext(options: {
   unavailable: string[];
 }> {
   const unavailable: string[] = [];
-  const identity = reviewIdentityFor(options.repository, options.pr);
-  const discussion = await fetchReviewDiscussion(options.adapter, identity);
-  if (discussion.unavailable !== undefined) unavailable.push("discussion");
+  const resolved = await resolveConversationIdentity(options.adapter, options.repository, options.pr);
+  if (resolved.unavailable !== undefined) unavailable.push("discussion");
+  const discussion = resolved.identity === undefined
+    ? { threads: [] as const, unavailable: "discussion" as const }
+    : await fetchReviewDiscussion(options.adapter, resolved.identity);
+  if (discussion.unavailable !== undefined && !unavailable.includes("discussion")) unavailable.push("discussion");
 
   let memories: readonly import("./conversation/state-schema.js").MemoryCreateEntry[] = [];
   let pending: readonly import("./conversation/state-schema.js").PendingClarification[] = [];
@@ -1051,13 +1071,48 @@ export async function review(
   const stateStore = missingStore ? undefined : openConversationStore(createStore, config, repository);
   if (stateStore === undefined) missingStore = true;
 
-  let loadedContext = await loadOptionalReviewContext({
+  let diff: string;
+  try {
+    diff = await config.vcsAdapter.getDiff(config.locator);
+  } catch (err) {
+    if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
+    console.warn(
+      `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +
+        `(${(err as Error).message}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
+        `this as over the ceiling and skipping the review (nothing was posted).`,
+    );
+    logStatus({
+      status: "skipped",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "diff-too-large",
+    });
+    return EXIT_OK;
+  }
+  if (config.maxDiffChars !== undefined && diff.length > config.maxDiffChars) {
+    console.warn(
+      `tgd-review-agent: diff is ${diff.length} chars, over the --max-diff-chars ceiling of ` +
+        `${config.maxDiffChars}; skipping the review (nothing was posted). Raise or drop the ` +
+        `flag to review this PR.`,
+    );
+    logStatus({
+      status: "skipped",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "diff-too-large",
+    });
+    return EXIT_OK;
+  }
+
+  const loadedContext = await loadOptionalReviewContext({
     adapter: config.vcsAdapter as Partial<ConversationAdapter>,
     store: stateStore,
     missingStore,
     repository,
     pr,
-    diff: "",
+    diff,
     stateRoot,
   });
   const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);
@@ -1159,51 +1214,6 @@ export async function review(
     logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
     return EXIT_OK;
   }
-
-  let diff: string;
-  try {
-    diff = await config.vcsAdapter.getDiff(config.locator);
-  } catch (err) {
-    if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
-    console.warn(
-      `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +
-        `(${(err as Error).message}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
-        `this as over the ceiling and skipping the review (nothing was posted).`,
-    );
-    logStatus({
-      status: "skipped",
-      findingsCount: 0,
-      rulesRun: [],
-      rulesFailed: [],
-      reason: "diff-too-large",
-    });
-    return EXIT_OK;
-  }
-  if (config.maxDiffChars !== undefined && diff.length > config.maxDiffChars) {
-    console.warn(
-      `tgd-review-agent: diff is ${diff.length} chars, over the --max-diff-chars ceiling of ` +
-        `${config.maxDiffChars}; skipping the review (nothing was posted). Raise or drop the ` +
-        `flag to review this PR.`,
-    );
-    logStatus({
-      status: "skipped",
-      findingsCount: 0,
-      rulesRun: [],
-      rulesFailed: [],
-      reason: "diff-too-large",
-    });
-    return EXIT_OK;
-  }
-
-  loadedContext = await loadOptionalReviewContext({
-    adapter: config.vcsAdapter as Partial<ConversationAdapter>,
-    store: stateStore,
-    missingStore,
-    repository,
-    pr,
-    diff,
-    stateRoot,
-  });
 
   if (stateStore !== undefined) {
     const existing = loadPublicationAction(

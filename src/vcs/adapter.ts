@@ -332,6 +332,12 @@ export interface RuleFileContent {
 
 export interface PullRequestInfo {
   id: string; // PR/MR number
+  /**
+   * Provider-native stable pull/merge request ID, not the review number.
+   * GitHub: GraphQL node ID (`PR_kwDO…`). GitLab: global database ID.
+   * Optional so existing test doubles that only have the number still work.
+   */
+  reviewId?: string;
   headSha: string;
   baseSha: string;
   startSha?: string;

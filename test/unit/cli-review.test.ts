@@ -25,7 +25,7 @@ import type { RuleDefinition } from "../../src/rules/types.js";
 import type { DispatchResult } from "../../src/review/types.js";
 import { orchestrate as buildPresentation } from "../../src/review/orchestrate.js";
 import type { OrchestrationResult } from "../../src/review/orchestrate.js";
-import { parseChildMarker } from "../../src/conversation/markers.js";
+import { computeRepositoryDigest, parseChildMarker } from "../../src/conversation/markers.js";
 import { createConversationStateStore } from "../../src/conversation/state-store.js";
 import { deriveConversationStatePaths } from "../../src/conversation/state-paths.js";
 import { parseRepositoryRef } from "../../src/target/review-target.js";
@@ -236,6 +236,7 @@ interface Harness {
     listReviewThreads?: ReturnType<typeof vi.fn>;
     listReviewEvents?: ReturnType<typeof vi.fn>;
     getReviewThread?: ReturnType<typeof vi.fn>;
+    resolveReviewIdentity?: ReturnType<typeof vi.fn>;
   };
   resolveConfig: ReturnType<typeof vi.fn>;
   loadRules: ReturnType<typeof vi.fn>;
@@ -488,7 +489,6 @@ describe("review", () => {
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/binding|recovery|note/i);
 
-    expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
@@ -522,7 +522,6 @@ describe("review", () => {
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/binding|recovery|note/i);
 
-    expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
     expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
@@ -557,7 +556,6 @@ describe("review", () => {
 
     await expect(review(h.args, depsFrom(h))).resolves.toBe(2);
 
-    expect(h.vcsAdapter.getDiff).not.toHaveBeenCalled();
     expect(h.dispatchRules).not.toHaveBeenCalled();
     expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
@@ -2717,6 +2715,94 @@ describe("conversation-aware review", () => {
     changed.resolveConfig.mockReturnValue(changed.config);
     await review(changed.args, depsFrom(changed));
     expect(changed.dispatchRules).toHaveBeenCalledOnce();
+  });
+
+  it("passes the native provider review identity — not the PR number — to conversation reads", async () => {
+    const nativeId = "PR_kwDOTestNativeId";
+    expect(nativeId).not.toBe("42");
+    const h = conversationHarness({ threads: [relevant] });
+    h.vcsAdapter.getPullRequest.mockResolvedValue(makePr({
+      url: CONVERSATION_PR_URL,
+      reviewId: nativeId,
+    }));
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.listReviewThreads).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reviewId: nativeId,
+        repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+      }),
+      undefined,
+    );
+    expect(h.vcsAdapter.getReviewThread).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewId: nativeId }),
+      "changed-line",
+    );
+  });
+
+  it("uses an adapter-resolved ReviewIdentity when the adapter exposes one", async () => {
+    const nativeId = "PR_kwDOResolvedFromAdapter";
+    const h = conversationHarness({ threads: [relevant] });
+    h.vcsAdapter.resolveReviewIdentity = vi.fn().mockResolvedValue({
+      provider: "github",
+      repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+      reviewNumber: 42,
+      reviewId: nativeId,
+      url: CONVERSATION_PR_URL,
+    });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.resolveReviewIdentity).toHaveBeenCalled();
+    expect(h.vcsAdapter.listReviewThreads).toHaveBeenCalledWith(
+      expect.objectContaining({ reviewId: nativeId }),
+      undefined,
+    );
+    expect(nativeId).not.toBe(String((await h.vcsAdapter.getPullRequest()).id));
+  });
+
+  it("does not skip when a human unresolved thread sits on a file that appears in the new diff", async () => {
+    const diff = [
+      "diff --git a/src/changed.ts b/src/changed.ts",
+      "--- a/src/changed.ts",
+      "+++ b/src/changed.ts",
+      "@@ -1,1 +1,2 @@",
+      " keep",
+      "+added",
+    ].join("\n");
+    const humanThread = conversationThread({
+      threadId: "human-changed-line",
+      events: [conversationComment("human-changed-line", "h1", "Please check this changed line", {
+        authorLogin: "alice",
+        authorIsBot: false,
+      })],
+    });
+
+    const first = conversationHarness();
+    first.vcsAdapter.getDiff.mockResolvedValue(diff);
+    await review(first.args, depsFrom(first));
+    const posted = String(first.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    const parsed = parseBotMarker(posted)!;
+
+    const second = conversationHarness({
+      botComment: {
+        id: "999",
+        body: posted,
+        lastReviewedSha: CONVERSATION_HEAD,
+        reviewedConfig: parsed.reviewedConfig,
+      },
+      threads: [humanThread],
+    });
+    second.args.stateDir = first.args.stateDir;
+    second.config = { ...second.config, stateDir: first.args.stateDir };
+    second.resolveConfig.mockReturnValue(second.config);
+    second.vcsAdapter.getDiff.mockResolvedValue(diff);
+
+    await review(second.args, depsFrom(second));
+
+    expect(second.dispatchRules).toHaveBeenCalledOnce();
+    expect(second.dispatchRules.mock.calls[0]?.[0].conversationContext?.text).toContain("Please check this changed line");
   });
 
   it("renders a visible notice when optional discussion context cannot load", async () => {

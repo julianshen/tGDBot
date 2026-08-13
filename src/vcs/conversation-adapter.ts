@@ -9,7 +9,7 @@ import type {
   Sha256Digest,
   StableConversationId,
 } from "../conversation/types.js";
-import type { ReviewProvider } from "../target/types.js";
+import type { RepositoryRef, ReviewProvider } from "../target/types.js";
 
 export const MAX_CURSOR_BYTES = 4_096;
 export const MAX_CURSOR_ORDER_KEY_BYTES = 512;
@@ -335,6 +335,11 @@ export interface ThreadReplyInput extends GeneralReplyInput {
  */
 export interface ConversationAdapter {
   getAuthenticatedBotIdentity(): Promise<BotIdentity>;
+  /**
+   * Resolve the provider-native review identity (GraphQL node ID / GitLab
+   * database ID) for conversation reads. `reviewId` must not be the PR/MR number.
+   */
+  resolveReviewIdentity(repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity>;
   /** Implementations must validate `after` and `pageToken` against `repository`. */
   listOpenReviews(repository: RepositoryBinding, after?: ReviewDiscoveryCursor, pageToken?: OpenReviewPageToken): Promise<OpenReviewPage>;
   /** Implementations must validate `after` against `review` before provider I/O. */

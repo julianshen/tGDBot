@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { parseBotMarker } from "../review/comment-marker.js";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
-import type { GitLabRepositoryRef } from "../target/types.js";
+import type { GitLabRepositoryRef, RepositoryRef } from "../target/types.js";
 import { computeContentDigest, computeRepositoryDigest, parseChildMarker, verifyChildMarkerBinding } from "../conversation/markers.js";
 import type { BotIdentity, ConversationItemIdentity, ReviewIdentity } from "../conversation/types.js";
 import { resolveGitLabRelatedWork } from "./gitlab-related-work.js";
@@ -1309,6 +1309,30 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       if (first.count === second.count && first.witness === second.witness) return second;
     }
     throw new ConcurrentGitLabMutationError();
+  }
+
+  async resolveReviewIdentity(repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
+    if (repository.provider !== "gitlab") throw new Error("GitLab review identity requires a GitLab repository");
+    if (!Number.isSafeInteger(reviewNumber) || reviewNumber <= 0) throw new Error("Invalid GitLab review binding");
+    if (this.repository && this.repository.canonicalUrl !== repository.canonicalUrl) {
+      throw new Error("GitLab configured repository binding mismatch");
+    }
+    const repo = repository;
+    const mr = parseConversationMergeRequest(await this.execGlab([
+      "api", "--method", "GET", "--hostname", repo.host,
+      projectEndpoint(repo, `merge_requests/${reviewNumber}`),
+    ]));
+    const url = `${repo.canonicalUrl}/-/merge_requests/${reviewNumber}`;
+    if (mr.iid !== reviewNumber || mr.webUrl !== url) {
+      throw new GlabOutputError("GitLab merge request identity binding mismatch");
+    }
+    return {
+      provider: "gitlab",
+      repositoryDigest: computeRepositoryDigest("gitlab", repo.canonicalUrl),
+      reviewNumber,
+      reviewId: mr.id,
+      url,
+    };
   }
 
   private async fetchConversationMergeRequest(review: ReviewIdentity): Promise<ConversationMergeRequest> {
