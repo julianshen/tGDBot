@@ -4,18 +4,27 @@
 // runs, PI_CODING_AGENT_DIR already points at the hermetic dir).
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { AuthStorage, ModelRegistry, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { ModelRuntime, getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
 import { AUTH_FILE, MODELS_FILE, SETTINGS_FILE } from "./session-hermetics.js";
 
-// The registry, read through the CURRENT agent dir (which, inside a dispatch
+// The runtime, read through the CURRENT agent dir (which, inside a dispatch
 // run, is the hermetic dir whose auth/models/settings are symlinks to the real
 // ones — so this credential view matches the sessions' exactly).
-function createRegistry(): { registry: ModelRegistry; agentDir: string } {
+//
+// pi 0.80.8 replaced AuthStorage/ModelRegistry.create with async
+// ModelRuntime.create(). allowModelNetwork is left false so resolution stays
+// local (auth.json + env + bundled catalogs) and never waits on a catalog
+// refresh. See https://github.com/earendil-works/pi/blob/v0.84.1/packages/coding-agent/docs/sdk.md
+async function createRuntime(): Promise<{ runtime: ModelRuntime; agentDir: string }> {
   const agentDir = getAgentDir();
-  const authStorage = AuthStorage.create(path.join(agentDir, AUTH_FILE));
-  return { registry: ModelRegistry.create(authStorage, path.join(agentDir, MODELS_FILE)), agentDir };
+  const runtime = await ModelRuntime.create({
+    authPath: path.join(agentDir, AUTH_FILE),
+    modelsPath: path.join(agentDir, MODELS_FILE),
+    allowModelNetwork: false,
+  });
+  return { runtime, agentDir };
 }
 
 /**
@@ -36,8 +45,8 @@ export interface OrchestratorModelRequest {
 
 // Known pi thinking-level suffixes. A rule may legitimately write
 // `model: claude-opus-4-5:high` — pi-subagents resolves that fuzzily for the
-// rule's OWN subagent (it strips the suffix), but ModelRegistry.find() is an
-// EXACT match and would miss it. Strip it here so the two agree; otherwise a
+// rule's OWN subagent (it strips the suffix), but ModelRuntime.getModel() is
+// an EXACT match and would miss it. Strip it here so the two agree; otherwise a
 // perfectly good rule model would be silently skipped as an orchestrator
 // candidate and we'd fall back to the ambient default — the bug we're fixing.
 const THINKING_SUFFIX_RE = /:(?:none|off|minimal|low|medium|high|max)$/i;
@@ -92,30 +101,30 @@ function readSettingsDefaultSpec(agentDir: string): string | undefined {
  *   4. nothing usable → return undefined, i.e. let pi apply its own auth-aware
  *      default (`getAvailable()`), exactly the pre-existing behavior.
  *
- * CRITICAL (caught in review): `ModelRegistry.find()` is a pure NAME lookup with
- * NO credential check, and setting `options.model` SHORT-CIRCUITS the SDK's own
- * auth-aware selection (`findInitialModel` gates the settings default on
- * `hasConfiguredAuth` and otherwise falls back to the auth-filtered
- * `getAvailable()`). Handing it an un-credentialed model is therefore strictly
- * WORSE than handing it none: a guaranteed `No API key found` at prompt() →
- * fallbackResult → EVERY rule marked failed. A rule's pinned model proves the
- * rule AUTHOR's box had that key, not that this one does (the shipped CI
- * workflow sets only ANTHROPIC_API_KEY). So every candidate is gated on
- * `hasConfiguredAuth`, which counts env-var keys — keeping env-var-only CI
- * working.
+ * CRITICAL (caught in review): `ModelRuntime.getModel()` is a pure NAME lookup
+ * with NO credential check, and setting `options.model` SHORT-CIRCUITS the
+ * SDK's own auth-aware selection (`findInitialModel` gates the settings
+ * default on `hasConfiguredAuth` and otherwise falls back to the auth-filtered
+ * available snapshot). Handing it an un-credentialed model is therefore
+ * strictly WORSE than handing it none: a guaranteed `No API key found` at
+ * prompt() → fallbackResult → EVERY rule marked failed. A rule's pinned model
+ * proves the rule AUTHOR's box had that key, not that this one does (the
+ * shipped CI workflow sets only ANTHROPIC_API_KEY). So every candidate is
+ * gated on `hasConfiguredAuth`, which counts env-var keys — keeping
+ * env-var-only CI working.
  *
  * Never throws: model selection must not be able to kill a review.
  */
-export function resolveOrchestratorModel(
+export async function resolveOrchestratorModel(
   request: OrchestratorModelRequest | undefined,
-): CreateAgentSessionOptions["model"] | undefined {
+): Promise<CreateAgentSessionOptions["model"] | undefined> {
   if (!request) return undefined;
 
-  // Read the registry through the SAME agent dir the session will use: by now
+  // Read the runtime through the SAME agent dir the session will use: by now
   // PI_CODING_AGENT_DIR already points at the hermetic dir (see dispatchRules),
   // whose auth.json/models.json/settings.json are symlinks to the real ones — so
   // this credential view matches the session's exactly.
-  const { registry, agentDir } = createRegistry();
+  const { runtime, agentDir } = await createRuntime();
 
   const settingsDefault = readSettingsDefaultSpec(agentDir);
   // Deduped, order-preserving: the same spec can legitimately appear more than
@@ -145,14 +154,14 @@ export function resolveOrchestratorModel(
       explain('is malformed — expected "<provider>/<model>"');
       continue;
     }
-    const model = registry.find(ref.provider, ref.modelId);
+    const model = runtime.getModel(ref.provider, ref.modelId);
     if (!model) {
       explain(`is not in the pi model registry (agent dir: ${agentDir})`);
       continue;
     }
     // THE gate. Without it we hand the session a credential-less model and
-    // guarantee a total review wipeout.
-    if (!registry.hasConfiguredAuth(model)) {
+    // guarantee a total review wipeout. hasConfiguredAuth takes a provider id.
+    if (!runtime.hasConfiguredAuth(model.provider)) {
       explain("has no configured credentials on this machine");
       continue;
     }
@@ -176,22 +185,22 @@ export function resolveOrchestratorModel(
  * suffix (`:high` etc.) is split off and returned separately so the session
  * can be created at the pinned level.
  */
-export function resolveRuleSessionModel(
+export async function resolveRuleSessionModel(
   provider: string,
   modelSpec: string,
-): {
+): Promise<{
   model?: CreateAgentSessionOptions["model"];
   thinkingLevel?: string;
   error?: string;
-} {
-  const { registry } = createRegistry();
+}> {
+  const { runtime } = await createRuntime();
   const suffixMatch = THINKING_SUFFIX_RE.exec(modelSpec);
   const modelId = modelSpec.replace(THINKING_SUFFIX_RE, "");
-  const model = registry.find(provider, modelId);
+  const model = runtime.getModel(provider, modelId);
   if (!model) {
     return { error: `model "${provider}/${modelId}" is not in the pi model registry` };
   }
-  if (!registry.hasConfiguredAuth(model)) {
+  if (!runtime.hasConfiguredAuth(model.provider)) {
     return { error: `no configured credentials for provider ${provider} on this machine` };
   }
   // Codex review (PR #7): the SDK's own ThinkingLevel type is "off" |
@@ -224,7 +233,7 @@ export interface EffectiveRulesResult {
  *   1. `--model` — if credentialed on this machine (warned about when not:
  *      the user asked for it by name).
  *   2. pi's own settings default — if credentialed.
- *   3. the first credentialed model in the registry (`getAvailable()[0]`),
+ *   3. the first credentialed model in the runtime (`getAvailableSnapshot()[0]`),
  *      pi's own auth-aware notion of "the model this machine can run".
  *
  * PINNED rules pass through untouched — even when their provider has no
@@ -236,16 +245,16 @@ export interface EffectiveRulesResult {
  * Never throws. When nothing resolves at all, unpinned rules land in
  * `unresolved` with a reason the caller MUST surface as a rule failure.
  */
-export function resolveEffectiveRules(
+export async function resolveEffectiveRules(
   rules: RuleDefinition[],
   explicitDefault?: string,
-): EffectiveRulesResult {
+): Promise<EffectiveRulesResult> {
   const unpinned = rules.filter((r) => r.provider === undefined || r.model === undefined);
   if (unpinned.length === 0) {
     return { effective: rules as EffectiveRule[], unresolved: {} };
   }
 
-  const { registry, agentDir } = createRegistry();
+  const { runtime, agentDir } = await createRuntime();
 
   // Resolve the ONE default spec all unpinned rules share.
   let defaultSpec: string | undefined;
@@ -260,8 +269,8 @@ export function resolveEffectiveRules(
   ].filter((spec, i, all) => all.indexOf(spec) === i);
   for (const spec of candidates) {
     const ref = parseModelRef(spec);
-    const model = ref ? registry.find(ref.provider, ref.modelId) : undefined;
-    if (model && registry.hasConfiguredAuth(model)) {
+    const model = ref ? runtime.getModel(ref.provider, ref.modelId) : undefined;
+    if (model && runtime.hasConfiguredAuth(model.provider)) {
       // Codex review (PR #7): preserve the ORIGINAL candidate spec (which may
       // carry a thinking-level suffix like ":high") rather than reconstructing
       // from `model.provider`/`model.id` — the registry lookup above already
@@ -281,7 +290,7 @@ export function resolveEffectiveRules(
     }
   }
   if (!defaultSpec) {
-    const available = registry.getAvailable();
+    const available = runtime.getAvailableSnapshot();
     if (available.length > 0) {
       defaultSpec = `${available[0].provider}/${available[0].id}`;
     }

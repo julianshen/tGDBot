@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && mkdir -p dist/rules/builtin && cp src/rules/builtin/tgd-review.md dist/rules/builtin/tgd-review.md && mkdir -p dist/review/builtin-agents && cp src/review/builtin-agents/reviewer.md dist/review/builtin-agents/reviewer.md",
-    "test": "vitest run test/unit && npm run test:type",
+    "test": "vitest run --dir test/unit && npm run test:type",
     "test:type": "tsc -p tsconfig.type-tests.json",
     "test:smoke": "vitest run test/smoke",
     "test:all": "vitest run",
@@ -19,7 +19,7 @@
   },
   "license": "UNLICENSED",
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.84.1",
     "@juicesharp/rpiv-advisor": "2.4.0",
     "gray-matter": "4.0.3",
     "pi-subagents": "0.47.1"

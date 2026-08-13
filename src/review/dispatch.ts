@@ -141,7 +141,7 @@ async function createRealDispatchSession(
   // Explicit model — NOT pi's ambient default. See resolveOrchestratorModel.
   // When it resolves to undefined (absent/malformed/unknown spec), omitting the
   // key leaves pi to pick its own default, i.e. the previous behavior.
-  const model = resolveOrchestratorModel(orchestratorModel);
+  const model = await resolveOrchestratorModel(orchestratorModel);
 
   const { session, modelFallbackMessage } = await createAgentSession({
     resourceLoader: loader,
@@ -298,7 +298,7 @@ async function runDispatch(
     // in place, so the registry sees the same credentials the sessions will.
     // A rule that cannot be given ANY model is reported failed with its
     // reason; it is never silently dropped and never burns a model call.
-    const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
+    const { effective, unresolved } = await resolveEffectiveRules(rules, orchestratorModel);
     unresolvedForFallback = unresolved;
     const unresolvedNames = Object.keys(unresolved);
     if (effective.length === 0) {
