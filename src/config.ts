@@ -3,14 +3,16 @@
 //
 // Both providers are selected only after target normalization: GitHub uses
 // GitHubAdapter (`gh`-backed), and GitLab uses GitLabAdapter (`glab`-backed).
-import type { CliArgs } from "./cli.js";
+import type { ReviewArgs } from "./cli-args.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
 import type { RepositoryRef } from "./target/types.js";
 import type { ReviewLocator, VcsAdapter } from "./vcs/adapter.js";
 import { GitHubAdapter } from "./vcs/github-adapter.js";
 import { GitLabAdapter } from "./vcs/gitlab-adapter.js";
 
-export interface ResolvedConfig extends CliArgs {
+export type ReviewConfigArgs = Omit<ReviewArgs, "command"> & { command?: "review" };
+
+export interface ResolvedConfig extends ReviewConfigArgs {
   readonly locator: ReviewLocator;
   readonly vcsAdapter: VcsAdapter;
 }
@@ -27,7 +29,7 @@ function repositoriesMatch(
     : left.canonicalUrl === right.canonicalUrl;
 }
 
-export function resolveReviewLocator(args: CliArgs): ReviewLocator {
+export function resolveReviewLocator(args: ReviewConfigArgs): ReviewLocator {
   if (/^\d+$/.test(args.pr)) {
     const number = Number(args.pr);
     if (args.repo !== undefined) {
@@ -59,7 +61,7 @@ export function resolveReviewLocator(args: CliArgs): ReviewLocator {
   return { kind: "repository", repo: target.repo, number: target.number };
 }
 
-export function resolveConfig(args: CliArgs): ResolvedConfig {
+export function resolveConfig(args: ReviewConfigArgs): ResolvedConfig {
   const locator = resolveReviewLocator(args);
   const provider = locator.kind === "ambient" ? locator.provider : locator.repo.provider;
   if (provider === "gitlab") {
@@ -67,5 +69,12 @@ export function resolveConfig(args: CliArgs): ResolvedConfig {
   }
 
   // GitHubAdapter defaults to the real `gh`-backed executor.
-  return { ...args, locator, vcsAdapter: new GitHubAdapter() };
+  return {
+    ...args,
+    locator,
+    vcsAdapter: new GitHubAdapter(
+      undefined,
+      locator.kind === "repository" && locator.repo.provider === "github" ? locator.repo : undefined,
+    ),
+  };
 }

@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { parseArgs as nodeParseArgs } from "node:util";
+import { parseCommandArgs } from "./cli-args.js";
+import type { PollArgs, ReviewArgs } from "./cli-args.js";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
@@ -11,6 +13,7 @@ import {
   replacePendingMarker,
 } from "./review/comment-marker.js";
 import type { TerminalReviewResult } from "./review/comment-marker.js";
+import type { InlineRecoveryState } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
@@ -21,74 +24,15 @@ import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
-import { validateInlinePublishOutcomes } from "./vcs/adapter.js";
-import { parseReviewTarget } from "./target/review-target.js";
+import { AmbiguousInlinePublishError, validateInlinePublishOutcomes } from "./vcs/adapter.js";
+
+export type { CommandArgs, PollArgs, ReviewArgs, SharedReviewOptions } from "./cli-args.js";
+export { parseCommandArgs } from "./cli-args.js";
 
 /**
  * Parsed configuration for the `review` command, per SPEC.md's API Contract.
  */
-export interface CliArgs {
-  pr: string;
-  vcs: "github" | "gitlab";
-  /** Internal parse provenance used to distinguish the default from an explicit --vcs. */
-  vcsExplicit?: boolean;
-  repo?: string;
-  /**
-   * "<provider>/<model>" — the DEFAULT model (design-review #6). Runs the
-   * ORCHESTRATING session and every rule that doesn't pin its own
-   * provider/model. Optional. Resolution order for each consumer is --model ->
-   * pi's settings default -> (orchestrator only: each pinned rule's model) ->
-   * pi's auth-aware default, and every candidate must have configured
-   * credentials on this machine (see resolveOrchestratorModel /
-   * resolveEffectiveRules).
-   */
-  model?: string;
-  rulesDir: string;
-  disableBuiltinRule: boolean;
-  advisor: "on" | "off";
-  /**
-   * ADR-007: whether to render committable ```suggestion blocks (one-click
-   * "Commit suggestion"). Default on. `off` downgrades them to plain,
-   * non-committable code blocks — for repos that do not want a one-click commit
-   * path from text an automated reviewer derived from an untrusted diff.
-   */
-  suggestions: "on" | "off";
-  dryRun: boolean;
-  trustLocalRules: boolean;
-  /**
-   * Design-review P0: which dispatch engine runs the rules.
-   *  - "direct" (default): one AgentSession per rule via the pi SDK's public
-   *    API, merged deterministically in TypeScript — no orchestrating LLM on
-   *    the data path. See src/review/direct-dispatch.ts.
-   *  - "legacy": the previous LLM-orchestrated pi-subagents fan-out
-   *    (src/review/dispatch.ts). Kept for one release as the escape hatch
-   *    while the direct engine gets live mileage.
-   */
-  dispatch: "direct" | "legacy";
-  /**
-   * Design-review item #13: a HARD cost ceiling on diff size. The dispatch
-   * prompt embeds the diff once per rule (O(rules × diff) tokens — see
-   * dispatch.ts's warnIfDiffCostRisk, which only WARNS). When set and the
-   * diff exceeds it, the run skips with a visible notice (exit 0, nothing
-   * posted) instead of silently spending. Absent = unlimited (the
-   * pre-existing behavior). Deliberately NOT part of the dedup config hash:
-   * a size-skip writes no marker, so a later run with a higher ceiling is
-   * never wrongly deduped, and for runs under the ceiling the output is
-   * ceiling-independent.
-   */
-  maxDiffChars?: number;
-}
-
-const DEFAULTS = {
-  vcs: "github" as const,
-  rulesDir: ".review/rules",
-  disableBuiltinRule: false,
-  advisor: "on" as const,
-  suggestions: "on" as const,
-  dryRun: false,
-  trustLocalRules: false,
-  dispatch: "direct" as const,
-};
+export type CliArgs = Omit<ReviewArgs, "command">;
 
 /**
  * Parses CLI argv into a CliArgs object for the `review` command.
@@ -121,115 +65,15 @@ const DEFAULTS = {
  * enforces the trust boundary in the first place.
  */
 export function parseArgs(argv: string[]): CliArgs {
-  const { values } = nodeParseArgs({
-    args: argv,
-    // Allow (and ignore) the leading positional `review` command token.
-    allowPositionals: true,
-    options: {
-      pr: { type: "string" },
-      repo: { type: "string" },
-      vcs: { type: "string" },
-      "rules-dir": { type: "string" },
-      "disable-builtin-rule": { type: "boolean" },
-      advisor: { type: "string" },
-      suggestions: { type: "string" },
-      model: { type: "string" },
-      "dry-run": { type: "boolean" },
-      "trust-local-rules": { type: "boolean" },
-      "max-diff-chars": { type: "string" },
-      dispatch: { type: "string" },
-    },
-  });
-
-  if (!values.pr) {
-    throw new Error(
-      "Missing required argument: --pr <number> (usage: tgd-review-agent review --pr <number>)",
-    );
+  const parsed = parseCommandArgs(argv[0] === "review" ? argv : ["review", ...argv]);
+  if (parsed.command !== "review") {
+    throw new Error("parseArgs only supports the review command");
   }
-
-  // Defense-in-depth (DEBT.md security item, Low): --pr is interpolated
-  // into `gh api repos/{owner}/{repo}/issues/${id}/comments`-style paths in
-  // github-adapter.ts. Not currently exploitable — execFile is invoked with
-  // array args (no shell), and in practice callers pass a genuine integer PR
-  // number — but a plain positive-integer check costs nothing and closes off
-  // any future path/query-string interpolation from accepting non-numeric
-  // input.
-  if (!/^\d+$/.test(values.pr as string)) {
-    try {
-      parseReviewTarget(values.pr as string);
-    } catch {
-      throw new Error(
-        `Invalid --pr value: "${values.pr as string}" (expected a positive integer or complete GitHub/GitLab review URL)`,
-      );
-    }
-  }
-
-  const vcs = (values.vcs as string | undefined) ?? DEFAULTS.vcs;
-  if (vcs !== "github" && vcs !== "gitlab") {
-    throw new Error(`Invalid --vcs value: "${vcs}" (expected "github" or "gitlab")`);
-  }
-
-  const advisor = (values.advisor as string | undefined) ?? DEFAULTS.advisor;
-  if (advisor !== "on" && advisor !== "off") {
-    throw new Error(`Invalid --advisor value: "${advisor}" (expected "on" or "off")`);
-  }
-
-  const suggestions = (values.suggestions as string | undefined) ?? DEFAULTS.suggestions;
-  if (suggestions !== "on" && suggestions !== "off") {
-    throw new Error(`Invalid --suggestions value: "${suggestions}" (expected "on" or "off")`);
-  }
-
-  const dispatch = (values.dispatch as string | undefined) ?? DEFAULTS.dispatch;
-  if (dispatch !== "direct" && dispatch !== "legacy") {
-    throw new Error(`Invalid --dispatch value: "${dispatch}" (expected "direct" or "legacy")`);
-  }
-
-  // Issue #1 (round 2), review fix: validate --model HERE, like --vcs/--advisor.
-  // `??` is nullish-only, so an EMPTY string would otherwise sail past the
-  // rule-derived default and land back on pi's ambient default — silently
-  // restoring the exact coupling this flag exists to remove (realistic trigger:
-  // a workflow passing `--model "${{ inputs.model }}"` with the input unset).
-  const model = values.model as string | undefined;
-  if (model !== undefined) {
-    const slash = model.indexOf("/");
-    if (slash <= 0 || slash === model.length - 1) {
-      throw new Error(
-        `Invalid --model value: "${model}" (expected "<provider>/<model>", e.g. "openai-codex/gpt-5.6-terra")`,
-      );
-    }
-  }
-
-  // Same validation posture as --pr: `parseArgs` is the one place bad input
-  // dies with a naming, actionable message instead of surfacing later as NaN
-  // comparisons. Zero is rejected too — a ceiling every diff exceeds is
-  // certainly a mistyped value, not a real configuration.
-  const maxDiffCharsRaw = values["max-diff-chars"] as string | undefined;
-  let maxDiffChars: number | undefined;
-  if (maxDiffCharsRaw !== undefined) {
-    if (!/^\d+$/.test(maxDiffCharsRaw) || Number(maxDiffCharsRaw) === 0) {
-      throw new Error(
-        `Invalid --max-diff-chars value: "${maxDiffCharsRaw}" (expected a positive integer, e.g. --max-diff-chars 500000)`,
-      );
-    }
-    maxDiffChars = Number(maxDiffCharsRaw);
-  }
-
-  const result: CliArgs = {
-    pr: values.pr as string,
-    repo: values.repo as string | undefined,
-    vcs,
-    model,
-    maxDiffChars,
-    dispatch,
-    rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
-    disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
-    advisor,
-    suggestions,
-    dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
-    trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,
-  };
+  const { command, stateDir, ...reviewArgs } = parsed;
+  void command;
+  const result: CliArgs = stateDir === undefined ? reviewArgs : { ...reviewArgs, stateDir };
   Object.defineProperty(result, "vcsExplicit", {
-    value: values.vcs !== undefined,
+    value: parsed.vcsExplicit,
     enumerable: false,
   });
   return result;
@@ -503,6 +347,31 @@ export async function review(
   // process died during the final marker update, finalize the exact same note
   // without dispatching again or risking duplicate inline POSTs.
   const recovery = botComment?.pendingState;
+  if (
+    botComment !== null &&
+    (recovery?.phase === "ambiguous" || (recovery?.phase === "ready" && recovery.inlineRecovery !== undefined)) &&
+    recovery.headSha === pr.headSha && recovery.configHash === configHash
+  ) {
+    if (recovery.noteId !== botComment.id || recovery.terminalResult === undefined || recovery.inlineRecovery === undefined || config.vcsAdapter.recoverInlineReview === undefined) {
+      throw new Error("Invalid current inline recovery binding; refusing to dispatch or write");
+    }
+    if (config.dryRun) return EXIT_PARTIAL;
+    const status = await config.vcsAdapter.recoverInlineReview(config.locator, recovery.inlineRecovery);
+    if (status !== "complete") {
+      // A durable ready/ambiguous checkpoint is written before the atomic POST.
+      // An empty marker lookup after that point is not proof of rejection:
+      // GitHub's REST/GraphQL views may lag an accepted write. Keep the full
+      // fallback visible and permanently suppress reposting this action until
+      // exact authenticated markers reconcile it.
+      logStatus({ status: "partial", findingsCount: recovery.terminalResult.findingsCount, rulesRun: recovery.terminalResult.rulesRun, rulesFailed: recovery.terminalResult.rulesFailed, reason: status === "none" ? "inline-publication-awaiting-consistency" : "inline-publication-still-ambiguous" });
+      return EXIT_PARTIAL;
+    }
+    const finalizedBody = `${recovery.inlineRecovery.noFallbackBody.trimEnd()}\n\n${formatMarker(pr.headSha, configHash)}`;
+    const finalized = await config.vcsAdapter.upsertComment(config.locator, finalizedBody, botComment);
+    if (finalized.id !== botComment.id || finalized.lastReviewedSha !== pr.headSha || finalized.reviewedConfig !== configHash) throw new Error("Could not finalize ambiguous inline recovery checkpoint");
+    logStatus({ status: recovery.terminalResult.status, findingsCount: recovery.terminalResult.findingsCount, rulesRun: recovery.terminalResult.rulesRun, rulesFailed: recovery.terminalResult.rulesFailed, reason: "recovered-ambiguous-inline-review" });
+    return recovery.terminalResult.exitCode;
+  }
   // Only a ready checkpoint for this exact SHA/config can represent an
   // interrupted current run. Once those two fields match, every remaining
   // binding is mandatory and a mismatch is corruption, not permission to
@@ -723,20 +592,39 @@ export async function review(
     // inline outcomes and selective fallback are settled do we replace it with
     // the complete dedup marker, targeting the exact returned identity.
     let allInlineIds: Set<string> | undefined;
+    let inlineRecovery: InlineRecoveryState | undefined;
     if (orchestration.inlineComments.length > 0) {
       allInlineIds = new Set(
         orchestration.inlineComments.map((comment) => comment.clientId),
       );
+      if (config.vcsAdapter.prepareInlineReviewRecovery !== undefined) {
+        const actionIdentity = createHash("sha256").update(JSON.stringify({ configHash, headSha: pr.headSha,
+          children: orchestration.inlineComments.map((comment) => ({ clientId: comment.clientId, path: comment.path, line: comment.line, startLine: comment.startLine ?? null, body: comment.body })) }), "utf8").digest("hex");
+        const prepared = await config.vcsAdapter.prepareInlineReviewRecovery(config.locator, pr.headSha, orchestration.inlineComments, `${configHash}:${actionIdentity}`);
+        inlineRecovery = { ...prepared, noFallbackBody: buildBody(orchestration, noFallbackIds, "") };
+      }
       // The provider assigns the real note identity on the first write, but
       // every already-known recovery field must be representable before that
       // write. A safe placeholder exercises the exact same bounded encoder.
-      formatPendingMarker({
+      if (provider === "github") {
+        if (orchestration.inlineComments.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
+        const payloadChars = orchestration.inlineComments.reduce((total, comment, index) => total + comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 256, 0);
+        if (payloadChars > 1_000_000 || orchestration.inlineComments.some((comment, index) => comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 128 > 65_536)) {
+          throw new Error("GitHub inline review exceeds the safe atomic payload size");
+        }
+      }
+      const readyPreflight = formatPendingMarker({
         phase: "ready",
         headSha: pr.headSha,
         configHash,
         noteId: "preflight",
         terminalResult,
+        inlineRecovery,
       });
+      buildBody(orchestration, allInlineIds, readyPreflight);
+      if (inlineRecovery !== undefined) {
+        buildBody(orchestration, allInlineIds, formatPendingMarker({ phase: "ambiguous", headSha: pr.headSha, configHash, noteId: "preflight", terminalResult, inlineRecovery }));
+      }
     }
 
     const writtenSummary = await config.vcsAdapter.upsertComment(
@@ -780,6 +668,7 @@ export async function review(
             configHash,
             noteId: writtenSummary.id,
             terminalResult,
+            inlineRecovery,
           }),
         ),
         writtenSummary,
@@ -825,11 +714,13 @@ export async function review(
     let finalFallbackIds = noFallbackIds;
     if (orchestration.inlineComments.length > 0) {
       let fallbackIds: Set<string> | undefined;
+      let ambiguousInlineWrite = false;
       try {
         const outcomes = await config.vcsAdapter.createInlineReview(
           config.locator,
           pr.headSha,
           orchestration.inlineComments,
+          inlineRecovery,
         );
         try {
           const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
@@ -843,6 +734,9 @@ export async function review(
           const validated = validateInlinePublishOutcomes(
             orchestration.inlineComments,
             outcomes,
+            config.locator.kind === "repository"
+              ? { repo: config.locator.repo, reviewNumber: config.locator.number }
+              : undefined,
           );
           fallbackIds = new Set(
             validated
@@ -857,15 +751,35 @@ export async function review(
           fallbackIds = allInlineIds;
         }
       } catch (err) {
-        console.warn(
-          `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
-            `rewriting the summary comment to carry every finding instead`,
-        );
-        fallbackIds = allInlineIds;
+        if (err instanceof AmbiguousInlinePublishError && inlineRecovery !== undefined) {
+          console.warn(
+            `tgd-review-agent: GitHub may have accepted the inline review (${err.message}); ` +
+              `not duplicating those findings into the summary; a later run will reconcile markers`,
+          );
+          fallbackIds = noFallbackIds;
+          ambiguousInlineWrite = true;
+        } else {
+          console.warn(
+            `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
+              `rewriting the summary comment to carry every finding instead`,
+          );
+          fallbackIds = allInlineIds;
+        }
       }
 
       if (fallbackIds && fallbackIds.size > 0) {
         finalFallbackIds = fallbackIds;
+      }
+
+      if (ambiguousInlineWrite) {
+        const ambiguousCheckpoint = await config.vcsAdapter.upsertComment(
+          config.locator,
+          buildBody(orchestration, allInlineIds!, formatPendingMarker({ phase: "ambiguous", headSha: pr.headSha, configHash, noteId: summaryIdentity.id, terminalResult, inlineRecovery: inlineRecovery! })),
+          summaryIdentity,
+        );
+        if (ambiguousCheckpoint.id !== summaryIdentity.id || ambiguousCheckpoint.pendingState?.phase !== "ambiguous") throw new Error("Could not persist ambiguous inline recovery checkpoint");
+        logStatus({ status: "partial", findingsCount: orchestration.findingsCount, rulesRun: orchestration.rulesRun, rulesFailed: orchestration.rulesFailed, reason: "inline-publication-ambiguous" });
+        return EXIT_PARTIAL;
       }
 
       const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
@@ -943,17 +857,41 @@ export async function review(
 }
 
 /**
- * Entry point. Parses argv, runs the `review` command, and exits with its
- * returned code. Parse errors and any error `review()` doesn't itself
- * recover from are logged and exit 1.
+ * Entry point. Parses argv, dispatches `review` or `poll`, and exits with the
+ * command's returned code. Poll currently uses an injectable seam whose
+ * default throws PollNotImplementedError until its runtime is implemented.
+ * Parse errors and unrecovered command errors are logged and exit 1.
  */
-export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
+export class PollNotImplementedError extends Error {
+  constructor() {
+    super("The poll command runtime is not implemented");
+    this.name = "PollNotImplementedError";
+  }
+}
+
+async function runPollNotImplemented(args: PollArgs): Promise<number> {
+  void args;
+  throw new PollNotImplementedError();
+}
+
+export interface MainDependencies {
+  runPoll?: (args: PollArgs) => Promise<number>;
+}
+
+export async function main(
+  argv: string[] = process.argv.slice(2),
+  dependencies: MainDependencies = {},
+): Promise<void> {
   try {
-    const args = parseArgs(argv);
-    const exitCode = await review(args);
+    const args = parseCommandArgs(argv);
+    const exitCode = args.command === "review"
+      ? await review(args)
+      : await (dependencies.runPoll ?? runPollNotImplemented)(args);
     process.exit(exitCode);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
+    const message = err instanceof PollNotImplementedError
+      ? `${err.name}: ${err.message}`
+      : err instanceof Error ? err.message : String(err);
     console.error(`tgd-review-agent: ${message}`);
     process.exit(EXIT_FATAL);
   }

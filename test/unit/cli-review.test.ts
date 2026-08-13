@@ -7,21 +7,68 @@
 // dependency-injection spirit as Task 5's `dispatchRules` (which itself
 // takes an injectable `createSession`).
 import { existsSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { parseArgs, review } from "../../src/cli.js";
+import { main, parseArgs, review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { computeReviewConfigHash, formatMarker } from "../../src/review/dedup.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
-import { formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
+import { deriveInlineChildId, formatInlineRecoveryMarker, formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import { resolveReviewLocator } from "../../src/config.js";
+import { AmbiguousInlinePublishError, validateConversationItemIdentity } from "../../src/vcs/adapter.js";
 import type { BotComment, PullRequestInfo, RuleFileContent, VcsAdapter } from "../../src/vcs/adapter.js";
 import type { LoadResult } from "../../src/rules/loader.js";
 import type { RuleDefinition } from "../../src/rules/types.js";
 import type { DispatchResult } from "../../src/review/types.js";
 import { orchestrate as buildPresentation } from "../../src/review/orchestrate.js";
 import type { OrchestrationResult } from "../../src/review/orchestrate.js";
+
+const postedInline = (clientId: string) => ({
+  clientId,
+  status: "posted" as const,
+  identity: validateConversationItemIdentity({
+    provider: "github" as const,
+    commentId: `comment-${clientId}`,
+    threadId: `thread-${clientId}`,
+    url: `https://github.com/acme/app/pull/42#discussion_rcomment-${clientId}`,
+  }, {
+    repo: { provider: "github", host: "github.com", owner: "acme", repo: "app", canonicalUrl: "https://github.com/acme/app" },
+    reviewNumber: 42,
+  }),
+});
+
+describe("main command dispatch", () => {
+  it("dispatches poll arguments through the injectable temporary seam", async () => {
+    const runPoll = vi.fn().mockResolvedValue(0);
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+
+    await main(["poll", "--repo", "owner/repo"], { runPoll });
+
+    expect(runPoll).toHaveBeenCalledWith(expect.objectContaining({
+      command: "poll",
+      repo: "owner/repo",
+    }));
+    expect(exit).toHaveBeenCalledWith(0);
+    exit.mockRestore();
+  });
+
+  it("reports the named not-implemented error for the default poll runtime", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+    try {
+      await main(["poll", "--repo", "owner/repo"]);
+
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("PollNotImplementedError"));
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      error.mockRestore();
+      exit.mockRestore();
+    }
+  });
+});
 
 describe("resolveReviewLocator", () => {
   it("resolves numeric ambient GitHub targets", () => {
@@ -162,6 +209,8 @@ interface Harness {
     upsertComment: ReturnType<typeof vi.fn>;
     getRuleFilesFromBase: ReturnType<typeof vi.fn>;
     createInlineReview: ReturnType<typeof vi.fn>;
+    prepareInlineReviewRecovery: ReturnType<typeof vi.fn>;
+    recoverInlineReview: ReturnType<typeof vi.fn>;
     resolveStaleReviewThreads: ReturnType<typeof vi.fn>;
   };
   resolveConfig: ReturnType<typeof vi.fn>;
@@ -215,8 +264,22 @@ function makeHarness(options: {
     getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
     createInlineReview: vi.fn().mockImplementation(
       (_locator, _headSha, comments: Array<{ clientId: string }>) =>
-        Promise.resolve(comments.map(({ clientId }) => ({ clientId, status: "posted" }))),
+        Promise.resolve(comments.map(({ clientId }) => postedInline(clientId))),
     ),
+    prepareInlineReviewRecovery: vi.fn().mockImplementation(
+      (_locator, headSha: string, comments: Array<{ clientId: string }>, runIdentity: string) => {
+        const parentId = `act_${createHash("sha256").update(runIdentity).digest("hex").slice(0, 32)}`;
+        return Promise.resolve({ noFallbackBody: "", children: comments.map(({ clientId }) => {
+          const repositoryDigest = "d".repeat(64);
+          const contentDigest = createHash("sha256").update(clientId).digest("hex");
+          const placementDigest = "e".repeat(64);
+          const childId = deriveInlineChildId(parentId, clientId, contentDigest, placementDigest);
+          const child = { clientId, kind: "finding" as const, parentId, childId, repositoryDigest, reviewNumber: 42, contentDigest, headSha, placementDigest };
+          return { ...child, marker: formatInlineRecoveryMarker(child) };
+        }) });
+      },
+    ),
+    recoverInlineReview: vi.fn().mockResolvedValue("complete"),
     resolveStaleReviewThreads: vi.fn().mockResolvedValue(0),
   };
 
@@ -1244,6 +1307,67 @@ describe("inline review comments", () => {
     return h;
   }
 
+  it("completes anchored fallback publication for an adapter without durable inline recovery capability", async () => {
+    const h = inlineHarness(partialPresentation());
+    h.args = makeArgs({ vcs: "gitlab" });
+    h.vcsAdapter.prepareInlineReviewRecovery = undefined as never;
+    h.vcsAdapter.recoverInlineReview = undefined as never;
+    h.vcsAdapter.createInlineReview.mockRejectedValue(new Error("inline unsupported"));
+    expect(await review(h.args, depsFrom(h))).toBe(0);
+    const finalBody = String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    expect(finalBody).toContain("finding 0");
+    expect(finalBody).toContain("tgd-review-agent:sha=");
+    expect(finalBody).not.toContain("phase=ambiguous");
+  });
+
+  it("keeps all findings durably visible and leaves a pending marker after an ambiguous inline write", async () => {
+    const h = inlineHarness(partialPresentation());
+    h.vcsAdapter.createInlineReview.mockRejectedValue(new AmbiguousInlinePublishError());
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
+    const finalBody = String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    for (const finding of ["finding 0", "finding 1", "finding 2"]) {
+      expect(finalBody).toContain(finding);
+    }
+    expect(parseBotMarker(finalBody)?.pendingState?.phase).toBe("ambiguous");
+    expect(finalBody).not.toContain("tgd-review-agent:sha=");
+  });
+
+  it("recovers an ambiguously accepted write on the next run without redispatch or repost", async () => {
+    const first = inlineHarness(partialPresentation());
+    first.vcsAdapter.createInlineReview.mockRejectedValue(new AmbiguousInlinePublishError());
+    await review(first.args, depsFrom(first));
+    const body = String(first.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    const parsed = parseBotMarker(body)!;
+    const second = makeHarness({ botComment: { id: "written-summary-1", body, ...parsed } });
+    second.vcsAdapter.recoverInlineReview.mockResolvedValue("complete");
+    const exit = await review(second.args, depsFrom(second));
+    expect(exit).toBe(0);
+    expect(second.dispatchRules).not.toHaveBeenCalled();
+    expect(second.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    const finalized = String(second.vcsAdapter.upsertComment.mock.calls[0]?.[1]);
+    expect(finalized).toContain("tgd-review-agent:sha=cafef00d");
+    expect(finalized).not.toContain("finding 0");
+  });
+
+  it("keeps fallback visible and pending when the first reconciliation sees no markers", async () => {
+    const first = inlineHarness(partialPresentation());
+    first.vcsAdapter.createInlineReview.mockRejectedValue(new AmbiguousInlinePublishError());
+    await review(first.args, depsFrom(first));
+    const body = String(first.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    const second = makeHarness({ botComment: { id: "written-summary-1", body, ...parseBotMarker(body)! } });
+    second.vcsAdapter.recoverInlineReview.mockResolvedValue("none");
+    const logSpy = vi.spyOn(console, "log");
+    expect(await review(second.args, depsFrom(second))).toBe(2);
+    expect(second.dispatchRules).not.toHaveBeenCalled();
+    expect(second.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(body).toContain("finding 0");
+    expect(parseBotMarker(body)?.pendingState?.phase).toBe("ambiguous");
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("inline-publication-awaiting-consistency"));
+  });
+
   const singleFinding = {
     ruleName: "rule-a",
     severity: "blocking" as const,
@@ -1470,9 +1594,9 @@ describe("inline review comments", () => {
     const presentation = partialPresentation();
     const h = inlineHarness(presentation);
     h.vcsAdapter.createInlineReview.mockResolvedValue([
-      { clientId: "finding-0", status: "posted" },
+      postedInline("finding-0"),
       { clientId: "finding-1", status: "failed", reason: "position rejected" },
-      { clientId: "finding-2", status: "posted" },
+      postedInline("finding-2"),
     ]);
     h.vcsAdapter.findBotComment
       .mockResolvedValueOnce(null)
@@ -1507,9 +1631,9 @@ describe("inline review comments", () => {
     const presentation = partialPresentation();
     const h = inlineHarness(presentation);
     h.vcsAdapter.createInlineReview.mockResolvedValue([
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "finding-1", status: "failed" },
-      { clientId: "finding-2", status: "posted" },
+      postedInline("finding-0"),
+      { clientId: "finding-1", status: "failed", reason: "position rejected" },
+      postedInline("finding-2"),
     ]);
     h.vcsAdapter.findBotComment
       .mockResolvedValueOnce(null)
@@ -1588,9 +1712,9 @@ describe("inline review comments", () => {
     const presentation = partialPresentation();
     const h = inlineHarness(presentation);
     h.vcsAdapter.createInlineReview.mockResolvedValue([
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "finding-1", status: "failed" },
-      { clientId: "finding-2", status: "posted" },
+      postedInline("finding-0"),
+      { clientId: "finding-1", status: "failed", reason: "position rejected" },
+      postedInline("finding-2"),
     ]);
     let stored: BotComment | null = null;
     let rejectCompleteOnce = true;
@@ -1652,9 +1776,9 @@ describe("inline review comments", () => {
     });
     h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
     h.vcsAdapter.createInlineReview.mockResolvedValue([
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "finding-1", status: "failed" },
-      { clientId: "finding-2", status: "posted" },
+      postedInline("finding-0"),
+      { clientId: "finding-1", status: "failed", reason: "position rejected" },
+      postedInline("finding-2"),
     ]);
     let stored: BotComment | null = null;
     let rejectCompleteOnce = true;
@@ -1738,23 +1862,23 @@ describe("inline review comments", () => {
 
   it.each([
     ["missing", [
-      { clientId: "finding-0", status: "posted" },
+      postedInline("finding-0"),
       { clientId: "finding-1", status: "failed" },
     ]],
     ["duplicate", [
-      { clientId: "finding-0", status: "posted" },
+      postedInline("finding-0"),
       { clientId: "finding-0", status: "failed" },
-      { clientId: "finding-2", status: "posted" },
+      postedInline("finding-2"),
     ]],
     ["unknown", [
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "finding-1", status: "posted" },
+      postedInline("finding-0"),
+      postedInline("finding-1"),
       { clientId: "not-a-finding", status: "failed" },
     ]],
     ["invalid status", [
-      { clientId: "finding-0", status: "posted" },
+      postedInline("finding-0"),
       { clientId: "finding-1", status: "accepted" },
-      { clientId: "finding-2", status: "posted" },
+      postedInline("finding-2"),
     ]],
   ])("falls back all inline candidates for %s outcome IDs", async (_name, outcomes) => {
     const presentation = partialPresentation();
@@ -1783,9 +1907,9 @@ describe("inline review comments", () => {
     const presentation = partialPresentation();
     const h = inlineHarness(presentation);
     h.vcsAdapter.createInlineReview.mockResolvedValue([
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "finding-1", status: "failed" },
-      { clientId: "finding-2", status: "posted" },
+      postedInline("finding-0"),
+      { clientId: "finding-1", status: "failed", reason: "position rejected" },
+      postedInline("finding-2"),
     ]);
     h.vcsAdapter.upsertComment.mockResolvedValueOnce(undefined);
 
@@ -1969,7 +2093,7 @@ describe("inline review comments", () => {
     log.mockRestore();
 
     const selective = setup();
-    selective.vcsAdapter.createInlineReview.mockResolvedValue([{ clientId: "finding-0", status: "posted" }, { clientId: "finding-1", status: "failed" }]);
+    selective.vcsAdapter.createInlineReview.mockResolvedValue([postedInline("finding-0"), { clientId: "finding-1", status: "failed", reason: "position rejected" }]);
     await review(selective.args, depsFrom(selective));
     for (const call of selective.vcsAdapter.upsertComment.mock.calls) expect(count(String(call[1]))).toBe(1);
 
