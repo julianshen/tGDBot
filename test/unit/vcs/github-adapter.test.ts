@@ -1355,6 +1355,41 @@ describe("GitHub conversation activity", () => {
       args.some((arg) => arg.includes("issues/42/comments")) ? JSON.stringify([{ id: 2, body: `edited\n${marker}`, user: { login: "octo-bot" }, html_url: `${review.url}#issuecomment-2` }]) : "[]");
     await expect(new GitHubAdapter(execGh, repo).findBotChildMarker(review, expected)).rejects.toThrow(/body digest/i);
   });
+
+  it("findPublishedMarker recovers a child marker through findBotChildMarker", async () => {
+    const visibleBody = "trusted finding";
+    const contentDigest = computeContentDigest(visibleBody);
+    const marker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `finding_${"b".repeat(32)}`,
+      repositoryDigest,
+      reviewNumber: 42,
+      contentDigest,
+    });
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") {
+        return JSON.stringify({
+          data: { repository: { pullRequest: { id: "PR_kwDO42", url: "https://github.com/octo-org/octo-repo/pull/42" } } },
+        });
+      }
+      if (args.some((arg) => String(arg).includes("issues/42/comments"))) {
+        return JSON.stringify([{
+          id: 2,
+          body: `${visibleBody}\n${marker}`,
+          user: { login: "octo-bot" },
+          html_url: "https://github.com/octo-org/octo-repo/pull/42#issuecomment-2",
+        }]);
+      }
+      return "[]";
+    });
+    await expect(new GitHubAdapter(execGh, repo).findPublishedMarker({
+      kind: "repository",
+      repo,
+      number: 42,
+    }, marker)).resolves.toMatchObject({ commentId: "2" });
+  });
 });
 
 // Design-review #10: resolveStaleReviewThreads collapses the bot's OWN

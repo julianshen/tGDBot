@@ -22,7 +22,7 @@ import type {
 import type { GitHubRepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
-import { computeContentDigest, computeRepositoryDigest, verifyChildMarkerBinding } from "../conversation/markers.js";
+import { computeContentDigest, computeRepositoryDigest, parseChildMarker, verifyChildMarkerBinding } from "../conversation/markers.js";
 import type { BotIdentity, ConversationItemIdentity, ReviewIdentity } from "../conversation/types.js";
 import {
   validateOpenReviewPageToken,
@@ -1052,6 +1052,54 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         page += 1;
       } while (rows.length === 50);
       }
+    return matches[0] ?? null;
+  }
+
+  async findPublishedMarker(locator: ReviewLocator, marker: string): Promise<ConversationItemIdentity | null> {
+    if (typeof marker !== "string" || marker.length === 0 || marker.length > 2_048) {
+      throw new Error("Invalid publication marker");
+    }
+    const { repo, id } = resolvePullLocator(locator);
+    const parsed = parseChildMarker(marker);
+    if (parsed !== null && repo !== undefined) {
+      const review = await this.resolveReviewIdentity(repo, Number(id));
+      return this.findBotChildMarker(review, {
+        provider: "github",
+        repositoryDigest: review.repositoryDigest,
+        reviewNumber: review.reviewNumber,
+        kind: parsed.kind,
+        parentId: parsed.parentId,
+        childId: parsed.childId,
+        contentDigest: parsed.contentDigest,
+      });
+    }
+    const bot = await this.getBotLogin(repo);
+    const matches: ConversationItemIdentity[] = [];
+    const binding = repo === undefined
+      ? undefined
+      : { repo, reviewNumber: Number(id) };
+    for (const stream of ["issue", "inline"] as const) {
+      const path = stream === "issue"
+        ? `${apiRepo(repo)}/issues/${id}/comments`
+        : `${apiRepo(repo)}/pulls/${id}/comments`;
+      for await (const rows of this.restCommentPages(repo, path, `${stream} publication markers`)) {
+        for (const row of rows) {
+          const author = typeof row.user === "object" && row.user !== null
+            ? (row.user as { login?: unknown }).login
+            : undefined;
+          if (typeof author !== "string" || author.toLowerCase() !== bot || typeof row.body !== "string") continue;
+          const lastLine = canonicalInlineBody(row.body).split("\n").at(-1) ?? "";
+          if (lastLine !== marker && !row.body.includes(marker)) continue;
+          const identity = {
+            provider: "github" as const,
+            commentId: providerId(row.id, "publication marker comment id"),
+            url: textField(row.html_url, "publication marker URL"),
+          };
+          matches.push(binding === undefined ? identity : validateConversationItemIdentity(identity, binding));
+          if (matches.length > 1) throw new Error("Multiple authenticated GitHub publication marker matches");
+        }
+      }
+    }
     return matches[0] ?? null;
   }
 

@@ -4,7 +4,7 @@ import { parseBotMarker } from "../review/comment-marker.js";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import type { GitLabRepositoryRef } from "../target/types.js";
-import { computeContentDigest, computeRepositoryDigest, verifyChildMarkerBinding } from "../conversation/markers.js";
+import { computeContentDigest, computeRepositoryDigest, parseChildMarker, verifyChildMarkerBinding } from "../conversation/markers.js";
 import type { BotIdentity, ConversationItemIdentity, ReviewIdentity } from "../conversation/types.js";
 import { resolveGitLabRelatedWork } from "./gitlab-related-work.js";
 import {
@@ -1778,6 +1778,54 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
           url: `${review.url}#note_${note.id}`,
         }, { repo, reviewNumber: review.reviewNumber }));
         if (matches.length > 1) throw new Error("Multiple authenticated GitLab child marker matches");
+      }
+    }
+    return matches[0] ?? null;
+  }
+
+  async findPublishedMarker(locator: ReviewLocator, marker: string): Promise<ConversationItemIdentity | null> {
+    if (typeof marker !== "string" || marker.length === 0 || marker.length > 2_048) {
+      throw new Error("Invalid publication marker");
+    }
+    const { repo, iid } = resolveMergeRequestLocator(locator);
+    const parsed = parseChildMarker(marker);
+    if (parsed !== null && this.repository !== undefined) {
+      const mr = parseConversationMergeRequest(await this.execGlab([
+        "api", "--method", "GET", "--hostname", repo.host,
+        projectEndpoint(repo, `merge_requests/${iid}`),
+      ]));
+      return this.findBotChildMarker({
+        provider: "gitlab",
+        repositoryDigest: computeRepositoryDigest("gitlab", repo.canonicalUrl),
+        reviewNumber: Number(iid),
+        reviewId: mr.id,
+        url: mr.webUrl,
+      }, {
+        provider: "gitlab",
+        repositoryDigest: parsed.repositoryDigest,
+        reviewNumber: parsed.reviewNumber,
+        kind: parsed.kind,
+        parentId: parsed.parentId,
+        childId: parsed.childId,
+        contentDigest: parsed.contentDigest,
+      });
+    }
+    const username = await this.getUsername(repo);
+    const matches: ConversationItemIdentity[] = [];
+    const binding = { repo, reviewNumber: Number(iid) };
+    for (const row of await this.paginateNdjson(repo, `merge_requests/${iid}/discussions`, 100, "discussions")) {
+      const discussion = parseConversationDiscussion(row);
+      for (const note of discussion.notes) {
+        if (note.author !== username) continue;
+        const lastLine = note.body.split(/\r?\n/u).at(-1) ?? "";
+        if (lastLine !== marker && !note.body.includes(marker)) continue;
+        matches.push(validateConversationItemIdentity({
+          provider: "gitlab",
+          commentId: note.id,
+          ...(discussion.individualNote ? {} : { threadId: discussion.id }),
+          url: `${repo.canonicalUrl}/-/merge_requests/${iid}#note_${note.id}`,
+        }, binding));
+        if (matches.length > 1) throw new Error("Multiple authenticated GitLab publication marker matches");
       }
     }
     return matches[0] ?? null;

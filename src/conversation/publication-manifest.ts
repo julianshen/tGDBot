@@ -368,15 +368,15 @@ async function writeOne(
     return markPosted(action, child, recovered);
   }
   await hooks?.beforeChildWrite?.(child);
+  let next: PublicationAction;
   try {
     const result = await writer.writeChild(child, action);
-    const next = updatePublicationChild(action, child.id, {
+    next = updatePublicationChild(action, child.id, {
       status: result.status,
       ...(result.identity === undefined ? {} : { identity: result.identity }),
     });
-    await hooks?.afterChildWrite?.(child);
-    return next;
   } catch (error) {
+    if ((error as { publicationHalt?: unknown } | undefined)?.publicationHalt === true) throw error;
     if (child.kind === "inline" || child.kind === "fallback") {
       const failed = updatePublicationChild(action, child.id, { status: "failed" });
       await hooks?.afterChildWrite?.(child);
@@ -385,6 +385,12 @@ async function writeOne(
     }
     throw error;
   }
+  await hooks?.afterChildWrite?.(child);
+  return next;
+}
+
+function isPublicationHalt(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { publicationHalt?: unknown }).publicationHalt === true;
 }
 
 function failInlinesSelectFallbacks(action: PublicationAction): PublicationAction {
@@ -475,18 +481,15 @@ export async function executePublication(options: {
               ...(result.identity === undefined ? {} : { identity: result.identity }),
             });
           }
-        } catch {
+        } catch (error) {
+          if (isPublicationHalt(error)) throw error;
           action = failInlinesSelectFallbacks(action);
         }
         await persistAction(session, action, now());
         await options.hooks?.afterChildWrite?.(first);
       }
       if (action.children.some((child) => child.kind === "fallback" && child.status === "pending")) {
-        if (action.children.some((child) => child.kind === "inline" && child.status === "failed")) {
-          action = failInlinesSelectFallbacks(action);
-        } else {
-          action = resolveSelectiveFallbacks(action);
-        }
+        action = resolveSelectiveFallbacks(action);
         await persistAction(session, action, now());
       }
     } else if (strategy === "gitlab-selective") {
@@ -494,8 +497,10 @@ export async function executePublication(options: {
         try {
           action = await writeOne(action, child, options.writer, options.hooks);
         } catch (error) {
+          if (isPublicationHalt(error)) throw error;
           const failed = (error as { publicationAction?: PublicationAction }).publicationAction;
-          action = failed ?? action;
+          if (failed === undefined) throw error;
+          action = failed;
         }
         await persistAction(session, action, now());
       }

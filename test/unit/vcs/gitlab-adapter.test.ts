@@ -1889,6 +1889,38 @@ describe("GitLab conversation activity", () => {
     await expect(new GitLabAdapter(activityExec([], discussions), repo).findBotChildMarker(review, expected)).rejects.toThrow(/body digest/i);
   });
 
+  it("findPublishedMarker recovers a child marker through findBotChildMarker", async () => {
+    const visibleBody = "trusted finding";
+    const contentDigest = computeContentDigest(visibleBody);
+    const marker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `finding_${"b".repeat(32)}`,
+      repositoryDigest,
+      reviewNumber: 42,
+      contentDigest,
+    });
+    const discussions = [{
+      id: "N2",
+      individual_note: true,
+      notes: [{
+        id: 2,
+        body: `${visibleBody}\n${marker}`,
+        author: { username: "octo-bot" },
+        created_at: "2026-08-01T00:00:00Z",
+        updated_at: "2026-08-01T00:00:00Z",
+        type: null,
+        system: false,
+        resolved: false,
+      }],
+    }];
+    await expect(new GitLabAdapter(activityExec([], discussions), repo).findPublishedMarker({
+      kind: "repository",
+      repo,
+      number: 42,
+    }, marker)).resolves.toMatchObject({ commentId: "2" });
+  });
+
   it("normalizes equivalent GitHub and GitLab fixtures into core records that differ only by provider identity", async () => {
     const githubRepo = parseRepositoryRef("octo-org/octo-repo", "github");
     const githubDigest = computeRepositoryDigest("github", githubRepo.canonicalUrl);

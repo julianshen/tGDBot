@@ -225,6 +225,8 @@ interface Harness {
     prepareInlineReviewRecovery: ReturnType<typeof vi.fn>;
     recoverInlineReview: ReturnType<typeof vi.fn>;
     resolveStaleReviewThreads: ReturnType<typeof vi.fn>;
+    findPublishedMarker: ReturnType<typeof vi.fn>;
+    findBotChildMarker: ReturnType<typeof vi.fn>;
   };
   resolveConfig: ReturnType<typeof vi.fn>;
   loadRules: ReturnType<typeof vi.fn>;
@@ -296,6 +298,8 @@ function makeHarness(options: {
     ),
     recoverInlineReview: vi.fn().mockResolvedValue("complete"),
     resolveStaleReviewThreads: vi.fn().mockResolvedValue(0),
+    findPublishedMarker: vi.fn().mockResolvedValue(null),
+    findBotChildMarker: vi.fn().mockResolvedValue(null),
   };
 
   const locator = resolveReviewLocator(args);
@@ -2124,8 +2128,16 @@ describe("inline review comments", () => {
 
 describe("review publication crash-matrix", () => {
   const DIFF = "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n";
+  const GITLAB_REPO = {
+    provider: "gitlab" as const,
+    host: "gitlab.example.com",
+    namespace: ["group"],
+    repo: "project",
+    canonicalUrl: "https://gitlab.example.com/group/project",
+  };
+  const GITLAB_BINDING = { repo: GITLAB_REPO, reviewNumber: 42 };
 
-  function threeInlineHarness(stateDir: string) {
+  function threeInlineHarness(stateDir: string, provider: "github" | "gitlab" = "github") {
     const findings: DispatchResult = {
       findings: [1, 2, 3].map((line, index) => ({
         ruleName: "rule-a",
@@ -2138,13 +2150,78 @@ describe("review publication crash-matrix", () => {
       rulesRun: ["rule-a"],
       rulesFailed: [],
     };
+    const args = provider === "gitlab"
+      ? makeArgs({
+          pr: "https://gitlab.example.com/group/project/-/merge_requests/42",
+          vcs: "gitlab",
+          stateDir,
+        })
+      : makeArgs({ stateDir });
     const h = makeHarness({
-      args: makeArgs({ stateDir }),
+      args,
+      pr: makePr({ url: provider === "gitlab" ? args.pr : undefined }),
       dispatchResult: findings,
     });
     h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
     h.orchestrate.mockImplementation(buildPresentation);
+    if (provider === "gitlab") {
+      h.vcsAdapter.prepareInlineReviewRecovery = undefined as never;
+      h.vcsAdapter.recoverInlineReview = undefined as never;
+    }
     return h;
+  }
+
+  function postedGitlabInline(clientId: string) {
+    const commentId = `note-${clientId.replace(/[^A-Za-z0-9._:-]/gu, "")}`;
+    return {
+      clientId,
+      status: "posted" as const,
+      identity: validateConversationItemIdentity({
+        provider: "gitlab",
+        commentId,
+        threadId: `discussion-${clientId.replace(/[^A-Za-z0-9._:-]/gu, "")}`,
+        url: `${GITLAB_REPO.canonicalUrl}/-/merge_requests/42#note_${commentId}`,
+      }, GITLAB_BINDING),
+    };
+  }
+
+  function wireSharedPublication(
+    h: Harness,
+    shared: {
+      stored: BotComment | null;
+      posted: Array<{ clientId: string; body: string; identity: ReturnType<typeof postedGitlabInline>["identity"] }>;
+    },
+  ) {
+    h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(shared.stored));
+    h.vcsAdapter.upsertComment.mockImplementation((_locator, body: string, existing: BotComment | null) => {
+      const parsed = parseBotMarker(body);
+      shared.stored = {
+        id: existing?.id ?? "written-summary-1",
+        body,
+        ...(parsed ?? { lastReviewedSha: "", reviewedConfig: "" }),
+      };
+      return Promise.resolve(shared.stored);
+    });
+    h.vcsAdapter.createInlineReview.mockImplementation(
+      (_locator, _headSha, comments: Array<{ clientId: string; body: string }>) => {
+        const outcomes = comments.map((comment) => {
+          const posted = comment.clientId === "finding-1"
+            ? { clientId: comment.clientId, status: "failed" as const, reason: "position rejected" }
+            : postedGitlabInline(comment.clientId);
+          if (posted.status === "posted") {
+            shared.posted.push({ clientId: comment.clientId, body: comment.body, identity: posted.identity });
+          }
+          return posted;
+        });
+        return Promise.resolve(outcomes);
+      },
+    );
+    h.vcsAdapter.findPublishedMarker.mockImplementation((_locator, marker: string) => {
+      const found = shared.posted.find((entry) => entry.body.includes(marker));
+      return Promise.resolve(found?.identity ?? null);
+    });
+    h.vcsAdapter.findBotChildMarker.mockImplementation(() => Promise.resolve(null));
+    return shared;
   }
 
   it("recovers a crash before the first provider write without invoking the model again", async () => {
@@ -2162,10 +2239,15 @@ describe("review publication crash-matrix", () => {
     expect(first.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
 
     const second = threeInlineHarness(stateDir);
+    const modelOnRecovery = vi.fn();
+    second.publicationHooks = { onModelWork: modelOnRecovery };
     expect(await review(second.args, depsFrom(second))).toBe(0);
     expect(second.dispatchRules).not.toHaveBeenCalled();
+    expect(second.orchestrate).not.toHaveBeenCalled();
+    expect(modelOnRecovery).not.toHaveBeenCalled();
     expect(second.vcsAdapter.upsertComment).toHaveBeenCalled();
     expect(second.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
+    expect(second.vcsAdapter.findPublishedMarker).toHaveBeenCalled();
   });
 
   it("recovers GitHub atomic-inline fallback from a frozen manifest", async () => {
@@ -2191,45 +2273,73 @@ describe("review publication crash-matrix", () => {
     expect(finalBody).toContain("finding 2");
   });
 
-  it("recovers GitLab selective fallback and writes only missing children", async () => {
-    const stateDir = isolatedStateDir();
-    const first = threeInlineHarness(stateDir);
-    first.args = { ...first.args, vcs: "gitlab" };
-    first.vcsAdapter.prepareInlineReviewRecovery = undefined as never;
-    first.vcsAdapter.recoverInlineReview = undefined as never;
-    first.vcsAdapter.createInlineReview.mockResolvedValue([
-      postedInline("finding-0"),
-      { clientId: "finding-1", status: "failed", reason: "position rejected" },
-      postedInline("finding-2"),
-    ]);
-    let inlineBatches = 0;
-    first.publicationHooks = {
-      afterChildWrite: async (child) => {
-        if (child.kind === "inline" && ++inlineBatches === 1) {
-          throw new Error("crash after first gitlab inline");
-        }
-      },
-    };
-    vi.spyOn(console, "log").mockImplementation(() => {});
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-    await expect(review(first.args, depsFrom(first))).rejects.toThrow(/crash after first gitlab inline/);
+  it.each([0, 1, 2, 3])(
+    "recovers GitLab after %s inline(s) were accepted before persist",
+    async (crashAfter) => {
+      const stateDir = isolatedStateDir();
+      const shared = {
+        stored: null as BotComment | null,
+        posted: [] as Array<{ clientId: string; body: string; identity: ReturnType<typeof postedGitlabInline>["identity"] }>,
+      };
+      const first = threeInlineHarness(stateDir, "gitlab");
+      wireSharedPublication(first, shared);
+      let inlinesSeen = 0;
+      first.publicationHooks = {
+        beforeChildWrite: async (child) => {
+          if (crashAfter === 0 && child.kind === "inline" && ++inlinesSeen === 1) {
+            throw new Error("crash before first gitlab inline");
+          }
+        },
+        afterChildWrite: async (child) => {
+          if (child.kind === "inline" && crashAfter > 0 && ++inlinesSeen === crashAfter) {
+            throw new Error(`crash after gitlab inline ${crashAfter} before persist`);
+          }
+        },
+      };
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      await expect(review(first.args, depsFrom(first))).rejects.toThrow(/crash (?:before first gitlab inline|after gitlab inline)/);
+      expect(first.dispatchRules).toHaveBeenCalledTimes(1);
+      const postedAfterCrash = {
+        0: [],
+        1: ["finding-0"],
+        2: ["finding-0"],
+        3: ["finding-0", "finding-2"],
+      }[crashAfter];
+      expect(shared.posted.map((entry) => entry.clientId)).toEqual(postedAfterCrash);
+      expect(shared.stored?.pendingState?.phase).toBe("ready");
 
-    const second = threeInlineHarness(stateDir);
-    second.args = first.args;
-    second.vcsAdapter.prepareInlineReviewRecovery = undefined as never;
-    second.vcsAdapter.recoverInlineReview = undefined as never;
-    second.vcsAdapter.createInlineReview.mockResolvedValue([
-      postedInline("finding-0"),
-      { clientId: "finding-1", status: "failed", reason: "position rejected" },
-      postedInline("finding-2"),
-    ]);
-    expect(await review(second.args, depsFrom(second))).toBe(0);
-    expect(second.dispatchRules).not.toHaveBeenCalled();
-    const finalBody = String(second.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
-    expect(finalBody).not.toContain("finding 0");
-    expect(finalBody).toContain("finding 1");
-    expect(finalBody).not.toContain("finding 2");
-  });
+      const second = threeInlineHarness(stateDir, "gitlab");
+      wireSharedPublication(second, shared);
+      const modelOnRecovery = vi.fn();
+      second.publicationHooks = { onModelWork: modelOnRecovery };
+      expect(shared.stored?.pendingState?.phase).toBe("ready");
+      expect(await review(second.args, depsFrom(second))).toBe(0);
+      expect(second.dispatchRules).not.toHaveBeenCalled();
+      expect(second.orchestrate).not.toHaveBeenCalled();
+      expect(modelOnRecovery).not.toHaveBeenCalled();
+      expect(second.vcsAdapter.findPublishedMarker).toHaveBeenCalled();
+      expect(second.vcsAdapter.findPublishedMarker.mock.calls.some((call) =>
+        typeof call[1] === "string" && call[1].includes("tgd-"),
+      )).toBe(true);
+      const postedIds = shared.posted.map((entry) => entry.clientId);
+      expect(postedIds).toEqual(["finding-0", "finding-2"]);
+      expect(new Set(postedIds).size).toBe(postedIds.length);
+      const resumeWrites = second.vcsAdapter.createInlineReview.mock.calls.flatMap(
+        (call) => (call[2] as Array<{ clientId: string }>).map((comment) => comment.clientId),
+      );
+      expect(resumeWrites).toEqual({
+        0: ["finding-0", "finding-1", "finding-2"],
+        1: ["finding-1", "finding-2"],
+        2: ["finding-1", "finding-2"],
+        3: [],
+      }[crashAfter]);
+      const finalBody = String(second.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+      expect(finalBody).not.toContain("finding 0");
+      expect(finalBody).toContain("finding 1");
+      expect(finalBody).not.toContain("finding 2");
+    },
+  );
 
   it("serializes two review publishers so each marker is written once", async () => {
     const stateDir = isolatedStateDir();
