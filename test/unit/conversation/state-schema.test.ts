@@ -135,6 +135,14 @@ describe("ledger invariants", () => {
         { id: `output_${"2".repeat(32)}`, kind: "finding", status: "prepared", placement: null, bodyDigest: digest, marker: formatChildMarker({ kind: "finding", parentId: `act_${"1".repeat(32)}`, childId: `finding_${"2".repeat(32)}`, repositoryDigest: digest, reviewNumber: 1, contentDigest: digest }) },
       ] },
     ], binding)).toThrow(/duplicate/i);
+    expect(validateEventEntries([
+      { ...base, state: "observed", successorActionId: null, manifest: [] },
+      { ...base, state: "completed", successorActionId: null, manifest: [] },
+    ], binding).map((entry) => entry.state)).toEqual(["observed", "completed"]);
+    expect(() => validateEventEntries([
+      { ...base, state: "observed", successorActionId: null, manifest: [] },
+      { ...base, state: "published", successorActionId: null, manifest: [] },
+    ], binding)).toThrow(/transition/i);
   });
 
   test("materializes create/tombstone memory entries and enforces capacity", () => {

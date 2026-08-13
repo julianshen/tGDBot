@@ -18,6 +18,8 @@ import type {
   ReviewEventPageToken,
 } from "../../../src/vcs/conversation-adapter.js";
 import type { ReviewIdentity } from "../../../src/conversation/types.js";
+import type { ConversationEventEntry } from "../../../src/conversation/state-schema.js";
+import type { ConversationStateStore } from "../../../src/conversation/state-store.js";
 import { decodeReviewProgress } from "../../../src/poll/discovery.js";
 import { poll } from "../../../src/poll/poll.js";
 
@@ -207,6 +209,17 @@ class ClassificationAdapter implements ConversationAdapter {
   }
 }
 
+async function journalEvents(store: ConversationStateStore): Promise<ConversationEventEntry[]> {
+  const entries: ConversationEventEntry[] = [];
+  let cursor = null;
+  for (;;) {
+    const page = await store.readAuditPage("events", cursor, 100);
+    entries.push(...(page.entries as ConversationEventEntry[]));
+    if (page.nextCursor === null) return entries;
+    cursor = page.nextCursor;
+  }
+}
+
 describe("classification-only poll", () => {
   it("classifies irrelevant, oversized, invalid, and recognized events without posting replies", async () => {
     const stateDir = await tempStateDir();
@@ -229,12 +242,18 @@ describe("classification-only poll", () => {
       log.mockRestore();
     }
 
-    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const snapshot = await store.readContextSnapshot();
     const observed = snapshot.events.filter((entry) => entry.state === "observed");
     const prepared = snapshot.events.filter((entry) => entry.state === "prepared");
-    expect(observed).toHaveLength(4);
+    expect(observed).toHaveLength(1);
     expect(prepared).toHaveLength(1);
     expect(prepared[0]?.manifest).toEqual([]);
+    expect(snapshot.events.filter((entry) => entry.state === "completed")).toHaveLength(0);
+    const journal = await journalEvents(store);
+    expect(journal.filter((entry) => entry.state === "observed")).toHaveLength(4);
+    expect(journal.filter((entry) => entry.state === "completed")).toHaveLength(3);
+    expect(journal.filter((entry) => entry.state === "prepared")).toHaveLength(1);
   });
 
   it("stops after 200 events, exits 0, and continues on the next invocation", async () => {
@@ -251,8 +270,10 @@ describe("classification-only poll", () => {
     adapter.eventCalls.length = 0;
     adapter.emittedEventIds.length = 0;
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
-    const first = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
-    expect(first.events.filter((entry) => entry.state === "observed")).toHaveLength(200);
+    const firstStore = createConversationStateStore({ root: stateDir, repository: repo });
+    const first = await firstStore.readContextSnapshot();
+    expect((await journalEvents(firstStore)).filter((entry) => entry.state === "observed")).toHaveLength(200);
+    expect(first.events.filter((entry) => entry.state === "observed")).toHaveLength(0);
     expect(decodeReviewProgress(first.cursor.reviews[0]?.cursor ?? null)?.eventOpaque).toBe(startAfter);
     expect(first.cursor.reviews[0]?.eventPageToken).toBeDefined();
     expect(adapter.emittedEventIds.flat()).toEqual(Array.from({ length: 200 }, (_, index) => `n${index}`));
@@ -266,10 +287,12 @@ describe("classification-only poll", () => {
     expect(adapter.eventCalls.some((call) => call.pageToken === undefined && call.after === startAfter)).toBe(false);
     expect(adapter.emittedEventIds[0]).toEqual(Array.from({ length: 50 }, (_, index) => `n${index + 200}`));
     expect(adapter.emittedEventIds.flat()).not.toContain("n0");
-    const second = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
-    expect(second.events.filter((entry) => entry.state === "observed")).toHaveLength(250);
+    const secondStore = createConversationStateStore({ root: stateDir, repository: repo });
+    const second = await secondStore.readContextSnapshot();
+    expect((await journalEvents(secondStore)).filter((entry) => entry.state === "observed")).toHaveLength(250);
+    expect(second.events.filter((entry) => entry.state === "observed")).toHaveLength(0);
     expect(second.cursor.reviews[0]).not.toHaveProperty("eventPageToken");
-  });
+  }, 30_000);
 
   it("does not persist classified activity during dry-run after initialization", async () => {
     const stateDir = await tempStateDir();
@@ -299,4 +322,32 @@ describe("classification-only poll", () => {
     const paths = deriveConversationStatePaths(stateDir, repo);
     await expect(lstat(paths.cursorPath)).resolves.toBeDefined();
   });
+
+  it("does not throw or stall after more than 1000 irrelevant events across polls", async () => {
+    const stateDir = await tempStateDir();
+    const adapter = new ClassificationAdapter([], [summary(1)], 1200);
+    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    const bootstrapped = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    const startAfter = decodeReviewProgress(bootstrapped.cursor.reviews[0]?.cursor ?? null)?.eventOpaque;
+
+    adapter.replaceEvents(Array.from({ length: 1100 }, (_, index) =>
+      commentEvent(
+        `irr-${index}`,
+        `noise ${index}`,
+        new Date(Date.parse("2026-08-14T00:00:00.000Z") + index * 1000).toISOString(),
+      )));
+
+    for (let invocation = 0; invocation < 8; invocation += 1) {
+      await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    }
+
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const snapshot = await store.readContextSnapshot();
+    expect(snapshot.events.length).toBeLessThan(1000);
+    expect(decodeReviewProgress(snapshot.cursor.reviews[0]?.cursor ?? null)?.eventOpaque).not.toBe(startAfter);
+    const journal = await journalEvents(store);
+    expect(journal.filter((entry) => entry.state === "observed").length).toBe(1100);
+    expect(journal.filter((entry) => entry.state === "completed").length).toBe(1100);
+    expect(snapshot.events.filter((entry) => entry.state === "observed")).toHaveLength(0);
+  }, 120_000);
 });

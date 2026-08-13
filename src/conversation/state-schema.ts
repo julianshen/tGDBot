@@ -537,7 +537,11 @@ export function validateEventEntries(
       if (entry.state !== "observed") throw new Error("Impossible action transition: first state must be observed");
     } else if (previous.state === "completed" || previous.state === "superseded") {
       throw new Error("Impossible action transition after terminal state");
-    } else if (entry.state !== "superseded" && order.indexOf(entry.state) !== order.indexOf(previous.state) + 1) {
+    } else if (entry.state !== "superseded" &&
+      // Classified-and-ignored observations complete with an empty manifest.
+      !(entry.state === "completed" && previous.state === "observed" &&
+        previous.manifest.length === 0 && entry.manifest.length === 0) &&
+      order.indexOf(entry.state) !== order.indexOf(previous.state) + 1) {
       throw new Error(`Impossible action transition from ${previous.state} to ${entry.state}`);
     }
     if (previous !== undefined && previous.identityDigest !== entry.identityDigest) {

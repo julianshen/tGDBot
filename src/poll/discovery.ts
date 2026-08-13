@@ -153,7 +153,7 @@ export function nextRoundRobinIndex(
   const active = activeReviews(reviews);
   if (active.length === 0) return 0;
   if (nextRoundRobinKey === null) return 0;
-  const found = active.findIndex((review) => String(review.reviewNumber) >= nextRoundRobinKey);
+  const found = active.findIndex((review) => review.reviewNumber >= Number(nextRoundRobinKey));
   return found === -1 ? 0 : found;
 }
 

@@ -103,16 +103,19 @@ async function classifyOpenReviewEvents(options: {
     if (page.nextPageToken !== undefined) pageTokens.set(review.reviewNumber, page.nextPageToken);
     else pageTokens.delete(review.reviewNumber);
 
-    const fresh: ReviewActivityEvent[] = [];
-    for (const event of page.events) {
-      const actionId = actionIdentity(event).actionId;
-      if (knownActionIds.has(actionId)) continue;
-      if (processed + fresh.length >= MAX_POLL_EVENTS) break;
-      fresh.push(event);
+    const pageIdentities = page.events.map((event) => ({ event, identity: actionIdentity(event) }));
+    const unchecked = pageIdentities.filter((item) => !knownActionIds.has(item.identity.actionId));
+    const recorded = unchecked.length === 0
+      ? new Map()
+      : await options.store.findTerminalActions(unchecked.map((item) => item.identity));
+    for (const item of unchecked) {
+      if (recorded.has(item.identity.actionId)) knownActionIds.add(item.identity.actionId);
     }
-    const stoppedEarly = processed + fresh.length >= MAX_POLL_EVENTS &&
-      page.events.some((event) => !knownActionIds.has(actionIdentity(event).actionId) &&
-        !fresh.includes(event));
+    const unseen = pageIdentities
+      .filter((item) => !knownActionIds.has(item.identity.actionId))
+      .map((item) => item.event);
+    const fresh = unseen.slice(0, Math.max(0, MAX_POLL_EVENTS - processed));
+    const stoppedEarly = unseen.length > fresh.length;
 
     const classified = fresh.map((event) => ({ event, parsed: classifyEvent(event, botIdentity) }));
     for (const item of classified) {
@@ -145,6 +148,8 @@ async function classifyOpenReviewEvents(options: {
           appendObservation(tx, identityPair, item.event.reviewNumber, options.now());
           if (item.parsed.kind === "command") {
             appendPrepared(tx, identityPair, item.event.reviewNumber, options.now());
+          } else {
+            appendClassifiedAndIgnored(tx, identityPair, item.event.reviewNumber, options.now());
           }
         }
         tx.replaceCursor({
@@ -231,6 +236,25 @@ function appendPrepared(
     identityDigest: identity.identityDigest,
     reviewNumber,
     state: "prepared",
+    at,
+    successorActionId: null,
+    manifest: [],
+  });
+}
+
+function appendClassifiedAndIgnored(
+  tx: { appendEvent(entry: ConversationEventEntry): void; snapshot: { cursor: { repository: RepositoryBinding } } },
+  identity: { actionId: string; identityDigest: string },
+  reviewNumber: number,
+  at: string,
+): void {
+  tx.appendEvent({
+    version: 1,
+    repository: tx.snapshot.cursor.repository,
+    actionId: identity.actionId,
+    identityDigest: identity.identityDigest,
+    reviewNumber,
+    state: "completed",
     at,
     successorActionId: null,
     manifest: [],

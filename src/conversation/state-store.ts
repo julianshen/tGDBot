@@ -89,6 +89,7 @@ export interface ConversationStateStore {
     readonly nextCursor: ConversationAuditCursor | null;
   }>;
   findTerminalAction(identity: TerminalActionIdentity): Promise<TerminalActionSummary | undefined>;
+  findTerminalActions(identities: readonly TerminalActionIdentity[]): Promise<ReadonlyMap<string, TerminalActionSummary>>;
   findMemory(id: string): Promise<MemoryIndexSummary | undefined>;
   findFinding(id: string): Promise<FindingIndexSummary | undefined>;
   transact<T>(fn: (tx: ConversationStateTransaction) => T): Promise<T>;
@@ -1184,12 +1185,23 @@ class FileConversationStateStore implements ConversationStateStore {
   }
 
   async findTerminalAction(identity: TerminalActionIdentity): Promise<TerminalActionSummary | undefined> {
+    const found = await this.findTerminalActions([identity]);
+    return found.get(identity.actionId);
+  }
+
+  async findTerminalActions(
+    identities: readonly TerminalActionIdentity[],
+  ): Promise<ReadonlyMap<string, TerminalActionSummary>> {
     return this.withLock(async (parentIdentity) => {
       const loaded = await this.loadState(parentIdentity);
-      const key = `${identity.actionId}:${identity.identityDigest}`;
-      const value = await this.findIndexValue("terminal-actions", loaded.journalHead.checkpoint.terminalActionIndex,
-        key, parentIdentity);
-      return value === undefined ? undefined : clone(value as TerminalActionSummary);
+      const found = new Map<string, TerminalActionSummary>();
+      for (const identity of identities) {
+        const key = `${identity.actionId}:${identity.identityDigest}`;
+        const value = await this.findIndexValue("terminal-actions", loaded.journalHead.checkpoint.terminalActionIndex,
+          key, parentIdentity);
+        if (value !== undefined) found.set(identity.actionId, clone(value as TerminalActionSummary));
+      }
+      return found;
     });
   }
 
