@@ -3,6 +3,8 @@ import type {
 } from "../target/types.js";
 import type { DiffPositionRange } from "../review/diff-anchors.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
+import type { ConversationItemIdentity } from "../conversation/types.js";
+import type { RepositoryRef } from "../target/types.js";
 
 export type ReviewLocator =
   | {
@@ -55,7 +57,19 @@ export interface VcsAdapter {
     locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
+    recovery?: import("../review/comment-marker.js").InlineRecoveryState,
   ): Promise<InlinePublishOutcome[]>;
+  prepareInlineReviewRecovery?(
+    locator: ReviewLocator,
+    headSha: string,
+    comments: readonly InlineReviewComment[],
+    runIdentity: string,
+  ): Promise<import("../review/comment-marker.js").InlineRecoveryState>;
+  /** Reconciles a previously ambiguous atomic inline write without reposting. */
+  recoverInlineReview?(
+    locator: ReviewLocator,
+    recovery: import("../review/comment-marker.js").InlineRecoveryState,
+  ): Promise<"complete" | "none" | "ambiguous">;
   /**
    * Design-review #10 (stale-comment accumulation): RESOLVES (collapses, never
    * deletes) every still-unresolved inline review thread that THIS BOT started
@@ -121,10 +135,133 @@ export interface InlineReviewComment {
   body: string;
 }
 
-export interface InlinePublishOutcome {
-  readonly clientId: string;
-  readonly status: "posted" | "failed";
-  readonly reason?: string;
+export type InlinePublishOutcome =
+  | { readonly clientId: string; readonly status: "posted"; readonly identity: ConversationItemIdentity }
+  | { readonly clientId: string; readonly status: "failed"; readonly reason: string };
+
+/**
+ * A provider accepted (or may have accepted) an atomic inline write, but the
+ * adapter could not recover every durable child identity. Callers must not
+ * publish fallback copies; a later marker reconciliation is the only safe path.
+ */
+export class AmbiguousInlinePublishError extends Error {
+  readonly code = "INLINE_WRITE_AMBIGUOUS";
+  constructor(message = "The provider may have accepted an inline review but complete identity recovery was ambiguous") {
+    super(message);
+    this.name = "AmbiguousInlinePublishError";
+  }
+}
+
+const MAX_INLINE_FAILURE_REASON_LENGTH = 512;
+const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const MAX_IDENTITY_URL_LENGTH = 2_048;
+interface CanonicalIdentityBinding {
+  readonly provider: "github" | "gitlab";
+  readonly canonicalUrl: string;
+  readonly reviewNumber: number;
+}
+const validatedConversationIdentities = new WeakMap<object, CanonicalIdentityBinding>();
+
+export interface ConversationIdentityBinding {
+  readonly repo: RepositoryRef;
+  readonly reviewNumber: number;
+}
+
+export function validateConversationItemIdentity(
+  identity: unknown,
+  expected: ConversationIdentityBinding,
+): ConversationItemIdentity {
+  if (typeof expected !== "object" || expected === null || typeof expected.repo !== "object" || expected.repo === null) {
+    throw new Error("conversation identity requires canonical repository/review binding");
+  }
+  if (!Number.isSafeInteger(expected.reviewNumber) || expected.reviewNumber <= 0) throw new Error("invalid identity review binding");
+  const canonicalBinding = Object.freeze({
+    provider: expected.repo.provider,
+    canonicalUrl: expected.repo.canonicalUrl,
+    reviewNumber: expected.reviewNumber,
+  });
+  if (typeof identity !== "object" || identity === null) throw new Error("posted inline outcome requires identity");
+  const prototype = Object.getPrototypeOf(identity) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) throw new Error("invalid inline identity prototype");
+  const keys = Reflect.ownKeys(identity);
+  const allowed = keys.includes("threadId")
+    ? ["provider", "commentId", "threadId", "url"]
+    : ["provider", "commentId", "url"];
+  if (keys.length !== allowed.length || keys.some((key) => typeof key !== "string" || !allowed.includes(key))) {
+    throw new Error("invalid inline identity keys");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(identity);
+  const candidate: Record<string, unknown> = {};
+  for (const key of allowed) {
+    const descriptor = descriptors[key];
+    if (!descriptor || !descriptor.enumerable || !("value" in descriptor)) {
+      throw new Error("inline identity fields must be enumerable data properties, not accessors");
+    }
+    candidate[key] = descriptor.value;
+  }
+  if (candidate.provider !== "github" && candidate.provider !== "gitlab") throw new Error("invalid inline identity provider");
+  if (typeof candidate.commentId !== "string" || !PROVIDER_ID_RE.test(candidate.commentId)) throw new Error("invalid inline identity commentId");
+  if (candidate.threadId !== undefined && (typeof candidate.threadId !== "string" || !PROVIDER_ID_RE.test(candidate.threadId))) {
+    throw new Error("invalid inline identity threadId");
+  }
+  if (typeof candidate.url !== "string" || candidate.url.length > MAX_IDENTITY_URL_LENGTH) throw new Error("invalid inline identity URL");
+  let url: URL;
+  try {
+    url = new URL(candidate.url);
+  } catch {
+    throw new Error("invalid inline identity URL");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.hostname === "" ||
+    url.username !== "" ||
+    url.password !== ""
+  ) {
+    throw new Error("invalid inline identity URL");
+  }
+  {
+    if (candidate.provider !== canonicalBinding.provider) throw new Error("inline identity provider binding mismatch");
+    const canonical = new URL(canonicalBinding.canonicalUrl);
+    if (url.origin !== canonical.origin) throw new Error("inline identity repository host binding mismatch");
+    const basePath = canonical.pathname.replace(/\/$/u, "");
+    const expectedPath = canonicalBinding.provider === "github"
+      ? `${basePath}/pull/${canonicalBinding.reviewNumber}`
+      : `${basePath}/-/merge_requests/${canonicalBinding.reviewNumber}`;
+    if (url.pathname !== expectedPath || url.search !== "") throw new Error("inline identity review URL binding mismatch");
+    const validFragment = candidate.provider === "github"
+      ? url.hash === `#discussion_r${candidate.commentId}` || url.hash === `#issuecomment-${candidate.commentId}`
+      : url.hash === `#note_${candidate.commentId}`;
+    if (!validFragment) throw new Error("inline identity comment URL binding mismatch");
+  }
+  const validated: ConversationItemIdentity = Object.freeze({
+    provider: candidate.provider,
+    commentId: candidate.commentId as string,
+    ...(candidate.threadId === undefined ? {} : { threadId: candidate.threadId as string }),
+    url: candidate.url,
+  });
+  validatedConversationIdentities.set(validated, canonicalBinding);
+  return validated;
+}
+
+function assertStoredIdentityBinding(
+  identity: ConversationItemIdentity,
+  binding: CanonicalIdentityBinding,
+): void {
+  if (!Object.isFrozen(identity) || identity.provider !== binding.provider) {
+    throw new Error("posted inline identity no longer matches its validated binding");
+  }
+  const canonical = new URL(binding.canonicalUrl);
+  const url = new URL(identity.url);
+  const basePath = canonical.pathname.replace(/\/$/u, "");
+  const expectedPath = binding.provider === "github"
+    ? `${basePath}/pull/${binding.reviewNumber}`
+    : `${basePath}/-/merge_requests/${binding.reviewNumber}`;
+  const validFragment = binding.provider === "github"
+    ? url.hash === `#discussion_r${identity.commentId}` || url.hash === `#issuecomment-${identity.commentId}`
+    : url.hash === `#note_${identity.commentId}`;
+  if (url.origin !== canonical.origin || url.pathname !== expectedPath || url.search !== "" || !validFragment) {
+    throw new Error("posted inline identity no longer matches its validated binding");
+  }
 }
 
 export function validateInlinePublishInputs(
@@ -146,17 +283,41 @@ export function validateInlinePublishInputs(
 export function validateInlinePublishOutcomes(
   comments: readonly InlineReviewComment[],
   outcomes: readonly InlinePublishOutcome[],
+  expectedIdentity?: ConversationIdentityBinding,
 ): InlinePublishOutcome[] {
   const expected = new Set(comments.map((comment) => comment.clientId));
   if (expected.size !== comments.length) throw new Error("duplicate inline comment clientId");
   const seen = new Set<string>();
+  const validated: InlinePublishOutcome[] = [];
   for (const outcome of outcomes) {
     if (!expected.has(outcome.clientId)) throw new Error(`unknown inline outcome clientId: ${outcome.clientId}`);
     if (seen.has(outcome.clientId)) throw new Error(`duplicate inline outcome clientId: ${outcome.clientId}`);
+    if (outcome.status === "posted") {
+      const identity = expectedIdentity
+        ? validateConversationItemIdentity(outcome.identity, expectedIdentity)
+        : (() => {
+            const stored = validatedConversationIdentities.get(outcome.identity as object);
+            if (!stored) throw new Error("posted inline identity requires validated repository/review binding");
+            assertStoredIdentityBinding(outcome.identity, stored);
+            return outcome.identity;
+          })();
+      validated.push({ ...outcome, identity });
+    } else if (outcome.status !== "failed") {
+      throw new Error("invalid inline outcome status");
+    } else if (
+      typeof outcome.reason !== "string" ||
+      outcome.reason.trim().length === 0 ||
+      outcome.reason.length > MAX_INLINE_FAILURE_REASON_LENGTH ||
+      /[\u0000-\u001f\u007f]/u.test(outcome.reason)
+    ) {
+      throw new Error("failed inline outcome requires a non-empty bounded reason without control characters");
+    } else {
+      validated.push({ clientId: outcome.clientId, status: "failed", reason: outcome.reason });
+    }
     seen.add(outcome.clientId);
   }
   if (seen.size !== expected.size) throw new Error("incomplete inline publish outcomes");
-  return [...outcomes];
+  return validated;
 }
 
 export interface RuleFileContent {
