@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type { PollArgs } from "../cli-args.js";
 import {
   conversationActionIdentity,
@@ -27,6 +30,7 @@ import {
   type PublicationWriter,
 } from "../conversation/publication-manifest.js";
 import {
+  childMarkerSuffix,
   createConversationPublicationChild,
   publicationBody,
   renderExplainReply,
@@ -807,7 +811,7 @@ function buildReplyChild(input: {
     contentDigest: "0".repeat(64),
   });
   const first = publicationBody(render(provisional));
-  const suffix = `\n\n${provisional}`;
+  const suffix = childMarkerSuffix(provisional);
   const visible = first.endsWith(suffix) ? first.slice(0, -suffix.length) : first;
   const marker = formatChildMarker({
     kind: "action",
@@ -844,24 +848,72 @@ async function loadReviewMetadata(
   }
 }
 
+function resolveSafeRuleFilePath(tempDir: string, filePath: string): string | null {
+  const dest = path.resolve(tempDir, filePath);
+  const relative = path.relative(tempDir, dest);
+  if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    return null;
+  }
+  return dest;
+}
+
+async function loadTrustedBaseRules(
+  reviewNumber: number,
+  metadata: PollReviewMetadata,
+  options: { readonly config: ResolvedPollConfig },
+): Promise<{ readonly rules: readonly RuleDefinition[] }> {
+  const includeBuiltin = !options.config.disableBuiltinRule;
+  if (options.config.trustLocalRules) {
+    const loaded = await loadRules(options.config.rulesDir, includeBuiltin);
+    return { rules: loaded.rules };
+  }
+  if (metadata.baseSha === undefined || metadata.baseSha.length === 0) {
+    throw new Error("conversation rule loading requires the review base SHA");
+  }
+  const locator = { kind: "repository" as const, repo: options.config.repository, number: reviewNumber };
+  const ruleFiles = await options.config.vcsAdapter.getRuleFilesFromBase(
+    locator,
+    metadata.baseSha,
+    options.config.rulesDir,
+  );
+  const tempRulesDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-rules-"));
+  try {
+    await Promise.all(ruleFiles.map(async (file) => {
+      const dest = resolveSafeRuleFilePath(tempRulesDir, file.path);
+      if (dest === null) {
+        console.warn(
+          `tgd-review-agent: skipping rule file with unsafe path "${file.path}" (resolves outside the rules directory)`,
+        );
+        return;
+      }
+      await mkdir(path.dirname(dest), { recursive: true });
+      await writeFile(dest, file.content, "utf-8");
+    }));
+    const loaded = await loadRules(tempRulesDir, includeBuiltin);
+    return { rules: loaded.rules };
+  } finally {
+    await rm(tempRulesDir, { recursive: true, force: true }).catch((err: unknown) => {
+      console.warn(
+        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${(err as Error).message})`,
+      );
+    });
+  }
+}
+
 async function loadActiveRules(
   reviewNumber: number,
   metadata: PollReviewMetadata,
   options: { readonly config: ResolvedPollConfig; readonly deps: PollDependencies },
 ): Promise<{ readonly rules: readonly RuleDefinition[]; readonly error?: Error }> {
-  if (options.deps.loadConversationRules !== undefined) {
-    return options.deps.loadConversationRules({
-      reviewNumber,
-      headSha: metadata.headSha,
-      baseSha: metadata.baseSha,
-    });
-  }
   try {
-    if (options.config.trustLocalRules) {
-      const loaded = await loadRules(options.config.rulesDir, !options.config.disableBuiltinRule);
-      return { rules: loaded.rules };
+    if (options.deps.loadConversationRules !== undefined) {
+      return await options.deps.loadConversationRules({
+        reviewNumber,
+        headSha: metadata.headSha,
+        baseSha: metadata.baseSha,
+      });
     }
-    return { rules: [], error: new Error("conversation rule loading requires an injected loader or --trust-local-rules") };
+    return await loadTrustedBaseRules(reviewNumber, metadata, options);
   } catch (error) {
     return { rules: [], error: error instanceof Error ? error : new Error(String(error)) };
   }

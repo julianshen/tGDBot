@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatChildMarker, parseChildMarker } from "../../../src/conversation/markers.js";
+import { computeContentDigest, formatChildMarker, parseChildMarker } from "../../../src/conversation/markers.js";
 import {
   MAX_PUBLIC_CONVERSATION_BODY_CHARS,
   createConversationPublicationChild,
@@ -205,6 +205,30 @@ describe("conversation reply rendering", () => {
     expect(scope).toMatch(/^## Out of scope\n/m);
     expect(lastMarker(usage)).toBe(marker);
     expect(lastMarker(scope)).toBe(marker);
+  });
+
+  it("uses a single-newline marker suffix whose visible prefix matches the adapter digest", () => {
+    const provisional = formatChildMarker({ ...markerInput, contentDigest: "0".repeat(64) });
+    const first = publicationBody(renderExplainReply({
+      explanation: "The logger prints user.token.",
+    }, provisional, githubBinding));
+    expect(first.endsWith(`\n${provisional}`)).toBe(true);
+    expect(first.endsWith(`\n\n${provisional}`)).toBe(false);
+
+    const visible = first.slice(0, -`\n${provisional}`.length);
+    const bound = formatChildMarker({ ...markerInput, contentDigest: computeContentDigest(visible) });
+    const text = publicationBody(renderExplainReply({
+      explanation: "The logger prints user.token.",
+    }, bound, githubBinding));
+    const candidate = text.split(/\r?\n/u).at(-1) ?? "";
+    const parsed = parseChildMarker(candidate);
+    expect(parsed).not.toBeNull();
+    const canonicalBody = text.replace(/\r\n?/gu, "\n");
+    const suffix = `\n${candidate}`;
+    expect(canonicalBody.endsWith(suffix)).toBe(true);
+    expect(canonicalBody.endsWith(`\n\n${candidate}`)).toBe(false);
+    const visibleBody = canonicalBody.slice(0, -suffix.length);
+    expect(computeContentDigest(visibleBody)).toBe(parsed!.contentDigest);
   });
 
   it("respects the 32,000-character public-body limit without cutting the marker", () => {

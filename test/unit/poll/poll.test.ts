@@ -9,7 +9,10 @@ import {
   computeRepositoryDigest,
   formatChildMarker,
   parseChildMarker,
+  verifyChildMarkerBinding,
 } from "../../../src/conversation/markers.js";
+import { resolvePollConfig } from "../../../src/poll/config.js";
+import type { VcsAdapter } from "../../../src/vcs/adapter.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
 import { createConversationStateStore } from "../../../src/conversation/state-store.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
@@ -426,6 +429,7 @@ class ExecutionAdapter extends ClassificationAdapter {
   readonly postedBodies: string[] = [];
   readonly postedKinds: Array<"general" | "thread"> = [];
   readonly publishedByMarker = new Map<string, ConversationItemIdentity>();
+  readonly acceptedBodies: string[] = [];
   failNextWrite: "throw" | "accept-then-fail" | null = null;
   threads = new Map<string, ReviewThreadSnapshot>();
   headSha = "c".repeat(40);
@@ -464,6 +468,7 @@ class ExecutionAdapter extends ClassificationAdapter {
       this.writes.push(kind);
       throw new Error("provider write failed");
     }
+    this.acceptedBodies.push(body);
     if (marker.length > 0) this.publishedByMarker.set(marker, identity);
     if (this.failNextWrite === "accept-then-fail") {
       this.failNextWrite = null;
@@ -810,6 +815,25 @@ describe("event-to-action poll", () => {
       .resolves.toBe(0);
     expect(adapter.postedBodies).toHaveLength(1);
   });
+
+  it("embeds a contentDigest that matches GitHub's visible-prefix contract", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    adapter.replaceEvents([commentEvent("bad", "@tgdbot frobnicate")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(0);
+    const body = adapter.postedBodies[0];
+    expect(body).toBeDefined();
+    const candidate = body!.split(/\r?\n/u).at(-1) ?? "";
+    const parsed = parseChildMarker(candidate);
+    expect(parsed).not.toBeNull();
+    const canonicalBody = body!.replace(/\r\n?/gu, "\n");
+    const suffix = `\n${candidate}`;
+    expect(canonicalBody.endsWith(suffix)).toBe(true);
+    expect(canonicalBody.endsWith(`\n\n${candidate}`)).toBe(false);
+    const visibleBody = canonicalBody.slice(0, -suffix.length);
+    expect(computeContentDigest(visibleBody)).toBe(parsed!.contentDigest);
+  });
 });
 
 describe("ambiguous-write recovery", () => {
@@ -892,6 +916,59 @@ describe("ambiguous-write recovery", () => {
     expect(completed?.manifest[0]?.body).toMatch(/## Reconsideration/);
     expect(completed?.manifest[0]?.identity).toBeDefined();
   });
+
+  it("recovers identity when lookup uses the real adapter digest contract", async () => {
+    class DigestContractAdapter extends ExecutionAdapter {
+      override async findBotChildMarker(
+        _review: ReviewIdentity,
+        marker: ChildMarkerLookup,
+      ): Promise<ConversationItemIdentity | null> {
+        const expected = {
+          kind: marker.kind,
+          parentId: marker.parentId,
+          childId: marker.childId,
+          repositoryDigest: marker.repositoryDigest,
+          reviewNumber: marker.reviewNumber,
+          contentDigest: marker.contentDigest,
+        };
+        for (const body of this.acceptedBodies) {
+          const candidate = body.split(/\r?\n/u).at(-1) ?? "";
+          if (!verifyChildMarkerBinding(candidate, expected)) continue;
+          const canonicalBody = body.replace(/\r\n?/gu, "\n");
+          const suffix = `\n${candidate}`;
+          if (!canonicalBody.endsWith(suffix)) {
+            throw new Error("Authenticated GitHub child marker is not a separable terminal suffix");
+          }
+          const visibleBody = canonicalBody.slice(0, -suffix.length);
+          if (computeContentDigest(visibleBody) !== marker.contentDigest) {
+            throw new Error("visible body digest mismatch");
+          }
+          return this.publishedByMarker.get(candidate) ?? null;
+        }
+        return null;
+      }
+    }
+
+    const adapter = new DigestContractAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    adapter.replaceEvents([commentEvent("bad", "@tgdbot frobnicate")]);
+    adapter.failNextWrite = "accept-then-fail";
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(1);
+    expect(adapter.acceptedBodies).toHaveLength(1);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(0);
+    expect(adapter.writes).toEqual(["general"]);
+    const journal = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    const completed = journal.find((entry) =>
+      entry.state === "completed" && entry.manifest.some((child) => child.status === "posted"));
+    expect(completed?.manifest[0]?.identity).toBeDefined();
+    const candidate = adapter.acceptedBodies[0]!.split(/\r?\n/u).at(-1) ?? "";
+    const parsed = parseChildMarker(candidate);
+    const visibleBody = adapter.acceptedBodies[0]!.replace(/\r\n?/gu, "\n").slice(0, -`\n${candidate}`.length);
+    expect(computeContentDigest(visibleBody)).toBe(parsed!.contentDigest);
+  });
 });
 
 describe("stale-head successors", () => {
@@ -931,6 +1008,53 @@ describe("stale-head successors", () => {
     expect(adapter.postedBodies).toHaveLength(1);
     expect(adapter.postedBodies[0]).toMatch(/## Explanation/);
     expect(createSession.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+});
+
+describe("default trusted poll rule loading", () => {
+  it("loads base-branch rules via the VCS adapter and can execute explain", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const command = installFindingThread(adapter, findingMarker!, threadComment("exp", "@tgdbot explain"));
+    adapter.replaceEvents([command]);
+    const getRuleFilesFromBase = vi.fn().mockResolvedValue([{
+      path: "no-token-logs.md",
+      content: [
+        "---",
+        "name: no-token-logs",
+        "provider: anthropic",
+        "model: claude-opus-4-5",
+        "---",
+        "Never log credentials, tokens, or secrets.",
+        "",
+      ].join("\n"),
+    }]);
+    const createSession = vi.fn(sessionFor(JSON.stringify({ explanation: "The logger prints user.token." })));
+    const args = pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" });
+    expect(args.trustLocalRules).toBe(false);
+
+    await expect(poll(args, {
+      conversationAdapter: adapter,
+      createSession,
+      getReviewMetadata: async () => ({
+        headSha: adapter.headSha,
+        baseSha: "b".repeat(40),
+        diff: currentHunk,
+      }),
+      resolvePollConfig: (pollInput) => ({
+        ...resolvePollConfig(pollInput),
+        vcsAdapter: { getRuleFilesFromBase } as unknown as VcsAdapter,
+      }),
+    })).resolves.toBe(0);
+
+    expect(getRuleFilesFromBase).toHaveBeenCalledWith(
+      { kind: "repository", repo, number: 1 },
+      "b".repeat(40),
+      ".review/rules",
+    );
+    expect(createSession).toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/## Explanation/);
   });
 });
 

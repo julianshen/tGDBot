@@ -105,8 +105,12 @@ export function validateBoundHttpsUrl(
   return url;
 }
 
+export function childMarkerSuffix(marker: string): string {
+  return `\n${marker}`;
+}
+
 function capToLimit(content: string, marker: string): string {
-  const suffix = `\n\n${marker}`;
+  const suffix = childMarkerSuffix(marker);
   const budget = Math.max(0, MAX_PUBLIC_CONVERSATION_BODY_CHARS - suffix.length);
   const trimmed = content.length <= budget ? content : content.slice(0, budget);
   return `${trimmed}${suffix}`;

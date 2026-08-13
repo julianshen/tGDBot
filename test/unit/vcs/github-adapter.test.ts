@@ -10,7 +10,8 @@ import {
   type ReviewLocator,
 } from "../../../src/vcs/adapter.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
-import { computeContentDigest, computeRepositoryDigest, formatChildMarker } from "../../../src/conversation/markers.js";
+import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "../../../src/conversation/markers.js";
+import { publicationBody, renderExplainReply } from "../../../src/conversation/render.js";
 import type { ReviewIdentity } from "../../../src/conversation/types.js";
 
 const fixturePath = (name: string): string =>
@@ -1477,6 +1478,58 @@ describe("GitHub conversation activity", () => {
     const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : args.some((arg) => arg.includes("issues/42/comments")) ? JSON.stringify(comments) : "[]");
     const adapter = new GitHubAdapter(execGh, repo);
     await expect(adapter.findBotChildMarker(review, { provider: "github", repositoryDigest, reviewNumber: 42, kind: "finding", parentId: `act_${"a".repeat(32)}`, childId: `finding_${"b".repeat(32)}`, contentDigest })).rejects.toThrow(/multiple.*marker/i);
+  });
+
+  it("recovers a conversation reply body through the child-marker digest contract", async () => {
+    const provisional = formatChildMarker({
+      kind: "action",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `out_${"b".repeat(32)}`,
+      repositoryDigest,
+      reviewNumber: 42,
+      contentDigest: "0".repeat(64),
+    });
+    const first = publicationBody(renderExplainReply({ explanation: "The logger prints user.token." }, provisional));
+    const suffix = `\n${provisional}`;
+    expect(first.endsWith(suffix)).toBe(true);
+    const visible = first.slice(0, -suffix.length);
+    const contentDigest = computeContentDigest(visible);
+    const marker = formatChildMarker({
+      kind: "action",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `out_${"b".repeat(32)}`,
+      repositoryDigest,
+      reviewNumber: 42,
+      contentDigest,
+    });
+    const body = publicationBody(renderExplainReply({ explanation: "The logger prints user.token." }, marker));
+    const candidate = body.split(/\r?\n/u).at(-1) ?? "";
+    const parsed = parseChildMarker(candidate);
+    expect(parsed?.contentDigest).toBe(contentDigest);
+    const visibleBody = body.replace(/\r\n?/gu, "\n").slice(0, -`\n${candidate}`.length);
+    expect(computeContentDigest(visibleBody)).toBe(parsed!.contentDigest);
+
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args.some((arg) => String(arg).includes("issues/42/comments"))) {
+        return JSON.stringify([{
+          id: 9,
+          body,
+          user: { login: "octo-bot" },
+          html_url: `${review.url}#issuecomment-9`,
+        }]);
+      }
+      return "[]";
+    });
+    await expect(new GitHubAdapter(execGh, repo).findBotChildMarker(review, {
+      provider: "github",
+      repositoryDigest,
+      reviewNumber: 42,
+      kind: "action",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `out_${"b".repeat(32)}`,
+      contentDigest,
+    })).resolves.toMatchObject({ commentId: "9" });
   });
 
   it("rejects an authenticated child marker copied onto edited visible content", async () => {
