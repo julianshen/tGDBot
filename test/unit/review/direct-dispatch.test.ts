@@ -38,10 +38,10 @@ const hoisted = vi.hoisted(() => {
     provider,
     name: `${provider}/${modelId}`,
   }));
-  const modelRegistryCreate = vi.fn(() => ({
-    find: findModelMock,
+  const modelRuntimeCreate = vi.fn(async () => ({
+    getModel: findModelMock,
     hasConfiguredAuth: vi.fn(() => true),
-    getAvailable: vi.fn((): { provider: string; id: string }[] => []),
+    getAvailableSnapshot: vi.fn((): { provider: string; id: string }[] => []),
   }));
   return {
     resourceLoaderInstances,
@@ -49,8 +49,7 @@ const hoisted = vi.hoisted(() => {
     createAgentSessionMock,
     sessionManagerInMemory: vi.fn(() => "fake-session-manager"),
     getAgentDirMock: vi.fn(() => "/fake/agent/dir"),
-    authStorageCreate: vi.fn(() => "fake-auth-storage"),
-    modelRegistryCreate,
+    modelRuntimeCreate,
   };
 });
 
@@ -60,8 +59,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   createReadOnlyTools: vi.fn(() => ({})),
   SessionManager: { inMemory: hoisted.sessionManagerInMemory },
   getAgentDir: hoisted.getAgentDirMock,
-  AuthStorage: { create: hoisted.authStorageCreate },
-  ModelRegistry: { create: hoisted.modelRegistryCreate },
+  ModelRuntime: { create: hoisted.modelRuntimeCreate },
 }));
 
 function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
@@ -212,9 +210,7 @@ describe("dispatchRulesDirect", () => {
 
   it("degrades model-registry setup failures to an all-failed dispatch result", async () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    hoisted.modelRegistryCreate.mockImplementationOnce(() => {
-      throw new Error("agent config unreadable");
-    });
+    hoisted.modelRuntimeCreate.mockRejectedValueOnce(new Error("agent config unreadable"));
     try {
       const result = await dispatchRulesDirect(
         [makeRule({ provider: undefined, model: undefined })],

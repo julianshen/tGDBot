@@ -46,7 +46,7 @@ const hoisted = vi.hoisted(() => {
   // container). Null by default, so every other test gets the real symlink.
   const failSymlinkFor: { name: string | null } = { name: null };
   // Orchestrator-model decoupling: the real factory resolves an explicit Model
-  // via ModelRegistry.find(provider, modelId) instead of inheriting pi's
+  // via ModelRuntime.getModel(provider, modelId) instead of inheriting pi's
   // ambient default. `findModelMock` lets a test say "this model resolves" (a
   // Model object) or "it doesn't" (undefined).
   const findModelMock = vi.fn((provider: string, modelId: string) => ({
@@ -54,20 +54,19 @@ const hoisted = vi.hoisted(() => {
     provider,
     name: `${provider}/${modelId}`,
   }));
-  const authStorageCreate = vi.fn(() => "fake-auth-storage");
-  // hasConfiguredAuth is THE credential gate (review: find() is a pure name
-  // lookup with no auth check). Default true; tests flip it to prove an
-  // un-credentialed model is never handed to the session.
+  // hasConfiguredAuth is THE credential gate (review: getModel() is a pure name
+  // lookup with no auth check). Takes a provider id. Default true; tests flip
+  // it to prove an un-credentialed model is never handed to the session.
   const hasConfiguredAuthMock = vi.fn(() => true);
-  // Design-review #6: resolveEffectiveRules falls back to the registry's
-  // auth-aware getAvailable() when no --model/settings default resolves for
-  // UNPINNED rules. Default empty (no credentialed provider); tests that
-  // exercise the fallback point it at fake models.
+  // Design-review #6: resolveEffectiveRules falls back to the runtime's
+  // auth-aware getAvailableSnapshot() when no --model/settings default
+  // resolves for UNPINNED rules. Default empty (no credentialed provider);
+  // tests that exercise the fallback point it at fake models.
   const getAvailableMock = vi.fn((): { provider: string; id: string }[] => []);
-  const modelRegistryCreate = vi.fn(() => ({
-    find: findModelMock,
+  const modelRuntimeCreate = vi.fn(async () => ({
+    getModel: findModelMock,
     hasConfiguredAuth: hasConfiguredAuthMock,
-    getAvailable: getAvailableMock,
+    getAvailableSnapshot: getAvailableMock,
   }));
 
   return {
@@ -75,8 +74,7 @@ const hoisted = vi.hoisted(() => {
     findModelMock,
     hasConfiguredAuthMock,
     getAvailableMock,
-    authStorageCreate,
-    modelRegistryCreate,
+    modelRuntimeCreate,
     resourceLoaderInstances,
     reload,
     FakeResourceLoader,
@@ -92,8 +90,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   createAgentSession: hoisted.createAgentSessionMock,
   SessionManager: { inMemory: hoisted.sessionManagerInMemory, create: hoisted.sessionManagerCreate },
   getAgentDir: hoisted.getAgentDirMock,
-  AuthStorage: { create: hoisted.authStorageCreate },
-  ModelRegistry: { create: hoisted.modelRegistryCreate },
+  ModelRuntime: { create: hoisted.modelRuntimeCreate },
 }));
 
 // dispatch.ts imports `symlink` as an ESM named binding, so it can't be spied
@@ -1360,7 +1357,7 @@ describe("issue #1: describeAuthContext distinguishes the two auth failure cause
 //
 // Resolution order is now: --model → pi's settings default → each rule's model
 // → pi's own auth-aware default. EVERY candidate is gated on hasConfiguredAuth,
-// because ModelRegistry.find() is a pure NAME lookup with no credential check
+// because ModelRuntime.getModel() is a pure NAME lookup with no credential check
 // and setting `options.model` SHORT-CIRCUITS the SDK's auth-aware selection —
 // so passing an un-credentialed model is strictly WORSE than passing none
 // (guaranteed `No API key found` → fallbackResult → every rule marked failed).
@@ -1433,7 +1430,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
   it("falls through to the RULES when pi's settings default has no credentials (the cron-box bug)", async () => {
     AGENT_DIR_WITH_DEFAULT("openai-codex/gpt-5.6-luna"); // the cron box's broken default
     okSession();
-    hoisted.hasConfiguredAuthMock.mockImplementation((m: { provider: string }) => m.provider === "xai");
+    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string) => provider === "xai");
     const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
 
     const result = await dispatchRules(rules, "diff", false);
@@ -1449,7 +1446,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
     AGENT_DIR_WITH_DEFAULT(undefined); // no settings default
     okSession();
     hoisted.hasConfiguredAuthMock.mockImplementation(
-      (m: { provider: string }) => m.provider === "anthropic",
+      (provider: string) => provider === "anthropic",
     );
     const rules = [
       makeRule({ name: "rule-a", provider: "openai-codex", model: "gpt-5.6-terra" }), // no key here
@@ -1493,7 +1490,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
   it("an unusable --model warns and falls through to the other candidates (never straight to the ambient default)", async () => {
     AGENT_DIR_WITH_DEFAULT(undefined);
     okSession();
-    hoisted.hasConfiguredAuthMock.mockImplementation((m: { provider: string }) => m.provider === "xai");
+    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string) => provider === "xai");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
 
@@ -1507,7 +1504,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
   });
 
   // Review finding: pi-subagents resolves a rule's model fuzzily (it strips a
-  // thinking suffix), but ModelRegistry.find() is EXACT. Without stripping, a
+  // thinking suffix), but ModelRuntime.getModel() is EXACT. Without stripping, a
   // rule written `model: claude-opus-4-5:high` would run fine as a subagent yet
   // be silently skipped as an orchestrator candidate.
   it("strips a thinking-level suffix so `model: x:high` still resolves (find() is exact; pi-subagents is fuzzy)", async () => {
@@ -1534,7 +1531,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
   it("dedupes candidates, so a rejected model is reported once, not once per duplicate", async () => {
     AGENT_DIR_WITH_DEFAULT("anthropic/claude-opus-4-5"); // settings default == --model below
     okSession();
-    hoisted.hasConfiguredAuthMock.mockImplementation((m: { provider: string }) => m.provider === "xai");
+    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string) => provider === "xai");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await dispatchRules(
@@ -1559,7 +1556,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
     AGENT_DIR_WITH_DEFAULT(undefined);
     okSession();
     hoisted.hasConfiguredAuthMock.mockImplementation(
-      (m: { provider: string }) => m.provider === "anthropic",
+      (provider: string) => provider === "anthropic",
     );
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 

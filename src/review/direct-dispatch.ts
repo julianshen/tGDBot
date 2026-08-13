@@ -126,7 +126,7 @@ async function createRealDirectSession(rule: EffectiveRule, cwd: string): Promis
   // not burn a session-construction round trip to discover it. The error
   // strings deliberately match PROVIDER_AUTH_ERROR_RE's vocabulary so
   // classifyTaskFailure names the cause in the PR comment.
-  const resolved = resolveRuleSessionModel(rule.provider, rule.model);
+  const resolved = await resolveRuleSessionModel(rule.provider, rule.model);
   if (!resolved.model) {
     throw new Error(resolved.error ?? `could not resolve model for rule "${rule.name}"`);
   }
@@ -193,7 +193,7 @@ function makeRealAdvisorSessionFactory(
       noContextFiles: true,
     });
     await loader.reload();
-    const model = resolveOrchestratorModel({
+    const model = await resolveOrchestratorModel({
       explicit: defaultModel,
       ruleCandidates: effective.map((r) => `${r.provider}/${r.model}`),
     });
@@ -275,7 +275,7 @@ export async function dispatchRulesDirect(
     // operational reasons (for example an unreadable agent configuration).
     // Keep it inside the runtime fallback boundary so such failures retain
     // dispatchRulesDirect's never-throws provider/setup contract.
-    const { effective, unresolved } = resolveEffectiveRules(rules, orchestratorModel);
+    const { effective, unresolved } = await resolveEffectiveRules(rules, orchestratorModel);
     const effectiveByName = new Map(effective.map((rule) => [rule.name, rule]));
 
     // An empty temp cwd for every session: nothing project-local to discover,
