@@ -1291,6 +1291,24 @@ describe("GitHub conversation activity", () => {
     expect(repositoryDigest).toBe(computeRepositoryDigest("github", repo.canonicalUrl));
   });
 
+  it("canonicalizes mixed-case owner/repo into one review identity digest", async () => {
+    const mixed = parseRepositoryRef("Octo-Org/Octo-Repo", "github");
+    const canonical = parseRepositoryRef("octo-org/octo-repo", "github");
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      data: { repository: { pullRequest: { id: "PR_kwDO42", url: `${mixed.canonicalUrl}/pull/42` } } },
+    }));
+    const adapter = new GitHubAdapter(execGh, mixed);
+    await expect(adapter.resolveReviewIdentity(mixed, 42)).resolves.toEqual({
+      provider: "github",
+      repositoryDigest: computeRepositoryDigest("github", canonical.canonicalUrl),
+      reviewNumber: 42,
+      reviewId: "PR_kwDO42",
+      url: `${canonical.canonicalUrl}/pull/42`,
+    });
+    expect(computeRepositoryDigest("github", mixed.canonicalUrl))
+      .not.toBe(computeRepositoryDigest("github", canonical.canonicalUrl));
+  });
+
   it("pages GraphQL thread summaries and can fetch a complete addressed thread", async () => {
     const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : readFixture("gh-review-threads.json"));
     const adapter = new GitHubAdapter(execGh, repo);

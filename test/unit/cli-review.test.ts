@@ -194,13 +194,18 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
   };
 }
 
+const DEFAULT_PR_URL = "https://github.com/acme/app/pull/42";
+const DEFAULT_REVIEW_ID = "PR_kwDOTest42";
+
 function makePr(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
   return {
     id: "42",
+    reviewId: DEFAULT_REVIEW_ID,
     headSha: "cafef00d",
     baseSha: "deadbeef",
     title: "Some PR",
     description: "Some description",
+    url: DEFAULT_PR_URL,
     ...overrides,
   };
 }
@@ -594,9 +599,10 @@ describe("review", () => {
       "tgd-review-agent: reviewing https://github.com/octo-org/octo-repo/pull/42 (head cafef00d)",
     );
 
-    // Without a URL (a minimal adapter): falls back to the PR number.
-    const withoutUrl = makeHarness({ pr: makePr({ headSha: "cafef00d" }), botComment: null });
-    await review(withoutUrl.args, depsFrom(withoutUrl));
+    // Without a URL (a minimal adapter): the log still names the PR number, then
+    // identity resolution fails closed instead of inventing a shared placeholder.
+    const withoutUrl = makeHarness({ pr: makePr({ headSha: "cafef00d", url: undefined }), botComment: null });
+    await expect(review(withoutUrl.args, depsFrom(withoutUrl))).rejects.toThrow(/identit|repository/i);
     expect(logSpy).toHaveBeenCalledWith("tgd-review-agent: reviewing PR #42 (head cafef00d)");
 
     logSpy.mockRestore();
@@ -2174,7 +2180,7 @@ describe("review publication crash-matrix", () => {
       : makeArgs({ stateDir });
     const h = makeHarness({
       args,
-      pr: makePr({ url: provider === "gitlab" ? args.pr : undefined }),
+      pr: makePr({ url: provider === "gitlab" ? args.pr : DEFAULT_PR_URL }),
       dispatchResult: findings,
     });
     h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
@@ -2903,6 +2909,8 @@ describe("conversation-aware review", () => {
     expect(typeof (preparedBeforeWrite as { bodyDigest?: string } | undefined)?.bodyDigest).toBe("string");
     expect(typeof (preparedBeforeWrite as { ruleDigest?: string } | undefined)?.ruleDigest).toBe("string");
     expect(typeof (preparedBeforeWrite as { ruleSnapshot?: string } | undefined)?.ruleSnapshot).toBe("string");
+    expect((preparedBeforeWrite as { reviewId?: string } | undefined)?.reviewId).toBe(DEFAULT_REVIEW_ID);
+    expect((preparedBeforeWrite as { reviewId?: string } | undefined)?.reviewId).not.toBe("42");
     expect(appended.some((entry) => entry.identity !== undefined)).toBe(true);
     expect(appended.find((entry) => entry.identity !== undefined)?.identity).toMatchObject({
       provider: "github",
@@ -2913,6 +2921,166 @@ describe("conversation-aware review", () => {
     expect(postedInlineBody).toContain(INLINE_COMMENT_MARKER);
     const markerLine = postedInlineBody.trim().split("\n").at(-1) ?? "";
     expect(parseChildMarker(markerLine)?.kind).toBe("finding");
+    expect(h.vcsAdapter.findBotChildMarker).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reviewId: DEFAULT_REVIEW_ID,
+        reviewNumber: 42,
+        repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+      }),
+      expect.objectContaining({ kind: "finding" }),
+    );
+  });
+
+  function inlineFindingOrchestration(message = "Boom.") {
+    const finding = {
+      ruleName: "rule-a",
+      severity: "blocking" as const,
+      category: "correctness",
+      file: "x.ts",
+      line: 2,
+      message,
+    };
+    return {
+      finding,
+      orchestrationResult: {
+        commentBody: "**Actionable comments posted: 1**",
+        inlineComments: [{
+          clientId: "finding-0",
+          path: "x.ts",
+          line: 2,
+          position: {
+            oldPath: "x.ts",
+            newPath: "x.ts",
+            start: { type: "new" as const, newLine: 2 },
+            end: { type: "new" as const, newLine: 2 },
+            sameHunk: true as const,
+          },
+          body: `_🔴 Blocking_\n\n**${message}**\n<!-- tgd-review-agent:inline -->`,
+        }],
+        findingsCount: 1,
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+        findingByClientId: new Map([["finding-0", finding]]),
+        summaryInput: {
+          rulesRun: ["rule-a"],
+          rulesFailed: [],
+          allFindings: [finding],
+          unanchored: [],
+          filesReviewed: ["x.ts"],
+          inlineCount: 1,
+        },
+      } satisfies OrchestrationResult,
+    };
+  }
+
+  it("canonicalizes mixed-case ambient GitHub identity across conversation, ledger, and publication", async () => {
+    const mixedUrl = "https://github.com/Azure/sdk/pull/42";
+    const mixedRepo = parseRepositoryRef("Azure/sdk", "github");
+    const canonicalRepo = parseRepositoryRef("azure/sdk", "github");
+    const nativeId = "PR_kwDOAzureSdk";
+    const { orchestrationResult } = inlineFindingOrchestration();
+    const h = makeHarness({
+      pr: makePr({ url: mixedUrl, reviewId: nativeId }),
+      orchestrationResult,
+    });
+    installConversationReads(h, [relevant]);
+    const { appended, createStateStore } = captureFindingAppends(h);
+
+    await review(h.args, { ...depsFrom(h), createStateStore });
+
+    const mixedStore = createConversationStateStore({ root: h.args.stateDir!, repository: mixedRepo });
+    const canonicalStore = createConversationStateStore({ root: h.args.stateDir!, repository: canonicalRepo });
+    const binding = mixedStore.repositoryBinding;
+    expect(canonicalStore.repositoryBinding).toEqual(binding);
+    expect(binding.repositoryDigest).not.toBe(
+      createHash("sha256").update(mixedRepo.canonicalUrl, "utf8").digest("hex"),
+    );
+    expect(binding.repositoryDigest).toBe(
+      createHash("sha256").update(canonicalRepo.canonicalUrl, "utf8").digest("hex"),
+    );
+
+    const conversationDigest = computeRepositoryDigest("github", canonicalRepo.canonicalUrl);
+    expect(conversationDigest).not.toBe(computeRepositoryDigest("github", mixedRepo.canonicalUrl));
+    expect(h.vcsAdapter.listReviewThreads).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reviewId: nativeId,
+        repositoryDigest: conversationDigest,
+      }),
+      undefined,
+    );
+    expect(h.vcsAdapter.findBotChildMarker).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reviewId: nativeId,
+        repositoryDigest: conversationDigest,
+      }),
+      expect.objectContaining({ kind: "finding" }),
+    );
+
+    expect(appended[0]).toMatchObject({
+      repository: binding,
+      reviewId: nativeId,
+    });
+    const snapshot = await mixedStore.readContextSnapshot();
+    const published = await mixedStore.readAuditPage("events");
+    expect(published.entries.length).toBeGreaterThan(0);
+    expect(published.entries.every((entry) =>
+      (entry as { repository: { repositoryDigest: string } }).repository.repositoryDigest === binding.repositoryDigest,
+    )).toBe(true);
+    expect(snapshot.findings.every((entry) => entry.repository.repositoryDigest === binding.repositoryDigest)).toBe(true);
+    expect(snapshot.findings.some((entry) => entry.reviewId === nativeId && entry.identity !== undefined)).toBe(true);
+  });
+
+  it("fails closed when ambient GitHub identity cannot be resolved", async () => {
+    const missingUrl = makeHarness({ pr: makePr({ url: undefined }) });
+    await expect(review(missingUrl.args, depsFrom(missingUrl))).rejects.toThrow(/identit|repository/i);
+    expect(missingUrl.dispatchRules).not.toHaveBeenCalled();
+
+    const unparsable = makeHarness({ pr: makePr({ url: "not-a-review-url" }) });
+    await expect(review(unparsable.args, depsFrom(unparsable))).rejects.toThrow(/identit|repository/i);
+    expect(unparsable.dispatchRules).not.toHaveBeenCalled();
+  });
+
+  it("binds prepared ledger identities when recovering after a post-write crash", async () => {
+    const stateDir = isolatedStateDir();
+    const nativeId = "PR_kwDORecover42";
+    const { orchestrationResult } = inlineFindingOrchestration("Recover me.");
+    const first = makeHarness({
+      args: makeArgs({ stateDir }),
+      pr: makePr({ url: CONVERSATION_PR_URL, reviewId: nativeId }),
+      orchestrationResult,
+    });
+    const firstCapture = captureFindingAppends(first);
+    first.publicationHooks = {
+      afterPublication: async () => {
+        throw new Error("crash after provider write before ledger bind");
+      },
+    };
+    await expect(review(first.args, { ...depsFrom(first), createStateStore: firstCapture.createStateStore }))
+      .rejects.toThrow(/crash after provider write before ledger bind/);
+    expect(firstCapture.appended.some((entry) => entry.identity === undefined)).toBe(true);
+    expect(firstCapture.appended.some((entry) => entry.identity !== undefined)).toBe(false);
+
+    const second = makeHarness({
+      args: makeArgs({ stateDir }),
+      pr: makePr({ url: CONVERSATION_PR_URL, reviewId: nativeId }),
+      orchestrationResult,
+    });
+    const secondCapture = captureFindingAppends(second);
+    expect(await review(second.args, { ...depsFrom(second), createStateStore: secondCapture.createStateStore })).toBe(0);
+    expect(second.dispatchRules).not.toHaveBeenCalled();
+    expect(secondCapture.appended.some((entry) => entry.identity !== undefined)).toBe(true);
+    expect(secondCapture.appended.find((entry) => entry.identity !== undefined)).toMatchObject({
+      reviewId: nativeId,
+      identity: { provider: "github", commentId: "comment-finding-0" },
+    });
+
+    const snapshot = await createConversationStateStore({
+      root: stateDir,
+      repository: conversationRepo,
+    }).readContextSnapshot();
+    expect(snapshot.findings.some((entry) =>
+      entry.reviewId === nativeId && entry.identity?.commentId === "comment-finding-0",
+    )).toBe(true);
   });
 
   it("continues a dry-run with a visible notice when the state store is missing", async () => {

@@ -33,7 +33,7 @@ import {
 } from "./conversation/context.js";
 import type { ReviewIdentity } from "./conversation/types.js";
 import type { ConversationAdapter, ReviewThreadSnapshot } from "./vcs/conversation-adapter.js";
-import { selectConversationStateRoot } from "./conversation/state-paths.js";
+import { canonicalStateRepositoryIdentity, selectConversationStateRoot } from "./conversation/state-paths.js";
 import {
   createConversationStateStore,
   type ConversationStateStore,
@@ -66,7 +66,7 @@ import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
 import type { RepositoryRef } from "./target/types.js";
-import type { BotComment, PullRequestInfo } from "./vcs/adapter.js";
+import type { BotComment, PullRequestInfo, VcsAdapter } from "./vcs/adapter.js";
 import { AmbiguousInlinePublishError, validateInlinePublishOutcomes } from "./vcs/adapter.js";
 
 export type { CommandArgs, PollArgs, ReviewArgs, SharedReviewOptions } from "./cli-args.js";
@@ -148,7 +148,7 @@ export interface ReviewDependencies {
   now?: () => string;
 }
 
-function repositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): RepositoryRef {
+function resolveRepositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): RepositoryRef {
   if (config.locator.kind === "repository") return config.locator.repo;
   if (typeof config.repo === "string" && config.repo.length > 0) {
     return parseRepositoryRef(config.repo, config.vcs);
@@ -156,16 +156,36 @@ function repositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): Repos
   if (typeof pr.url === "string" && pr.url.length > 0) {
     try {
       return parseReviewTarget(pr.url).repo;
-    } catch {
-      // Fall through to the ambient placeholder used only for local state isolation.
+    } catch (error) {
+      throw new Error("Cannot resolve a canonical repository identity for this review", { cause: error });
     }
   }
+  throw new Error("Cannot resolve a canonical repository identity for this review");
+}
+
+function repositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): RepositoryRef {
+  return canonicalStateRepositoryIdentity(resolveRepositoryForReview(config, pr));
+}
+
+function storeBindingOf(store: ConversationStateStore | undefined, repository: RepositoryRef) {
+  if (store !== undefined) return store.repositoryBinding;
   return {
-    provider: "github",
-    host: "github.com",
-    owner: "ambient",
-    repo: "review",
-    canonicalUrl: "https://github.com/ambient/review",
+    provider: repository.provider,
+    repositoryDigest: repositoryDigestOf(repository),
+  };
+}
+
+function reviewUrlFor(repository: RepositoryRef, reviewNumber: number): string {
+  return `${repository.canonicalUrl}${repository.provider === "gitlab" ? "/-/merge_requests/" : "/pull/"}${reviewNumber}`;
+}
+
+function canonicalizeReviewIdentity(repository: RepositoryRef, identity: ReviewIdentity): ReviewIdentity {
+  return {
+    provider: repository.provider,
+    repositoryDigest: computeRepositoryDigest(repository.provider, repository.canonicalUrl),
+    reviewNumber: identity.reviewNumber,
+    reviewId: identity.reviewId,
+    url: reviewUrlFor(repository, identity.reviewNumber),
   };
 }
 
@@ -180,7 +200,7 @@ function reviewIdentityFor(repository: RepositoryRef, pr: PullRequestInfo): Revi
     repositoryDigest: computeRepositoryDigest(provider, repository.canonicalUrl),
     reviewNumber: Number(pr.id),
     reviewId: pr.reviewId ?? String(pr.id),
-    url: pr.url ?? `${repository.canonicalUrl}${provider === "gitlab" ? "/-/merge_requests/" : "/pull/"}${Number(pr.id)}`,
+    url: reviewUrlFor(repository, Number(pr.id)),
   };
 }
 
@@ -191,7 +211,9 @@ async function resolveConversationIdentity(
 ): Promise<{ identity?: ReviewIdentity; unavailable?: "discussion" }> {
   if (typeof adapter.resolveReviewIdentity === "function") {
     try {
-      return { identity: await adapter.resolveReviewIdentity(repository, Number(pr.id)) };
+      return {
+        identity: canonicalizeReviewIdentity(repository, await adapter.resolveReviewIdentity(repository, Number(pr.id))),
+      };
     } catch (error) {
       rethrowIfIntegrityFailure(error);
       return { unavailable: "discussion" };
@@ -281,13 +303,17 @@ async function loadOptionalReviewContext(options: {
   readonly pr: PullRequestInfo;
   readonly diff: string;
   readonly stateRoot?: string;
+  readonly identity?: ReviewIdentity;
+  readonly identityUnavailable?: "discussion";
 }): Promise<{
   conversationContext?: { text: string; digest: string };
   fingerprint?: string;
   unavailable: string[];
 }> {
   const unavailable: string[] = [];
-  const resolved = await resolveConversationIdentity(options.adapter, options.repository, options.pr);
+  const resolved = options.identity !== undefined || options.identityUnavailable !== undefined
+    ? { identity: options.identity, unavailable: options.identityUnavailable }
+    : await resolveConversationIdentity(options.adapter, options.repository, options.pr);
   if (resolved.unavailable !== undefined) unavailable.push("discussion");
   const discussion = resolved.identity === undefined
     ? { threads: [] as const, unavailable: "discussion" as const }
@@ -559,6 +585,27 @@ async function loadRulesForReview(
   }
 }
 
+async function bindPublishedFindingIdentities(
+  store: ConversationStateStore,
+  published: PublicationAction,
+  preparedFindings?: readonly FindingLedgerEntry[],
+): Promise<void> {
+  const existing = (await store.readContextSnapshot()).findings;
+  const prepared = preparedFindings ?? existing;
+  const bound: FindingLedgerEntry[] = [];
+  for (const child of published.children) {
+    if (child.kind !== "inline" || child.identity === undefined) continue;
+    const source = prepared.find((entry) => entry.id === child.id) ?? existing.find((entry) => entry.id === child.id);
+    if (source === undefined || source.identity !== undefined) continue;
+    if (existing.find((entry) => entry.id === source.id)?.identity !== undefined) continue;
+    bound.push(bindFindingLedgerIdentity(source, child.identity));
+  }
+  if (bound.length === 0) return;
+  await store.transact((tx) => {
+    for (const entry of bound) tx.appendFinding(entry);
+  });
+}
+
 async function publishReviewFromManifest(options: {
   readonly action: PublicationAction;
   readonly store: ConversationStateStore;
@@ -580,10 +627,12 @@ async function publishReviewFromManifest(options: {
   readonly terminalResult?: TerminalReviewResult;
   readonly inlineRecovery?: InlineRecoveryState;
   readonly preparedFindings?: readonly FindingLedgerEntry[];
+  readonly identity?: ReviewIdentity;
 }): Promise<number> {
   const {
     store, config, pr, configHash, provider, hooks, now, orchestration, buildBody,
   } = options;
+  const reviewIdentity = options.identity ?? reviewIdentityFor(repositoryForReview(config, pr), pr);
   let botComment = options.botComment;
   const summaryPlacement = options.action.children.find((child) => child.kind === "summary")?.placement;
   const terminalResult = options.terminalResult ??
@@ -734,18 +783,11 @@ async function publishReviewFromManifest(options: {
         if (found !== null) return found;
       }
       const findBotChildMarker = (config.vcsAdapter as VcsAdapter & Partial<ConversationAdapter>).findBotChildMarker;
-      const parsed = parseChildMarker(child.marker);
+      const parsed = parseChildMarker(child.marker)
+        ?? parseChildMarker((child.body.split(/\r?\n/u).at(-1) ?? "").trim());
       if (typeof findBotChildMarker === "function" && parsed !== null) {
-        const found = await findBotChildMarker({
-          provider,
-          repositoryDigest: options.action.repository.repositoryDigest,
-          reviewNumber: Number(pr.id),
-          reviewId: String(pr.id),
-          url: repositoryUrl(config, pr) + (provider === "github"
-            ? `/pull/${Number(pr.id)}`
-            : `/-/merge_requests/${Number(pr.id)}`),
-        }, {
-          provider,
+        const found = await findBotChildMarker(reviewIdentity, {
+          provider: reviewIdentity.provider,
           repositoryDigest: parsed.repositoryDigest,
           reviewNumber: parsed.reviewNumber,
           kind: parsed.kind,
@@ -931,20 +973,7 @@ async function publishReviewFromManifest(options: {
     throw error;
   }
 
-  const preparedFindings = options.preparedFindings ?? [];
-  if (preparedFindings.length > 0) {
-    const existing = (await store.readContextSnapshot()).findings;
-    await store.transact((tx) => {
-      for (const child of published.children) {
-        if (child.kind !== "inline" || child.identity === undefined) continue;
-        const prepared = preparedFindings.find((entry) => entry.id === child.id);
-        if (prepared === undefined) continue;
-        const already = existing.find((entry) => entry.id === prepared.id);
-        if (already?.identity !== undefined) continue;
-        tx.appendFinding(bindFindingLedgerIdentity(prepared, child.identity));
-      }
-    });
-  }
+  await bindPublishedFindingIdentities(store, published, options.preparedFindings);
 
   if ((published.state === "completed" || published.state === "superseded") &&
     published.children.length === 0) {
@@ -982,15 +1011,7 @@ async function publishReviewFromManifest(options: {
 }
 
 function repositoryUrl(config: ResolvedConfig, pr: PullRequestInfo): string {
-  if (config.locator.kind === "repository") return config.locator.repo.canonicalUrl;
-  if (typeof pr.url === "string" && pr.url.length > 0) {
-    try {
-      return parseReviewTarget(pr.url).repo.canonicalUrl;
-    } catch {
-      return "https://github.com/ambient/review";
-    }
-  }
-  return "https://github.com/ambient/review";
+  return repositoryForReview(config, pr).canonicalUrl;
 }
 
 /**
@@ -1106,6 +1127,12 @@ export async function review(
     return EXIT_OK;
   }
 
+  const resolvedIdentity = await resolveConversationIdentity(
+    config.vcsAdapter as Partial<ConversationAdapter>,
+    repository,
+    pr,
+  );
+  const reviewIdentity = resolvedIdentity.identity ?? reviewIdentityFor(repository, pr);
   const loadedContext = await loadOptionalReviewContext({
     adapter: config.vcsAdapter as Partial<ConversationAdapter>,
     store: stateStore,
@@ -1114,13 +1141,13 @@ export async function review(
     pr,
     diff,
     stateRoot,
+    identity: resolvedIdentity.identity,
+    identityUnavailable: resolvedIdentity.unavailable,
   });
   const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);
+  const storeBinding = storeBindingOf(stateStore, repository);
   const publicationIdentity = reviewPublicationIdentity({
-    repository: {
-      provider: repository.provider,
-      repositoryDigest: repositoryDigestOf(repository),
-    },
+    repository: storeBinding,
     reviewNumber: Number(pr.id),
     headSha: pr.headSha,
     configHash,
@@ -1145,6 +1172,7 @@ export async function review(
         provider,
         hooks: publicationHooks,
         now,
+        identity: reviewIdentity,
       });
     }
   }
@@ -1231,6 +1259,7 @@ export async function review(
         provider,
         hooks: publicationHooks,
         now,
+        identity: reviewIdentity,
       });
     }
   }
@@ -1406,7 +1435,6 @@ export async function review(
 
     const parentId = `act_${publicationIdentity.actionId.slice("action_".length)}`;
     const publicRepositoryDigest = computeRepositoryDigest(repository.provider, repository.canonicalUrl);
-    const storeBinding = { provider: repository.provider, repositoryDigest: repositoryDigestOf(repository) };
     const preparedFindings: FindingLedgerEntry[] = [];
     const inlines = orchestration.inlineComments.map((comment, index) => {
       const recovered = inlineRecovery?.children[index];
@@ -1441,7 +1469,7 @@ export async function review(
           repository: storeBinding,
           id: childId,
           reviewNumber: Number(pr.id),
-          reviewId: String(pr.id),
+          reviewId: reviewIdentity.reviewId,
           baseSha: pr.baseSha,
           headSha: pr.headSha,
           finding,
@@ -1483,10 +1511,7 @@ export async function review(
     const preparedAction: PublicationAction = {
       ...publicationIdentity,
       reviewNumber: Number(pr.id),
-      repository: {
-        provider: repository.provider,
-        repositoryDigest: repositoryDigestOf(repository),
-      },
+      repository: storeBinding,
       state: "manifest-ready",
       successorActionId: null,
       children: frozenChildren,
@@ -1516,6 +1541,7 @@ export async function review(
       terminalResult,
       inlineRecovery,
       preparedFindings,
+      identity: reviewIdentity,
     });
   }
 

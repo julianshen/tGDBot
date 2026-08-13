@@ -90,6 +90,7 @@ export interface ConversationExclusiveSession {
 }
 
 export interface ConversationStateStore {
+  readonly repositoryBinding: Readonly<RepositoryBinding>;
   readContextSnapshot(): Promise<ConversationContextSnapshot>;
   readAuditPage(journal: JournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{
     readonly entries: readonly unknown[];

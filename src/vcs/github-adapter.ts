@@ -158,6 +158,16 @@ function textField(value: unknown, label: string): string {
   return value;
 }
 
+function canonicalGitHubRepository(repo: GitHubRepositoryRef): GitHubRepositoryRef {
+  const owner = repo.owner.toLowerCase();
+  const name = repo.repo.toLowerCase();
+  return { provider: "github", host: "github.com", owner, repo: name, canonicalUrl: `https://github.com/${owner}/${name}` };
+}
+
+function sameGitHubRepository(left: GitHubRepositoryRef, right: GitHubRepositoryRef): boolean {
+  return canonicalGitHubRepository(left).canonicalUrl === canonicalGitHubRepository(right).canonicalUrl;
+}
+
 function providerId(value: unknown, label: string): string {
   const id = typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? String(value) : value;
   if (typeof id !== "string" || !PROVIDER_ID_RE.test(id)) throw new Error(`Invalid GitHub ${label}`);
@@ -442,8 +452,12 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
   private requireRepository(binding: { provider: string; repositoryDigest: string }): GitHubRepositoryRef {
     if (binding.provider !== "github") throw new Error("GitHub repository provider binding mismatch");
     if (!this.repository) throw new Error("GitHub repository activity requires an explicit canonical repository");
-    const expected = computeRepositoryDigest("github", this.repository.canonicalUrl);
-    if (binding.repositoryDigest !== expected) throw new Error("GitHub repository digest binding mismatch");
+    const canonical = canonicalGitHubRepository(this.repository);
+    const expected = new Set([
+      computeRepositoryDigest("github", this.repository.canonicalUrl),
+      computeRepositoryDigest("github", canonical.canonicalUrl),
+    ]);
+    if (!expected.has(binding.repositoryDigest)) throw new Error("GitHub repository digest binding mismatch");
     return this.repository;
   }
 
@@ -457,14 +471,14 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !match || Number(match[3]) !== review.reviewNumber) {
       throw new Error("Invalid GitHub review URL binding");
     }
-    const repo: GitHubRepositoryRef = {
+    const repo = canonicalGitHubRepository({
       provider: "github", host: "github.com", owner: match[1]!, repo: match[2]!,
       canonicalUrl: `https://github.com/${match[1]}/${match[2]}`,
-    };
-    if (url.hostname !== repo.host || computeRepositoryDigest("github", repo.canonicalUrl) !== review.repositoryDigest) {
+    });
+    if (url.hostname.toLowerCase() !== repo.host || computeRepositoryDigest("github", repo.canonicalUrl) !== review.repositoryDigest) {
       throw new Error("GitHub review repository binding mismatch");
     }
-    if (this.repository && this.repository.canonicalUrl !== repo.canonicalUrl) throw new Error("GitHub configured repository binding mismatch");
+    if (this.repository && !sameGitHubRepository(this.repository, repo)) throw new Error("GitHub configured repository binding mismatch");
     providerId(review.reviewId, "review id");
     return repo;
   }
@@ -472,16 +486,26 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
   async resolveReviewIdentity(repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
     if (repository.provider !== "github") throw new Error("GitHub review identity requires a GitHub repository");
     if (!Number.isSafeInteger(reviewNumber) || reviewNumber <= 0) throw new Error("Invalid GitHub review binding");
-    if (this.repository && this.repository.canonicalUrl !== repository.canonicalUrl) {
+    if (this.repository && !sameGitHubRepository(this.repository, repository)) {
       throw new Error("GitHub configured repository binding mismatch");
     }
     const repo = repository;
+    const canonical = canonicalGitHubRepository(repo);
     const query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id url}}}";
     const parsed = object(JSON.parse(await this.execGh(["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `owner=${repo.owner}`, "-F", `name=${repo.repo}`, "-F", `number=${reviewNumber}`])), "pull request identity");
     const pull = object(object(object(parsed.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");
     const url = textField(pull.url, "GraphQL pull request URL");
-    if (url !== `${repo.canonicalUrl}/pull/${reviewNumber}`) throw new Error("GitHub GraphQL pull request URL binding mismatch");
-    return { provider: "github", repositoryDigest: computeRepositoryDigest("github", repo.canonicalUrl), reviewNumber, reviewId: providerId(pull.id, "GraphQL pull request id"), url };
+    if (url.toLowerCase() !== `${canonical.canonicalUrl}/pull/${reviewNumber}` &&
+      url.toLowerCase() !== `${repo.canonicalUrl}/pull/${reviewNumber}`.toLowerCase()) {
+      throw new Error("GitHub GraphQL pull request URL binding mismatch");
+    }
+    return {
+      provider: "github",
+      repositoryDigest: computeRepositoryDigest("github", canonical.canonicalUrl),
+      reviewNumber,
+      reviewId: providerId(pull.id, "GraphQL pull request id"),
+      url: `${canonical.canonicalUrl}/pull/${reviewNumber}`,
+    };
   }
 
   private async scanStablePages<T>(scan: () => Promise<StableScanResult<T>>): Promise<StableScanResult<T>> {
