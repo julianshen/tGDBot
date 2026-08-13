@@ -1732,6 +1732,42 @@ describe("GitLab conversation activity", () => {
     });
   });
 
+  it("fails closed when a discussion position new_path contains a control character", async () => {
+    const discussions = activityDiscussions();
+    const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    const position = { ...(note.position as Record<string, unknown>), new_path: "src/a.ts\u0000evil" };
+    note.position = position;
+    const execGlab = activityExec(activityNotes(), discussions);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).rejects.toBeInstanceOf(GlabOutputError);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).rejects.toThrow(/note path/i);
+  });
+
+  it.each([
+    ["missing original head", (position: Record<string, unknown>) => { delete position.head_sha; }, /originalHeadSha/i],
+    ["heads equal to the current MR SHA", (position: Record<string, unknown>) => { position.head_sha = HEAD_B; }, /heads must differ/i],
+  ])("fails closed when a provider-outdated placement has %s", async (_name, mutate, expected) => {
+    const discussions = activityDiscussions();
+    const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    note.outdated = true;
+    const position = { ...(note.position as Record<string, unknown>) };
+    mutate(position);
+    note.position = position;
+    const execGlab = activityExec(activityNotes(), discussions);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).rejects.toThrow(expected);
+  });
+
+  it("rejects a non-decimal GitLab thread page token", async () => {
+    const adapter = new GitLabAdapter(activityExec(), repo);
+    const token = {
+      scope: "review-thread-page" as const,
+      provider: "gitlab" as const,
+      repositoryDigest,
+      reviewNumber: 42,
+      opaque: "01",
+    };
+    await expect(adapter.listReviewThreads(review, token)).rejects.toThrow(/page token/i);
+  });
+
   it("normalizes a nullable FILE discussion without a line", async () => {
     const discussions = activityDiscussions();
     const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;

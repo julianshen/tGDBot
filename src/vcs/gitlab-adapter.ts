@@ -22,6 +22,7 @@ import type {
   VcsAdapter,
 } from "./adapter.js";
 import {
+  validateConversationAnchor,
   validateOpenReviewPageToken,
   validateReviewDiscoveryCursor,
   validateReviewEventCursor,
@@ -880,9 +881,10 @@ function parseConversationNote(value: unknown): ConversationNote {
 function parseConversationPosition(value: unknown): ConversationNote["position"] | undefined {
   if (value === undefined || value === null) return undefined;
   const position = conversationRecord(value, "note position");
-  const file = typeof position.new_path === "string" && position.new_path.length > 0
+  const chosenPath = typeof position.new_path === "string" && position.new_path.length > 0
     ? position.new_path
-    : conversationText(position.old_path, "note path");
+    : position.old_path;
+  const file = conversationText(chosenPath, "note path");
   const positionType = typeof position.position_type === "string" ? position.position_type : "text";
   const rawLine = position.new_line ?? position.old_line;
   const line = rawLine == null ? undefined : Number(rawLine);
@@ -1464,13 +1466,22 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
   ): Promise<Record<string, unknown>[]> {
     const rows: Record<string, unknown>[] = [];
     for (let page = 1; page <= MAX_TARGET_PAGES; page += 1) {
+      const query = suffix.endsWith("/notes")
+        ? [
+          "--field", "sort=asc",
+          "--field", "order_by=created_at",
+          "--field", `per_page=${perPage}`,
+          "--field", `page=${page}`,
+        ]
+        : [
+          "--field", `per_page=${perPage}`,
+          "--field", `page=${page}`,
+        ];
       const batch = parseNdjsonPage(await this.execGlab([
         "api", "--method", "GET", "--output", "ndjson",
         "--hostname", repo.host,
         projectEndpoint(repo, suffix),
-        "--field", ...(suffix.endsWith("/notes") ? ["sort=asc", "--field", "order_by=created_at", "--field"] : []),
-        `per_page=${perPage}`,
-        "--field", `page=${page}`,
+        ...query,
       ]), label);
       if (batch.length > perPage) throw new GlabOutputError(`GitLab ${label} page exceeds requested bound`);
       rows.push(...batch);
@@ -1621,20 +1632,22 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     const originalHeadSha = root.position.headSha;
     // Outdated means the provider marked the anchor stale, not that HEAD moved.
     const outdated = root.outdated === true || discussionOutdated === true;
-    return {
+    return validateConversationAnchor({
       file: root.position.file,
       ...(root.position.line === undefined ? {} : { line: root.position.line }),
       ...(root.position.side === undefined ? {} : { side: root.position.side }),
       ...(originalHeadSha === undefined ? {} : { originalHeadSha, currentHeadSha }),
       outdated,
-    };
+    });
   }
 
   async listReviewThreads(review: ReviewIdentity, pageToken?: ReviewThreadPageToken): Promise<ReviewThreadPage> {
     const repo = this.repositoryForReview(review);
     const binding = { provider: "gitlab" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
-    const page = pageToken === undefined ? 1 : Number(validateReviewThreadPageToken(pageToken, binding).opaque);
-    if (!Number.isSafeInteger(page) || page <= 0) throw new Error("Invalid GitLab thread page token");
+    const opaque = pageToken === undefined ? "1" : validateReviewThreadPageToken(pageToken, binding).opaque;
+    if (!/^[1-9]\d*$/u.test(opaque)) throw new Error("Invalid GitLab thread page token");
+    const page = Number(opaque);
+    if (!Number.isSafeInteger(page)) throw new Error("Invalid GitLab thread page token");
     const mr = await this.fetchConversationMergeRequest(review);
     const rows = parseNdjsonPage(await this.execGlab([
       "api", "--method", "GET", "--output", "ndjson",
