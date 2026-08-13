@@ -7,9 +7,27 @@ import { parseCommandArgs } from "./cli-args.js";
 import type { PollArgs, ReviewArgs } from "./cli-args.js";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
+import {
+  buildReviewPublicationGraph,
+  executeReviewPublication,
+  loadPublicationAction,
+  reviewPublicationIdentity,
+  updatePublicationChild,
+  type PublicationAction,
+  type PublicationChild,
+  type PublicationExecutorHooks,
+} from "./conversation/publication-manifest.js";
+import { computeContentDigest } from "./conversation/markers.js";
+import { selectConversationStateRoot } from "./conversation/state-paths.js";
+import {
+  createConversationStateStore,
+  type ConversationStateStore,
+} from "./conversation/state-store.js";
 import { poll } from "./poll/poll.js";
 import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
 import {
+  deriveInlineChildId,
+  formatInlineRecoveryMarker,
   formatPendingMarker,
   replacePendingMarker,
 } from "./review/comment-marker.js";
@@ -24,7 +42,9 @@ import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeR
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
-import type { PullRequestInfo } from "./vcs/adapter.js";
+import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
+import type { RepositoryRef } from "./target/types.js";
+import type { BotComment, PullRequestInfo } from "./vcs/adapter.js";
 import { AmbiguousInlinePublishError, validateInlinePublishOutcomes } from "./vcs/adapter.js";
 
 export type { CommandArgs, PollArgs, ReviewArgs, SharedReviewOptions } from "./cli-args.js";
@@ -96,6 +116,30 @@ export interface ReviewDependencies {
     diff?: string,
     options?: { inline?: boolean; suggestions?: boolean; relatedWork?: readonly RelatedWorkItem[] },
   ) => OrchestrationResult;
+  createStateStore?: typeof createConversationStateStore;
+  publicationHooks?: PublicationExecutorHooks;
+  now?: () => string;
+}
+
+function repositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): RepositoryRef {
+  if (config.locator.kind === "repository") return config.locator.repo;
+  if (typeof config.repo === "string" && config.repo.length > 0) {
+    return parseRepositoryRef(config.repo, config.vcs);
+  }
+  if (typeof pr.url === "string" && pr.url.length > 0) {
+    try {
+      return parseReviewTarget(pr.url).repo;
+    } catch {
+      // Fall through to the ambient placeholder used only for local state isolation.
+    }
+  }
+  return {
+    provider: "github",
+    host: "github.com",
+    owner: "ambient",
+    repo: "review",
+    canonicalUrl: "https://github.com/ambient/review",
+  };
 }
 
 // Named exit codes (Task 8 review fix #3; refined by review fix #1) — see
@@ -141,6 +185,32 @@ const STATUS_LOG_PREFIX = "TGD_REVIEW_RESULT: ";
 
 function logStatus(log: StatusLog): void {
   console.log(`${STATUS_LOG_PREFIX}${JSON.stringify(log)}`);
+}
+
+function selectedFallbackIds(action: PublicationAction): Set<string> {
+  return new Set(
+    action.children
+      .filter((child) => child.kind === "fallback" && child.status === "fallback-selected")
+      .map((child) => child.replacesId)
+      .filter((id): id is string => typeof id === "string"),
+  );
+}
+
+function clientIdOf(child: PublicationChild): string {
+  return child.placement.kind === "inline" && child.placement.clientId !== undefined
+    ? child.placement.clientId
+    : child.id;
+}
+
+function composeFrozenSummary(action: PublicationAction, fallbackIds: ReadonlySet<string>, marker: string): string {
+  const summary = action.children.find((child) => child.kind === "summary");
+  if (summary === undefined) throw new Error("publication manifest is missing the summary child");
+  const extras = action.children
+    .filter((child) => child.kind === "fallback" && child.replacesId !== undefined && fallbackIds.has(child.replacesId))
+    .map((child) => child.body);
+  const suffix = extras.length === 0 ? marker : `${extras.join("\n\n")}\n\n${marker}`;
+  return extras.length === 0 ? `${summary.body}${summary.body.endsWith("\n") ? "" : "\n\n"}${marker}` :
+    `${summary.body.trimEnd()}\n\n${suffix}`;
 }
 
 function sameTerminalResult(
@@ -275,6 +345,356 @@ async function loadRulesForReview(
   }
 }
 
+async function publishReviewFromManifest(options: {
+  readonly action: PublicationAction;
+  readonly store: ConversationStateStore;
+  readonly config: ResolvedConfig;
+  readonly pr: PullRequestInfo;
+  readonly configHash: string;
+  readonly botComment: BotComment | null;
+  readonly provider: "github" | "gitlab";
+  readonly hooks?: PublicationExecutorHooks;
+  readonly now: () => string;
+  readonly orchestration?: OrchestrationResult;
+  readonly loadErrors?: LoadResult["errors"];
+  readonly buildBody?: (
+    o: OrchestrationResult,
+    failedIds: ReadonlySet<string>,
+    marker?: string,
+    providerLimit?: boolean,
+  ) => string;
+  readonly terminalResult?: TerminalReviewResult;
+  readonly inlineRecovery?: InlineRecoveryState;
+}): Promise<number> {
+  const {
+    store, config, pr, configHash, provider, hooks, now, orchestration, buildBody,
+  } = options;
+  const loadErrors = options.loadErrors ?? [];
+  let botComment = options.botComment;
+  const summaryPlacement = options.action.children.find((child) => child.kind === "summary")?.placement;
+  const terminalResult = options.terminalResult ??
+    (summaryPlacement?.kind === "summary" ? summaryPlacement.terminalResult : undefined) ?? {
+      status: "posted" as const,
+      findingsCount: options.action.children.filter((child) => child.kind === "inline").length,
+      rulesRun: [],
+      rulesFailed: [],
+      exitCode: 0 as const,
+    };
+
+  const published = await executeReviewPublication({
+    store,
+    action: options.action,
+    hooks,
+    now,
+    publish: async ({ action: start, persist }) => {
+      let action = start;
+      const postedSummary = action.children.find((child) => child.kind === "summary" && child.identity !== undefined);
+      if (botComment === null && postedSummary?.identity !== undefined) {
+        botComment = {
+          id: postedSummary.identity.commentId,
+          body: postedSummary.body,
+          lastReviewedSha: "",
+          reviewedConfig: "",
+        };
+      }
+      const summary = action.children.find((child) => child.kind === "summary");
+      const inlineChildren = action.children.filter((child) => child.kind === "inline");
+      const noFallbackIds = new Set<string>();
+      const allInlineIds = new Set(inlineChildren.map((child) => clientIdOf(child)));
+      const inlineRecovery = options.inlineRecovery;
+
+      const bodyFor = (failedIds: ReadonlySet<string>, marker: string): string => {
+        if (orchestration !== undefined && buildBody !== undefined) {
+          return buildBody(orchestration, failedIds, marker);
+        }
+        return composeFrozenSummary(action, failedIds, marker);
+      };
+
+      if (summary !== undefined && summary.status === "pending") {
+        await hooks?.beforeChildWrite?.(summary);
+        if (inlineChildren.length > 0 && provider === "github") {
+          if (inlineChildren.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
+          const payloadChars = inlineChildren.reduce((total, child, index) =>
+            total + child.body.length + (inlineRecovery?.children[index]?.marker.length ?? child.marker.length) + 256, 0);
+          if (payloadChars > 1_000_000 || inlineChildren.some((child, index) =>
+            child.body.length + (inlineRecovery?.children[index]?.marker.length ?? child.marker.length) + 128 > 65_536)) {
+            throw new Error("GitHub inline review exceeds the safe atomic payload size");
+          }
+        }
+        const writtenSummary = await config.vcsAdapter.upsertComment(
+          config.locator,
+          bodyFor(noFallbackIds, formatPendingMarker({ phase: "publishing", headSha: pr.headSha, configHash })),
+          botComment,
+        );
+        if (
+          !writtenSummary ||
+          typeof writtenSummary.id !== "string" ||
+          writtenSummary.id.length === 0 ||
+          writtenSummary.lastReviewedSha !== "" ||
+          writtenSummary.reviewedConfig !== "" ||
+          writtenSummary.pendingState?.phase !== "publishing" ||
+          writtenSummary.pendingState.headSha !== pr.headSha ||
+          writtenSummary.pendingState.configHash !== configHash
+        ) {
+          throw new Error("The VCS adapter did not return the exact identity of the pending summary note");
+        }
+        let summaryIdentity = writtenSummary;
+        botComment = writtenSummary;
+        if (inlineChildren.length > 0) {
+          const checkpoint = await config.vcsAdapter.upsertComment(
+            config.locator,
+            bodyFor(allInlineIds, formatPendingMarker({
+              phase: "ready",
+              headSha: pr.headSha,
+              configHash,
+              noteId: writtenSummary.id,
+              terminalResult,
+              inlineRecovery,
+            })),
+            writtenSummary,
+          );
+          if (
+            checkpoint.id !== writtenSummary.id ||
+            checkpoint.lastReviewedSha !== "" ||
+            checkpoint.reviewedConfig !== "" ||
+            checkpoint.pendingState?.phase !== "ready" ||
+            checkpoint.pendingState.headSha !== pr.headSha ||
+            checkpoint.pendingState.configHash !== configHash ||
+            checkpoint.pendingState.noteId !== writtenSummary.id ||
+            !sameTerminalResult(checkpoint.pendingState.terminalResult, terminalResult)
+          ) {
+            throw new Error("The VCS adapter could not confirm the exact ready recovery checkpoint");
+          }
+          summaryIdentity = checkpoint;
+          botComment = checkpoint;
+        }
+        action = updatePublicationChild(action, summary.id, {
+          status: "posted",
+          identity: {
+            provider,
+            commentId: summaryIdentity.id,
+            url: provider === "github"
+              ? `${repositoryUrl(config, pr)}/pull/${Number(pr.id)}#issuecomment-${summaryIdentity.id}`
+              : `${repositoryUrl(config, pr)}/-/merge_requests/${Number(pr.id)}#note_${summaryIdentity.id}`,
+          },
+        });
+        action = await persist(action);
+        await hooks?.afterChildWrite?.(summary);
+      }
+
+      try {
+        const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.locator);
+        if (resolved > 0) {
+          console.log(`tgd-review-agent: resolved ${resolved} stale inline comment thread(s) from previous runs`);
+        }
+      } catch (err) {
+        console.warn(
+          `tgd-review-agent: could not resolve stale inline comment threads (${(err as Error).message}); ` +
+            `continuing — old threads stay expanded but this run is unaffected`,
+        );
+      }
+
+      let finalFallbackIds = selectedFallbackIds(action);
+      const pendingInlines = action.children.filter((child) => child.kind === "inline" && child.status === "pending");
+      if (pendingInlines.length > 0) {
+        await hooks?.beforeChildWrite?.(pendingInlines[0]!);
+        let fallbackIds: Set<string> | undefined;
+        let ambiguousInlineWrite = false;
+        const comments = pendingInlines.map((child) => ({
+          clientId: clientIdOf(child),
+          path: child.placement.kind === "inline" ? child.placement.file : "",
+          line: child.placement.kind === "inline" ? child.placement.line : 1,
+          ...(child.placement.kind === "inline" && child.placement.startLine !== undefined
+            ? { startLine: child.placement.startLine }
+            : {}),
+          position: child.placement.kind === "inline" && child.placement.position !== undefined
+            ? child.placement.position
+            : {
+                oldPath: child.placement.kind === "inline" ? child.placement.file : "",
+                newPath: child.placement.kind === "inline" ? child.placement.file : "",
+                start: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
+                end: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
+                sameHunk: true as const,
+              },
+          body: child.body,
+        }));
+        try {
+          const outcomes = await config.vcsAdapter.createInlineReview(
+            config.locator,
+            pr.headSha,
+            comments,
+            inlineRecovery,
+          );
+          try {
+            const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
+              if (typeof outcome !== "object" || outcome === null) return false;
+              const candidate = outcome as Record<string, unknown>;
+              return typeof candidate.clientId === "string" &&
+                (candidate.status === "posted" || candidate.status === "failed") &&
+                (candidate.reason === undefined || typeof candidate.reason === "string");
+            });
+            if (!shapesValid) throw new Error("malformed inline publish outcome");
+            const validated = validateInlinePublishOutcomes(
+              comments,
+              outcomes,
+              config.locator.kind === "repository"
+                ? { repo: config.locator.repo, reviewNumber: config.locator.number }
+                : undefined,
+            );
+            fallbackIds = new Set(
+              validated.filter((outcome) => outcome.status === "failed").map((outcome) => outcome.clientId),
+            );
+            for (const child of pendingInlines) {
+              const outcome = validated.find((entry) => entry.clientId === clientIdOf(child));
+              if (outcome?.status === "posted") {
+                action = updatePublicationChild(action, child.id, { status: "posted", identity: outcome.identity });
+              } else {
+                action = updatePublicationChild(action, child.id, { status: "failed" });
+              }
+            }
+          } catch (err) {
+            console.warn(
+              `tgd-review-agent: inline review returned invalid outcomes (${(err as Error).message}); ` +
+                `rewriting the summary comment to carry every inline finding instead`,
+            );
+            fallbackIds = allInlineIds;
+            for (const child of pendingInlines) {
+              action = updatePublicationChild(action, child.id, { status: "failed" });
+            }
+          }
+        } catch (err) {
+          if (err instanceof AmbiguousInlinePublishError && inlineRecovery !== undefined) {
+            console.warn(
+              `tgd-review-agent: GitHub may have accepted the inline review (${err.message}); ` +
+                `not duplicating those findings into the summary; a later run will reconcile markers`,
+            );
+            fallbackIds = noFallbackIds;
+            ambiguousInlineWrite = true;
+          } else {
+            console.warn(
+              `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
+                `rewriting the summary comment to carry every finding instead`,
+            );
+            fallbackIds = allInlineIds;
+            for (const child of pendingInlines) {
+              action = updatePublicationChild(action, child.id, { status: "failed" });
+            }
+          }
+        }
+
+        if (fallbackIds && fallbackIds.size > 0) finalFallbackIds = fallbackIds;
+        for (const child of action.children) {
+          if (child.kind !== "fallback" || child.status !== "pending") continue;
+          const inline = child.replacesId === undefined
+            ? undefined
+            : action.children.find((entry) => entry.id === child.replacesId);
+          const used = inline !== undefined && finalFallbackIds.has(clientIdOf(inline));
+          action = updatePublicationChild(action, child.id, {
+            status: used ? "fallback-selected" : "failed",
+          });
+        }
+        action = await persist(action);
+        await hooks?.afterChildWrite?.(pendingInlines[0]!);
+
+        const summaryIdentity = botComment;
+        if (summaryIdentity === null) throw new Error("Review publication is missing the summary identity");
+        if (ambiguousInlineWrite) {
+          const ambiguousCheckpoint = await config.vcsAdapter.upsertComment(
+            config.locator,
+            bodyFor(allInlineIds, formatPendingMarker({
+              phase: "ambiguous",
+              headSha: pr.headSha,
+              configHash,
+              noteId: summaryIdentity.id,
+              terminalResult,
+              inlineRecovery: inlineRecovery!,
+            })),
+            summaryIdentity,
+          );
+          if (ambiguousCheckpoint.id !== summaryIdentity.id || ambiguousCheckpoint.pendingState?.phase !== "ambiguous") {
+            throw new Error("Could not persist ambiguous inline recovery checkpoint");
+          }
+          logStatus({
+            status: "partial",
+            findingsCount: terminalResult.findingsCount,
+            rulesRun: [...terminalResult.rulesRun],
+            rulesFailed: [...terminalResult.rulesFailed],
+            reason: "inline-publication-ambiguous",
+          });
+          return action;
+        }
+
+        const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
+          config.locator,
+          bodyFor(finalFallbackIds, formatPendingMarker({
+            phase: "ready",
+            headSha: pr.headSha,
+            configHash,
+            noteId: summaryIdentity.id,
+            terminalResult,
+          })),
+          summaryIdentity,
+        );
+        if (
+          selectiveCheckpoint.id !== summaryIdentity.id ||
+          selectiveCheckpoint.lastReviewedSha !== "" ||
+          selectiveCheckpoint.reviewedConfig !== "" ||
+          selectiveCheckpoint.pendingState?.phase !== "ready" ||
+          selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
+          selectiveCheckpoint.pendingState.configHash !== configHash ||
+          selectiveCheckpoint.pendingState.noteId !== summaryIdentity.id ||
+          !sameTerminalResult(selectiveCheckpoint.pendingState.terminalResult, terminalResult)
+        ) {
+          throw new Error("The VCS adapter could not confirm the exact selective recovery checkpoint");
+        }
+        botComment = selectiveCheckpoint;
+      }
+
+      if (botComment === null) throw new Error("Review publication is missing the summary identity");
+      const finalizedSummary = await config.vcsAdapter.upsertComment(
+        config.locator,
+        bodyFor(finalFallbackIds, formatMarker(pr.headSha, configHash)),
+        botComment,
+      );
+      if (
+        !finalizedSummary ||
+        finalizedSummary.id !== botComment.id ||
+        finalizedSummary.lastReviewedSha !== pr.headSha ||
+        finalizedSummary.reviewedConfig !== configHash
+      ) {
+        throw new Error("The VCS adapter could not confirm finalization of the exact completed summary note");
+      }
+      return action;
+    },
+  });
+
+  const completed = published.state === "completed" ||
+    published.children.every((child) => child.status === "posted" || child.status === "failed" ||
+      child.status === "fallback-selected");
+  if (!completed) return EXIT_PARTIAL;
+  logStatus({
+    status: terminalResult.status,
+    findingsCount: terminalResult.findingsCount,
+    rulesRun: [...terminalResult.rulesRun],
+    rulesFailed: [...terminalResult.rulesFailed],
+    loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
+    ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
+  });
+  return terminalResult.exitCode;
+}
+
+function repositoryUrl(config: ResolvedConfig, pr: PullRequestInfo): string {
+  if (config.locator.kind === "repository") return config.locator.repo.canonicalUrl;
+  if (typeof pr.url === "string" && pr.url.length > 0) {
+    try {
+      return parseReviewTarget(pr.url).repo.canonicalUrl;
+    } catch {
+      return "https://github.com/ambient/review";
+    }
+  }
+  return "https://github.com/ambient/review";
+}
+
 /**
  * The actual `review` command flow: resolve config, fetch the PR + existing
  * bot comment, decide dedup, load + dispatch rules, orchestrate the merged
@@ -304,6 +724,9 @@ export async function review(
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
+  const createStore = deps.createStateStore ?? createConversationStateStore;
+  const publicationHooks = deps.publicationHooks;
+  const now = deps.now ?? (() => new Date().toISOString());
 
   const config = resolveConfigFn(args);
   const pr = await config.vcsAdapter.getPullRequest(config.locator);
@@ -488,6 +911,42 @@ export async function review(
     return EXIT_OK;
   }
 
+  const repository = repositoryForReview(config, pr);
+  const stateStore = config.dryRun
+    ? undefined
+    : createStore({
+        root: selectConversationStateRoot({ explicitStateDir: config.stateDir }),
+        repository,
+      });
+  const publicationIdentity = reviewPublicationIdentity({
+    repository: {
+      provider: repository.provider,
+      repositoryDigest: createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex"),
+    },
+    reviewNumber: Number(pr.id),
+    headSha: pr.headSha,
+    configHash,
+  });
+  if (stateStore !== undefined) {
+    const existing = loadPublicationAction(
+      (await stateStore.readContextSnapshot()).events,
+      publicationIdentity,
+    );
+    if (existing !== undefined && (existing.state === "manifest-ready" || existing.state === "published")) {
+      return publishReviewFromManifest({
+        action: existing,
+        store: stateStore,
+        config,
+        pr,
+        configHash,
+        botComment,
+        provider,
+        hooks: publicationHooks,
+        now,
+      });
+    }
+  }
+
   const { rules, errors: loadErrors } = await loadRulesForReview(config, pr, loadRulesFn);
 
   // Task 8 review fix #1: surface load errors via console.error whenever
@@ -585,19 +1044,10 @@ export async function review(
     if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
     console.log(buildBody(orchestration, noFallbackIds, undefined, false));
   } else {
-    // ORDER MATTERS. The summary is durable and updatable; inline comments are
-    // append-only.
-    //
-    // Write an explicit PENDING marker first. It makes the durable summary
-    // rediscoverable without claiming this SHA/config is complete. Only after
-    // inline outcomes and selective fallback are settled do we replace it with
-    // the complete dedup marker, targeting the exact returned identity.
-    let allInlineIds: Set<string> | undefined;
+    if (stateStore === undefined) throw new Error("Review publication requires a conversation state store");
     let inlineRecovery: InlineRecoveryState | undefined;
+    const allInlineIds = new Set(orchestration.inlineComments.map((comment) => comment.clientId));
     if (orchestration.inlineComments.length > 0) {
-      allInlineIds = new Set(
-        orchestration.inlineComments.map((comment) => comment.clientId),
-      );
       if (config.vcsAdapter.prepareInlineReviewRecovery !== undefined) {
         const actionIdentity = createHash("sha256").update(JSON.stringify({ configHash, headSha: pr.headSha,
           children: orchestration.inlineComments.map((comment) => ({ clientId: comment.clientId, path: comment.path, line: comment.line, startLine: comment.startLine ?? null, body: comment.body })) }), "utf8").digest("hex");
@@ -628,210 +1078,71 @@ export async function review(
       }
     }
 
-    const writtenSummary = await config.vcsAdapter.upsertComment(
-      config.locator,
-      buildBody(
-        orchestration,
-        noFallbackIds,
-        formatPendingMarker({
-          phase: "publishing",
-          headSha: pr.headSha,
-          configHash,
-        }),
-      ),
+    const parentId = `act_${publicationIdentity.actionId.slice("action_".length)}`;
+    const inlines = orchestration.inlineComments.map((comment, index) => {
+      const recovered = inlineRecovery?.children[index];
+      const contentDigest = recovered?.contentDigest ?? computeContentDigest(comment.body);
+      const placementDigest = recovered?.placementDigest ?? createHash("sha256").update(JSON.stringify({
+        path: comment.path, line: comment.line, startLine: comment.startLine ?? null,
+      }), "utf8").digest("hex");
+      const childId = recovered?.childId ?? deriveInlineChildId(parentId, comment.clientId, contentDigest, placementDigest);
+      const marker = recovered?.marker ?? formatInlineRecoveryMarker({
+        kind: "finding",
+        parentId,
+        childId,
+        repositoryDigest: publicationIdentity.identityDigest,
+        reviewNumber: Number(pr.id),
+        contentDigest,
+        headSha: pr.headSha,
+        placementDigest,
+      });
+      return {
+        clientId: comment.clientId,
+        childId,
+        body: comment.body,
+        marker,
+        file: comment.path,
+        line: comment.line,
+        startLine: comment.startLine,
+        position: comment.position,
+      };
+    });
+    const frozenChildren = buildReviewPublicationGraph({
+      actionId: publicationIdentity.actionId,
+      summaryBody: buildBody(orchestration, noFallbackIds, ""),
+      headSha: pr.headSha,
+      configHash,
+      terminalResult,
+      inlines,
+      fallbacks: inlines.map((inline) => ({ replacesId: inline.childId, body: inline.body })),
+    });
+    const preparedAction: PublicationAction = {
+      ...publicationIdentity,
+      reviewNumber: Number(pr.id),
+      repository: {
+        provider: repository.provider,
+        repositoryDigest: createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex"),
+      },
+      state: "manifest-ready",
+      successorActionId: null,
+      children: frozenChildren,
+    };
+    return publishReviewFromManifest({
+      action: preparedAction,
+      store: stateStore,
+      config,
+      pr,
+      configHash,
       botComment,
-    );
-    if (
-      !writtenSummary ||
-      typeof writtenSummary.id !== "string" ||
-      writtenSummary.id.length === 0 ||
-      writtenSummary.lastReviewedSha !== "" ||
-      writtenSummary.reviewedConfig !== "" ||
-      writtenSummary.pendingState?.phase !== "publishing" ||
-      writtenSummary.pendingState.headSha !== pr.headSha ||
-      writtenSummary.pendingState.configHash !== configHash
-    ) {
-      throw new Error(
-        "The VCS adapter did not return the exact identity of the pending summary note",
-      );
-    }
-
-    let summaryIdentity = writtenSummary;
-    if (orchestration.inlineComments.length > 0) {
-      const checkpoint = await config.vcsAdapter.upsertComment(
-        config.locator,
-        buildBody(
-          orchestration,
-          allInlineIds!,
-          formatPendingMarker({
-            phase: "ready",
-            headSha: pr.headSha,
-            configHash,
-            noteId: writtenSummary.id,
-            terminalResult,
-            inlineRecovery,
-          }),
-        ),
-        writtenSummary,
-      );
-      if (
-        checkpoint.id !== writtenSummary.id ||
-        checkpoint.lastReviewedSha !== "" ||
-        checkpoint.reviewedConfig !== "" ||
-        checkpoint.pendingState?.phase !== "ready" ||
-        checkpoint.pendingState.headSha !== pr.headSha ||
-        checkpoint.pendingState.configHash !== configHash ||
-        checkpoint.pendingState.noteId !== writtenSummary.id ||
-        !sameTerminalResult(checkpoint.pendingState.terminalResult, terminalResult)
-      ) {
-        throw new Error(
-          "The VCS adapter could not confirm the exact ready recovery checkpoint",
-        );
-      }
-      summaryIdentity = checkpoint;
-    }
-
-    // Design-review #10: collapse the PREVIOUS runs' inline threads before
-    // posting this run's. Inline review comments are append-only, so without
-    // this every past head SHA's comments accumulate uncollapsed forever.
-    // Resolved threads stay visible as history — nothing is deleted, and only
-    // threads the bot itself started are touched. Runs AFTER the pending write
-    // (idempotency must never depend on cosmetic cleanup) and BEFORE the new
-    // inline post (so this run's comments are the only unresolved ones left).
-    // Strictly best-effort: a failure here must not abort or degrade the
-    // review — warn and carry on.
-    try {
-      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.locator);
-      if (resolved > 0) {
-        console.log(`tgd-review-agent: resolved ${resolved} stale inline comment thread(s) from previous runs`);
-      }
-    } catch (err) {
-      console.warn(
-        `tgd-review-agent: could not resolve stale inline comment threads (${(err as Error).message}); ` +
-          `continuing — old threads stay expanded but this run is unaffected`,
-      );
-    }
-
-    let finalFallbackIds = noFallbackIds;
-    if (orchestration.inlineComments.length > 0) {
-      let fallbackIds: Set<string> | undefined;
-      let ambiguousInlineWrite = false;
-      try {
-        const outcomes = await config.vcsAdapter.createInlineReview(
-          config.locator,
-          pr.headSha,
-          orchestration.inlineComments,
-          inlineRecovery,
-        );
-        try {
-          const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
-            if (typeof outcome !== "object" || outcome === null) return false;
-            const candidate = outcome as Record<string, unknown>;
-            return typeof candidate.clientId === "string" &&
-              (candidate.status === "posted" || candidate.status === "failed") &&
-              (candidate.reason === undefined || typeof candidate.reason === "string");
-          });
-          if (!shapesValid) throw new Error("malformed inline publish outcome");
-          const validated = validateInlinePublishOutcomes(
-            orchestration.inlineComments,
-            outcomes,
-            config.locator.kind === "repository"
-              ? { repo: config.locator.repo, reviewNumber: config.locator.number }
-              : undefined,
-          );
-          fallbackIds = new Set(
-            validated
-              .filter((outcome) => outcome.status === "failed")
-              .map((outcome) => outcome.clientId),
-          );
-        } catch (err) {
-          console.warn(
-            `tgd-review-agent: inline review returned invalid outcomes (${(err as Error).message}); ` +
-              `rewriting the summary comment to carry every inline finding instead`,
-          );
-          fallbackIds = allInlineIds;
-        }
-      } catch (err) {
-        if (err instanceof AmbiguousInlinePublishError && inlineRecovery !== undefined) {
-          console.warn(
-            `tgd-review-agent: GitHub may have accepted the inline review (${err.message}); ` +
-              `not duplicating those findings into the summary; a later run will reconcile markers`,
-          );
-          fallbackIds = noFallbackIds;
-          ambiguousInlineWrite = true;
-        } else {
-          console.warn(
-            `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
-              `rewriting the summary comment to carry every finding instead`,
-          );
-          fallbackIds = allInlineIds;
-        }
-      }
-
-      if (fallbackIds && fallbackIds.size > 0) {
-        finalFallbackIds = fallbackIds;
-      }
-
-      if (ambiguousInlineWrite) {
-        const ambiguousCheckpoint = await config.vcsAdapter.upsertComment(
-          config.locator,
-          buildBody(orchestration, allInlineIds!, formatPendingMarker({ phase: "ambiguous", headSha: pr.headSha, configHash, noteId: summaryIdentity.id, terminalResult, inlineRecovery: inlineRecovery! })),
-          summaryIdentity,
-        );
-        if (ambiguousCheckpoint.id !== summaryIdentity.id || ambiguousCheckpoint.pendingState?.phase !== "ambiguous") throw new Error("Could not persist ambiguous inline recovery checkpoint");
-        logStatus({ status: "partial", findingsCount: orchestration.findingsCount, rulesRun: orchestration.rulesRun, rulesFailed: orchestration.rulesFailed, reason: "inline-publication-ambiguous" });
-        return EXIT_PARTIAL;
-      }
-
-      const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
-        config.locator,
-        buildBody(
-          orchestration,
-          finalFallbackIds,
-          formatPendingMarker({
-            phase: "ready",
-            headSha: pr.headSha,
-            configHash,
-            noteId: summaryIdentity.id,
-            terminalResult,
-          }),
-        ),
-        summaryIdentity,
-      );
-      if (
-        selectiveCheckpoint.id !== summaryIdentity.id ||
-        selectiveCheckpoint.lastReviewedSha !== "" ||
-        selectiveCheckpoint.reviewedConfig !== "" ||
-        selectiveCheckpoint.pendingState?.phase !== "ready" ||
-        selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
-        selectiveCheckpoint.pendingState.configHash !== configHash ||
-        selectiveCheckpoint.pendingState.noteId !== summaryIdentity.id ||
-        !sameTerminalResult(
-          selectiveCheckpoint.pendingState.terminalResult,
-          terminalResult,
-        )
-      ) {
-        throw new Error(
-          "The VCS adapter could not confirm the exact selective recovery checkpoint",
-        );
-      }
-      summaryIdentity = selectiveCheckpoint;
-    }
-    const finalizedSummary = await config.vcsAdapter.upsertComment(
-      config.locator,
-      buildBody(orchestration, finalFallbackIds),
-      summaryIdentity,
-    );
-    if (
-      !finalizedSummary ||
-      finalizedSummary.id !== summaryIdentity.id ||
-      finalizedSummary.lastReviewedSha !== pr.headSha ||
-      finalizedSummary.reviewedConfig !== configHash
-    ) {
-      throw new Error(
-        "The VCS adapter could not confirm finalization of the exact completed summary note",
-      );
-    }
+      provider,
+      hooks: publicationHooks,
+      now,
+      orchestration,
+      loadErrors,
+      buildBody,
+      terminalResult,
+      inlineRecovery,
+    });
   }
 
   logStatus({

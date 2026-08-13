@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  deriveInlineChildId,
   formatPendingMarker,
   parseBotMarker,
   replacePendingMarker,
@@ -51,6 +52,40 @@ describe("parseBotMarker", () => {
     });
     expect(replacePendingMarker(`summary\n\n${marker}`, "<!-- complete -->"))
       .toBe("summary\n\n<!-- complete -->");
+  });
+
+  it("round-trips exact child recovery bindings and rejects unknown child properties", () => {
+    const parentId = `act_${"a".repeat(32)}`;
+    const contentDigest = "d".repeat(64);
+    const placementDigest = "f".repeat(64);
+    const childBase = { clientId: "finding-0", kind: "finding" as const, parentId,
+      childId: deriveInlineChildId(parentId, "finding-0", contentDigest, placementDigest), repositoryDigest: "c".repeat(64), reviewNumber: 42,
+      contentDigest, headSha: "e".repeat(40), placementDigest };
+    const child = { ...childBase, marker: `<!-- tgd-inline-child:v=3;kind=finding;parent=${childBase.parentId};child=${childBase.childId};repo=${childBase.repositoryDigest};review=42;content=${childBase.contentDigest};head=${childBase.headSha};placement=${childBase.placementDigest} -->` };
+    const state = { phase: "ambiguous" as const, headSha: "e".repeat(40), configHash: "cfg", noteId: "note-1",
+      terminalResult: { status: "posted" as const, findingsCount: 1, rulesRun: ["rule"], rulesFailed: [], exitCode: 0 as const },
+      inlineRecovery: { children: [child], noFallbackBody: "summary" } };
+    expect(parseBotMarker(formatPendingMarker(state))?.pendingState?.inlineRecovery).toEqual(state.inlineRecovery);
+    expect(() => formatPendingMarker({ ...state, inlineRecovery: { children: [{ ...child, extra: true }], noFallbackBody: "summary" } } as never)).toThrow(/recovery/i);
+  });
+
+  it("rejects tampered derived child IDs and duplicate semantic marker bindings", () => {
+    const parentId = `act_${"a".repeat(32)}`;
+    const contentDigest = "d".repeat(64);
+    const placementDigest = "f".repeat(64);
+    const make = (clientId: string) => {
+      const childId = deriveInlineChildId(parentId, clientId, contentDigest, placementDigest);
+      const base = { clientId, kind: "finding" as const, parentId, childId, repositoryDigest: "c".repeat(64), reviewNumber: 42, contentDigest, headSha: "e".repeat(40), placementDigest };
+      return { ...base, marker: `<!-- tgd-inline-child:v=3;kind=finding;parent=${parentId};child=${childId};repo=${base.repositoryDigest};review=42;content=${contentDigest};head=${base.headSha};placement=${placementDigest} -->` };
+    };
+    const terminalResult = { status: "posted" as const, findingsCount: 2, rulesRun: ["rule"], rulesFailed: [], exitCode: 0 as const };
+    const state = (children: unknown[]) => ({ phase: "ambiguous" as const, headSha: "e".repeat(40), configHash: "cfg", noteId: "note", terminalResult,
+      inlineRecovery: { children, noFallbackBody: "summary" } });
+    expect(() => formatPendingMarker(state([{ ...make("finding-0"), childId: `finding_${"0".repeat(32)}` }]) as never)).toThrow(/recovery/i);
+    const first = make("finding-0");
+    expect(() => formatPendingMarker(state([first, { ...make("finding-1"), childId: first.childId, marker: first.marker }]) as never)).toThrow(/recovery/i);
+    expect(() => formatPendingMarker(state([first, { ...make("finding-1"), marker: first.marker }]) as never)).toThrow(/recovery/i);
+    expect(() => formatPendingMarker(state([first, make("finding-1")]) as never)).toThrow(/duplicate child binding/i);
   });
 
   it("accepts 65 rules and rule names longer than 128 characters", () => {

@@ -7,7 +7,7 @@ import {
   validatePendingSnapshot,
   validateTransactionIntent,
 } from "../../../src/conversation/state-schema.js";
-import { formatChildMarker } from "../../../src/conversation/markers.js";
+import { computeContentDigest, formatChildMarker } from "../../../src/conversation/markers.js";
 
 const digest = "a".repeat(64);
 const binding = { provider: "github" as const, repositoryDigest: digest };
@@ -117,22 +117,24 @@ describe("ledger invariants", () => {
       { ...base, state: "observed", successorActionId: null, manifest: [] },
       { ...base, state: "superseded", successorActionId: base.actionId, manifest: [] },
     ], binding)).toThrow(/successor|itself/i);
-    const child = { id: `output_${"3".repeat(32)}`, kind: "finding", placement: null, bodyDigest: digest,
-      marker: formatChildMarker({ kind: "finding", parentId: `act_${"1".repeat(32)}`, childId: `finding_${"3".repeat(32)}`, repositoryDigest: digest, reviewNumber: 1, contentDigest: digest }) };
+    const body = "finding body";
+    const bodyDigest = computeContentDigest(body);
+    const child = { id: `finding_${"3".repeat(32)}`, kind: "inline", placement: { kind: "inline", file: "src/a.ts", line: 1 },
+      body, bodyDigest, marker: formatChildMarker({ kind: "finding", parentId: `act_${"1".repeat(32)}`, childId: `finding_${"3".repeat(32)}`, repositoryDigest: digest, reviewNumber: 1, contentDigest: bodyDigest }) };
     expect(() => validateEventEntries([
       { ...base, state: "observed", successorActionId: null, manifest: [] },
       { ...base, state: "prepared", successorActionId: null, manifest: [] },
-      { ...base, state: "manifest-ready", successorActionId: null, manifest: [{ ...child, status: "prepared" }] },
-      { ...base, state: "published", successorActionId: null, manifest: [{ ...child, status: "published" }] },
+      { ...base, state: "manifest-ready", successorActionId: null, manifest: [{ ...child, status: "pending" }] },
+      { ...base, state: "published", successorActionId: null, manifest: [{ ...child, status: "posted" }] },
       { ...base, state: "superseded", successorActionId: `action_${"4".repeat(32)}`,
-        manifest: [{ ...child, status: "prepared" }] },
+        manifest: [{ ...child, status: "pending" }] },
     ], binding)).toThrow(/status|transition/i);
     expect(() => validateEventEntries([
       { ...base, state: "observed", successorActionId: null, manifest: [] },
       { ...base, state: "prepared", successorActionId: null, manifest: [] },
       { ...base, state: "manifest-ready", successorActionId: null, manifest: [
-        { id: `output_${"2".repeat(32)}`, kind: "finding", status: "prepared", placement: null, bodyDigest: digest, marker: formatChildMarker({ kind: "finding", parentId: `act_${"1".repeat(32)}`, childId: `finding_${"2".repeat(32)}`, repositoryDigest: digest, reviewNumber: 1, contentDigest: digest }) },
-        { id: `output_${"2".repeat(32)}`, kind: "finding", status: "prepared", placement: null, bodyDigest: digest, marker: formatChildMarker({ kind: "finding", parentId: `act_${"1".repeat(32)}`, childId: `finding_${"2".repeat(32)}`, repositoryDigest: digest, reviewNumber: 1, contentDigest: digest }) },
+        { id: `finding_${"2".repeat(32)}`, kind: "inline", status: "pending", placement: { kind: "inline", file: "src/a.ts", line: 1 }, body, bodyDigest, marker: formatChildMarker({ kind: "finding", parentId: `act_${"1".repeat(32)}`, childId: `finding_${"2".repeat(32)}`, repositoryDigest: digest, reviewNumber: 1, contentDigest: bodyDigest }) },
+        { id: `finding_${"2".repeat(32)}`, kind: "inline", status: "pending", placement: { kind: "inline", file: "src/a.ts", line: 1 }, body, bodyDigest, marker: formatChildMarker({ kind: "finding", parentId: `act_${"1".repeat(32)}`, childId: `finding_${"2".repeat(32)}`, repositoryDigest: digest, reviewNumber: 1, contentDigest: bodyDigest }) },
       ] },
     ], binding)).toThrow(/duplicate/i);
     expect(validateEventEntries([

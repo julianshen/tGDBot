@@ -6,12 +6,13 @@
 // `gh` CLI, real network, or a real pi SDK/LLM session — same
 // dependency-injection spirit as Task 5's `dispatchRules` (which itself
 // takes an injectable `createSession`).
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
+import os from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { main, parseArgs, review } from "../../src/cli.js";
-import type { CliArgs } from "../../src/cli.js";
+import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
 import { computeReviewConfigHash, formatMarker } from "../../src/review/dedup.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
 import { deriveInlineChildId, formatInlineRecoveryMarker, formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
@@ -24,6 +25,20 @@ import type { RuleDefinition } from "../../src/rules/types.js";
 import type { DispatchResult } from "../../src/review/types.js";
 import { orchestrate as buildPresentation } from "../../src/review/orchestrate.js";
 import type { OrchestrationResult } from "../../src/review/orchestrate.js";
+
+const temporaryStateRoots: string[] = [];
+
+afterEach(() => {
+  for (const directory of temporaryStateRoots.splice(0)) {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+function isolatedStateDir(): string {
+  const directory = realpathSync(mkdtempSync(path.join(os.tmpdir(), "tgd-review-state-")));
+  temporaryStateRoots.push(directory);
+  return directory;
+}
 
 const postedInline = (clientId: string) => ({
   clientId,
@@ -215,6 +230,7 @@ interface Harness {
   loadRules: ReturnType<typeof vi.fn>;
   dispatchRules: ReturnType<typeof vi.fn>;
   orchestrate: ReturnType<typeof vi.fn>;
+  publicationHooks?: ReviewDependencies["publicationHooks"];
 }
 
 function makeHarness(options: {
@@ -227,6 +243,7 @@ function makeHarness(options: {
   ruleFilesFromBase?: RuleFileContent[];
 } = {}): Harness {
   const args = options.args ?? makeArgs();
+  if (args.stateDir === undefined) args.stateDir = isolatedStateDir();
   const pr = options.pr ?? makePr();
   const botComment = options.botComment ?? null;
   const loadResult: LoadResult = options.loadResult ?? { rules: [makeRule()], errors: [] };
@@ -305,6 +322,7 @@ function depsFrom(h: Harness) {
     loadRules: h.loadRules,
     dispatchRules: h.dispatchRules,
     orchestrate: h.orchestrate,
+    publicationHooks: h.publicationHooks,
   };
 }
 
@@ -1698,7 +1716,7 @@ describe("inline review comments", () => {
     });
 
     await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
-    expect(h.dispatchRules).toHaveBeenCalledTimes(2);
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
     expect(stored).toMatchObject({
       id: "written-777",
       lastReviewedSha: "cafef00d",
@@ -2103,3 +2121,141 @@ describe("inline review comments", () => {
     vi.restoreAllMocks();
   });
 });
+
+describe("review publication crash-matrix", () => {
+  const DIFF = "diff --git a/x.ts b/x.ts\n--- a/x.ts\n+++ b/x.ts\n@@ -0,0 +1,3 @@\n+one\n+two\n+three\n";
+
+  function threeInlineHarness(stateDir: string) {
+    const findings: DispatchResult = {
+      findings: [1, 2, 3].map((line, index) => ({
+        ruleName: "rule-a",
+        severity: "warning" as const,
+        category: "correctness",
+        file: "x.ts",
+        line,
+        message: `finding ${index}`,
+      })),
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    };
+    const h = makeHarness({
+      args: makeArgs({ stateDir }),
+      dispatchResult: findings,
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
+    h.orchestrate.mockImplementation(buildPresentation);
+    return h;
+  }
+
+  it("recovers a crash before the first provider write without invoking the model again", async () => {
+    const stateDir = isolatedStateDir();
+    const first = threeInlineHarness(stateDir);
+    first.publicationHooks = {
+      beforeChildWrite: async () => {
+        throw new Error("crash before first write");
+      },
+    };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await expect(review(first.args, depsFrom(first))).rejects.toThrow(/crash before first write/);
+    expect(first.dispatchRules).toHaveBeenCalledTimes(1);
+    expect(first.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(first.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+
+    const second = threeInlineHarness(stateDir);
+    expect(await review(second.args, depsFrom(second))).toBe(0);
+    expect(second.dispatchRules).not.toHaveBeenCalled();
+    expect(second.vcsAdapter.upsertComment).toHaveBeenCalled();
+    expect(second.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
+  });
+
+  it("recovers GitHub atomic-inline fallback from a frozen manifest", async () => {
+    const stateDir = isolatedStateDir();
+    const first = threeInlineHarness(stateDir);
+    first.vcsAdapter.createInlineReview.mockRejectedValue(new Error("atomic inline rejected"));
+    first.publicationHooks = {
+      afterChildWrite: async (child) => {
+        if (child.kind === "inline") throw new Error("crash after atomic inline fallback");
+      },
+    };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(review(first.args, depsFrom(first))).rejects.toThrow(/crash after atomic inline fallback|atomic inline rejected/);
+
+    const second = threeInlineHarness(stateDir);
+    second.vcsAdapter.createInlineReview.mockRejectedValue(new Error("atomic inline rejected"));
+    expect(await review(second.args, depsFrom(second))).toBe(0);
+    expect(second.dispatchRules).not.toHaveBeenCalled();
+    const finalBody = String(second.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1] ?? first.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    expect(finalBody).toContain("finding 0");
+    expect(finalBody).toContain("finding 1");
+    expect(finalBody).toContain("finding 2");
+  });
+
+  it("recovers GitLab selective fallback and writes only missing children", async () => {
+    const stateDir = isolatedStateDir();
+    const first = threeInlineHarness(stateDir);
+    first.args = { ...first.args, vcs: "gitlab" };
+    first.vcsAdapter.prepareInlineReviewRecovery = undefined as never;
+    first.vcsAdapter.recoverInlineReview = undefined as never;
+    first.vcsAdapter.createInlineReview.mockResolvedValue([
+      postedInline("finding-0"),
+      { clientId: "finding-1", status: "failed", reason: "position rejected" },
+      postedInline("finding-2"),
+    ]);
+    let inlineBatches = 0;
+    first.publicationHooks = {
+      afterChildWrite: async (child) => {
+        if (child.kind === "inline" && ++inlineBatches === 1) {
+          throw new Error("crash after first gitlab inline");
+        }
+      },
+    };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(review(first.args, depsFrom(first))).rejects.toThrow(/crash after first gitlab inline/);
+
+    const second = threeInlineHarness(stateDir);
+    second.args = first.args;
+    second.vcsAdapter.prepareInlineReviewRecovery = undefined as never;
+    second.vcsAdapter.recoverInlineReview = undefined as never;
+    second.vcsAdapter.createInlineReview.mockResolvedValue([
+      postedInline("finding-0"),
+      { clientId: "finding-1", status: "failed", reason: "position rejected" },
+      postedInline("finding-2"),
+    ]);
+    expect(await review(second.args, depsFrom(second))).toBe(0);
+    expect(second.dispatchRules).not.toHaveBeenCalled();
+    const finalBody = String(second.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    expect(finalBody).not.toContain("finding 0");
+    expect(finalBody).toContain("finding 1");
+    expect(finalBody).not.toContain("finding 2");
+  });
+
+  it("serializes two review publishers so each marker is written once", async () => {
+    const stateDir = isolatedStateDir();
+    const release = Promise.withResolvers<void>();
+    const ready: Array<PromiseWithResolvers<void>> = [];
+    const first = threeInlineHarness(stateDir);
+    const second = threeInlineHarness(stateDir);
+    const pause = async () => {
+      const gate = Promise.withResolvers<void>();
+      ready.push(gate);
+      gate.resolve();
+      await release.promise;
+    };
+    first.publicationHooks = { beforePublication: pause };
+    second.publicationHooks = { beforePublication: pause };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const runs = Promise.all([
+      review(first.args, depsFrom(first)),
+      review(second.args, depsFrom(second)),
+    ]);
+    await vi.waitFor(() => expect(ready).toHaveLength(2));
+    release.resolve();
+    await expect(runs).resolves.toEqual([0, 0]);
+    const inlineCalls = first.vcsAdapter.createInlineReview.mock.calls.length
+      + second.vcsAdapter.createInlineReview.mock.calls.length;
+    expect(inlineCalls).toBe(1);
+  });
+});
+

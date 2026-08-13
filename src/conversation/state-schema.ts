@@ -1,5 +1,5 @@
-import type { BotIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
-import { parseChildMarker } from "./markers.js";
+import type { BotIdentity, ConversationItemIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
+import { computeContentDigest, parseChildMarker } from "./markers.js";
 
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{7,64}$/iu;
@@ -51,16 +51,44 @@ export interface ConversationPendingSnapshot {
 }
 
 export type ActionState = "observed" | "prepared" | "manifest-ready" | "published" | "completed" | "superseded";
-export type PublicationStatus = "prepared" | "published" | "completed";
+export type PublicationChildKind = "summary" | "group-reply" | "inline" | "general-question" | "fallback";
+export type PublicationChildStatus = "pending" | "posted" | "failed" | "fallback-selected";
+export type PublicationStatus = PublicationChildStatus;
+
+export type PublicationPlacement =
+  | { readonly kind: "summary"; readonly headSha?: string; readonly configHash?: string; readonly terminalResult?: PublicationTerminalResult }
+  | { readonly kind: "group-reply"; readonly threadId?: string }
+  | { readonly kind: "inline"; readonly file: string; readonly line: number; readonly startLine?: number; readonly side?: "old" | "new"; readonly clientId?: string; readonly position?: PublicationInlinePosition }
+  | { readonly kind: "general-question"; readonly file?: string; readonly line?: number }
+  | { readonly kind: "fallback" };
+
+export interface PublicationInlinePosition {
+  readonly oldPath: string;
+  readonly newPath: string;
+  readonly start: { readonly type: "old" | "new"; readonly oldLine?: number; readonly newLine: number };
+  readonly end: { readonly type: "old" | "new"; readonly oldLine?: number; readonly newLine: number };
+  readonly sameHunk: true;
+}
+
+export interface PublicationTerminalResult {
+  readonly status: "posted" | "partial";
+  readonly findingsCount: number;
+  readonly rulesRun: readonly string[];
+  readonly rulesFailed: readonly string[];
+  readonly loadErrors?: readonly string[];
+  readonly exitCode: 0 | 2;
+}
 
 export interface PublicationManifestChild {
   readonly id: string;
-  readonly kind: "action" | "finding" | "clarification";
-  readonly status: PublicationStatus;
-  readonly placement: ConversationPlacement | null;
+  readonly kind: PublicationChildKind;
+  readonly status: PublicationChildStatus;
+  readonly placement: PublicationPlacement;
+  readonly body: string;
   readonly bodyDigest: string;
   readonly marker: string;
-  readonly identity?: BotIdentity;
+  readonly identity?: ConversationItemIdentity;
+  readonly replacesId?: string;
 }
 
 export interface ConversationEventEntry {
@@ -472,23 +500,164 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
   return { version: 1, repository, clarifications, directions };
 }
 
+function publicationKind(value: unknown, name: string): PublicationChildKind {
+  if (value !== "summary" && value !== "group-reply" && value !== "inline" &&
+    value !== "general-question" && value !== "fallback") {
+    throw new Error(`${name} is invalid`);
+  }
+  return value;
+}
+
+function publicationStatus(value: unknown, name: string): PublicationChildStatus {
+  if (value !== "pending" && value !== "posted" && value !== "failed" && value !== "fallback-selected") {
+    throw new Error(`${name} is invalid`);
+  }
+  return value;
+}
+
+function publicationBody(value: unknown, name: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 65_536 ||
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${name} must be bounded publication body text`);
+  }
+  return value;
+}
+
+function conversationItemIdentity(value: unknown, name: string): ConversationItemIdentity {
+  const object = exact(value, name, ["provider", "commentId", "url"], ["threadId"]);
+  if (object.provider !== "github" && object.provider !== "gitlab") throw new Error(`${name}.provider is invalid`);
+  const commentId = text(object.commentId, `${name}.commentId`, 256);
+  const url = text(object.url, `${name}.url`, 2_048);
+  return {
+    provider: object.provider,
+    commentId,
+    url,
+    ...(object.threadId === undefined ? {} : { threadId: text(object.threadId, `${name}.threadId`, 256) }),
+  };
+}
+
+function publicationInlinePosition(value: unknown, name: string): PublicationInlinePosition {
+  const object = exact(value, name, ["oldPath", "newPath", "start", "end", "sameHunk"]);
+  if (object.sameHunk !== true) throw new Error(`${name}.sameHunk is invalid`);
+  const endpoint = (candidate: unknown, endpointName: string) => {
+    const point = exact(candidate, endpointName, ["type", "newLine"], ["oldLine"]);
+    if (point.type !== "old" && point.type !== "new") throw new Error(`${endpointName}.type is invalid`);
+    return {
+      type: point.type,
+      newLine: positiveInteger(point.newLine, `${endpointName}.newLine`),
+      ...(point.oldLine === undefined ? {} : { oldLine: positiveInteger(point.oldLine, `${endpointName}.oldLine`) }),
+    };
+  };
+  return {
+    oldPath: text(object.oldPath, `${name}.oldPath`, 4_096),
+    newPath: text(object.newPath, `${name}.newPath`, 4_096),
+    start: endpoint(object.start, `${name}.start`),
+    end: endpoint(object.end, `${name}.end`),
+    sameHunk: true,
+  };
+}
+
+function publicationTerminalResult(value: unknown, name: string): PublicationTerminalResult {
+  const object = exact(value, name, ["status", "findingsCount", "rulesRun", "rulesFailed", "exitCode"], ["loadErrors"]);
+  if (object.status !== "posted" && object.status !== "partial") throw new Error(`${name}.status is invalid`);
+  if (!Number.isSafeInteger(object.findingsCount) || (object.findingsCount as number) < 0) {
+    throw new Error(`${name}.findingsCount is invalid`);
+  }
+  if (object.exitCode !== 0 && object.exitCode !== 2) throw new Error(`${name}.exitCode is invalid`);
+  const names = (candidate: unknown, field: string): readonly string[] =>
+    array(candidate, field, 1_000).map((entry, index) => text(entry, `${field}[${index}]`, 65_536));
+  return {
+    status: object.status,
+    findingsCount: object.findingsCount as number,
+    rulesRun: names(object.rulesRun, `${name}.rulesRun`),
+    rulesFailed: names(object.rulesFailed, `${name}.rulesFailed`),
+    exitCode: object.exitCode,
+    ...(object.loadErrors === undefined ? {} : { loadErrors: names(object.loadErrors, `${name}.loadErrors`) }),
+  };
+}
+
+function publicationPlacement(value: unknown, name: string): PublicationPlacement {
+  const object = exact(value, name, ["kind"], ["headSha", "configHash", "terminalResult", "threadId", "file", "line",
+    "startLine", "side", "clientId", "position"]);
+  if (object.kind === "summary") {
+    return {
+      kind: "summary",
+      ...(object.headSha === undefined ? {} : { headSha: text(object.headSha, `${name}.headSha`, 64) }),
+      ...(object.configHash === undefined ? {} : { configHash: text(object.configHash, `${name}.configHash`, 64) }),
+      ...(object.terminalResult === undefined ? {} : {
+        terminalResult: publicationTerminalResult(object.terminalResult, `${name}.terminalResult`),
+      }),
+    };
+  }
+  if (object.kind === "group-reply") {
+    return {
+      kind: "group-reply",
+      ...(object.threadId === undefined ? {} : { threadId: text(object.threadId, `${name}.threadId`, 256) }),
+    };
+  }
+  if (object.kind === "inline") {
+    return {
+      kind: "inline",
+      file: text(object.file, `${name}.file`, 4_096),
+      line: positiveInteger(object.line, `${name}.line`),
+      ...(object.startLine === undefined ? {} : { startLine: positiveInteger(object.startLine, `${name}.startLine`) }),
+      ...(object.side === undefined ? {} : object.side === "old" || object.side === "new" ? { side: object.side } :
+        (() => { throw new Error(`${name}.side is invalid`); })()),
+      ...(object.clientId === undefined ? {} : { clientId: text(object.clientId, `${name}.clientId`, 128) }),
+      ...(object.position === undefined ? {} : { position: publicationInlinePosition(object.position, `${name}.position`) }),
+    };
+  }
+  if (object.kind === "general-question") {
+    return {
+      kind: "general-question",
+      ...(object.file === undefined ? {} : { file: text(object.file, `${name}.file`, 4_096) }),
+      ...(object.line === undefined ? {} : { line: positiveInteger(object.line, `${name}.line`) }),
+    };
+  }
+  if (object.kind === "fallback") return { kind: "fallback" };
+  throw new Error(`${name}.kind is invalid`);
+}
+
+function childIdPrefix(kind: PublicationChildKind): "output" | "finding" | "clarification" {
+  if (kind === "inline") return "finding";
+  if (kind === "general-question") return "clarification";
+  return "output";
+}
+
 function manifestChild(value: unknown, name: string, repository: RepositoryBinding, actionId: string, reviewNumber: number): PublicationManifestChild {
-  const object = exact(value, name, ["id", "kind", "status", "placement", "bodyDigest", "marker"], ["identity"]);
-  if (object.kind !== "action" && object.kind !== "finding" && object.kind !== "clarification") throw new Error(`${name}.kind is invalid`);
-  if (object.status !== "prepared" && object.status !== "published" && object.status !== "completed") throw new Error(`${name}.status is invalid`);
-  const childId = id(object.id, `${name}.id`, "output");
+  const object = exact(value, name, ["id", "kind", "status", "placement", "body", "bodyDigest", "marker"],
+    ["identity", "replacesId"]);
+  const kind = publicationKind(object.kind, `${name}.kind`);
+  const status = publicationStatus(object.status, `${name}.status`);
+  const childId = id(object.id, `${name}.id`, childIdPrefix(kind));
+  const body = publicationBody(object.body, `${name}.body`);
   const bodyDigest = digest(object.bodyDigest, `${name}.bodyDigest`);
+  if (bodyDigest !== computeContentDigest(body)) throw new Error(`${name}.bodyDigest does not match body`);
   const marker = text(object.marker, `${name}.marker`, 4_096);
   const parsed = parseChildMarker(marker);
-  const markerPrefix = object.kind === "action" ? "out" : object.kind === "finding" ? "finding" : "clar";
-  const markerChildId = `${markerPrefix}_${childId.slice("output_".length)}`;
-  const parentId = `act_${actionId.slice("action_".length)}`;
-  if (parsed === null || parsed.kind !== object.kind || parsed.parentId !== parentId || parsed.childId !== markerChildId || parsed.repositoryDigest !== repository.repositoryDigest || parsed.reviewNumber !== reviewNumber || parsed.contentDigest !== bodyDigest) {
-    throw new Error(`${name}.marker does not canonically bind the manifest child`);
+  if (parsed !== null) {
+    const markerKind = kind === "inline" ? "finding" : kind === "general-question" ? "clarification" : "action";
+    const markerPrefix = markerKind === "action" ? "out" : markerKind === "finding" ? "finding" : "clar";
+    const hex = childId.slice(childId.indexOf("_") + 1);
+    const markerChildId = `${markerPrefix}_${hex}`;
+    const parentId = `act_${actionId.slice("action_".length)}`;
+    if (parsed.kind !== markerKind || parsed.parentId !== parentId || parsed.childId !== markerChildId ||
+      parsed.repositoryDigest !== repository.repositoryDigest || parsed.reviewNumber !== reviewNumber ||
+      parsed.contentDigest !== bodyDigest) {
+      throw new Error(`${name}.marker does not canonically bind the manifest child`);
+    }
   }
-  return { id: childId, kind: object.kind, status: object.status,
-    placement: placement(object.placement, `${name}.placement`), bodyDigest, marker,
-    ...(object.identity === undefined ? {} : { identity: identity(object.identity, `${name}.identity`) }) };
+  const validatedIdentity = object.identity === undefined ? undefined :
+    conversationItemIdentity(object.identity, `${name}.identity`);
+  if (validatedIdentity !== undefined && validatedIdentity.provider !== repository.provider) {
+    throw new Error("publication identity provider does not match repository");
+  }
+  return {
+    id: childId, kind, status, placement: publicationPlacement(object.placement, `${name}.placement`),
+    body, bodyDigest, marker,
+    ...(validatedIdentity === undefined ? {} : { identity: validatedIdentity }),
+    ...(object.replacesId === undefined ? {} : { replacesId: id(object.replacesId, `${name}.replacesId`) }),
+  };
 }
 
 export function validateEventEntry(value: unknown, expected: RepositoryBinding, name = "event"): ConversationEventEntry {
@@ -510,6 +679,7 @@ export function validateEventEntry(value: unknown, expected: RepositoryBinding, 
       }
     }
     if (new Set(manifest.map((child) => child.id)).size !== manifest.length) throw new Error("manifest contains duplicate child IDs");
+    if (new Set(manifest.map((child) => child.marker)).size !== manifest.length) throw new Error("manifest contains duplicate child markers");
     return { version: 1 as const, repository, actionId, identityDigest: digest(object.identityDigest, "event identity digest"), reviewNumber, state: object.state as ActionState,
       at: date(object.at, "event at"), successorActionId, manifest };
 }
@@ -527,16 +697,28 @@ export function validateEventEntries(
     id: child.id,
     kind: child.kind,
     placement: child.placement,
+    body: child.body,
     bodyDigest: child.bodyDigest,
     marker: child.marker,
-    ...(child.identity === undefined ? {} : { identity: child.identity }),
+    ...(child.replacesId === undefined ? {} : { replacesId: child.replacesId }),
   }));
+  const childIsTerminal = (child: PublicationManifestChild, manifest: readonly PublicationManifestChild[]): boolean => {
+    if (child.status === "posted" || child.status === "fallback-selected") return true;
+    if (child.status === "failed" && child.kind === "fallback") return true;
+    if (child.status === "failed" && manifest.some((entry) =>
+      entry.kind === "fallback" && entry.replacesId === child.id && entry.status === "fallback-selected")) {
+      return true;
+    }
+    return child.kind === "fallback" && manifest.some((entry) => entry.id === child.replacesId && entry.status === "posted");
+  };
   for (const entry of entries) {
     const previous = prior.get(entry.actionId);
     if (previous === undefined) {
       if (entry.state !== "observed") throw new Error("Impossible action transition: first state must be observed");
     } else if (previous.state === "completed" || previous.state === "superseded") {
       throw new Error("Impossible action transition after terminal state");
+    } else if (entry.state === previous.state && entry.state === "published") {
+      // Child status/identity may advance while the action remains published.
     } else if (entry.state !== "superseded" &&
       // Classified-and-ignored observations complete with an empty manifest.
       !(entry.state === "completed" && previous.state === "observed" &&
@@ -551,10 +733,11 @@ export function validateEventEntries(
     if ((entry.state === "observed" || entry.state === "prepared") && entry.manifest.length !== 0) {
       throw new Error(`${entry.state} action cannot have a publication manifest`);
     }
-    const requiredChildStatus = entry.state === "manifest-ready" ? "prepared" :
-      entry.state === "published" ? "published" : entry.state === "completed" ? "completed" : undefined;
-    if (requiredChildStatus !== undefined && entry.manifest.some((child) => child.status !== requiredChildStatus)) {
-      throw new Error(`publication manifest status is inconsistent with ${entry.state}`);
+    if (entry.state === "manifest-ready" && entry.manifest.some((child) => child.status !== "pending")) {
+      throw new Error("publication manifest status is inconsistent with manifest-ready");
+    }
+    if (entry.state === "completed" && entry.manifest.some((child) => !childIsTerminal(child, entry.manifest))) {
+      throw new Error("completed action has a child that lacks terminal posted/fallback state");
     }
     if (previous !== undefined &&
       (order.indexOf(previous.state) >= order.indexOf("manifest-ready") || entry.state === "superseded") &&
@@ -562,7 +745,7 @@ export function validateEventEntries(
       throw new Error("Immutable publication manifest changed");
     }
     if (previous !== undefined && entry.state === "superseded") {
-      const statusOrder: readonly PublicationStatus[] = ["prepared", "published", "completed"];
+      const statusOrder: readonly PublicationChildStatus[] = ["pending", "posted", "failed", "fallback-selected"];
       if (entry.manifest.some((child, index) =>
         statusOrder.indexOf(child.status) < statusOrder.indexOf(previous.manifest[index]!.status))) {
         throw new Error("Superseded publication manifest contains an impossible status transition");

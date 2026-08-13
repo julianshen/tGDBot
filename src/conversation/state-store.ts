@@ -82,6 +82,12 @@ export interface ConversationStateTransaction {
   replacePending(snapshot: ConversationPendingSnapshot): void;
 }
 
+export interface ConversationExclusiveSession {
+  snapshot(): ConversationContextSnapshot;
+  commit(fn: (tx: ConversationStateTransaction) => void): Promise<void>;
+  findTerminalAction(identity: TerminalActionIdentity): Promise<TerminalActionSummary | undefined>;
+}
+
 export interface ConversationStateStore {
   readContextSnapshot(): Promise<ConversationContextSnapshot>;
   readAuditPage(journal: JournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{
@@ -93,6 +99,7 @@ export interface ConversationStateStore {
   findMemory(id: string): Promise<MemoryIndexSummary | undefined>;
   findFinding(id: string): Promise<FindingIndexSummary | undefined>;
   transact<T>(fn: (tx: ConversationStateTransaction) => T): Promise<T>;
+  withExclusiveLock<T>(fn: (session: ConversationExclusiveSession) => Promise<T>): Promise<T>;
 }
 
 export interface TerminalActionIdentity { readonly actionId: string; readonly identityDigest: string }
@@ -1262,7 +1269,44 @@ class FileConversationStateStore implements ConversationStateStore {
 
   async transact<T>(fn: (tx: ConversationStateTransaction) => T): Promise<T> {
     if (typeof fn !== "function") throw new Error("Conversation state transaction callback must be a function");
+    return this.withLock((parentIdentity) => this.applyTransaction(parentIdentity, fn));
+  }
+
+  async withExclusiveLock<T>(fn: (session: ConversationExclusiveSession) => Promise<T>): Promise<T> {
+    if (typeof fn !== "function") throw new Error("Conversation exclusive lock callback must be a function");
     return this.withLock(async (parentIdentity) => {
+      const session: ConversationExclusiveSession = {
+        snapshot: () => {
+          throw new Error("Conversation exclusive session snapshot must be loaded before use");
+        },
+        commit: (txFn) => this.applyTransaction(parentIdentity, txFn),
+        findTerminalAction: async (identity) => {
+          const loaded = await this.loadState(parentIdentity);
+          const value = await this.findIndexValue(
+            "terminal-actions",
+            loaded.journalHead.checkpoint.terminalActionIndex,
+            `${identity.actionId}:${identity.identityDigest}`,
+            parentIdentity,
+          );
+          return value === undefined ? undefined : clone(value as TerminalActionSummary);
+        },
+      };
+      let loaded = await this.loadState(parentIdentity);
+      session.snapshot = () => contextOf(loaded);
+      const originalCommit = session.commit;
+      session.commit = async (txFn) => {
+        const result = await originalCommit(txFn);
+        loaded = await this.loadState(parentIdentity);
+        return result;
+      };
+      return fn(session);
+    });
+  }
+
+  private async applyTransaction<T>(
+    parentIdentity: { dev: number; ino: number },
+    fn: (tx: ConversationStateTransaction) => T,
+  ): Promise<T> {
       const loaded = await this.loadState(parentIdentity);
       let cursor = clone(loaded.cursor);
       let pending = clone(loaded.pending);
@@ -1393,7 +1437,6 @@ class FileConversationStateStore implements ConversationStateStore {
       if (writePending) replacements.push(this.replacement("pending.json", serializeSnapshot(pending), transactionId));
       await this.commit(replacements, transactionId, parentIdentity);
       return result;
-    });
   }
 }
 

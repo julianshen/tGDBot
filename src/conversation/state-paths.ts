@@ -252,7 +252,14 @@ async function preparePhysicalAncestors(
       if (parentInfo.isSymbolicLink() || !parentInfo.isDirectory()) {
         throw new Error(`Conversation state ancestor is unsafe: ${parent}`);
       }
-      await fs.mkdir(candidate, { mode: 0o700 });
+      try {
+        await fs.mkdir(candidate, { mode: 0o700 });
+      } catch (createError) {
+        if (!(typeof createError === "object" && createError !== null && "code" in createError &&
+          (createError as NodeJS.ErrnoException).code === "EEXIST")) {
+          throw createError;
+        }
+      }
       await inspectExistingPath(fs, candidate, true, platform, uid);
     }
   }
@@ -266,7 +273,14 @@ async function protectDirectory(
 ): Promise<Stats> {
   let before = await inspectExistingPath(fs, directory, true, platform, uid);
   if (before === undefined) {
-    await fs.mkdir(directory, { mode: 0o700 });
+    try {
+      await fs.mkdir(directory, { mode: 0o700 });
+    } catch (error) {
+      if (!(typeof error === "object" && error !== null && "code" in error &&
+        (error as NodeJS.ErrnoException).code === "EEXIST")) {
+        throw error;
+      }
+    }
     before = await inspectExistingPath(fs, directory, true, platform, uid);
   }
   if (before === undefined) throw new Error(`Conversation state directory was not created: ${directory}`);

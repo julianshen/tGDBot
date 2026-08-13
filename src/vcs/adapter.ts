@@ -70,6 +70,11 @@ export interface VcsAdapter {
     locator: ReviewLocator,
     recovery: import("../review/comment-marker.js").InlineRecoveryState,
   ): Promise<"complete" | "none" | "ambiguous">;
+  /** Recovers a previously written child by its frozen publication marker. */
+  findPublishedMarker?(
+    locator: ReviewLocator,
+    marker: string,
+  ): Promise<ConversationItemIdentity | null>;
   /**
    * Design-review #10 (stale-comment accumulation): RESOLVES (collapses, never
    * deletes) every still-unresolved inline review thread that THIS BOT started
