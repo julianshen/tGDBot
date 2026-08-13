@@ -48,6 +48,7 @@ export interface PublicationExecutorHooks {
   beforePublication?: () => Promise<void>;
   beforeChildWrite?: (child: PublicationChild) => Promise<void>;
   afterChildWrite?: (child: PublicationChild) => Promise<void>;
+  afterPublication?: (action: PublicationAction) => Promise<void>;
   onModelWork?: () => void;
 }
 
@@ -431,6 +432,7 @@ export async function executePublication(options: {
   readonly hooks?: PublicationExecutorHooks;
   readonly strategy?: PublicationStrategy;
   readonly now?: () => string;
+  readonly finalize?: (action: PublicationAction) => Promise<void>;
 }): Promise<PublicationAction> {
   const now = options.now ?? (() => new Date().toISOString());
   const strategy = options.strategy ?? "sequential";
@@ -518,6 +520,8 @@ export async function executePublication(options: {
     }
 
     if (action.state !== "completed") {
+      await options.hooks?.afterPublication?.(action);
+      await options.finalize?.(action);
       action = completePublication(action);
       await persistAction(session, action, now());
     }
@@ -606,6 +610,7 @@ export async function executeReviewPublication(options: {
   readonly action: PublicationAction;
   readonly hooks?: PublicationExecutorHooks;
   readonly now?: () => string;
+  readonly finalize?: (action: PublicationAction) => Promise<void>;
   readonly publish: (context: {
     readonly action: PublicationAction;
     readonly hooks?: PublicationExecutorHooks;
@@ -636,6 +641,8 @@ export async function executeReviewPublication(options: {
     });
     if (action.state !== "completed" && action.state !== "superseded" &&
       action.children.every((child) => childIsTerminal(child, action.children))) {
+      await options.hooks?.afterPublication?.(action);
+      await options.finalize?.(action);
       action = completePublication(action);
       await persistAction(session, action, now());
     }

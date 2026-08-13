@@ -7,6 +7,7 @@ import {
   completePublication,
   executePublication,
   freezePublication,
+  loadPublicationAction,
   observePublication,
   preparePublication,
   startPublication,
@@ -408,6 +409,83 @@ describe("publication crash-matrix recovery", () => {
     const fallbacks = result.children.filter((entry) => entry.kind === "fallback");
     expect(fallbacks.map((entry) => entry.status)).toEqual(["failed", "fallback-selected", "failed"]);
     expect(result.state).toBe("completed");
+  });
+
+  test("keeps the frozen graph after a crash between complete persist and summary finalize", async () => {
+    const store = createStore(await stateRoot());
+    const children = graph();
+    const frozen = freezePublication(preparePublication(observePublication({
+      actionId: ACTION_ID,
+      identityDigest: IDENTITY,
+      reviewNumber: 42,
+      repository: BINDING,
+    })), children);
+    const written: string[] = [];
+    const posted = new Map<string, ConversationItemIdentity>();
+    await expect(executePublication({
+      store,
+      action: frozen,
+      strategy: "gitlab-selective",
+      writer: {
+        async lookupChild(entry) {
+          return posted.get(entry.marker) ?? null;
+        },
+        async writeChild(entry) {
+          written.push(entry.marker);
+          if (entry.kind === "inline" && entry.placement.kind === "inline" && entry.placement.clientId === "finding-1") {
+            return { status: "failed" };
+          }
+          const identity = postedIdentity(entry, createHash("sha256").update(entry.marker).digest("hex").slice(0, 12));
+          posted.set(entry.marker, identity);
+          return { status: "posted", identity };
+        },
+      },
+      hooks: {
+        afterPublication: async () => {
+          throw new Error("crash after complete persist before summary rewrite");
+        },
+      },
+    })).rejects.toThrow(/crash after complete persist before summary rewrite/);
+
+    const snapshot = await store.readContextSnapshot();
+    const retained = loadPublicationAction(snapshot.events, {
+      actionId: ACTION_ID,
+      identityDigest: IDENTITY,
+    });
+    expect(retained?.state).toBe("published");
+    expect(retained?.children).toHaveLength(children.length);
+    expect(retained?.children.every((entry) => entry.status !== "pending")).toBe(true);
+    expect(retained?.children.filter((entry) => entry.kind === "inline").map((entry) => entry.status))
+      .toEqual(["posted", "failed", "posted"]);
+    expect(retained?.children.filter((entry) => entry.kind === "fallback").map((entry) => entry.status))
+      .toEqual(["failed", "fallback-selected", "failed"]);
+    expect(await store.findTerminalAction({ actionId: ACTION_ID, identityDigest: IDENTITY }))
+      .toBeUndefined();
+
+    const recoveredWrites: string[] = [];
+    const modelOnRecovery = vi.fn();
+    const result = await executePublication({
+      store,
+      action: frozen,
+      strategy: "gitlab-selective",
+      writer: {
+        async lookupChild(entry) {
+          return posted.get(entry.marker) ?? null;
+        },
+        async writeChild(entry) {
+          recoveredWrites.push(entry.marker);
+          throw new Error(`duplicate write of ${entry.kind}`);
+        },
+      },
+      hooks: { onModelWork: modelOnRecovery },
+    });
+    expect(modelOnRecovery).not.toHaveBeenCalled();
+    expect(recoveredWrites).toEqual([]);
+    expect(result.state).toBe("completed");
+    expect(result.children.filter((entry) => entry.kind === "inline").map((entry) => entry.status))
+      .toEqual(["posted", "failed", "posted"]);
+    expect(result.children.filter((entry) => entry.kind === "fallback").map((entry) => entry.status))
+      .toEqual(["failed", "fallback-selected", "failed"]);
   });
 });
 

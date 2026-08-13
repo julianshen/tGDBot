@@ -2341,6 +2341,66 @@ describe("review publication crash-matrix", () => {
     },
   );
 
+  it("does not promote the conservative ready body after a crash between complete persist and summary rewrite", async () => {
+    const stateDir = isolatedStateDir();
+    let stored: BotComment | null = null;
+    const wire = (h: Harness) => {
+      h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(stored));
+      h.vcsAdapter.upsertComment.mockImplementation((_locator, body: string, existing: BotComment | null) => {
+        const parsed = parseBotMarker(body);
+        stored = {
+          id: existing?.id ?? "written-summary-1",
+          body,
+          ...(parsed ?? { lastReviewedSha: "", reviewedConfig: "" }),
+        };
+        return Promise.resolve(stored);
+      });
+      h.vcsAdapter.createInlineReview.mockResolvedValue([
+        postedInline("finding-0"),
+        { clientId: "finding-1", status: "failed", reason: "position rejected" },
+        postedInline("finding-2"),
+      ]);
+    };
+
+    const first = threeInlineHarness(stateDir);
+    wire(first);
+    first.publicationHooks = {
+      afterPublication: async () => {
+        throw new Error("crash after complete persist before summary rewrite");
+      },
+    };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await expect(review(first.args, depsFrom(first))).rejects.toThrow(
+      /crash after complete persist before summary rewrite/,
+    );
+    expect(first.dispatchRules).toHaveBeenCalledTimes(1);
+    expect(first.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
+    expect(stored?.pendingState?.phase).toBe("ready");
+    expect(stored?.lastReviewedSha).toBe("");
+    expect(stored?.body).toContain("finding 0");
+    expect(stored?.body).toContain("finding 1");
+    expect(stored?.body).toContain("finding 2");
+
+    const second = threeInlineHarness(stateDir);
+    wire(second);
+    second.vcsAdapter.createInlineReview.mockImplementation(() => {
+      throw new Error("duplicate inline publish");
+    });
+    const modelOnRecovery = vi.fn();
+    second.publicationHooks = { onModelWork: modelOnRecovery };
+    expect(await review(second.args, depsFrom(second))).toBe(0);
+    expect(second.dispatchRules).not.toHaveBeenCalled();
+    expect(second.orchestrate).not.toHaveBeenCalled();
+    expect(modelOnRecovery).not.toHaveBeenCalled();
+    expect(second.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+    expect(stored?.pendingState).toBeUndefined();
+    expect(stored?.lastReviewedSha).toBe("cafef00d");
+    expect(stored?.reviewedConfig).toBe(computeReviewConfigHash(second.config));
+    expect(stored?.body).not.toContain("finding 0");
+    expect(stored?.body).toContain("finding 1");
+    expect(stored?.body).not.toContain("finding 2");
+  });
+
   it("serializes two review publishers so each marker is written once", async () => {
     const stateDir = isolatedStateDir();
     const release = Promise.withResolvers<void>();

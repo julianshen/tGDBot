@@ -9,6 +9,7 @@ import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
 import {
   buildReviewPublicationGraph,
+  childIsTerminal,
   executePublication,
   loadPublicationAction,
   reviewPublicationIdentity,
@@ -645,6 +646,65 @@ async function publishReviewFromManifest(options: {
     },
   };
 
+  const finalizePublishedSummary = async (action: PublicationAction): Promise<void> => {
+    const finalFallbackIds = selectedFallbackIds(action);
+    if (botComment === null) {
+      const postedSummary = action.children.find((child) => child.kind === "summary" && child.identity !== undefined);
+      if (postedSummary?.identity !== undefined) {
+        botComment = {
+          id: postedSummary.identity.commentId,
+          body: postedSummary.body,
+          lastReviewedSha: "",
+          reviewedConfig: "",
+        };
+      }
+    }
+    if (botComment === null) {
+      if (action.state === "completed" || action.state === "superseded") return;
+      throw new Error("Review publication is missing the summary identity");
+    }
+    if (action.children.some((child) => child.kind === "inline")) {
+      const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
+        config.locator,
+        bodyFor(action, finalFallbackIds, formatPendingMarker({
+          phase: "ready",
+          headSha: pr.headSha,
+          configHash,
+          noteId: botComment.id,
+          terminalResult,
+        })),
+        botComment,
+      );
+      if (
+        selectiveCheckpoint.id !== botComment.id ||
+        selectiveCheckpoint.lastReviewedSha !== "" ||
+        selectiveCheckpoint.reviewedConfig !== "" ||
+        selectiveCheckpoint.pendingState?.phase !== "ready" ||
+        selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
+        selectiveCheckpoint.pendingState.configHash !== configHash ||
+        selectiveCheckpoint.pendingState.noteId !== botComment.id ||
+        !sameTerminalResult(selectiveCheckpoint.pendingState.terminalResult, terminalResult)
+      ) {
+        throw new Error("The VCS adapter could not confirm the exact selective recovery checkpoint");
+      }
+      botComment = selectiveCheckpoint;
+    }
+    const finalizedSummary = await config.vcsAdapter.upsertComment(
+      config.locator,
+      bodyFor(action, finalFallbackIds, formatMarker(pr.headSha, configHash)),
+      botComment,
+    );
+    if (
+      !finalizedSummary ||
+      finalizedSummary.id !== botComment.id ||
+      finalizedSummary.lastReviewedSha !== pr.headSha ||
+      finalizedSummary.reviewedConfig !== configHash
+    ) {
+      throw new Error("The VCS adapter could not confirm finalization of the exact completed summary note");
+    }
+    botComment = finalizedSummary;
+  };
+
   let published: PublicationAction;
   try {
     published = await executePublication({
@@ -654,6 +714,7 @@ async function publishReviewFromManifest(options: {
       hooks,
       now,
       strategy: provider === "github" ? "github-atomic" : "gitlab-selective",
+      finalize: finalizePublishedSummary,
     });
   } catch (error) {
     if (error instanceof AmbiguousInlinePublishError) {
@@ -670,42 +731,12 @@ async function publishReviewFromManifest(options: {
   }
 
   if ((published.state === "completed" || published.state === "superseded") &&
-    published.children.length === 0 && botComment !== null) {
-    const finalizedBody = replacePendingMarker(botComment.body, formatMarker(pr.headSha, configHash));
-    const finalized = await config.vcsAdapter.upsertComment(config.locator, finalizedBody, botComment);
+    published.children.length === 0) {
     if (
-      !finalized ||
-      finalized.id !== botComment.id ||
-      finalized.lastReviewedSha !== pr.headSha ||
-      finalized.reviewedConfig !== configHash
+      botComment !== null &&
+      botComment.lastReviewedSha === pr.headSha &&
+      botComment.reviewedConfig === configHash
     ) {
-      throw new Error("The VCS adapter could not confirm finalization of the exact completed summary note");
-    }
-    logStatus({
-      status: terminalResult.status,
-      findingsCount: terminalResult.findingsCount,
-      rulesRun: [...terminalResult.rulesRun],
-      rulesFailed: [...terminalResult.rulesFailed],
-      loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
-      ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
-    });
-    return terminalResult.exitCode;
-  }
-
-  const finalFallbackIds = selectedFallbackIds(published);
-  if (botComment === null) {
-    const postedSummary = published.children.find((child) => child.kind === "summary" && child.identity !== undefined);
-    if (postedSummary?.identity !== undefined) {
-      botComment = {
-        id: postedSummary.identity.commentId,
-        body: postedSummary.body,
-        lastReviewedSha: "",
-        reviewedConfig: "",
-      };
-    }
-  }
-  if (botComment === null) {
-    if (published.state === "completed" || published.state === "superseded") {
       logStatus({
         status: terminalResult.status,
         findingsCount: terminalResult.findingsCount,
@@ -716,46 +747,7 @@ async function publishReviewFromManifest(options: {
       });
       return terminalResult.exitCode;
     }
-    throw new Error("Review publication is missing the summary identity");
-  }
-  if (published.children.some((child) => child.kind === "inline")) {
-    const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
-      config.locator,
-      bodyFor(published, finalFallbackIds, formatPendingMarker({
-        phase: "ready",
-        headSha: pr.headSha,
-        configHash,
-        noteId: botComment.id,
-        terminalResult,
-      })),
-      botComment,
-    );
-    if (
-      selectiveCheckpoint.id !== botComment.id ||
-      selectiveCheckpoint.lastReviewedSha !== "" ||
-      selectiveCheckpoint.reviewedConfig !== "" ||
-      selectiveCheckpoint.pendingState?.phase !== "ready" ||
-      selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
-      selectiveCheckpoint.pendingState.configHash !== configHash ||
-      selectiveCheckpoint.pendingState.noteId !== botComment.id ||
-      !sameTerminalResult(selectiveCheckpoint.pendingState.terminalResult, terminalResult)
-    ) {
-      throw new Error("The VCS adapter could not confirm the exact selective recovery checkpoint");
-    }
-    botComment = selectiveCheckpoint;
-  }
-  const finalizedSummary = await config.vcsAdapter.upsertComment(
-    config.locator,
-    bodyFor(published, finalFallbackIds, formatMarker(pr.headSha, configHash)),
-    botComment,
-  );
-  if (
-    !finalizedSummary ||
-    finalizedSummary.id !== botComment.id ||
-    finalizedSummary.lastReviewedSha !== pr.headSha ||
-    finalizedSummary.reviewedConfig !== configHash
-  ) {
-    throw new Error("The VCS adapter could not confirm finalization of the exact completed summary note");
+    throw new Error("completed publication is missing its frozen manifest; refusing to finalize a conservative ready summary");
   }
 
   const completed = published.state === "completed" ||
@@ -854,6 +846,46 @@ export async function review(
     throw new Error(
       "Invalid pending review recovery metadata; refusing to dispatch or write",
     );
+  }
+
+  const repository = repositoryForReview(config, pr);
+  const stateStore = config.dryRun
+    ? undefined
+    : createStore({
+        root: selectConversationStateRoot({ explicitStateDir: config.stateDir }),
+        repository,
+      });
+  const publicationIdentity = reviewPublicationIdentity({
+    repository: {
+      provider: repository.provider,
+      repositoryDigest: createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex"),
+    },
+    reviewNumber: Number(pr.id),
+    headSha: pr.headSha,
+    configHash,
+  });
+  if (stateStore !== undefined) {
+    const existing = loadPublicationAction(
+      (await stateStore.readContextSnapshot()).events,
+      publicationIdentity,
+    );
+    if (
+      existing !== undefined &&
+      existing.children.length > 0 &&
+      existing.children.every((child) => childIsTerminal(child, existing.children))
+    ) {
+      return publishReviewFromManifest({
+        action: existing,
+        store: stateStore,
+        config,
+        pr,
+        configHash,
+        botComment,
+        provider,
+        hooks: publicationHooks,
+        now,
+      });
+    }
   }
 
   // A ready checkpoint means a previous process already made the conservative
@@ -972,43 +1004,11 @@ export async function review(
     return EXIT_OK;
   }
 
-  const repository = repositoryForReview(config, pr);
-  const stateStore = config.dryRun
-    ? undefined
-    : createStore({
-        root: selectConversationStateRoot({ explicitStateDir: config.stateDir }),
-        repository,
-      });
-  const publicationIdentity = reviewPublicationIdentity({
-    repository: {
-      provider: repository.provider,
-      repositoryDigest: createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex"),
-    },
-    reviewNumber: Number(pr.id),
-    headSha: pr.headSha,
-    configHash,
-  });
   if (stateStore !== undefined) {
     const existing = loadPublicationAction(
       (await stateStore.readContextSnapshot()).events,
       publicationIdentity,
-    ) ?? await (async () => {
-      const terminal = await stateStore.findTerminalAction(publicationIdentity);
-      if (terminal === undefined || (terminal.state !== "completed" && terminal.state !== "superseded")) {
-        return undefined;
-      }
-      return {
-        ...publicationIdentity,
-        reviewNumber: Number(pr.id),
-        repository: {
-          provider: repository.provider,
-          repositoryDigest: createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex"),
-        },
-        state: terminal.state,
-        successorActionId: terminal.successorActionId,
-        children: [] as PublicationAction["children"],
-      };
-    })();
+    );
     if (existing !== undefined && (existing.state === "manifest-ready" || existing.state === "published" || existing.state === "completed")) {
       return publishReviewFromManifest({
         action: existing,
