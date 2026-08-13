@@ -3030,6 +3030,44 @@ describe("conversation-aware review", () => {
     expect(snapshot.findings.some((entry) => entry.reviewId === nativeId && entry.identity !== undefined)).toBe(true);
   });
 
+  it("accepts mixed-case repository locators against lowercase recovered inline identity URLs", async () => {
+    const mixedUrl = "https://github.com/Azure/sdk/pull/42";
+    const { orchestrationResult } = inlineFindingOrchestration();
+    const h = makeHarness({
+      args: makeArgs({ pr: mixedUrl }),
+      pr: makePr({ url: mixedUrl, reviewId: "PR_kwDOAzureSdk" }),
+      orchestrationResult,
+    });
+    installConversationReads(h, [relevant]);
+    const { appended, createStateStore } = captureFindingAppends(h);
+    h.vcsAdapter.createInlineReview.mockImplementation((_locator, _headSha, comments: Array<{ clientId: string }>) =>
+      Promise.resolve(comments.map(({ clientId }) => ({
+        clientId,
+        status: "posted" as const,
+        identity: {
+          provider: "github" as const,
+          commentId: `comment-${clientId}`,
+          threadId: `thread-${clientId}`,
+          url: `https://github.com/azure/sdk/pull/42#discussion_rcomment-${clientId}`,
+        },
+      }))),
+    );
+
+    expect(h.config.locator).toMatchObject({
+      kind: "repository",
+      repo: { owner: "Azure", repo: "sdk" },
+      number: 42,
+    });
+    expect(await review(h.args, { ...depsFrom(h), createStateStore })).toBe(0);
+    expect(appended.find((entry) => entry.identity !== undefined)).toMatchObject({
+      identity: {
+        provider: "github",
+        commentId: "comment-finding-0",
+        url: "https://github.com/azure/sdk/pull/42#discussion_rcomment-finding-0",
+      },
+    });
+  });
+
   it("fails closed when ambient GitHub identity cannot be resolved", async () => {
     const missingUrl = makeHarness({ pr: makePr({ url: undefined }) });
     await expect(review(missingUrl.args, depsFrom(missingUrl))).rejects.toThrow(/identit|repository/i);

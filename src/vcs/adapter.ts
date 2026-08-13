@@ -172,6 +172,35 @@ export interface ConversationIdentityBinding {
   readonly reviewNumber: number;
 }
 
+function canonicalIdentityBinding(expected: ConversationIdentityBinding): CanonicalIdentityBinding {
+  if (expected.repo.provider === "github") {
+    const owner = expected.repo.owner.toLowerCase();
+    const repository = expected.repo.repo.toLowerCase();
+    return Object.freeze({
+      provider: "github",
+      canonicalUrl: `https://github.com/${owner}/${repository}`,
+      reviewNumber: expected.reviewNumber,
+    });
+  }
+  return Object.freeze({
+    provider: expected.repo.provider,
+    canonicalUrl: expected.repo.canonicalUrl,
+    reviewNumber: expected.reviewNumber,
+  });
+}
+
+function identityReviewUrlMatches(url: URL, binding: CanonicalIdentityBinding): boolean {
+  const canonical = new URL(binding.canonicalUrl);
+  if (url.origin !== canonical.origin || url.search !== "") return false;
+  const basePath = canonical.pathname.replace(/\/$/u, "");
+  const expectedPath = binding.provider === "github"
+    ? `${basePath}/pull/${binding.reviewNumber}`
+    : `${basePath}/-/merge_requests/${binding.reviewNumber}`;
+  return binding.provider === "github"
+    ? url.pathname.toLowerCase() === expectedPath.toLowerCase()
+    : url.pathname === expectedPath;
+}
+
 export function validateConversationItemIdentity(
   identity: unknown,
   expected: ConversationIdentityBinding,
@@ -180,11 +209,7 @@ export function validateConversationItemIdentity(
     throw new Error("conversation identity requires canonical repository/review binding");
   }
   if (!Number.isSafeInteger(expected.reviewNumber) || expected.reviewNumber <= 0) throw new Error("invalid identity review binding");
-  const canonicalBinding = Object.freeze({
-    provider: expected.repo.provider,
-    canonicalUrl: expected.repo.canonicalUrl,
-    reviewNumber: expected.reviewNumber,
-  });
+  const canonicalBinding = canonicalIdentityBinding(expected);
   if (typeof identity !== "object" || identity === null) throw new Error("posted inline outcome requires identity");
   const prototype = Object.getPrototypeOf(identity) as unknown;
   if (prototype !== Object.prototype && prototype !== null) throw new Error("invalid inline identity prototype");
@@ -226,13 +251,7 @@ export function validateConversationItemIdentity(
   }
   {
     if (candidate.provider !== canonicalBinding.provider) throw new Error("inline identity provider binding mismatch");
-    const canonical = new URL(canonicalBinding.canonicalUrl);
-    if (url.origin !== canonical.origin) throw new Error("inline identity repository host binding mismatch");
-    const basePath = canonical.pathname.replace(/\/$/u, "");
-    const expectedPath = canonicalBinding.provider === "github"
-      ? `${basePath}/pull/${canonicalBinding.reviewNumber}`
-      : `${basePath}/-/merge_requests/${canonicalBinding.reviewNumber}`;
-    if (url.pathname !== expectedPath || url.search !== "") throw new Error("inline identity review URL binding mismatch");
+    if (!identityReviewUrlMatches(url, canonicalBinding)) throw new Error("inline identity review URL binding mismatch");
     const validFragment = candidate.provider === "github"
       ? url.hash === `#discussion_r${candidate.commentId}` || url.hash === `#issuecomment-${candidate.commentId}`
       : url.hash === `#note_${candidate.commentId}`;
@@ -255,16 +274,11 @@ function assertStoredIdentityBinding(
   if (!Object.isFrozen(identity) || identity.provider !== binding.provider) {
     throw new Error("posted inline identity no longer matches its validated binding");
   }
-  const canonical = new URL(binding.canonicalUrl);
   const url = new URL(identity.url);
-  const basePath = canonical.pathname.replace(/\/$/u, "");
-  const expectedPath = binding.provider === "github"
-    ? `${basePath}/pull/${binding.reviewNumber}`
-    : `${basePath}/-/merge_requests/${binding.reviewNumber}`;
   const validFragment = binding.provider === "github"
     ? url.hash === `#discussion_r${identity.commentId}` || url.hash === `#issuecomment-${identity.commentId}`
     : url.hash === `#note_${identity.commentId}`;
-  if (url.origin !== canonical.origin || url.pathname !== expectedPath || url.search !== "" || !validFragment) {
+  if (!identityReviewUrlMatches(url, binding) || !validFragment) {
     throw new Error("posted inline identity no longer matches its validated binding");
   }
 }

@@ -59,6 +59,24 @@ describe("validateInlinePublishOutcomes", () => {
     expect(validateConversationItemIdentity(gitlabIdentity, gitlabBinding)).toEqual(gitlabIdentity);
   });
 
+  it("accepts a mixed-case GitHub locator against a lowercase identity URL", () => {
+    const mixedRepo = {
+      provider: "github" as const, host: "github.com" as const, owner: "Azure", repo: "sdk",
+      canonicalUrl: "https://github.com/Azure/sdk",
+    };
+    const lowercaseIdentity = {
+      provider: "github" as const,
+      commentId: "123",
+      threadId: "456",
+      url: "https://github.com/azure/sdk/pull/42#discussion_r123",
+    };
+    const binding = { repo: mixedRepo, reviewNumber: 42 };
+    expect(validateConversationItemIdentity(lowercaseIdentity, binding)).toEqual(lowercaseIdentity);
+    expect(validateInlinePublishOutcomes(comments, [
+      { clientId: "finding-0", status: "posted", identity: lowercaseIdentity },
+    ], binding)).toEqual([{ clientId: "finding-0", status: "posted", identity: lowercaseIdentity }]);
+  });
+
   it("cannot create an unbound brand or forge/reuse a branded identity", () => {
     // @ts-expect-error Identity validation always requires a canonical binding.
     expect(() => validateConversationItemIdentity(identity)).toThrow(/binding/i);

@@ -1138,7 +1138,10 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
             commentId: providerId(row.id, "publication marker comment id"),
             url: textField(row.html_url, "publication marker URL"),
           };
-          matches.push(binding === undefined ? identity : validateConversationItemIdentity(identity, binding));
+          matches.push(binding === undefined ? identity : validateConversationItemIdentity(identity, {
+            repo: canonicalGitHubRepository(binding.repo),
+            reviewNumber: binding.reviewNumber,
+          }));
           if (matches.length > 1) throw new Error("Multiple authenticated GitHub publication marker matches");
         }
       }
@@ -1399,7 +1402,9 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         const threadId = metadata.threadId;
         if (!threadId) throw new AmbiguousInlinePublishError("Recovered inline comment has no GraphQL thread identity");
         return validateConversationItemIdentity({ provider: "github", commentId: id, threadId,
-          url: boundGitHubCommentUrl(textField(row.html_url, "inline recovery comment URL"), review) }, { repo, reviewNumber: Number(resolved.id) });
+          url: boundGitHubCommentUrl(textField(row.html_url, "inline recovery comment URL"), review) }, {
+          repo: canonicalGitHubRepository(repo), reviewNumber: Number(resolved.id),
+        });
       });
     };
     const existing = await recover();

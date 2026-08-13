@@ -1774,6 +1774,55 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
     });
   });
 
+  it("recovers identities when the locator is mixed-case and recovered URLs are lowercase", async () => {
+    const mixed = parseRepositoryRef("Azure/sdk", "github");
+    const displayUrl = "https://github.com/Azure/sdk/pull/42";
+    const canonicalUrl = "https://github.com/azure/sdk/pull/42";
+    const head = "d".repeat(40);
+    const calls: { args: string[]; stdin?: string }[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      calls.push({ args, stdin });
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") {
+        return JSON.stringify({ data: { repository: { pullRequest: {
+          id: "PR_kwDOAzureSdk", url: displayUrl, headRefOid: head,
+          reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
+            id: "T100", isResolved: false, isOutdated: false, path: "a.ts", line: 1, originalLine: null,
+            comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
+              databaseId: 100, body: "posted", author: { login: "octo-bot" },
+              createdAt: "2026-08-01T00:00:00Z", updatedAt: "2026-08-01T00:00:00Z",
+              url: `${displayUrl}#discussion_r100`,
+              commit: { oid: head }, originalCommit: { oid: head }, replyTo: null,
+            }] },
+          }] },
+        } } } });
+      }
+      if (args.includes("POST")) return "{}";
+      const posted = calls.find((call) => call.args.includes("POST"));
+      if (!posted) return "[]";
+      const body = (JSON.parse(posted.stdin!) as { comments: { body: string }[] }).comments[0]!.body;
+      return JSON.stringify([{
+        id: 100, body, user: { login: "octo-bot" }, path: "a.ts", line: 1, side: "RIGHT",
+        commit_id: head, html_url: `${displayUrl}#discussion_r100`,
+        pull_request_url: "https://api.github.com/repos/Azure/sdk/pulls/42",
+      }]);
+    };
+    const adapter = new GitHubAdapter(execGh, mixed);
+    const comments = [{ clientId: "finding-0", path: "a.ts", line: 1, body: "finding", position: {} as never }];
+    const outcomes = await adapter.createInlineReview({ kind: "repository", repo: mixed, number: 42 }, head, comments);
+    expect(outcomes).toEqual([{
+      clientId: "finding-0",
+      status: "posted",
+      identity: {
+        provider: "github",
+        commentId: "100",
+        threadId: "T100",
+        url: `${canonicalUrl}#discussion_r100`,
+      },
+    }]);
+    expect(validateInlinePublishOutcomes(comments, outcomes, { repo: mixed, reviewNumber: 42 })).toEqual(outcomes);
+  });
+
   it("fails closed after an accepted write with partial recovery and never posts twice", async () => {
     let posts = 0;
     const repo = parseRepositoryRef("octo-org/octo-repo", "github");

@@ -727,7 +727,7 @@ async function publishReviewFromManifest(options: {
           comments,
           outcomes,
           config.locator.kind === "repository"
-            ? { repo: config.locator.repo, reviewNumber: config.locator.number }
+            ? { repo: repositoryForReview(config, pr), reviewNumber: config.locator.number }
             : undefined,
         );
         for (const child of children) {
