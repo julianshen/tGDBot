@@ -131,6 +131,21 @@ export function eventCursorFrom(
   };
 }
 
+export function eventPageTokenFrom(
+  binding: RepositoryBinding,
+  reviewNumber: number,
+  opaque: string | undefined,
+): ReviewEventPageToken | undefined {
+  if (opaque === undefined) return undefined;
+  return {
+    scope: "review-event-page",
+    provider: binding.provider,
+    repositoryDigest: binding.repositoryDigest,
+    reviewNumber,
+    opaque,
+  };
+}
+
 export function nextRoundRobinIndex(
   reviews: readonly ReviewCursorRecord[],
   nextRoundRobinKey: string | null,
@@ -171,15 +186,16 @@ export async function currentEventHighWater(
   adapter: ConversationAdapter,
   identity: ReviewIdentity,
 ): Promise<ReviewEventCursor> {
-  let after: ReviewEventCursor | undefined;
+  const after: ReviewEventCursor | undefined = undefined;
   let pageToken: ReviewEventPageToken | undefined;
+  let terminal: ReviewEventCursor | undefined;
   do {
     const page = await adapter.listReviewEvents(identity, after, pageToken);
-    after = page.nextCursor;
     pageToken = page.nextPageToken;
+    if (pageToken === undefined) terminal = page.nextCursor;
   } while (pageToken !== undefined);
-  if (after === undefined) throw new Error("Review event listing did not return a high-water cursor");
-  return after;
+  if (terminal === undefined) throw new Error("Review event listing did not return a high-water cursor");
+  return terminal;
 }
 
 export async function commitBootstrapIfAbsent(
@@ -295,6 +311,7 @@ function applyDiscoveredReviews(
         lastSeenEpoch: epoch,
       }),
       retired: false,
+      ...(existing?.eventPageToken === undefined ? {} : { eventPageToken: existing.eventPageToken }),
     });
   }
   return [...byNumber.values()].sort((left, right) => left.reviewNumber - right.reviewNumber);
@@ -318,7 +335,12 @@ function retireUnseen(
     const progress = decodeReviewProgress(review.cursor);
     if (review.retired || (progress?.lastSeenEpoch ?? 0) >= epoch) return review.retired
       ? review
-      : { reviewNumber: review.reviewNumber, cursor: review.cursor, retired: false };
+      : {
+          reviewNumber: review.reviewNumber,
+          cursor: review.cursor,
+          retired: false,
+          ...(review.eventPageToken === undefined ? {} : { eventPageToken: review.eventPageToken }),
+        };
     return { reviewNumber: review.reviewNumber, cursor: review.cursor, retired: true, retiredAt };
   });
 }

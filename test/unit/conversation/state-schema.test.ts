@@ -32,6 +32,19 @@ describe("strict state schemas", () => {
       .toThrow(/initialized|epoch/i);
   });
 
+  test("accepts an optional version-1 eventPageToken on a review cursor record", () => {
+    const review = { reviewNumber: 1, cursor: "{\"id\":\"PR_1\"}", retired: false };
+    expect(validateCursorSnapshot({ ...cursor, reviews: [review] }, binding).reviews[0]).not.toHaveProperty("eventPageToken");
+    expect(validateCursorSnapshot({
+      ...cursor,
+      reviews: [{ ...review, eventPageToken: "page-2" }],
+    }, binding).reviews[0]).toMatchObject({ eventPageToken: "page-2" });
+    expect(() => validateCursorSnapshot({
+      ...cursor,
+      reviews: [{ ...review, eventPageToken: "" }],
+    }, binding)).toThrow(/eventPageToken/i);
+  });
+
   test("rejects accessors, symbols, and non-plain prototypes before reading properties", () => {
     const accessor = { ...cursor } as Record<string, unknown>;
     Object.defineProperty(accessor, "initialized", { enumerable: true, get: () => true });

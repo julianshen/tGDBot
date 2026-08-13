@@ -22,6 +22,7 @@ import {
   decodeReviewProgress,
   encodeReviewProgress,
   eventCursorFrom,
+  eventPageTokenFrom,
   fetchBootstrapStaging,
   nextRoundRobinIndex,
   reviewIdentityFrom,
@@ -95,7 +96,8 @@ async function classifyOpenReviewEvents(options: {
     if (progress === null) throw new Error(`Review ${review.reviewNumber} is missing stored progress`);
     const identity = reviewIdentityFrom(options.binding, review.reviewNumber, progress);
     const after = eventCursorFrom(options.binding, review.reviewNumber, progress);
-    const pageToken = pageTokens.get(review.reviewNumber);
+    const pageToken = eventPageTokenFrom(options.binding, review.reviewNumber, review.eventPageToken)
+      ?? pageTokens.get(review.reviewNumber);
 
     const page: ReviewEventPage = await options.adapter.listReviewEvents(identity, after, pageToken);
     if (page.nextPageToken !== undefined) pageTokens.set(review.reviewNumber, page.nextPageToken);
@@ -124,16 +126,17 @@ async function classifyOpenReviewEvents(options: {
     }
 
     const completedPage = !stoppedEarly;
+    const listingComplete = page.nextPageToken === undefined;
     const nextRoundRobinKey = stoppedEarly
       ? String(review.reviewNumber)
       : nextKey(currentActive, index);
-    const advancedProgress = page.events.length === 0
-      ? progress
-      : {
+    const advancedProgress = listingComplete && page.events.length > 0
+      ? {
           ...progress,
           eventOpaque: page.nextCursor.opaque,
           eventOrderKey: page.nextCursor.orderKey,
-        };
+        }
+      : progress;
 
     if (!options.dryRun && (classified.length > 0 || completedPage)) {
       await options.store.transact((tx) => {
@@ -150,7 +153,12 @@ async function classifyOpenReviewEvents(options: {
           reviews: completedPage
             ? tx.snapshot.cursor.reviews.map((entry) =>
                 entry.reviewNumber === review.reviewNumber
-                  ? { ...entry, cursor: encodeReviewProgress(advancedProgress) }
+                  ? {
+                      reviewNumber: entry.reviewNumber,
+                      cursor: encodeReviewProgress(advancedProgress),
+                      retired: false,
+                      ...(page.nextPageToken === undefined ? {} : { eventPageToken: page.nextPageToken.opaque }),
+                    }
                   : entry)
             : tx.snapshot.cursor.reviews,
         });

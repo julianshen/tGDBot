@@ -14,6 +14,7 @@ export interface ReviewCursorRecord {
   readonly cursor: string | null;
   readonly retired: boolean;
   readonly retiredAt?: string;
+  readonly eventPageToken?: string;
 }
 
 export interface ConversationCursorSnapshot {
@@ -438,12 +439,13 @@ export function validateCursorSnapshot(value: unknown, expected: RepositoryBindi
     throw new Error("cursor initialized flag and epoch are inconsistent");
   }
   const reviews = array(object.reviews, "cursor.reviews", 5_000).map((entry, index) => {
-    const review = exact(entry, `cursor.reviews[${index}]`, ["reviewNumber", "cursor", "retired"], ["retiredAt"]);
+    const review = exact(entry, `cursor.reviews[${index}]`, ["reviewNumber", "cursor", "retired"], ["retiredAt", "eventPageToken"]);
     if (typeof review.retired !== "boolean") throw new Error("review retired flag must be boolean");
     if (review.retired && review.retiredAt === undefined) throw new Error("retired review must record retiredAt");
     if (!review.retired && review.retiredAt !== undefined) throw new Error("active review cannot record retiredAt");
     return { reviewNumber: positiveInteger(review.reviewNumber, "reviewNumber"), cursor: nullableText(review.cursor, "review cursor"),
-      retired: review.retired, ...(review.retiredAt === undefined ? {} : { retiredAt: date(review.retiredAt, "retiredAt") }) };
+      retired: review.retired, ...(review.retiredAt === undefined ? {} : { retiredAt: date(review.retiredAt, "retiredAt") }),
+      ...(review.eventPageToken === undefined ? {} : { eventPageToken: text(review.eventPageToken, "eventPageToken", 4_096) }) };
   });
   if (new Set(reviews.map((review) => review.reviewNumber)).size !== reviews.length) throw new Error("cursor contains duplicate reviews");
   return { version: 1, repository, initialized: object.initialized, initializedEpoch: object.initializedEpoch as number,

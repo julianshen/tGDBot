@@ -74,6 +74,7 @@ function commentEvent(
   eventId: string,
   body: string,
   updatedAt = "2026-08-13T12:00:00.000Z",
+  orderKey = `${updatedAt}|${eventId}`,
 ): ReviewActivityEvent {
   return {
     kind: "general-comment",
@@ -82,7 +83,7 @@ function commentEvent(
     reviewNumber,
     eventId,
     revisionId: `${eventId}:1`,
-    orderKey: `${updatedAt}|${eventId}`,
+    orderKey,
     authorLogin: "alice",
     authorIsBot: false,
     createdAt: updatedAt,
@@ -127,9 +128,38 @@ interface FakeAdapterOptions {
   failEventPageTimes?: number;
 }
 
+function epochEventCursor(reviewNumber: number): ReviewEventCursor {
+  return {
+    scope: "review-events",
+    provider: "github",
+    repositoryDigest,
+    reviewNumber,
+    opaque: JSON.stringify({ at: "1970-01-01T00:00:00.000Z", seen: [] }),
+    orderKey: "1970-01-01T00:00:00.000Z",
+  };
+}
+
+function encodeEventPageToken(page: number, after: string | null): string {
+  return JSON.stringify({ page, after });
+}
+
+function decodeEventPageToken(opaque: string): { page: number; after: string | null } {
+  const parsed = JSON.parse(opaque) as { page?: number; after?: string | null };
+  if (!Number.isSafeInteger(parsed.page) || (parsed.page as number) < 1 ||
+    (parsed.after !== null && typeof parsed.after !== "string")) {
+    throw new Error("invalid event page token");
+  }
+  return { page: parsed.page as number, after: parsed.after ?? null };
+}
+
+function eventPageIndex(pageToken?: string): number {
+  return pageToken === undefined ? 0 : decodeEventPageToken(pageToken).page;
+}
+
 class FakeConversationAdapter implements ConversationAdapter {
   readonly openReviewCalls: Array<{ pageToken?: string }> = [];
   readonly eventCalls: Array<{ reviewNumber: number; after?: string; pageToken?: string }> = [];
+  readonly emittedEventIds: string[][] = [];
   readonly writes: string[] = [];
   private eventPageFailures = 0;
 
@@ -179,7 +209,12 @@ class FakeConversationAdapter implements ConversationAdapter {
     pageToken?: ReviewEventPageToken,
   ): Promise<ReviewEventPage> {
     const pageSize = this.options.eventPageSize ?? 100;
-    const pageIndex = pageToken === undefined ? 0 : Number(pageToken.opaque);
+    const startAfter = after?.opaque ?? null;
+    const continuation = pageToken === undefined ? { page: 0, after: startAfter } : decodeEventPageToken(pageToken.opaque);
+    if (continuation.after !== startAfter) {
+      throw new Error("continuation cursor binding mismatch");
+    }
+    const pageIndex = continuation.page;
     this.eventCalls.push({
       reviewNumber: review.reviewNumber,
       after: after?.opaque,
@@ -197,16 +232,19 @@ class FakeConversationAdapter implements ConversationAdapter {
     }
     const all = this.options.eventsByReview.get(review.reviewNumber) ?? [];
     const remaining = eventsAfter(all, after);
-    const start = after === undefined ? pageIndex * pageSize : 0;
+    const start = pageIndex * pageSize;
     const events = remaining.slice(start, start + pageSize);
     const stillPending = remaining.slice(start + events.length);
     const consumed = all.filter((event) => !stillPending.includes(event));
     const hasMore = stillPending.length > 0;
+    this.emittedEventIds.push(events.map((event) => event.eventId));
     return {
       events,
-      nextCursor: after !== undefined && events.length === 0
-        ? after
-        : encodeEventCursor(review.reviewNumber, consumed),
+      nextCursor: hasMore
+        ? after ?? epochEventCursor(review.reviewNumber)
+        : after !== undefined && events.length === 0
+          ? after
+          : encodeEventCursor(review.reviewNumber, consumed),
       ...(hasMore
         ? {
             nextPageToken: {
@@ -214,7 +252,7 @@ class FakeConversationAdapter implements ConversationAdapter {
               provider: "github" as const,
               repositoryDigest,
               reviewNumber: review.reviewNumber,
-              opaque: String(pageIndex + 1),
+              opaque: encodeEventPageToken(pageIndex + 1, startAfter),
             },
           }
         : {}),
@@ -346,7 +384,8 @@ describe("poll discovery and bootstrap", () => {
 
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.openReviewCalls).toHaveLength(2);
-    expect(adapter.eventCalls.some((call) => call.reviewNumber === 1 && call.pageToken === "1")).toBe(true);
+    expect(adapter.eventCalls.some((call) => call.reviewNumber === 1 && eventPageIndex(call.pageToken) === 1)).toBe(true);
+    expect(adapter.eventCalls.filter((call) => call.reviewNumber === 1).every((call) => call.after === undefined)).toBe(true);
     await expect(lstat(paths.cursorPath)).resolves.toBeDefined();
   });
 
@@ -462,23 +501,54 @@ describe("poll discovery and bootstrap", () => {
       )?.eventOpaque);
   });
 
-  it("includes events that share the cursor's equal-time boundary", async () => {
+  it("includes an equal-time event omitted from the committed high-water seen-set", async () => {
     const stateDir = await tempStateDir();
     const stamp = "2026-08-14T10:00:00.000Z";
-    const eventsByReview = new Map<number, ReviewActivityEvent[]>();
+    const eventsByReview = new Map<number, ReviewActivityEvent[]>([
+      [1, [commentEvent(1, "seed", "committed at T", stamp, stamp)]],
+    ]);
     const adapter = new FakeConversationAdapter({
       openReviewPages: [[summary(1)]],
       eventsByReview,
     });
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    const bootstrapped = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    const committed = decodeReviewProgress(bootstrapped.cursor.reviews[0]?.cursor ?? null);
+    expect(committed?.eventOrderKey).toBe(stamp);
+    expect(JSON.parse(committed?.eventOpaque ?? "{}")).toMatchObject({ at: stamp, seen: ["seed"] });
 
     eventsByReview.set(1, [
-      commentEvent(1, "same-a", "first at boundary", stamp),
-      commentEvent(1, "same-b", "second at boundary", stamp),
+      commentEvent(1, "seed", "committed at T", stamp, stamp),
+      commentEvent(1, "late", "same time, not in seen-set", stamp, stamp),
     ]);
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
     const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
-    expect(snapshot.events.filter((entry) => entry.state === "observed")).toHaveLength(2);
+    expect(snapshot.events.filter((entry) => entry.state === "observed")).toHaveLength(1);
+  });
+
+  it("bootstraps a review with more than 100 events using a frozen after cursor", async () => {
+    const stateDir = await tempStateDir();
+    const adapter = new FakeConversationAdapter({
+      openReviewPages: [[summary(1)]],
+      eventsByReview: new Map([
+        [1, Array.from({ length: 150 }, (_, index) =>
+          commentEvent(1, `hist-${index}`, "old", "2026-08-03T00:00:00.000Z"))],
+      ]),
+      eventPageSize: 100,
+    });
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    } finally {
+      log.mockRestore();
+    }
+    expect(adapter.eventCalls.every((call) => call.after === undefined)).toBe(true);
+    expect(adapter.eventCalls.some((call) => eventPageIndex(call.pageToken) === 1)).toBe(true);
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(snapshot.events).toEqual([]);
+    const progress = decodeReviewProgress(snapshot.cursor.reviews[0]?.cursor ?? null);
+    expect(JSON.parse(progress?.eventOpaque ?? "{}").seen).toHaveLength(150);
+    expect(snapshot.cursor.reviews[0]).not.toHaveProperty("eventPageToken");
   });
 
   it("visits known reviews round-robin and resumes from the saved next key", async () => {
@@ -540,6 +610,8 @@ describe("poll discovery and bootstrap", () => {
       eventPageSize: 100,
     });
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    const bootstrapped = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    const startAfter = decodeReviewProgress(bootstrapped.cursor.reviews[0]?.cursor ?? null)?.eventOpaque;
 
     eventsByReview.set(
       1,
@@ -550,15 +622,62 @@ describe("poll discovery and bootstrap", () => {
 
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).rejects.toThrow(/event page 2/);
     const afterFailure = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
-    const cursorAfterFailure = afterFailure.cursor.reviews.find((review) => review.reviewNumber === 1)?.cursor;
+    const failedReview = afterFailure.cursor.reviews.find((review) => review.reviewNumber === 1);
     expect(afterFailure.events.filter((entry) => entry.state === "observed")).toHaveLength(100);
+    expect(decodeReviewProgress(failedReview?.cursor ?? null)?.eventOpaque).toBe(startAfter);
+    const pageTwoCalls = () => adapter.eventCalls.filter((call) => eventPageIndex(call.pageToken) === 1);
+    expect(pageTwoCalls()).toHaveLength(1);
+    const failedToken = pageTwoCalls()[0]?.pageToken;
+    expect(failedToken).toEqual(encodeEventPageToken(1, startAfter ?? null));
+    expect(failedReview?.eventPageToken).toBe(failedToken);
 
-    adapter.eventCalls.length = 0;
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
-    expect(adapter.eventCalls.some((call) => call.pageToken === "1" || call.after !== undefined)).toBe(true);
+    expect(pageTwoCalls().length).toBeGreaterThan(1);
+    expect(pageTwoCalls().every((call) => call.pageToken === failedToken)).toBe(true);
+    expect(adapter.eventCalls.filter((call) => call.after === startAfter && call.pageToken === undefined)).toHaveLength(1);
     const recovered = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
     expect(recovered.events.filter((entry) => entry.state === "observed")).toHaveLength(150);
-    expect(recovered.cursor.reviews.find((review) => review.reviewNumber === 1)?.cursor).not.toBe(cursorAfterFailure);
+    expect(recovered.cursor.reviews.find((review) => review.reviewNumber === 1)).not.toHaveProperty("eventPageToken");
+    expect(decodeReviewProgress(recovered.cursor.reviews[0]?.cursor ?? null)?.eventOpaque).not.toBe(startAfter);
+  });
+
+  it("resumes a 250-event review from the same after cursor and next page token", async () => {
+    const stateDir = await tempStateDir();
+    const eventsByReview = new Map<number, ReviewActivityEvent[]>();
+    const adapter = new FakeConversationAdapter({
+      openReviewPages: [[summary(1)]],
+      eventsByReview,
+      eventPageSize: 100,
+    });
+    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    const bootstrapped = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    const startAfter = decodeReviewProgress(bootstrapped.cursor.reviews[0]?.cursor ?? null)?.eventOpaque;
+
+    eventsByReview.set(
+      1,
+      Array.from({ length: 250 }, (_, index) => commentEvent(1, `n${index}`, `comment ${index}`, "2026-08-14T00:00:00.000Z")),
+    );
+    adapter.eventCalls.length = 0;
+    adapter.emittedEventIds.length = 0;
+    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    const first = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(first.events.filter((entry) => entry.state === "observed")).toHaveLength(200);
+    expect(decodeReviewProgress(first.cursor.reviews[0]?.cursor ?? null)?.eventOpaque).toBe(startAfter);
+    expect(first.cursor.reviews[0]?.eventPageToken).toBe(encodeEventPageToken(2, startAfter ?? null));
+    expect(adapter.emittedEventIds.flat()).toEqual(Array.from({ length: 200 }, (_, index) => `n${index}`));
+
+    adapter.eventCalls.length = 0;
+    adapter.emittedEventIds.length = 0;
+    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    expect(adapter.eventCalls[0]).toEqual(
+      expect.objectContaining({ after: startAfter, pageToken: encodeEventPageToken(2, startAfter ?? null) }),
+    );
+    expect(adapter.eventCalls.some((call) => call.after === startAfter && call.pageToken === undefined)).toBe(false);
+    expect(adapter.emittedEventIds[0]).toEqual(Array.from({ length: 50 }, (_, index) => `n${index + 200}`));
+    expect(adapter.emittedEventIds.flat()).not.toContain("n0");
+    const second = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(second.events.filter((entry) => entry.state === "observed")).toHaveLength(250);
+    expect(second.cursor.reviews[0]).not.toHaveProperty("eventPageToken");
   });
 
   it("does not advance a review cursor when that review's fetch fails after another review succeeds", async () => {
