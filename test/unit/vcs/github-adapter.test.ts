@@ -1,14 +1,17 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
+import { ConcurrentGitHubMutationError, GitHubAdapter } from "../../../src/vcs/github-adapter.js";
 import { INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
 import {
   validateInlinePublishOutcomes,
+  AmbiguousInlinePublishError,
   type BotComment,
   type ReviewLocator,
 } from "../../../src/vcs/adapter.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
+import { computeContentDigest, computeRepositoryDigest, formatChildMarker } from "../../../src/conversation/markers.js";
+import type { ReviewIdentity } from "../../../src/conversation/types.js";
 
 const fixturePath = (name: string): string =>
   fileURLToPath(new URL(`../../fixtures/${name}`, import.meta.url));
@@ -20,7 +23,7 @@ const readFixture = (name: string): string => readFileSync(fixturePath(name), "u
 // in src/vcs/github-adapter.ts for why `gh api` silently defaults to POST
 // once any `-f`/`-F` param is passed, and the real end-to-end 422 this
 // caused against `hmchangw/chat` PR #491.
-const PAGINATED_COMMENTS_ARGS_PREFIX = ["api", "-X", "GET", "--paginate", "--slurp", "-f", "per_page=100"];
+const BOUNDED_COMMENTS_ARGS_PREFIX = ["api", "-X", "GET", "-f", "per_page=50", "-f", "page=1"];
 
 /**
  * Builds an execGh mock that dispatches based on the `gh` subcommand:
@@ -41,6 +44,23 @@ const locator = (number: number): ReviewLocator => ({
   number,
 });
 const locator42 = locator(42);
+
+function inlineThreadsFixture(ids: number[], paths: string[], head = "d".repeat(40), lines = [13, 5]): string {
+  const nodes = ids.map((id, index) => ({
+    id: `T${id}`, isResolved: false, isOutdated: false, path: paths[index],
+    line: lines[index] ?? 5, originalLine: null,
+    comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{
+      databaseId: id, body: "posted", author: { login: "octo-bot" },
+      createdAt: "2026-08-01T00:00:00Z", updatedAt: "2026-08-01T00:00:00Z",
+      url: `https://github.com/octo-org/octo-repo/pull/42#discussion_r${id}`,
+      commit: { oid: head }, originalCommit: { oid: head }, replyTo: null,
+    }] },
+  }));
+  return JSON.stringify({ data: { repository: { pullRequest: {
+    id: "PR_kwDO42", url: "https://github.com/octo-org/octo-repo/pull/42", headRefOid: head,
+    reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes },
+  } } } });
+}
 
 describe("GitHubAdapter", () => {
   const explicitRepo = parseRepositoryRef("octo-org/octo-repo", "github");
@@ -120,8 +140,9 @@ describe("GitHubAdapter", () => {
     ]);
   });
 
-  it("AC-2.2: scopes summary, inline, and trusted-rule operations to the explicit repository", async () => {
-    const execGh = vi.fn(async (args: string[]) => {
+  it("AC-2.2: scopes summary and trusted-rule operations while inline posting remains disabled", async () => {
+    let inlineBodies: string[] = [];
+    const execGh = vi.fn(async (args: string[], stdin?: string) => {
       if (args[0] === "api" && args[1] === "user") return readFixture("gh-user.json");
       if (args.includes("repos/octo-org/octo-repo/issues/42/comments")) {
         if (args.includes("POST")) return JSON.stringify({ id: 88, body: "summary" });
@@ -129,6 +150,14 @@ describe("GitHubAdapter", () => {
       }
       if (args.includes("repos/octo-org/octo-repo/issues/comments/99")) {
         return JSON.stringify({ id: 99, body: "updated" });
+      }
+      if (args.includes("repos/octo-org/octo-repo/pulls/42/reviews")) {
+        inlineBodies = (JSON.parse(stdin!) as { comments: { body: string }[] }).comments.map((comment) => comment.body);
+        return "{}";
+      }
+      if (args[1] === "graphql") return inlineThreadsFixture([700], ["src/a.ts"], "a".repeat(40));
+      if (args.includes("repos/octo-org/octo-repo/pulls/42/comments")) {
+        return JSON.stringify(inlineBodies.map((body, index) => ({ id: 700 + index, body, user: { login: "tgd-review-agent[bot]" }, path: "src/a.ts", line: 13, side: "RIGHT", commit_id: "a".repeat(40), html_url: `https://github.com/octo-org/octo-repo/pull/42#discussion_r${700 + index}`, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42" })));
       }
       if (args.includes("repos/octo-org/octo-repo/contents/.tgd-review/rules?ref=def456")) {
         return "[]";
@@ -145,11 +174,11 @@ describe("GitHubAdapter", () => {
       lastReviewedSha: "abc1234",
       reviewedConfig: "cfg",
     });
-    await adapter.createInlineReview(explicitLocator, "abc123", [
+    await adapter.createInlineReview(explicitLocator, "a".repeat(40), [
       {
         clientId: "finding-0",
         path: "src/a.ts",
-        line: 7,
+        line: 13,
         body: "finding",
         position: {} as never,
       },
@@ -158,7 +187,7 @@ describe("GitHubAdapter", () => {
 
     const calls = execGh.mock.calls.map(([args]) => args as string[]);
     expect(calls).toContainEqual([
-      ...PAGINATED_COMMENTS_ARGS_PREFIX,
+      ...BOUNDED_COMMENTS_ARGS_PREFIX,
       "repos/octo-org/octo-repo/issues/42/comments",
       "--hostname",
       "github.com",
@@ -183,16 +212,7 @@ describe("GitHubAdapter", () => {
       "--input",
       "-",
     ]);
-    expect(calls).toContainEqual([
-      "api",
-      "repos/octo-org/octo-repo/pulls/42/reviews",
-      "--hostname",
-      "github.com",
-      "-X",
-      "POST",
-      "--input",
-      "-",
-    ]);
+    expect(calls.some((args) => args.includes("repos/octo-org/octo-repo/pulls/42/reviews"))).toBe(true);
     expect(calls).toContainEqual([
       "api",
       "repos/octo-org/octo-repo/contents/.tgd-review/rules?ref=def456",
@@ -327,7 +347,7 @@ describe("GitHubAdapter", () => {
       reviewedConfig: "",
     });
     expect(execGh).toHaveBeenCalledWith([
-      ...PAGINATED_COMMENTS_ARGS_PREFIX,
+      ...BOUNDED_COMMENTS_ARGS_PREFIX,
       "repos/{owner}/{repo}/issues/42/comments",
     ]);
   });
@@ -490,7 +510,7 @@ describe("GitHubAdapter", () => {
 
   // --- Review fix #2 (correctness): pagination ---
 
-  it("correctness fix: findBotComment paginates the comment list fetch (--paginate -f per_page=100)", async () => {
+  it("correctness fix: findBotComment fetches explicit bounded comment pages", async () => {
     const execGh = mockExecGhWithIdentity("gh-user.json", "gh-comments.json");
     const adapter = new GitHubAdapter(execGh);
 
@@ -500,10 +520,10 @@ describe("GitHubAdapter", () => {
       "api",
       "-X",
       "GET",
-      "--paginate",
-      "--slurp",
       "-f",
-      "per_page=100",
+      "per_page=50",
+      "-f",
+      "page=1",
       "repos/{owner}/{repo}/issues/42/comments",
     ]);
   });
@@ -522,7 +542,7 @@ describe("GitHubAdapter", () => {
 
     await expect(adapter.findBotComment(locator42)).resolves.toMatchObject({ id: "222", lastReviewedSha: "abc1234" });
     expect(execGh).toHaveBeenCalledWith([
-      "api", "-X", "GET", "--paginate", "--slurp", "-f", "per_page=100",
+      ...BOUNDED_COMMENTS_ARGS_PREFIX,
       "repos/{owner}/{repo}/issues/42/comments",
     ]);
   });
@@ -549,7 +569,7 @@ describe("GitHubAdapter", () => {
     await adapter.findBotComment(locator42);
 
     const paginatedCall = execGh.mock.calls.find(
-      ([args]) => args[0] === "api" && args.includes("--paginate"),
+      ([args]) => args[0] === "api" && args.includes("per_page=50"),
     );
     expect(paginatedCall).toBeDefined();
     const [args] = paginatedCall as [string[]];
@@ -704,7 +724,7 @@ describe("GitHubAdapter", () => {
     });
     const adapter = new GitHubAdapter(execGh);
 
-    await expect(adapter.findBotComment(locator42)).rejects.toThrow(SyntaxError);
+    await expect(adapter.findBotComment(locator42)).rejects.toThrow(/JSON/);
   });
 
   it("test coverage fix (pinning): findBotComment rejects when the `gh api user` call returns malformed/non-JSON output", async () => {
@@ -981,6 +1001,362 @@ describe("GitHubAdapter", () => {
   });
 });
 
+describe("GitHub conversation activity", () => {
+  const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+  const repositoryDigest = computeRepositoryDigest("github", repo.canonicalUrl);
+  const review: ReviewIdentity = {
+    provider: "github",
+    repositoryDigest,
+    reviewNumber: 42,
+    reviewId: "PR_kwDO42",
+    url: "https://github.com/octo-org/octo-repo/pull/42",
+  };
+
+  it("evicts a failed authenticated identity lookup and normalizes the retry", async () => {
+    const execGh = vi.fn()
+      .mockRejectedValueOnce(new Error("expired token"))
+      .mockResolvedValueOnce(JSON.stringify({ login: "Octo-Bot" }));
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.getAuthenticatedBotIdentity()).rejects.toThrow(/expired token/);
+    await expect(adapter.getAuthenticatedBotIdentity()).resolves.toEqual({
+      provider: "github", login: "octo-bot", mention: "@octo-bot",
+    });
+    expect(execGh).toHaveBeenCalledTimes(2);
+    expect(execGh).toHaveBeenLastCalledWith(["api", "user", "--hostname", "github.com"]);
+  });
+
+  it("lists a stable explicit page of open PRs and emits bound cursors", async () => {
+    const execGh = vi.fn().mockResolvedValue(readFixture("gh-open-prs.json"));
+    const adapter = new GitHubAdapter(execGh, repo);
+    const page = await adapter.listOpenReviews({ provider: "github", repositoryDigest });
+    expect(page.reviews.map((item) => item.identity.reviewId)).toEqual(["PR_kwDO3", "PR_kwDO12"]);
+    expect(page.nextCursor).toMatchObject({ scope: "open-review-discovery", provider: "github", repositoryDigest });
+    expect(execGh).toHaveBeenCalledWith([
+      "api", "-X", "GET", "repos/octo-org/octo-repo/pulls", "--hostname", "github.com",
+      "-f", "state=all", "-f", "sort=created", "-f", "direction=asc", "-f", "per_page=100", "-f", "page=1",
+    ]);
+  });
+
+  it("bounds open review discovery memory while scanning immutable provider pages", async () => {
+    const template = (JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>)[0]!;
+    const rows = Array.from({ length: 100 }, (_, index) => ({ ...template, id: index + 1, node_id: `PR_${index + 1}`, number: index + 1, html_url: `${repo.canonicalUrl}/pull/${index + 1}` }));
+    const execGh = vi.fn(async (args: string[]) => args.includes("page=1") ? JSON.stringify(rows) : "[]");
+    const adapter = new GitHubAdapter(execGh, repo);
+    const first = await adapter.listOpenReviews({ provider: "github", repositoryDigest });
+    expect(first.reviews).toHaveLength(100);
+    expect(execGh).toHaveBeenLastCalledWith(expect.arrayContaining(["-f", "page=2"]));
+    expect(execGh.mock.calls.flatMap(([args]) => args as string[])).not.toContain("--paginate");
+  });
+
+  it("discovers an old PR updated after the cursor and includes unseen equal-time identities", async () => {
+    const rows = JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>;
+    rows[0]!.updated_at = "2026-08-13T10:00:00Z";
+    rows[1]!.updated_at = "2026-08-12T10:00:00Z";
+    const adapter = new GitHubAdapter(vi.fn().mockResolvedValue(JSON.stringify(rows)), repo);
+    const page = await adapter.listOpenReviews(
+      { provider: "github", repositoryDigest },
+      { scope: "open-review-discovery", provider: "github", repositoryDigest, opaque: JSON.stringify({ at: "2026-08-12T10:00:00Z", seen: [] }), orderKey: "2026-08-12T10:00:00Z" },
+    );
+    expect(page.reviews.map((item) => item.identity.reviewId)).toEqual(["PR_kwDO12", "PR_kwDO3"]);
+    expect(JSON.parse(page.nextCursor!.opaque)).toMatchObject({ at: "2026-08-13T10:00:00.000Z", seen: [], cutoff: expect.any(String) });
+  });
+
+  it("replays the same PR at the inclusive updated-time boundary even when its ID was seen", async () => {
+    const rows = JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>;
+    rows[0]!.updated_at = "2026-08-12T10:00:00Z";
+    const adapter = new GitHubAdapter(vi.fn().mockResolvedValue(JSON.stringify([rows[0]])), repo);
+    const page = await adapter.listOpenReviews(
+      { provider: "github", repositoryDigest },
+      { scope: "open-review-discovery", provider: "github", repositoryDigest,
+        opaque: JSON.stringify({ at: "2026-08-12T10:00:00Z", seen: ["PR_kwDO3"] }), orderKey: "2026-08-12T10:00:00Z" },
+    );
+    expect(page.reviews.map((item) => item.identity.reviewId)).toEqual(["PR_kwDO3"]);
+  });
+
+  it("retries a torn open-review snapshot and filters closed rows only after verification", async () => {
+    const template = (JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>)[0]!;
+    const open = { ...template, id: 1, node_id: "PR_1", number: 1, html_url: `${repo.canonicalUrl}/pull/1` };
+    const closed = { ...template, id: 2, node_id: "PR_2", number: 2, state: "closed", html_url: `${repo.canonicalUrl}/pull/2` };
+    let completeScans = 0;
+    const execGh = vi.fn(async () => {
+      completeScans += 1;
+      if (completeScans === 1) return JSON.stringify([open]);
+      return JSON.stringify([open, closed]);
+    });
+    const page = await new GitHubAdapter(execGh, repo).listOpenReviews({ provider: "github", repositoryDigest });
+    expect(page.reviews.map((entry) => entry.identity.reviewId)).toEqual(["PR_1"]);
+    expect(execGh).toHaveBeenCalledTimes(4);
+    expect(execGh.mock.calls[0]![0]).toEqual(expect.arrayContaining(["-f", "state=all"]));
+  });
+
+  it("fails closed when every verified open-review snapshot pair changes", async () => {
+    const template = (JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>)[0]!;
+    let sequence = 0;
+    const execGh = vi.fn(async () => {
+      sequence += 1;
+      return JSON.stringify([{ ...template, id: sequence, node_id: `PR_${sequence}`, number: sequence, html_url: `${repo.canonicalUrl}/pull/${sequence}` }]);
+    });
+    await expect(new GitHubAdapter(execGh, repo).listOpenReviews({ provider: "github", repositoryDigest })).rejects.toBeInstanceOf(ConcurrentGitHubMutationError);
+    expect(execGh).toHaveBeenCalledTimes(6);
+  });
+
+  it("continues 250 equal-time open reviews with a compact snapshot-bound token", async () => {
+    const template = (JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>)[0]!;
+    const rows = Array.from({ length: 250 }, (_, index) => ({ ...template, id: index + 1, node_id: `PR_${index + 1}`, number: index + 1,
+      updated_at: "2026-08-12T10:00:00Z", html_url: `${repo.canonicalUrl}/pull/${index + 1}` }));
+    const execGh = vi.fn(async (args: string[]) => {
+      const page = Number(args.find((arg) => arg.startsWith("page="))?.slice(5) ?? "1");
+      return JSON.stringify(rows.slice((page - 1) * 100, page * 100));
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    const found: string[] = [];
+    let token: import("../../../src/vcs/conversation-adapter.js").OpenReviewPageToken | undefined;
+    do {
+      const page = await adapter.listOpenReviews({ provider: "github", repositoryDigest }, undefined, token);
+      found.push(...page.reviews.map((entry) => entry.identity.reviewId));
+      token = page.nextPageToken;
+      if (token) expect(Buffer.byteLength(token.opaque)).toBeLessThan(4_000);
+    } while (token);
+    expect(found).toEqual(rows.map((row) => row.node_id));
+  });
+
+  it("rejects a continuation whose cutoff was altered without its checksum", async () => {
+    const template = (JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>)[0]!;
+    const rows = Array.from({ length: 101 }, (_, index) => ({ ...template, id: index + 1, node_id: `PR_${index + 1}`, number: index + 1,
+      updated_at: "2026-08-12T10:00:00Z", html_url: `${repo.canonicalUrl}/pull/${index + 1}` }));
+    const execGh = vi.fn(async (args: string[]) => JSON.stringify(args.includes("page=1") ? rows.slice(0, 100) : rows.slice(100)));
+    const adapter = new GitHubAdapter(execGh, repo);
+    const first = await adapter.listOpenReviews({ provider: "github", repositoryDigest });
+    const token = JSON.parse(first.nextPageToken!.opaque) as Record<string, unknown>;
+    token.cutoff = `${String(token.cutoff)}-tampered`;
+    await expect(adapter.listOpenReviews({ provider: "github", repositoryDigest }, undefined, { ...first.nextPageToken!, opaque: JSON.stringify(token) })).rejects.toThrow(/checksum/i);
+  });
+
+  it("records a compact terminal cutoff so a completed equal-time tie does not replay forever", async () => {
+    const template = (JSON.parse(readFixture("gh-open-prs.json")) as Array<Record<string, unknown>>)[0]!;
+    const rows = Array.from({ length: 101 }, (_, index) => ({ ...template, id: index + 1, node_id: `PR_${index + 1}`, number: index + 1,
+      updated_at: "2026-08-12T10:00:00Z", html_url: `${repo.canonicalUrl}/pull/${index + 1}` }));
+    const execGh = vi.fn(async (args: string[]) => JSON.stringify(args.includes("page=1") ? rows.slice(0, 100) : rows.slice(100)));
+    const adapter = new GitHubAdapter(execGh, repo);
+    const first = await adapter.listOpenReviews({ provider: "github", repositoryDigest });
+    const last = await adapter.listOpenReviews({ provider: "github", repositoryDigest }, undefined, first.nextPageToken);
+    expect(JSON.parse(last.nextCursor!.opaque)).toMatchObject({ at: "2026-08-12T10:00:00.000Z", cutoff: expect.any(String) });
+    await expect(adapter.listOpenReviews({ provider: "github", repositoryDigest }, last.nextCursor)).resolves.toMatchObject({ reviews: [] });
+  });
+
+  it("normalizes issue and inline comments in total updated-time order, including edits", async () => {
+    const fixture = JSON.parse(readFixture("gh-review-activity.json")) as { issueComments: unknown[]; reviewComments: unknown[] };
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") return readFixture("gh-review-threads.json");
+      return JSON.stringify(args.some((arg) => arg.includes("issues/42/comments")) ? fixture.issueComments : fixture.reviewComments);
+    });
+    const events = await new GitHubAdapter(execGh, repo).listReviewEvents(review);
+    expect(events.events.map((event) => [event.kind, event.commentId, event.authorIsBot])).toEqual([
+      ["thread-resolution", undefined, undefined], ["comment-edit", "7", false], ["thread-comment", "8", true],
+    ]);
+    expect(events.events[2]).toMatchObject({ threadId: "T1", placement: { file: "src/a.ts", line: 4, side: "new", outdated: true, currentHeadSha: "b".repeat(40) } });
+    expect(events.nextCursor).toMatchObject({ scope: "review-events", reviewNumber: 42 });
+    expect(execGh.mock.calls.filter(([args]) => (args as string[]).includes("per_page=50"))).toHaveLength(4);
+    expect(execGh.mock.calls.flatMap(([args]) => args as string[])).not.toContain("--paginate");
+  });
+
+  it("keeps an unseen changed revision at the same cursor timestamp regardless of digest order", async () => {
+    const fixture = JSON.parse(readFixture("gh-review-activity.json")) as { issueComments: Array<Record<string, unknown>>; reviewComments: unknown[] };
+    fixture.issueComments[0]!.body = "changed again";
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) :
+      args[1] === "graphql" ? readFixture("gh-review-threads.json") : JSON.stringify(args.some((arg) => arg.includes("issues/42/comments")) ? fixture.issueComments : fixture.reviewComments));
+    const cursor = { scope: "review-events" as const, provider: "github" as const, repositoryDigest, reviewNumber: 42,
+      opaque: JSON.stringify({ at: "2026-08-02T00:00:00Z", seen: ["deadbeef"] }), orderKey: "2026-08-02T00:00:00Z" };
+    const page = await new GitHubAdapter(execGh, repo).listReviewEvents(review, cursor);
+    expect(page.events).toHaveLength(2);
+    expect(page.events[0]!.updatedAt).toBe("2026-08-02T00:00:00.000Z");
+  });
+
+  it("never regresses an event high-water when a traversal observes only older rows", async () => {
+    const fixture = JSON.parse(readFixture("gh-review-activity.json")) as { issueComments: unknown[]; reviewComments: unknown[] };
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) :
+      args[1] === "graphql" ? readFixture("gh-review-threads.json") : JSON.stringify(args.some((arg) => arg.includes("issues/42/comments")) ? fixture.issueComments : fixture.reviewComments));
+    const boundary = { at: "2027-01-01T00:00:00.000Z", seen: [] as string[] };
+    const cursor = { scope: "review-events" as const, provider: "github" as const, repositoryDigest, reviewNumber: 42, opaque: JSON.stringify(boundary), orderKey: boundary.at };
+    let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
+    let last = cursor;
+    do {
+      const page = await new GitHubAdapter(execGh, repo).listReviewEvents(review, cursor, token);
+      expect(page.events).toHaveLength(0);
+      expect(page.nextCursor.orderKey).toBe(boundary.at);
+      last = page.nextCursor;
+      token = page.nextPageToken;
+    } while (token);
+    expect(JSON.parse(last.opaque)).toEqual(boundary);
+  });
+
+  it("emits resolved and reopened thread snapshot revisions without a new comment", async () => {
+    const activity = JSON.parse(readFixture("gh-review-activity.json")) as { issueComments: unknown[]; reviewComments: unknown[] };
+    const threads = JSON.parse(readFixture("gh-review-threads.json")) as { data: { repository: { pullRequest: Record<string, unknown> & { reviewThreads: { nodes: Array<Record<string, unknown>> } } } } };
+    threads.data.repository.pullRequest.updatedAt = "2026-08-03T00:00:00Z";
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) :
+      args[1] === "graphql" ? JSON.stringify(threads) : JSON.stringify(args.some((arg) => arg.includes("issues/42/comments")) ? activity.issueComments : activity.reviewComments));
+    const adapter = new GitHubAdapter(execGh, repo);
+    const first = await adapter.listReviewEvents(review);
+    threads.data.repository.pullRequest.reviewThreads.nodes[0]!.isResolved = true;
+    threads.data.repository.pullRequest.updatedAt = "2026-08-04T00:00:00Z";
+    const resolved = await adapter.listReviewEvents(review, first.nextCursor);
+    expect(resolved.events).toMatchObject([{ kind: "thread-resolution", threadId: "T1", resolved: true, updatedAt: "2026-08-04T00:00:00.000Z" }]);
+    threads.data.repository.pullRequest.reviewThreads.nodes[0]!.isResolved = false;
+    threads.data.repository.pullRequest.updatedAt = "2026-08-05T00:00:00Z";
+    const reopened = await adapter.listReviewEvents(review, resolved.nextCursor);
+    expect(reopened.events).toMatchObject([{ kind: "thread-resolution", threadId: "T1", resolved: false, updatedAt: "2026-08-05T00:00:00.000Z" }]);
+  });
+
+  it("pages an interleaved three-stream activity traversal with bounded exact continuation state", async () => {
+    const at = (index: number) => new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString();
+    const issueRows = Array.from({ length: 120 }, (_, index) => ({ id: 1000 + index, body: `issue-${index}`, user: { login: "alice" }, created_at: at(index), updated_at: at(index), html_url: `${review.url}#issuecomment-${1000 + index}` }));
+    const inlineRows = Array.from({ length: 120 }, (_, index) => ({ id: 2000 + index, body: `inline-${index}`, user: { login: "bob" }, created_at: at(index), updated_at: at(index), html_url: `${review.url}#discussion_r${2000 + index}`, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42", path: `src/${index}.ts`, line: 1, side: "RIGHT", commit_id: "a".repeat(40) }));
+    const threadNodes = inlineRows.map((row, index) => ({ id: `T${index}`, isResolved: index % 2 === 0, isOutdated: false, subjectType: "LINE", diffSide: "RIGHT", path: row.path, line: 1, originalLine: 1,
+      comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ databaseId: row.id, body: row.body, author: { login: "bob" }, createdAt: at(index), updatedAt: at(index), url: row.html_url, commit: { oid: "a".repeat(40) }, originalCommit: { oid: "a".repeat(40) }, replyTo: null }] } }));
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") {
+        const cursorArg = args.find((arg) => arg.startsWith("cursor="));
+        const start = cursorArg === undefined ? 0 : Number(cursorArg.slice("cursor=T".length));
+        const nodes = threadNodes.slice(start, start + 100);
+        const end = start + nodes.length;
+        return JSON.stringify({ data: { repository: { pullRequest: { id: review.reviewId, url: review.url, headRefOid: "a".repeat(40), updatedAt: "2026-09-01T00:00:00Z",
+          reviewThreads: { pageInfo: { hasNextPage: end < threadNodes.length, endCursor: end < threadNodes.length ? `T${end}` : null }, nodes } } } } });
+      }
+      const pageArg = args.find((arg) => arg.startsWith("page="));
+      const start = ((Number(pageArg?.slice(5) ?? "1")) - 1) * 50;
+      return JSON.stringify((args.some((arg) => arg.includes("issues/42/comments")) ? issueRows : inlineRows).slice(start, start + 50));
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    const found = new Set<string>();
+    let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
+    do {
+      const page = await adapter.listReviewEvents(review, undefined, token);
+      expect(page.events.length).toBeLessThanOrEqual(100);
+      for (const event of page.events) {
+        const key = `${event.eventId}:${event.revisionId}`;
+        expect(found.has(key)).toBe(false);
+        found.add(key);
+      }
+      token = page.nextPageToken;
+    } while (token);
+    expect(found.size).toBe(360);
+    expect(execGh.mock.calls.flatMap(([args]) => args as string[])).not.toEqual(expect.arrayContaining(["--paginate", "--slurp"]));
+  });
+
+  it("continues 300 equal-time activity revisions and terminally advances without starvation", async () => {
+    const at = "2026-08-12T10:00:00Z";
+    const rows = Array.from({ length: 300 }, (_, index) => ({ id: index + 1, body: `issue-${index}`, user: { login: "alice" }, created_at: at,
+      updated_at: at, html_url: `${review.url}#issuecomment-${index + 1}` }));
+    const emptyThreads = JSON.stringify({ data: { repository: { pullRequest: { id: review.reviewId, url: review.url, headRefOid: "a".repeat(40), updatedAt: at,
+      reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } } });
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") return emptyThreads;
+      if (args.some((arg) => arg.includes("pulls/42/comments"))) return "[]";
+      const page = Number(args.find((arg) => arg.startsWith("page="))?.slice(5) ?? "1");
+      return JSON.stringify(rows.slice((page - 1) * 50, page * 50));
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    const found: string[] = [];
+    let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
+    let terminal: import("../../../src/vcs/conversation-adapter.js").ReviewEventCursor | undefined;
+    do {
+      const page = await adapter.listReviewEvents(review, undefined, token);
+      found.push(...page.events.map((event) => `${event.eventId}:${event.revisionId}`));
+      token = page.nextPageToken;
+      terminal = page.nextCursor;
+      if (token) expect(Buffer.byteLength(token.opaque)).toBeLessThan(4_000);
+    } while (token);
+    expect(found).toHaveLength(300);
+    expect(new Set(found)).toHaveLength(300);
+    await expect(adapter.listReviewEvents(review, terminal)).resolves.toMatchObject({ events: [] });
+  });
+
+  it("pages GraphQL thread summaries and can fetch a complete addressed thread", async () => {
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : readFixture("gh-review-threads.json"));
+    const adapter = new GitHubAdapter(execGh, repo);
+    const page = await adapter.listReviewThreads(review);
+    expect(page.threads[0]).toMatchObject({ threadId: "T1", rootCommentId: "8", outdated: true, resolved: false });
+    const snapshot = await adapter.getReviewThread(review, "T1");
+    expect(snapshot.events).toHaveLength(1);
+    expect(snapshot.events[0]).toMatchObject({ kind: "thread-comment", threadId: "T1", commentId: "8" });
+  });
+
+  it("normalizes a nullable FILE review thread without a line", async () => {
+    const fixture = JSON.parse(readFixture("gh-review-threads.json")) as { data: { repository: { pullRequest: { reviewThreads: { nodes: Array<Record<string, unknown>> } } } } };
+    const node = fixture.data.repository.pullRequest.reviewThreads.nodes[0];
+    Object.assign(node, { subjectType: "FILE", diffSide: "RIGHT", line: null, originalLine: null });
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : JSON.stringify(fixture));
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.listReviewThreads(review)).resolves.toMatchObject({ threads: [{ placement: { file: "src/a.ts", side: "new", outdated: true } }] });
+    expect((await adapter.getReviewThread(review, "T1")).placement).not.toHaveProperty("line");
+    expect(execGh.mock.calls.find(([args]) => (args as string[])[1] === "graphql")?.[0].join(" ")).toContain("subjectType diffSide path line originalLine");
+  });
+
+  it("posts replies with stdin JSON and validates the returned binding", async () => {
+    const execGh = vi.fn(async (args: string[], stdin?: string) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") return readFixture("gh-review-threads.json");
+      const body = JSON.parse(stdin ?? "{}") as { body?: string };
+      const id = args.some((arg) => arg.includes("comments/8/replies")) ? 10 : 9;
+      return JSON.stringify({ id, body: body.body, user: { login: "octo-bot" }, html_url: `https://github.com/octo-org/octo-repo/pull/42#${id === 9 ? "issuecomment-" : "discussion_r"}${id}`, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42", ...(id === 10 ? { in_reply_to_id: 8 } : {}) });
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.postGeneralReply(review, { provider: "github", repositoryDigest, reviewNumber: 42, body: "hello" })).resolves.toMatchObject({ commentId: "9" });
+    await expect(adapter.postThreadReply(review, { provider: "github", repositoryDigest, reviewNumber: 42, threadId: "T1", parentCommentId: "8", body: "reply" })).resolves.toMatchObject({ commentId: "10", threadId: "T1" });
+    expect(execGh).toHaveBeenCalledWith(["api", "repos/octo-org/octo-repo/issues/42/comments", "--hostname", "github.com", "-X", "POST", "--input", "-"], JSON.stringify({ body: "hello" }));
+    expect(execGh).toHaveBeenCalledWith(["api", "repos/octo-org/octo-repo/pulls/42/comments/8/replies", "--hostname", "github.com", "-X", "POST", "--input", "-"], JSON.stringify({ body: "reply" }));
+  });
+
+  it("rejects a thread reply when the parent is outside the addressed GraphQL thread", async () => {
+    const execGh = vi.fn(async (args: string[]) => args[1] === "graphql" ? readFixture("gh-review-threads.json") : JSON.stringify({ login: "octo-bot" }));
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.postThreadReply(review, { provider: "github", repositoryDigest, reviewNumber: 42, threadId: "T1", parentCommentId: "999", body: "reply" })).rejects.toThrow(/parent.*thread/i);
+    expect(execGh.mock.calls.some(([args]) => (args as string[]).includes("POST"))).toBe(false);
+  });
+
+  it("posts a reply addressed to a nested comment through the thread root endpoint", async () => {
+    const fixture = JSON.parse(readFixture("gh-review-threads.json")) as { data: { repository: { pullRequest: { reviewThreads: { nodes: Array<{ comments: { nodes: Array<Record<string, unknown>> } }> } } } } };
+    fixture.data.repository.pullRequest.reviewThreads.nodes[0]!.comments.nodes.push({
+      databaseId: 9, body: "nested", author: { login: "alice" }, createdAt: "2026-08-01T00:00:01Z", updatedAt: "2026-08-01T00:00:01Z",
+      url: `${review.url}#discussion_r9`, commit: { oid: "a".repeat(40) }, originalCommit: { oid: "a".repeat(40) }, replyTo: { databaseId: 8 },
+    });
+    const execGh = vi.fn(async (args: string[], stdin?: string) => {
+      if (args.includes("POST")) return JSON.stringify({ id: 10, body: JSON.parse(stdin!).body, user: { login: "octo-bot" }, html_url: `${review.url}#discussion_r10`, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42", in_reply_to_id: 8 });
+      return args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : JSON.stringify(fixture);
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.postThreadReply(review, { provider: "github", repositoryDigest, reviewNumber: 42, threadId: "T1", parentCommentId: "9", body: "reply" })).resolves.toMatchObject({ commentId: "10", threadId: "T1" });
+    expect(execGh).toHaveBeenCalledWith(["api", "repos/octo-org/octo-repo/pulls/42/comments/8/replies", "--hostname", "github.com", "-X", "POST", "--input", "-"], JSON.stringify({ body: "reply" }));
+  });
+
+  it("ignores spoofed markers and rejects multiple authenticated matches", async () => {
+    const visibleBody = "trusted finding";
+    const contentDigest = computeContentDigest(visibleBody);
+    const marker = formatChildMarker({ kind: "finding", parentId: `act_${"a".repeat(32)}`, childId: `finding_${"b".repeat(32)}`, repositoryDigest, reviewNumber: 42, contentDigest });
+    const comments = [
+      { id: 1, body: `${visibleBody}\n${marker}`, user: { login: "mallory" }, html_url: "https://github.com/octo-org/octo-repo/pull/42#issuecomment-1" },
+      { id: 2, body: `${visibleBody}\n${marker}`, user: { login: "octo-bot" }, html_url: "https://github.com/octo-org/octo-repo/pull/42#issuecomment-2" },
+      { id: 3, body: `${visibleBody}\n${marker}`, user: { login: "octo-bot" }, html_url: "https://github.com/octo-org/octo-repo/pull/42#issuecomment-3" },
+    ];
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : args.some((arg) => arg.includes("issues/42/comments")) ? JSON.stringify(comments) : "[]");
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.findBotChildMarker(review, { provider: "github", repositoryDigest, reviewNumber: 42, kind: "finding", parentId: `act_${"a".repeat(32)}`, childId: `finding_${"b".repeat(32)}`, contentDigest })).rejects.toThrow(/multiple.*marker/i);
+  });
+
+  it("rejects an authenticated child marker copied onto edited visible content", async () => {
+    const contentDigest = computeContentDigest("trusted");
+    const expected = { provider: "github" as const, repositoryDigest, reviewNumber: 42, kind: "finding" as const, parentId: `act_${"a".repeat(32)}`, childId: `finding_${"b".repeat(32)}`, contentDigest };
+    const marker = formatChildMarker(expected);
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) :
+      args.some((arg) => arg.includes("issues/42/comments")) ? JSON.stringify([{ id: 2, body: `edited\n${marker}`, user: { login: "octo-bot" }, html_url: `${review.url}#issuecomment-2` }]) : "[]");
+    await expect(new GitHubAdapter(execGh, repo).findBotChildMarker(review, expected)).rejects.toThrow(/body digest/i);
+  });
+});
+
 // Design-review #10: resolveStaleReviewThreads collapses the bot's OWN
 // unresolved inline threads via GraphQL — never a human's thread, never an
 // already-resolved one, and never by deleting anything.
@@ -1194,63 +1570,150 @@ describe("resolveStaleReviewThreads", () => {
 // ADR-007: a multi-line committable suggestion spans start_line..line. GitHub
 // requires start_side alongside start_line, and start_line < line.
 describe("createInlineReview: multi-line suggestion ranges", () => {
-  it("sends start_line + start_side for a multi-line range, and omits them for a single line", async () => {
+  it("posts one atomic review and recovers every identity after an incomplete direct response", async () => {
     const calls: { args: string[]; stdin?: string }[] = [];
     const execGh: ExecGh = async (args, stdin) => {
       calls.push({ args, stdin });
-      return "{}";
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") return inlineThreadsFixture([100, 101], ["a.ts", "b.ts"]);
+      if (args.includes("POST")) return "{}";
+      const posted = calls.find((call) => call.args.includes("POST"));
+      if (!posted) return "[]";
+      const bodies = (JSON.parse(posted.stdin!) as { comments: { body: string }[] }).comments.map((comment, index) => ({
+        id: 100 + index, body: comment.body, user: { login: "octo-bot" },
+        path: index === 0 ? "a.ts" : "b.ts", line: index === 0 ? 13 : 5, side: "RIGHT",
+        ...(index === 0 ? { start_line: 11, start_side: "RIGHT" } : {}), commit_id: "d".repeat(40),
+        html_url: `https://github.com/octo-org/octo-repo/pull/42#discussion_r${100 + index}`,
+        pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42",
+      }));
+      return JSON.stringify(bodies);
     };
-    const adapter = new GitHubAdapter(execGh);
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(execGh, repo);
 
     const comments = [
       { clientId: "finding-0", path: "a.ts", line: 13, startLine: 11, body: "multi", position: {} as never },
       { clientId: "finding-1", path: "b.ts", line: 5, body: "single", position: {} as never },
     ];
-    const outcomes = await adapter.createInlineReview(locator42, "deadbeef", comments);
-    expect(outcomes).toEqual([
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "finding-1", status: "posted" },
+    const outcomes = await adapter.createInlineReview({ kind: "repository", repo, number: 42 }, "d".repeat(40), comments);
+    expect(outcomes).toMatchObject([
+      { clientId: "finding-0", status: "posted", identity: { commentId: "100" } },
+      { clientId: "finding-1", status: "posted", identity: { commentId: "101" } },
     ]);
-
-    const payload = JSON.parse(calls[0].stdin as string) as {
-      commit_id: string;
-      event: string;
-      comments: Record<string, unknown>[];
-    };
-
-    expect(payload.commit_id).toBe("deadbeef");
-    expect(payload.event).toBe("COMMENT");
-    expect(payload.comments[0]).toEqual({
-      path: "a.ts",
-      line: 13, // LAST line of the range
-      side: "RIGHT",
-      start_line: 11,
-      start_side: "RIGHT",
-      body: "multi",
-    });
-    // A single-line comment must NOT carry start_line (GitHub rejects start_line === line).
-    expect(payload.comments[1]).toEqual({
-      path: "b.ts",
-      line: 5,
-      side: "RIGHT",
-      body: "single",
+    expect(calls.filter((call) => call.args.includes("POST"))).toHaveLength(1);
+    expect(JSON.parse(calls.find((call) => call.args.includes("POST"))!.stdin!)).toMatchObject({
+      commit_id: "d".repeat(40), event: "COMMENT", body: "tGD inline review",
+      comments: [{ path: "a.ts", line: 13, side: "RIGHT", start_line: 11, start_side: "RIGHT" }, { path: "b.ts", line: 5, side: "RIGHT" }],
     });
   });
 
-  it("returns one safe failed outcome per comment when GitHub rejects the atomic write", async () => {
-    const adapter = new GitHubAdapter(async () => {
-      throw new Error("HTTP 422 secret-token=do-not-publish");
-    });
+  it("fails closed after an accepted write with partial recovery and never posts twice", async () => {
+    let posts = 0;
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(async (args, stdin) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args.includes("POST")) { posts += 1; return "{}"; }
+      if (posts === 0) return "[]";
+      const body = (JSON.parse(stdin ?? "{}") as { body?: string }).body;
+      void body;
+      return "[]";
+    }, repo);
     const comments = [
       { clientId: "finding-0", path: "a.ts", line: 1, body: "a", position: {} as never },
       { clientId: "finding-1", path: "b.ts", line: 2, body: "b", position: {} as never },
     ];
-    const outcomes = await adapter.createInlineReview(locator42, "deadbeef", comments);
-    expect(outcomes).toEqual([
-      { clientId: "finding-0", status: "failed", reason: "GitHub rejected the inline review" },
-      { clientId: "finding-1", status: "failed", reason: "GitHub rejected the inline review" },
+    await expect(adapter.createInlineReview({ kind: "repository", repo, number: 42 }, "d".repeat(40), comments)).rejects.toBeInstanceOf(AmbiguousInlinePublishError);
+    expect(posts).toBe(1);
+  });
+
+  it("posts the same client/body again on a later head because the marker binds head and placement", async () => {
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const posted: Array<{ body: string; head: string }> = [];
+    let currentHead = "a".repeat(40);
+    const execGh: ExecGh = async (args, stdin) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") return inlineThreadsFixture(posted.map((_, index) => 200 + index), posted.map(() => "a.ts"), currentHead, posted.map(() => 13));
+      if (args.includes("POST")) {
+        const payload = JSON.parse(stdin!) as { commit_id: string; comments: Array<{ body: string }> };
+        currentHead = payload.commit_id;
+        posted.push(...payload.comments.map((comment) => ({ body: comment.body, head: payload.commit_id })));
+        return "{}";
+      }
+      return JSON.stringify(posted.map((comment, index) => ({ id: 200 + index, body: comment.body, user: { login: "octo-bot" }, path: "a.ts", line: 13, side: "RIGHT", commit_id: comment.head, html_url: `https://github.com/octo-org/octo-repo/pull/42#discussion_r${200 + index}`, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42" })));
+    };
+    const adapter = new GitHubAdapter(execGh, repo);
+    const comments = [{ clientId: "finding-0", path: "a.ts", line: 13, body: "same", position: {} as never }];
+    await adapter.createInlineReview({ kind: "repository", repo, number: 42 }, "a".repeat(40), comments);
+    await adapter.createInlineReview({ kind: "repository", repo, number: 42 }, "b".repeat(40), comments);
+    expect(posted).toHaveLength(2);
+    expect(posted[0]!.body.split(/\r?\n/u).at(-1)).not.toBe(posted[1]!.body.split(/\r?\n/u).at(-1));
+  });
+
+  it("prepares exact run-bound child markers so an earlier same-head/config child cannot recover", async () => {
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const repositoryDigest = computeRepositoryDigest("github", repo.canonicalUrl);
+    const adapter = new GitHubAdapter(vi.fn(), repo);
+    const comments = [{ clientId: "finding-0", path: "a.ts", line: 1, body: "same", position: {} as never }];
+    const first = await adapter.prepareInlineReviewRecovery({ kind: "repository", repo, number: 42 }, "a".repeat(40), comments, "config-a");
+    const second = await adapter.prepareInlineReviewRecovery({ kind: "repository", repo, number: 42 }, "a".repeat(40), comments, "config-b");
+    expect(first.children[0]).toMatchObject({ clientId: "finding-0", kind: "finding", repositoryDigest, reviewNumber: 42, headSha: "a".repeat(40) });
+    expect(first.children[0]!.marker).not.toBe(second.children[0]!.marker);
+    expect(first.children[0]!.parentId).not.toBe(second.children[0]!.parentId);
+  });
+
+  it("recovers only exact full child markers and ignores same-head content, placement, and config variants", async () => {
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    let rows: unknown[] = [];
+    const execGh = vi.fn(async (args: string[]) => args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : JSON.stringify(rows));
+    const adapter = new GitHubAdapter(execGh, repo);
+    const locator = { kind: "repository" as const, repo, number: 42 };
+    const head = "a".repeat(40);
+    const comment = (body: string, line: number) => [{ clientId: "finding-0", path: "a.ts", line, body, position: {} as never }];
+    const expected = await adapter.prepareInlineReviewRecovery(locator, head, comment("current", 2), "config-current");
+    const variants = await Promise.all([
+      adapter.prepareInlineReviewRecovery(locator, head, comment("old", 2), "config-current"),
+      adapter.prepareInlineReviewRecovery(locator, head, comment("current", 1), "config-current"),
+      adapter.prepareInlineReviewRecovery(locator, head, comment("current", 2), "config-old"),
     ]);
-    expect(JSON.stringify(outcomes)).not.toContain("secret-token");
+    rows = variants.map((manifest, index) => ({ id: index + 1, body: `body\n${manifest.children[0]!.marker}`, user: { login: "octo-bot" }, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42" }));
+    await expect(adapter.recoverInlineReview(locator, expected)).resolves.toBe("none");
+    rows.push({ id: 9, body: `current\n${INLINE_COMMENT_MARKER}\n${expected.children[0]!.marker}`, user: { login: "octo-bot" }, path: "a.ts", line: 2, side: "RIGHT", start_line: null, start_side: null, commit_id: head, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42" });
+    await expect(adapter.recoverInlineReview(locator, expected)).resolves.toBe("complete");
+  });
+
+  it("rejects duplicate or tampered recovery manifests before any GitHub API call", async () => {
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const execGh = vi.fn();
+    const adapter = new GitHubAdapter(execGh, repo);
+    const locator = { kind: "repository" as const, repo, number: 42 };
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 1, body: "a", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 2, body: "b", position: {} as never },
+    ];
+    const manifest = await adapter.prepareInlineReviewRecovery(locator, "a".repeat(40), comments, "config");
+    const first = manifest.children[0]!;
+    for (const children of [
+      [first, { ...manifest.children[1]!, childId: first.childId, marker: first.marker }],
+      [first, { ...manifest.children[1]!, marker: first.marker }],
+      [{ ...first, childId: `finding_${"0".repeat(32)}` }],
+    ]) {
+      await expect(adapter.recoverInlineReview(locator, { ...manifest, children } as never)).rejects.toThrow(/manifest|recovery/i);
+    }
+    expect(execGh).not.toHaveBeenCalled();
+  });
+
+  it("rejects explicit recovery repository and review mismatches before any GitHub API call", async () => {
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const execGh = vi.fn();
+    const adapter = new GitHubAdapter(execGh, repo);
+    const locator = { kind: "repository" as const, repo, number: 42 };
+    const comments = [{ clientId: "finding-0", path: "a.ts", line: 1, body: "a", position: {} as never }];
+    const manifest = await adapter.prepareInlineReviewRecovery(locator, "a".repeat(40), comments, "config");
+
+    await expect(adapter.recoverInlineReview({ ...locator, number: 43 }, manifest)).rejects.toThrow(/review mismatch/i);
+    const otherRepo = parseRepositoryRef("octo-org/other-repo", "github");
+    await expect(adapter.recoverInlineReview({ ...locator, repo: otherRepo }, manifest)).rejects.toThrow(/repository mismatch/i);
+    expect(execGh).not.toHaveBeenCalled();
   });
 
   it("validates complete, unique, known outcome IDs", () => {
@@ -1259,15 +1722,15 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
       { clientId: "finding-1", path: "b.ts", line: 2, body: "b", position: {} as never },
     ];
     expect(() => validateInlinePublishOutcomes(comments, [
-      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-0", status: "failed", reason: "safe" },
     ])).toThrow(/complete/i);
     expect(() => validateInlinePublishOutcomes(comments, [
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-0", status: "failed", reason: "safe" },
+      { clientId: "finding-0", status: "failed", reason: "safe" },
     ])).toThrow(/duplicate/i);
     expect(() => validateInlinePublishOutcomes(comments, [
-      { clientId: "finding-0", status: "posted" },
-      { clientId: "unknown", status: "posted" },
+      { clientId: "finding-0", status: "failed", reason: "safe" },
+      { clientId: "unknown", status: "failed", reason: "safe" },
     ])).toThrow(/unknown/i);
   });
 });

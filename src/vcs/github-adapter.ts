@@ -1,7 +1,15 @@
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
-import { parseBotMarker } from "../review/comment-marker.js";
-import { validateInlinePublishInputs } from "./adapter.js";
+import {
+  deriveInlineChildId,
+  formatInlineRecoveryMarker,
+  parseBotMarker,
+  validateInlineRecoveryState,
+  type InlineRecoveryChild,
+  type InlineRecoveryState,
+} from "../review/comment-marker.js";
+import { AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -14,6 +22,29 @@ import type {
 import type { GitHubRepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
+import { computeContentDigest, computeRepositoryDigest, verifyChildMarkerBinding } from "../conversation/markers.js";
+import type { BotIdentity, ConversationItemIdentity, ReviewIdentity } from "../conversation/types.js";
+import {
+  validateOpenReviewPageToken,
+  validateReviewDiscoveryCursor,
+  validateReviewEventCursor,
+  validateReviewEventPageToken,
+  validateReviewThreadPageToken,
+  type ChildMarkerLookup,
+  type ConversationAdapter,
+  type GeneralReplyInput,
+  type OpenReviewPage,
+  type OpenReviewPageToken,
+  type ReviewDiscoveryCursor,
+  type ReviewEventCursor,
+  type ReviewActivityEvent,
+  type ReviewEventPage,
+  type ReviewEventPageToken,
+  type ReviewThreadPage,
+  type ReviewThreadPageToken,
+  type ReviewThreadSnapshot,
+  type ThreadReplyInput,
+} from "./conversation-adapter.js";
 
 /**
  * Seam for shelling out to the `gh` CLI. GitHubAdapter accepts an ExecGh
@@ -61,6 +92,33 @@ export const realExecGh: ExecGh = (args, stdin, options) =>
     }
   });
 
+export class GitHubThreadSnapshotTooLargeError extends Error {
+  readonly code = "GITHUB_THREAD_SNAPSHOT_TOO_LARGE";
+  constructor() {
+    super("GitHub review thread exceeds the 10,000-comment atomic snapshot limit");
+    this.name = "GitHubThreadSnapshotTooLargeError";
+  }
+}
+
+export class GitHubLookupResourceLimitError extends Error {
+  constructor(message = "GitHub targeted lookup exceeded its bounded resource limit") {
+    super(message);
+    this.name = "GitHubLookupResourceLimitError";
+  }
+}
+
+export class ConcurrentGitHubMutationError extends Error {
+  constructor(message = "GitHub changed during a stable snapshot scan") {
+    super(message);
+    this.name = "ConcurrentGitHubMutationError";
+  }
+}
+
+const MAX_THREAD_SNAPSHOT_COMMENTS = 10_000;
+const MAX_TARGET_THREAD_PAGES = 1_000;
+const MAX_TARGET_COMMENT_PAGES = 1_000;
+const MAX_STABLE_SCAN_ATTEMPTS = 3;
+
 interface GhPrViewJson {
   headRefOid: string;
   baseRefOid: string;
@@ -69,12 +127,6 @@ interface GhPrViewJson {
   title: string;
   body?: string | null;
   url?: string;
-}
-
-interface GhIssueComment {
-  id: number | string;
-  body: string;
-  user: { login: string };
 }
 
 function validatedIssueCommentId(id: string): number {
@@ -90,6 +142,143 @@ function validatedIssueCommentId(id: string): number {
 
 interface GhUser {
   login: string;
+}
+
+const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?(?:\[bot\])?$/u;
+const SHA_RE = /^[0-9a-f]{40,64}$/u;
+const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+
+function object(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`Invalid GitHub ${label} response`);
+  return value as Record<string, unknown>;
+}
+
+function textField(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || /[\u0000-\u001f\u007f]/u.test(value)) throw new Error(`Invalid GitHub ${label}`);
+  return value;
+}
+
+function providerId(value: unknown, label: string): string {
+  const id = typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? String(value) : value;
+  if (typeof id !== "string" || !PROVIDER_ID_RE.test(id)) throw new Error(`Invalid GitHub ${label}`);
+  return id;
+}
+
+function timestamp(value: unknown, label: string): string {
+  const result = textField(value, label);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/u.test(result)) {
+    throw new Error(`Invalid GitHub ${label}`);
+  }
+  const epoch = Date.parse(result);
+  if (!Number.isFinite(epoch)) throw new Error(`Invalid GitHub ${label}`);
+  return new Date(epoch).toISOString();
+}
+
+function digest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function canonicalInlineBody(body: string): string {
+  return body.replace(/\r\n?/gu, "\n");
+}
+
+function orderKey(at: string, type: string, id: string, revision = ""): string {
+  return `${at}|${type}|${id.padStart(32, "0")}|${revision}`;
+}
+
+function eventBoundaryToken(event: ReviewActivityEvent): string {
+  return event.kind === "thread-resolution"
+    ? `r:${event.threadId}:${event.resolved ? "1" : "0"}:${event.outdated ? "1" : "0"}`
+    : event.revisionId;
+}
+
+function parseSlurpedArray(raw: string, label: string): Record<string, unknown>[] {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch (cause) { throw new Error(`Invalid GitHub ${label} JSON`, { cause }); }
+  if (!Array.isArray(value)) throw new Error(`Invalid GitHub ${label} response`);
+  const flat = value.length > 0 && Array.isArray(value[0]) ? (value as unknown[][]).flat() : value;
+  return flat.map((entry) => object(entry, label));
+}
+
+interface InclusiveHighWater { readonly at: string; readonly seen: readonly string[]; readonly cutoff?: string }
+
+interface StableScanResult<T> {
+  readonly witness: string;
+  readonly count: number;
+  readonly candidates: readonly T[];
+  readonly cutoffRank?: number;
+}
+
+interface TieContinuation {
+  readonly v: 1;
+  readonly cursor: string | null;
+  readonly cutoff: string;
+  readonly witness: string;
+  readonly count: number;
+  readonly emittedRank: number;
+  readonly checksum: string;
+}
+
+function decodeHighWater(opaque: string): InclusiveHighWater {
+  try {
+    const value = object(JSON.parse(opaque), "cursor high-water");
+    const at = timestamp(value.at, "cursor high-water timestamp");
+    if (!Array.isArray(value.seen) || value.seen.some((id) => typeof id !== "string" || id.length === 0)) throw new Error("Invalid GitHub cursor seen set");
+    if (value.cutoff !== undefined && (typeof value.cutoff !== "string" || value.cutoff.length === 0)) throw new Error("Invalid GitHub cursor cutoff");
+    return { at, seen: value.seen as string[], ...(typeof value.cutoff === "string" ? { cutoff: value.cutoff } : {}) };
+  } catch (cause) {
+    throw new Error("Invalid GitHub cursor high-water state", { cause });
+  }
+}
+
+function encodeHighWater(at: string, seen: readonly string[], cutoff?: string): string {
+  const unique = cutoff ? [] : [...new Set(seen)].sort();
+  let encoded = JSON.stringify({ at, seen: unique, ...(cutoff ? { cutoff } : {}) });
+  if (Buffer.byteLength(encoded, "utf8") > 3_900) {
+    const overlap = new Date(Date.parse(at) - 1).toISOString();
+    encoded = JSON.stringify({ at: overlap, seen: [] });
+  }
+  return encoded;
+}
+
+type TieContinuationPayload = Omit<TieContinuation, "checksum">;
+
+function tieContinuationChecksum(value: TieContinuationPayload): string {
+  return digest(JSON.stringify(value));
+}
+
+function encodeTieContinuation(value: TieContinuationPayload): string {
+  const encoded = JSON.stringify({ ...value, checksum: tieContinuationChecksum(value) });
+  if (Buffer.byteLength(encoded, "utf8") > 3_900) throw new Error("GitHub continuation token exceeds safe bound");
+  return encoded;
+}
+
+function decodeTieContinuation(opaque: string): TieContinuation {
+  try {
+    const value = object(JSON.parse(opaque), "tie continuation");
+    const keys = Object.keys(value).sort();
+    if (keys.join("\0") !== ["checksum", "count", "cursor", "cutoff", "emittedRank", "v", "witness"].sort().join("\0")) throw new Error("Invalid GitHub continuation properties");
+    if (value.v !== 1 || (value.cursor !== null && typeof value.cursor !== "string") || typeof value.cutoff !== "string" || value.cutoff.length === 0 ||
+      typeof value.witness !== "string" || !/^[0-9a-f]{64}$/u.test(value.witness) || !Number.isSafeInteger(value.count) || (value.count as number) < 0 ||
+      !Number.isSafeInteger(value.emittedRank) || (value.emittedRank as number) <= 0 || (value.emittedRank as number) > (value.count as number) ||
+      typeof value.checksum !== "string" || !/^[0-9a-f]{64}$/u.test(value.checksum)) {
+      throw new Error("Invalid GitHub tie continuation");
+    }
+    if (value.cursor !== null) decodeHighWater(value.cursor);
+    const parsed = value as unknown as TieContinuation;
+    const { checksum, ...payload } = parsed;
+    if (checksum !== tieContinuationChecksum(payload)) throw new Error("Invalid GitHub continuation checksum");
+    return parsed;
+  } catch (cause) {
+    throw new Error(cause instanceof Error && /checksum/iu.test(cause.message)
+      ? "Invalid GitHub tie continuation checksum"
+      : "Invalid GitHub tie continuation state", { cause });
+  }
+}
+
+function addWitnessEntry(hash: ReturnType<typeof createHash>, parts: readonly string[]): void {
+  for (const part of parts) hash.update(`${Buffer.byteLength(part, "utf8")}:`).update(part);
+  hash.update("\n");
 }
 
 // `gh repo view --json nameWithOwner` response — the resolved "owner/name" of
@@ -203,8 +392,11 @@ function apiHost(repo?: GitHubRepositoryRef): string[] {
  * explicit GraphQL variables. Ambient locators retain `gh`'s repository
  * inference and reproduce the existing ambient command arguments.
  */
-export class GitHubAdapter implements VcsAdapter {
-  constructor(private readonly execGh: ExecGh = realExecGh) {}
+export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
+  constructor(
+    private readonly execGh: ExecGh = realExecGh,
+    private readonly repository?: GitHubRepositoryRef,
+  ) {}
 
   resolveRelatedWork(references: readonly RelatedWorkReference[]): Promise<readonly RelatedWorkItem[]> {
     return resolveGitHubRelatedWork(references, this.execGh);
@@ -229,12 +421,638 @@ export class GitHubAdapter implements VcsAdapter {
     let promise = this.botLoginPromises.get(cacheKey);
     if (!promise) {
       promise = this.execGh(["api", "user", ...apiHost(repo)]).then((out) => {
-        const parsed = JSON.parse(out) as GhUser;
-        return parsed.login;
+        const parsed = object(JSON.parse(out) as GhUser, "authenticated user");
+        const login = textField(parsed.login, "authenticated user login").toLowerCase();
+        if (!LOGIN_RE.test(login)) throw new Error("Invalid GitHub authenticated user login");
+        return login;
+      }).catch((error: unknown) => {
+        this.botLoginPromises.delete(cacheKey);
+        throw error;
       });
       this.botLoginPromises.set(cacheKey, promise);
     }
     return promise;
+  }
+
+  async getAuthenticatedBotIdentity(): Promise<BotIdentity> {
+    const login = await this.getBotLogin(this.repository);
+    return { provider: "github", login, mention: `@${login}` };
+  }
+
+  private requireRepository(binding: { provider: string; repositoryDigest: string }): GitHubRepositoryRef {
+    if (binding.provider !== "github") throw new Error("GitHub repository provider binding mismatch");
+    if (!this.repository) throw new Error("GitHub repository activity requires an explicit canonical repository");
+    const expected = computeRepositoryDigest("github", this.repository.canonicalUrl);
+    if (binding.repositoryDigest !== expected) throw new Error("GitHub repository digest binding mismatch");
+    return this.repository;
+  }
+
+  private repositoryForReview(review: ReviewIdentity): GitHubRepositoryRef {
+    if (review.provider !== "github" || !Number.isSafeInteger(review.reviewNumber) || review.reviewNumber <= 0) {
+      throw new Error("Invalid GitHub review binding");
+    }
+    let url: URL;
+    try { url = new URL(review.url); } catch { throw new Error("Invalid GitHub review URL"); }
+    const match = /^\/([^/]+)\/([^/]+)\/pull\/([1-9]\d*)$/u.exec(url.pathname);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash || !match || Number(match[3]) !== review.reviewNumber) {
+      throw new Error("Invalid GitHub review URL binding");
+    }
+    const repo: GitHubRepositoryRef = {
+      provider: "github", host: "github.com", owner: match[1]!, repo: match[2]!,
+      canonicalUrl: `https://github.com/${match[1]}/${match[2]}`,
+    };
+    if (url.hostname !== repo.host || computeRepositoryDigest("github", repo.canonicalUrl) !== review.repositoryDigest) {
+      throw new Error("GitHub review repository binding mismatch");
+    }
+    if (this.repository && this.repository.canonicalUrl !== repo.canonicalUrl) throw new Error("GitHub configured repository binding mismatch");
+    providerId(review.reviewId, "review id");
+    return repo;
+  }
+
+  private async resolveReviewIdentity(repo: GitHubRepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
+    const query = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id url}}}";
+    const parsed = object(JSON.parse(await this.execGh(["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `owner=${repo.owner}`, "-F", `name=${repo.repo}`, "-F", `number=${reviewNumber}`])), "pull request identity");
+    const pull = object(object(object(parsed.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");
+    const url = textField(pull.url, "GraphQL pull request URL");
+    if (url !== `${repo.canonicalUrl}/pull/${reviewNumber}`) throw new Error("GitHub GraphQL pull request URL binding mismatch");
+    return { provider: "github", repositoryDigest: computeRepositoryDigest("github", repo.canonicalUrl), reviewNumber, reviewId: providerId(pull.id, "GraphQL pull request id"), url };
+  }
+
+  private async scanStablePages<T>(scan: () => Promise<StableScanResult<T>>): Promise<StableScanResult<T>> {
+    for (let attempt = 0; attempt < MAX_STABLE_SCAN_ATTEMPTS; attempt += 1) {
+      const first = await scan();
+      const second = await scan();
+      if (first.count === second.count && first.witness === second.witness) return second;
+    }
+    throw new ConcurrentGitHubMutationError();
+  }
+
+  async listOpenReviews(
+    repositoryBinding: { provider: "github" | "gitlab"; repositoryDigest: string },
+    after?: ReviewDiscoveryCursor,
+    pageToken?: OpenReviewPageToken,
+  ): Promise<OpenReviewPage> {
+    const repo = this.requireRepository(repositoryBinding);
+    const binding = { provider: "github" as const, repositoryDigest: repositoryBinding.repositoryDigest };
+    const cursor = after === undefined ? undefined : validateReviewDiscoveryCursor(after, binding);
+    const continuation = pageToken === undefined ? undefined : decodeTieContinuation(validateOpenReviewPageToken(pageToken, binding).opaque);
+    if (continuation && continuation.cursor !== (cursor?.opaque ?? null)) throw new Error("GitHub open review continuation cursor binding mismatch");
+    const boundary = continuation?.cursor === null ? undefined : continuation ? decodeHighWater(continuation.cursor) : cursor ? decodeHighWater(cursor.opaque) : undefined;
+    const cutoff = continuation?.cutoff;
+    const snapshot = await this.scanStablePages(async () => {
+      const candidates: OpenReviewPage["reviews"][number][] = [];
+      const hash = createHash("sha256");
+      let count = 0;
+      let cutoffRank = 0;
+      let previousStable = -1;
+      for (let page = 1; page <= 10_000; page += 1) {
+        const rows = parseSlurpedArray(await this.execGh([
+          "api", "-X", "GET", `${apiRepo(repo)}/pulls`, ...apiHost(repo),
+          "-f", "state=all", "-f", "sort=created", "-f", "direction=asc",
+          "-f", "per_page=100", "-f", `page=${page}`,
+        ]), "pull requests");
+        if (rows.length > 100) throw new Error("GitHub pull request page exceeds requested bound");
+        for (const row of rows) {
+          const databaseId = providerId(row.id, "pull request database id");
+          const stable = Number(databaseId);
+          if (!Number.isSafeInteger(stable) || stable <= previousStable) throw new Error("GitHub pull request stable ordering is nonmonotonic or duplicated");
+          previousStable = stable;
+          const id = providerId(row.node_id, "pull request node id");
+          const number = Number(row.number);
+          const state = row.state;
+          if (!Number.isSafeInteger(number) || number <= 0 || (state !== "open" && state !== "closed")) throw new Error("Invalid GitHub pull request binding");
+          const url = textField(row.html_url, "pull request URL");
+          if (url !== `${repo.canonicalUrl}/pull/${number}`) throw new Error("Invalid GitHub pull request URL binding");
+          const headSha = textField(object(row.head, "pull request head").sha, "pull request head SHA");
+          if (!SHA_RE.test(headSha)) throw new Error("Invalid GitHub pull request head SHA");
+          const updatedAt = timestamp(row.updated_at, "pull request updated timestamp");
+          const title = textField(row.title, "pull request title");
+          addWitnessEntry(hash, [databaseId, id, String(number), state, url, headSha, updatedAt, title]);
+          count += 1;
+          const item = { identity: { ...binding, reviewNumber: number, reviewId: id, url }, title, headSha, updatedAt,
+            orderKey: `${updatedAt}|${number.toString().padStart(16, "0")}|${databaseId.padStart(32, "0")}` };
+          const afterBoundary = !boundary || updatedAt > boundary.at || (updatedAt === boundary.at && (!boundary.cutoff || item.orderKey > boundary.cutoff));
+          if (state === "open" && afterBoundary && cutoff && item.orderKey <= cutoff) cutoffRank += 1;
+          if (state === "open" && afterBoundary && (!cutoff || item.orderKey > cutoff)) {
+            candidates.push(item);
+            candidates.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+            if (candidates.length > 101) candidates.pop();
+          }
+        }
+        if (rows.length < 100) break;
+        if (page === 10_000) throw new Error("GitHub pull request scan exceeded safe page bound");
+      }
+      return { witness: hash.digest("hex"), count, candidates, cutoffRank };
+    });
+    if (continuation && (continuation.witness !== snapshot.witness || continuation.count !== snapshot.count)) throw new ConcurrentGitHubMutationError("GitHub changed during an open review continuation");
+    if (continuation && snapshot.cutoffRank !== continuation.emittedRank) throw new Error("GitHub open review continuation cutoff rank mismatch");
+    const reviews = snapshot.candidates.slice(0, 100);
+    if (new Set(reviews.map((item) => item.identity.reviewId)).size !== reviews.length || new Set(reviews.map((item) => item.identity.reviewNumber)).size !== reviews.length) throw new Error("Duplicate GitHub pull request identity");
+    const priorAt = boundary?.at ?? new Date(0).toISOString();
+    const highAt = reviews.at(-1)?.updatedAt ?? priorAt;
+    const highSeen = reviews.filter((item) => item.updatedAt === highAt).map((item) => item.identity.reviewId);
+    const hasMore = snapshot.candidates.length > 100;
+    const stableCursor = hasMore
+      ? { scope: "open-review-discovery" as const, ...binding, opaque: cursor?.opaque ?? encodeHighWater(new Date(0).toISOString(), []), orderKey: cursor?.orderKey ?? new Date(0).toISOString() }
+      : reviews.length === 0 && cursor
+        ? cursor
+        : { scope: "open-review-discovery" as const, ...binding, opaque: encodeHighWater(highAt, highSeen, reviews.at(-1)?.orderKey), orderKey: highAt };
+    return {
+      reviews,
+      nextCursor: stableCursor,
+      ...(hasMore ? { nextPageToken: { scope: "open-review-page" as const, ...binding,
+        opaque: encodeTieContinuation({ v: 1, cursor: cursor?.opaque ?? null, cutoff: reviews.at(-1)!.orderKey, witness: snapshot.witness, count: snapshot.count,
+          emittedRank: (continuation?.emittedRank ?? 0) + reviews.length }) } } : {}),
+    };
+  }
+
+  private async reviewCommentStreamPage(review: ReviewIdentity, stream: "issue" | "inline", page: number): Promise<Record<string, unknown>[]> {
+    const repo = this.repositoryForReview(review);
+    const path = stream === "issue" ? `${apiRepo(repo)}/issues/${review.reviewNumber}/comments` : `${apiRepo(repo)}/pulls/${review.reviewNumber}/comments`;
+    const raw = await this.execGh(["api", "-X", "GET", "-f", "per_page=50", "-f", `page=${page}`, path, ...apiHost(repo)]);
+    return parseSlurpedArray(raw, stream === "issue" ? "issue comments" : "review comments");
+  }
+
+  private async *restCommentPages(repo: GitHubRepositoryRef | undefined, path: string, label: string): AsyncGenerator<Record<string, unknown>[]> {
+    for (let page = 1; page <= MAX_TARGET_COMMENT_PAGES; page += 1) {
+      const raw = await this.execGh(["api", "-X", "GET", "-f", "per_page=50", "-f", `page=${page}`, path, ...apiHost(repo)]);
+      const rows = parseSlurpedArray(raw, label);
+      yield rows;
+      if (rows.length < 50) return;
+    }
+    throw new GitHubLookupResourceLimitError(`GitHub ${label} pagination exceeded its bounded resource limit`);
+  }
+
+  private async threadMetadataForCommentIds(review: ReviewIdentity, ids: ReadonlySet<string>): Promise<Map<string, ReturnType<GitHubAdapter["normalizeThread"]>>> {
+    const result = new Map<string, ReturnType<GitHubAdapter["normalizeThread"]>>();
+    if (ids.size === 0) return result;
+    const seen = new Set<string>();
+    let cursor: string | undefined;
+    let pages = 0;
+    do {
+      pages += 1;
+      if (pages > MAX_TARGET_THREAD_PAGES) throw new GitHubLookupResourceLimitError();
+      if (cursor && seen.has(cursor)) throw new Error("GitHub review thread mapping repeated cursor");
+      if (cursor) seen.add(cursor);
+      const response = await this.reviewThreadsResponse(review, cursor);
+      const connection = this.threadConnection(response, review);
+      const pull = object(object(object(response.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");
+      const nodes = Array.isArray(connection.nodes) ? connection.nodes.map((node) => object(node, "review thread")) : (() => { throw new Error("Invalid GitHub review thread nodes"); })();
+      for (const node of nodes) {
+        const normalized = this.normalizeThread(review, node, pull.headRefOid, pull.updatedAt);
+        for (const comment of normalized.nodes) {
+          const id = providerId(comment.databaseId, "review thread comment id");
+          if (ids.has(id)) result.set(id, normalized);
+        }
+        const comments = object(node.comments, "review thread comments");
+        const info = object(comments.pageInfo, "review thread comment page info");
+        if (typeof info.hasNextPage !== "boolean") throw new Error("Invalid GitHub review thread comment page info");
+        const missing = new Set([...ids].filter((id) => !result.has(id)));
+        if (info.hasNextPage && missing.size > 0) {
+          const found = await this.findIdsInRemainingThreadComments(review, normalized.threadId, textField(info.endCursor, "review thread comment end cursor"), missing);
+          for (const id of found) result.set(id, normalized);
+        }
+      }
+      const info = object(connection.pageInfo, "review thread page info");
+      if (typeof info.hasNextPage !== "boolean") throw new Error("Invalid GitHub review thread page info");
+      const next = info.hasNextPage ? textField(info.endCursor, "review thread end cursor") : undefined;
+      if (next !== undefined && next === cursor) throw new Error("GitHub review thread mapping nonadvancing cursor");
+      cursor = result.size === ids.size ? undefined : next;
+    } while (cursor);
+    if (result.size !== ids.size) throw new Error("GitHub review comment is missing its GraphQL thread binding");
+    return result;
+  }
+
+  private async findIdsInRemainingThreadComments(review: ReviewIdentity, threadId: string, cursor: string, wanted: ReadonlySet<string>): Promise<Set<string>> {
+    const repo = this.repositoryForReview(review);
+    const query = "query($threadId:ID!,$cursor:String!){node(id:$threadId){... on PullRequestReviewThread{id pullRequest{id number url repository{nameWithOwner}} comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{databaseId}}}}}";
+    const found = new Set<string>();
+    const seen = new Set<string>();
+    let next: string | undefined = cursor;
+    let pages = 0;
+    while (next && found.size < wanted.size) {
+      pages += 1;
+      if (pages > MAX_TARGET_COMMENT_PAGES) throw new GitHubLookupResourceLimitError();
+      if (seen.has(next)) throw new Error("GitHub targeted thread comment pagination repeated cursor");
+      seen.add(next);
+      const raw = await this.execGh(["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `threadId=${threadId}`, "-f", `cursor=${next}`]);
+      const root = object(JSON.parse(raw) as unknown, "targeted thread comment page");
+      const node = object(object(root.data, "targeted thread GraphQL data").node, "targeted thread GraphQL node");
+      const pull = object(node.pullRequest, "targeted thread pull request");
+      if (node.id !== threadId || pull.id !== review.reviewId || pull.number !== review.reviewNumber || pull.url !== review.url || object(pull.repository, "targeted thread repository").nameWithOwner !== `${repo.owner}/${repo.repo}`) throw new Error("GitHub targeted thread review binding mismatch");
+      const comments = object(node.comments, "targeted thread comments");
+      if (!Array.isArray(comments.nodes)) throw new Error("Invalid GitHub targeted thread comment nodes");
+      for (const entry of comments.nodes) {
+        const id = providerId(object(entry, "targeted thread comment").databaseId, "targeted thread comment id");
+        if (wanted.has(id)) found.add(id);
+      }
+      const info = object(comments.pageInfo, "targeted thread comment page info");
+      if (typeof info.hasNextPage !== "boolean") throw new Error("Invalid GitHub targeted thread comment page info");
+      const candidate = info.hasNextPage ? textField(info.endCursor, "targeted thread comment end cursor") : undefined;
+      if (candidate !== undefined && candidate === next) throw new Error("GitHub targeted thread comment pagination nonadvancing cursor");
+      next = candidate;
+    }
+    return found;
+  }
+
+  async listReviewEvents(review: ReviewIdentity, after?: ReviewEventCursor, pageToken?: ReviewEventPageToken): Promise<ReviewEventPage> {
+    return this.listReviewEventsStable(review, after, pageToken);
+  }
+
+  private async listReviewEventsStable(review: ReviewIdentity, after?: ReviewEventCursor, pageToken?: ReviewEventPageToken): Promise<ReviewEventPage> {
+    const binding = { provider: "github" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const cursor = after === undefined ? undefined : validateReviewEventCursor(after, binding);
+    const continuation = pageToken === undefined ? undefined : decodeTieContinuation(validateReviewEventPageToken(pageToken, binding).opaque);
+    if (continuation && continuation.cursor !== (cursor?.opaque ?? null)) throw new Error("GitHub review event continuation cursor binding mismatch");
+    const boundary = continuation?.cursor === null ? undefined : continuation ? decodeHighWater(continuation.cursor) : cursor ? decodeHighWater(cursor.opaque) : undefined;
+    const bot = await this.getBotLogin(this.repositoryForReview(review));
+    const snapshot = await this.scanStablePages(() => this.scanReviewEventsOnce(review, boundary, continuation?.cutoff, bot));
+    if (continuation && (continuation.witness !== snapshot.witness || continuation.count !== snapshot.count)) throw new ConcurrentGitHubMutationError("GitHub changed during a review event continuation");
+    if (continuation && snapshot.cutoffRank !== continuation.emittedRank) throw new Error("GitHub review event continuation cutoff rank mismatch");
+    const events = snapshot.candidates.slice(0, 100);
+    const highAt = events.at(-1)?.updatedAt ?? boundary?.at ?? new Date(0).toISOString();
+    const highSeen = events.filter((event) => event.updatedAt === highAt).map(eventBoundaryToken);
+    const hasMore = snapshot.candidates.length > 100;
+    const stableCursor = hasMore
+      ? { scope: "review-events" as const, ...binding, opaque: cursor?.opaque ?? encodeHighWater(new Date(0).toISOString(), []), orderKey: cursor?.orderKey ?? new Date(0).toISOString() }
+      : events.length === 0 && cursor
+        ? cursor
+        : { scope: "review-events" as const, ...binding, opaque: encodeHighWater(highAt, highSeen, events.at(-1)?.orderKey), orderKey: highAt };
+    return { events, nextCursor: stableCursor,
+      ...(hasMore ? { nextPageToken: { scope: "review-event-page" as const, ...binding,
+        opaque: encodeTieContinuation({ v: 1, cursor: cursor?.opaque ?? null, cutoff: events.at(-1)!.orderKey, witness: snapshot.witness, count: snapshot.count,
+          emittedRank: (continuation?.emittedRank ?? 0) + events.length }) } } : {}) };
+  }
+
+  private async scanReviewEventsOnce(review: ReviewIdentity, boundary: InclusiveHighWater | undefined, cutoff: string | undefined, bot: string): Promise<StableScanResult<ReviewActivityEvent>> {
+    const repo = this.repositoryForReview(review);
+    const binding = { provider: "github" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const hash = createHash("sha256");
+    let count = 0;
+    let cutoffRank = 0;
+    type RawCandidate = { row: Record<string, unknown>; inline: boolean; orderKey: string; updatedAt: string; revisionId: string };
+    const rawCandidates: RawCandidate[] = [];
+    const keepRaw = (candidate: RawCandidate): void => {
+      if (boundary && (candidate.updatedAt < boundary.at || (candidate.updatedAt === boundary.at && (boundary.cutoff ? candidate.orderKey <= boundary.cutoff : boundary.seen.includes(candidate.revisionId))))) return;
+      if (cutoff && candidate.orderKey <= cutoff) { cutoffRank += 1; return; }
+      rawCandidates.push(candidate);
+      rawCandidates.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+      if (rawCandidates.length > 101) rawCandidates.pop();
+    };
+    for (const stream of ["issue", "inline"] as const) {
+      let previousId = 0;
+      const seenIds = new Set<string>();
+      for (let page = 1; page <= 10_000; page += 1) {
+        const rows = await this.reviewCommentStreamPage(review, stream, page);
+        for (const row of rows) {
+          const id = providerId(row.id, "comment id");
+          const numericId = Number(id);
+          if (!Number.isSafeInteger(numericId) || numericId <= previousId || seenIds.has(id)) throw new Error("GitHub comment stable ordering is nonmonotonic or duplicated");
+          previousId = numericId;
+          seenIds.add(id);
+          const body = typeof row.body === "string" ? row.body : (() => { throw new Error("Invalid GitHub comment body"); })();
+          const updatedAt = timestamp(row.updated_at, "comment updated timestamp");
+          const revisionId = digest(`${id}\0${updatedAt}\0${body}`);
+          const type = stream === "inline" ? "review-comment" : "issue-comment";
+          addWitnessEntry(hash, [stream, id, revisionId, digest(JSON.stringify(row))]);
+          count += 1;
+          keepRaw({ row, inline: stream === "inline", updatedAt, revisionId, orderKey: orderKey(updatedAt, type, id, revisionId) });
+        }
+        if (rows.length < 50) break;
+        if (page === 10_000) throw new Error("GitHub comment scan exceeded safe page bound");
+      }
+    }
+    const inlineIds = new Set(rawCandidates.filter((candidate) => candidate.inline).map((candidate) => providerId(candidate.row.id, "review comment id")));
+    const threadMetadata = await this.threadMetadataForCommentIds(review, inlineIds);
+    const events = rawCandidates.map((candidate): ReviewActivityEvent => {
+      const row = candidate.row;
+      const id = providerId(row.id, "comment id");
+      const body = row.body as string;
+      const authorLogin = textField(object(row.user, "comment author").login, "comment author login").toLowerCase();
+      if (!LOGIN_RE.test(authorLogin)) throw new Error("Invalid GitHub comment author login");
+      const createdAt = timestamp(row.created_at, "comment created timestamp");
+      const url = textField(row.html_url, "comment URL");
+      const expectedFragment = candidate.inline ? `#discussion_r${id}` : `#issuecomment-${id}`;
+      if (url !== `${review.url}${expectedFragment}`) throw new Error("Invalid GitHub comment URL binding");
+      const edited = candidate.updatedAt !== createdAt;
+      if (!candidate.inline) return { ...binding, kind: edited ? "comment-edit" : "general-comment", eventId: `issue-comment:${id}`, revisionId: candidate.revisionId,
+        ...(edited ? { editedRevisionId: candidate.revisionId } : {}), orderKey: candidate.orderKey, authorLogin, authorIsBot: authorLogin === bot,
+        createdAt, updatedAt: candidate.updatedAt, body, url, commentId: id } as ReviewActivityEvent;
+      if (row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`) throw new Error("Invalid GitHub review comment pull request binding");
+      const metadata = threadMetadata.get(id);
+      if (!metadata) throw new Error("GitHub review comment is missing its GraphQL thread binding");
+      const file = textField(row.path, "review comment path");
+      const lineValue = row.line ?? row.original_line;
+      const line = lineValue == null ? undefined : Number(lineValue);
+      if (file !== metadata.placement.file || line !== metadata.placement.line) throw new Error("GitHub review comment placement differs from its thread binding");
+      const restSide = row.side === "LEFT" ? "old" as const : row.side === "RIGHT" ? "new" as const : undefined;
+      const placement = metadata.placement.side === undefined && restSide !== undefined ? { ...metadata.placement, side: restSide } : metadata.placement;
+      const parent = row.in_reply_to_id == null ? undefined : providerId(row.in_reply_to_id, "parent comment id");
+      return { ...binding, kind: edited ? "comment-edit" : "thread-comment", eventId: `review-comment:${id}`, revisionId: candidate.revisionId,
+        ...(edited ? { editedRevisionId: candidate.revisionId } : {}), orderKey: candidate.orderKey, authorLogin, authorIsBot: authorLogin === bot,
+        createdAt, updatedAt: candidate.updatedAt, body, url, commentId: id, threadId: metadata.threadId, ...(parent ? { parentCommentId: parent } : {}), placement } as ReviewActivityEvent;
+    });
+    const seenThreadIds = new Set<string>();
+    let threadCursor: string | undefined;
+    do {
+      const response = await this.reviewThreadsResponse(review, threadCursor);
+      const connection = this.threadConnection(response, review);
+      const pull = object(object(object(response.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");
+      const nodes = Array.isArray(connection.nodes) ? connection.nodes.map((node) => object(node, "review thread")) : (() => { throw new Error("Invalid GitHub review thread nodes"); })();
+      for (const node of nodes) {
+        const thread = this.normalizeThread(review, node, pull.headRefOid, pull.updatedAt);
+        if (seenThreadIds.has(thread.threadId)) throw new Error("Duplicate GitHub review thread identity");
+        seenThreadIds.add(thread.threadId);
+        addWitnessEntry(hash, ["thread", thread.threadId, digest(JSON.stringify(node)), thread.resolutionObservedAt, thread.placement.currentHeadSha ?? ""]);
+        count += 1;
+        const root = thread.nodes[0]!;
+        const createdAt = timestamp(root.createdAt, "review thread resolution created timestamp");
+        const updatedAt = thread.resolutionObservedAt;
+        const revisionId = digest(`${thread.threadId}\0resolved=${String(thread.resolved)}\0outdated=${String(thread.outdated)}`);
+        const event: ReviewActivityEvent = { ...binding, kind: "thread-resolution", eventId: `thread-resolution:${thread.threadId}`, revisionId,
+          orderKey: orderKey(updatedAt, "thread-resolution", thread.threadId, revisionId), createdAt, updatedAt, body: "", url: thread.url,
+          threadId: thread.threadId, resolved: thread.resolved, outdated: thread.outdated, placement: thread.placement };
+        const afterBoundary = !boundary || event.updatedAt > boundary.at || (event.updatedAt === boundary.at && (boundary.cutoff ? event.orderKey > boundary.cutoff : !boundary.seen.includes(eventBoundaryToken(event))));
+        if (afterBoundary && cutoff && event.orderKey <= cutoff) cutoffRank += 1;
+        if (afterBoundary && (!cutoff || event.orderKey > cutoff)) {
+          events.push(event);
+          events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+          if (events.length > 101) events.pop();
+        }
+      }
+      const info = object(connection.pageInfo, "review thread page info");
+      const next = info.hasNextPage === true ? textField(info.endCursor, "review thread end cursor") : undefined;
+      if (next !== undefined && next === threadCursor) throw new Error("GitHub review thread scan nonadvancing cursor");
+      threadCursor = next;
+    } while (threadCursor);
+    events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    return { candidates: events, witness: hash.digest("hex"), count, cutoffRank };
+  }
+
+  private async reviewThreadsResponse(review: ReviewIdentity, cursor?: string): Promise<Record<string, unknown>> {
+    const repo = this.repositoryForReview(review);
+    const query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){id url headRefOid updatedAt reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated subjectType diffSide path line originalLine comments(first:1){pageInfo{hasNextPage endCursor} nodes{databaseId body author{login} createdAt updatedAt url commit{oid} originalCommit{oid} replyTo{databaseId}}}}}}}}";
+    const args = ["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `owner=${repo.owner}`, "-F", `name=${repo.repo}`, "-F", `number=${review.reviewNumber}`];
+    if (cursor) args.push("-f", `cursor=${cursor}`);
+    let parsed: unknown;
+    try { parsed = JSON.parse(await this.execGh(args)); } catch (cause) { throw new Error("Invalid GitHub review threads JSON", { cause }); }
+    return object(parsed, "review threads");
+  }
+
+  private threadConnection(response: Record<string, unknown>, review: ReviewIdentity): Record<string, unknown> {
+    const data = object(response.data, "GraphQL data");
+    const repository = object(data.repository, "GraphQL repository");
+    const pull = object(repository.pullRequest, "GraphQL pull request");
+    if (pull.id !== review.reviewId || pull.url !== review.url) throw new Error("GitHub GraphQL review binding mismatch");
+    return object(pull.reviewThreads, "GraphQL review threads");
+  }
+
+  private normalizeThread(review: ReviewIdentity, row: Record<string, unknown>, currentHead?: unknown, observedAt?: unknown) {
+    const binding = { provider: "github" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const threadId = providerId(row.id, "review thread id");
+    if (typeof row.isResolved !== "boolean" || typeof row.isOutdated !== "boolean") throw new Error("Invalid GitHub review thread state");
+    const comments = object(row.comments, "review thread comments");
+    const nodes = Array.isArray(comments.nodes) ? comments.nodes.map((node) => object(node, "review thread comment")) : (() => { throw new Error("Invalid GitHub review thread comments"); })();
+    if (nodes.length === 0) throw new Error("Invalid GitHub empty review thread");
+    const root = nodes[0]!;
+    const rootCommentId = providerId(root.databaseId, "review thread root comment id");
+    const url = textField(root.url, "review thread URL");
+    if (url !== `${review.url}#discussion_r${rootCommentId}`) throw new Error("Invalid GitHub review thread URL binding");
+    const updatedAt = nodes.map((node) => timestamp(node.updatedAt, "review thread updated timestamp")).sort().at(-1)!;
+    const subjectType = row.subjectType ?? "LINE";
+    if (subjectType !== "LINE" && subjectType !== "FILE") throw new Error("Invalid GitHub review thread subject type");
+    const file = textField(row.path, "review thread path");
+    const rawLine = row.line ?? row.originalLine;
+    const line = rawLine == null ? undefined : Number(rawLine);
+    if (subjectType === "LINE" && (!Number.isSafeInteger(line) || (line as number) <= 0)) throw new Error("Invalid GitHub review thread line");
+    if (subjectType === "FILE" && line !== undefined) throw new Error("Invalid GitHub file-level review thread line");
+    const diffSide = row.diffSide;
+    if (diffSide !== undefined && diffSide !== null && diffSide !== "LEFT" && diffSide !== "RIGHT") throw new Error("Invalid GitHub review thread diff side");
+    const original = object(root.originalCommit ?? root.commit, "review thread original commit");
+    const originalHeadSha = textField(original.oid, "review thread original head");
+    const currentHeadSha = textField(currentHead ?? object(root.commit, "review thread commit").oid, "review thread current head");
+    if (!SHA_RE.test(originalHeadSha) || !SHA_RE.test(currentHeadSha)) throw new Error("Invalid GitHub review thread head");
+    const placement = { file, ...(line === undefined ? {} : { line }), ...(diffSide == null ? {} : { side: diffSide === "LEFT" ? "old" as const : "new" as const }), originalHeadSha, currentHeadSha, outdated: row.isOutdated as boolean };
+    const resolutionObservedAt = observedAt === undefined ? updatedAt : timestamp(observedAt, "pull request observed timestamp");
+    return { ...binding, threadId, rootCommentId, url, resolved: row.isResolved as boolean, outdated: row.isOutdated as boolean, updatedAt, resolutionObservedAt, orderKey: orderKey(updatedAt, "thread", threadId), placement, nodes, comments };
+  }
+
+  private async remainingThreadComments(review: ReviewIdentity, threadId: string, cursor: string): Promise<Record<string, unknown>[]> {
+    const repo = this.repositoryForReview(review);
+    const query = "query($threadId:ID!,$cursor:String!){node(id:$threadId){... on PullRequestReviewThread{id pullRequest{id number url headRefOid repository{nameWithOwner}} comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{databaseId body author{login} createdAt updatedAt url commit{oid} originalCommit{oid} replyTo{databaseId}}}}}}";
+    const result: Record<string, unknown>[] = [];
+    const seen = new Set<string>();
+    let next: string | undefined = cursor;
+    let pages = 0;
+    while (next) {
+      pages += 1;
+      if (pages > MAX_TARGET_COMMENT_PAGES) throw new GitHubLookupResourceLimitError();
+      if (seen.has(next)) throw new Error("GitHub thread comment pagination repeated cursor");
+      seen.add(next);
+      const raw = await this.execGh(["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `threadId=${threadId}`, "-f", `cursor=${next}`]);
+      const root = object(JSON.parse(raw) as unknown, "thread comment page");
+      const node = object(object(root.data, "thread comment GraphQL data").node, "thread comment GraphQL node");
+      const pull = object(node.pullRequest, "thread comment pull request");
+      if (node.id !== threadId || pull.id !== review.reviewId || pull.number !== review.reviewNumber || pull.url !== review.url || object(pull.repository, "thread comment repository").nameWithOwner !== `${repo.owner}/${repo.repo}`) {
+        throw new Error("GitHub addressed thread review binding mismatch");
+      }
+      const comments = object(node.comments, "thread comment connection");
+      if (!Array.isArray(comments.nodes)) throw new Error("Invalid GitHub thread comment nodes");
+      result.push(...comments.nodes.map((entry) => object(entry, "thread comment")));
+      if (result.length > MAX_THREAD_SNAPSHOT_COMMENTS) throw new GitHubThreadSnapshotTooLargeError();
+      const info = object(comments.pageInfo, "thread comment page info");
+      if (typeof info.hasNextPage !== "boolean") throw new Error("Invalid GitHub thread comment page info");
+      next = info.hasNextPage ? textField(info.endCursor, "thread comment end cursor") : undefined;
+    }
+    return result;
+  }
+
+  async listReviewThreads(review: ReviewIdentity, pageToken?: ReviewThreadPageToken): Promise<ReviewThreadPage> {
+    const binding = { provider: "github" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const cursor = pageToken === undefined ? undefined : validateReviewThreadPageToken(pageToken, binding).opaque;
+    const response = await this.reviewThreadsResponse(review, cursor);
+    const connection = this.threadConnection(response, review);
+    const nodes = Array.isArray(connection.nodes) ? connection.nodes.map((node) => object(node, "review thread")) : (() => { throw new Error("Invalid GitHub review thread nodes"); })();
+    const pull = object(object(object(response.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");
+    const threads = (await Promise.all(nodes.map(async (node) => {
+      const comments = object(node.comments, "review thread comments");
+      const info = object(comments.pageInfo, "review thread comment page info");
+      if (typeof info.hasNextPage !== "boolean") throw new Error("Invalid GitHub review thread comment page info");
+      if (info.hasNextPage) {
+        const more = await this.remainingThreadComments(review, providerId(node.id, "review thread id"), textField(info.endCursor, "review thread comment end cursor"));
+        if (!Array.isArray(comments.nodes)) throw new Error("Invalid GitHub review thread comment nodes");
+        comments.nodes.push(...more);
+        info.hasNextPage = false;
+        info.endCursor = null;
+      }
+      const normalized = this.normalizeThread(review, node, pull.headRefOid, pull.updatedAt);
+      const { nodes: _nodes, comments: _comments, ...summary } = normalized;
+      void _nodes;
+      void _comments;
+      return summary;
+    }))).sort((a, b) => a.orderKey.localeCompare(b.orderKey));
+    const pageInfo = object(connection.pageInfo, "review thread page info");
+    if (typeof pageInfo.hasNextPage !== "boolean") throw new Error("Invalid GitHub review thread page info");
+    const next = pageInfo.hasNextPage ? textField(pageInfo.endCursor, "review thread end cursor") : undefined;
+    return { threads, ...(next ? { nextPageToken: { scope: "review-thread-page", ...binding, opaque: next } } : {}) };
+  }
+
+  async getReviewThread(review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
+    providerId(threadId, "review thread id");
+    let cursor: string | undefined;
+    let found: ReturnType<GitHubAdapter["normalizeThread"]> | undefined;
+    const seen = new Set<string>();
+    let pages = 0;
+    do {
+      pages += 1;
+      if (pages > MAX_TARGET_THREAD_PAGES) throw new GitHubLookupResourceLimitError();
+      if (cursor && seen.has(cursor)) throw new Error("GitHub review thread pagination repeated cursor");
+      if (cursor) seen.add(cursor);
+      const response = await this.reviewThreadsResponse(review, cursor);
+      const connection = this.threadConnection(response, review);
+      const pull = object(object(object(response.data, "GraphQL data").repository, "GraphQL repository").pullRequest, "GraphQL pull request");
+      const nodes = Array.isArray(connection.nodes) ? connection.nodes.map((node) => object(node, "review thread")) : [];
+      const match = nodes.find((node) => node.id === threadId);
+      if (match) found = this.normalizeThread(review, match, pull.headRefOid, pull.updatedAt);
+      const info = object(connection.pageInfo, "review thread page info");
+      cursor = info.hasNextPage === true ? textField(info.endCursor, "review thread end cursor") : undefined;
+    } while (!found && cursor);
+    if (!found) throw new Error("GitHub review thread not found in target review");
+    const firstPageInfo = object(found.comments.pageInfo, "review thread comment page info");
+    if (typeof firstPageInfo.hasNextPage !== "boolean") throw new Error("Invalid GitHub review thread comment page info");
+    if (firstPageInfo.hasNextPage) {
+      const next = textField(firstPageInfo.endCursor, "review thread comment end cursor");
+      found.nodes.push(...await this.remainingThreadComments(review, threadId, next));
+    }
+    if (found.nodes.length > MAX_THREAD_SNAPSHOT_COMMENTS) throw new GitHubThreadSnapshotTooLargeError();
+    const bot = await this.getBotLogin(this.repositoryForReview(review));
+    const events = found.nodes.map((node, index): ReviewActivityEvent => {
+      const commentId = providerId(node.databaseId, "review thread comment id");
+      const authorLogin = textField(object(node.author, "review thread comment author").login, "review thread comment author login").toLowerCase();
+      const createdAt = timestamp(node.createdAt, "review thread comment created timestamp");
+      const updatedAt = timestamp(node.updatedAt, "review thread comment updated timestamp");
+      const body = typeof node.body === "string" ? node.body : (() => { throw new Error("Invalid GitHub review thread comment body"); })();
+      const revisionId = digest(`${commentId}\0${updatedAt}\0${body}`);
+      const eventUrl = textField(node.url, "review thread comment URL");
+      if (eventUrl !== `${review.url}#discussion_r${commentId}`) throw new Error("Invalid GitHub review thread comment URL binding");
+      if (!LOGIN_RE.test(authorLogin)) throw new Error("Invalid GitHub review thread comment author login");
+      return { provider: "github" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber,
+        kind: updatedAt === createdAt ? "thread-comment" as const : "comment-edit" as const,
+        eventId: `review-comment:${commentId}`, revisionId, ...(updatedAt === createdAt ? {} : { editedRevisionId: revisionId }),
+        orderKey: orderKey(updatedAt, "review-comment", commentId, revisionId), authorLogin, authorIsBot: authorLogin === bot,
+        createdAt, updatedAt, body, url: eventUrl, commentId,
+        threadId: found!.threadId, ...(index === 0 ? {} : { parentCommentId: providerId(object(node.replyTo ?? {}, "review thread reply").databaseId ?? found!.rootCommentId, "review thread parent id") }), placement: found!.placement } as ReviewActivityEvent;
+    }).sort((a, b) => a.orderKey.localeCompare(b.orderKey));
+    const { nodes: _nodes, comments: _comments, ...summary } = found;
+    void _nodes;
+    void _comments;
+    return { ...summary, events };
+  }
+
+  private async writeConversationComment(
+    review: ReviewIdentity,
+    body: string,
+    path: string,
+    threadId?: string,
+    parentCommentId?: string,
+  ): Promise<ConversationItemIdentity> {
+    if (typeof body !== "string" || body.length === 0) throw new Error("GitHub reply body must not be empty");
+    const repo = this.repositoryForReview(review);
+    const bot = await this.getBotLogin(repo);
+    let value: unknown;
+    try {
+      value = JSON.parse(await this.execGh(["api", path, ...apiHost(repo), "-X", "POST", "--input", "-"], JSON.stringify({ body })));
+    } catch (cause) {
+      throw new Error("Invalid GitHub reply write response", { cause });
+    }
+    const row = object(value, "reply write");
+    const id = providerId(row.id, "reply id");
+    if (row.body !== body || textField(object(row.user, "reply author").login, "reply author login").toLowerCase() !== bot) {
+      throw new Error("GitHub reply response body/author mismatch");
+    }
+    if (threadId && row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`) {
+      throw new Error("GitHub thread reply review binding mismatch");
+    }
+    if (parentCommentId !== undefined && providerId(row.in_reply_to_id, "reply parent id") !== parentCommentId) {
+      throw new Error("GitHub thread reply parent mismatch");
+    }
+    return validateConversationItemIdentity({ provider: "github", commentId: id, ...(threadId ? { threadId } : {}), url: textField(row.html_url, "reply URL") }, { repo, reviewNumber: review.reviewNumber });
+  }
+
+  async postGeneralReply(review: ReviewIdentity, input: GeneralReplyInput): Promise<ConversationItemIdentity> {
+    this.validateReplyInput(review, input);
+    const repo = this.repositoryForReview(review);
+    return this.writeConversationComment(review, input.body, `${apiRepo(repo)}/issues/${review.reviewNumber}/comments`);
+  }
+
+  async postThreadReply(review: ReviewIdentity, input: ThreadReplyInput): Promise<ConversationItemIdentity> {
+    this.validateReplyInput(review, input);
+    providerId(input.threadId, "reply thread id");
+    if (!input.parentCommentId) throw new Error("GitHub thread replies require parentCommentId");
+    const parent = providerId(input.parentCommentId, "reply parent comment id");
+    const repo = this.repositoryForReview(review);
+    let metadata: Map<string, ReturnType<GitHubAdapter["normalizeThread"]>>;
+    try {
+      metadata = await this.threadMetadataForCommentIds(review, new Set([parent]));
+    } catch (cause) {
+      throw new Error("GitHub reply parent does not belong to addressed thread", { cause });
+    }
+    const thread = metadata.get(parent);
+    if (thread?.threadId !== input.threadId) throw new Error("GitHub reply parent does not belong to addressed thread");
+    const root = thread.rootCommentId;
+    return this.writeConversationComment(review, input.body, `${apiRepo(repo)}/pulls/${review.reviewNumber}/comments/${root}/replies`, input.threadId, root);
+  }
+
+  private validateReplyInput(review: ReviewIdentity, input: GeneralReplyInput): void {
+    if (input.provider !== review.provider || input.repositoryDigest !== review.repositoryDigest || input.reviewNumber !== review.reviewNumber) {
+      throw new Error("GitHub reply input binding mismatch");
+    }
+  }
+
+  async findBotChildMarker(review: ReviewIdentity, marker: ChildMarkerLookup): Promise<ConversationItemIdentity | null> {
+    if (marker.provider !== review.provider || marker.repositoryDigest !== review.repositoryDigest || marker.reviewNumber !== review.reviewNumber) {
+      throw new Error("GitHub child marker lookup binding mismatch");
+    }
+    const repo = this.repositoryForReview(review);
+    const bot = await this.getBotLogin(repo);
+    const matches: ConversationItemIdentity[] = [];
+    const expected = { kind: marker.kind, parentId: marker.parentId, childId: marker.childId, repositoryDigest: marker.repositoryDigest, reviewNumber: marker.reviewNumber, contentDigest: marker.contentDigest };
+    for (const stream of ["issue", "inline"] as const) {
+      let page = 1;
+      let rows: Record<string, unknown>[];
+      do {
+        if (page > MAX_TARGET_COMMENT_PAGES) throw new GitHubLookupResourceLimitError("GitHub marker pagination exceeded its bounded resource limit");
+        rows = await this.reviewCommentStreamPage(review, stream, page);
+        const matchingRows: Record<string, unknown>[] = [];
+        for (const row of rows) {
+        const author = textField(object(row.user, "marker comment author").login, "marker comment author login").toLowerCase();
+        if (author !== bot || typeof row.body !== "string") continue;
+        const candidate = row.body.split(/\r?\n/u).at(-1) ?? "";
+        if (!verifyChildMarkerBinding(candidate, expected)) continue;
+          const canonicalBody = canonicalInlineBody(row.body);
+          const suffix = `\n${candidate}`;
+          if (!canonicalBody.endsWith(suffix)) throw new Error("Authenticated GitHub child marker is not a separable terminal suffix");
+          let visibleBody = canonicalBody.slice(0, -suffix.length);
+          const inlineSuffix = `\n${INLINE_COMMENT_MARKER}`;
+          if (visibleBody.endsWith(inlineSuffix)) visibleBody = visibleBody.slice(0, -inlineSuffix.length);
+          if (computeContentDigest(visibleBody) !== marker.contentDigest) throw new Error("Authenticated GitHub child marker visible body digest mismatch");
+          matchingRows.push(row);
+        }
+        const inlineMetadata = stream === "inline" ? await this.threadMetadataForCommentIds(review, new Set(matchingRows.map((row) => providerId(row.id, "marker comment id")))) : undefined;
+        for (const row of matchingRows) {
+        const id = providerId(row.id, "marker comment id");
+        if (stream === "inline" && row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${review.reviewNumber}`) throw new Error("GitHub marker review binding mismatch");
+        const threadId = stream === "inline" ? inlineMetadata!.get(id)?.threadId : undefined;
+        if (stream === "inline" && !threadId) throw new Error("GitHub marker comment is missing its GraphQL thread binding");
+        matches.push(validateConversationItemIdentity({ provider: "github", commentId: id,
+          ...(threadId ? { threadId } : {}),
+          url: textField(row.html_url, "marker comment URL") }, { repo, reviewNumber: review.reviewNumber }));
+          if (matches.length > 1) throw new Error("Multiple authenticated GitHub child marker matches");
+        }
+        page += 1;
+      } while (rows.length === 50);
+      }
+    return matches[0] ?? null;
   }
 
   /**
@@ -288,8 +1106,8 @@ export class GitHubAdapter implements VcsAdapter {
 
   /**
    * AC-2.2 / AC-2.3: lists PR comments via `gh api
-   * repos/{owner}/{repo}/issues/{id}/comments` (paginated — `--paginate -f
-   * per_page=100` — since the default 30/page could put the bot's own prior
+   * repos/{owner}/{repo}/issues/{id}/comments` in explicit bounded 50-item
+   * pages (since the default 30/page could put the bot's own prior
    * comment on page 2+, causing upsertComment to CREATE a duplicate instead
    * of editing it) and returns the first comment that is BOTH authored by
    * the bot's own verified identity (via getBotLogin(), never trusted from
@@ -301,14 +1119,10 @@ export class GitHubAdapter implements VcsAdapter {
    * api`'s documented default method is GET for a path like this one, but
    * that default silently flips to POST the moment ANY `-f`/`-F` parameter
    * is present on the invocation — regardless of the target endpoint. Since
-   * this call passes `-f per_page=100` for pagination, omitting `-X GET`
+   * this call passes `-f per_page=50` and `-f page=N`, omitting `-X GET`
    * makes `gh` issue a POST to the issue-comments endpoint, which GitHub
    * interprets as "create a comment" and rejects with HTTP 422 (`"body"
-   * wasn't supplied`) — confirmed empirically:
-   *   `gh api --paginate -f per_page=100 repos/{owner}/{repo}/issues/{id}/comments`
-   *     → 422 "body" wasn't supplied
-   *   `gh api --method GET --paginate -f per_page=100 repos/{owner}/{repo}/issues/{id}/comments`
-   *     → correct paginated comments array
+   * wasn't supplied`). Explicit GET keeps every bounded page a read.
    * Without the explicit method flag, findBotComment fails on EVERY
    * `review` invocation (it runs before dedup/rule-loading/dispatch), so
    * this is a load-bearing flag, not decoration — do not remove it as
@@ -334,28 +1148,18 @@ export class GitHubAdapter implements VcsAdapter {
   async findBotComment(locator: ReviewLocator): Promise<BotComment | null> {
     const { repo, id } = resolvePullLocator(locator);
     const botLogin = await this.getBotLogin(repo);
-    const out = await this.execGh([
-      "api",
-      "-X",
-      "GET",
-      "--paginate",
-      "--slurp",
-      "-f",
-      "per_page=100",
-      `${apiRepo(repo)}/issues/${id}/comments`,
-      ...apiHost(repo),
-    ]);
-    const parsed = JSON.parse(out) as GhIssueComment[] | GhIssueComment[][];
-    const comments = Array.isArray(parsed[0]) ? (parsed as GhIssueComment[][]).flat() : parsed as GhIssueComment[];
-    for (const comment of comments) {
-      if (comment.user?.login !== botLogin) continue;
+    for await (const comments of this.restCommentPages(repo, `${apiRepo(repo)}/issues/${id}/comments`, "review summary comments")) {
+      for (const comment of comments) {
+      const author = typeof comment.user === "object" && comment.user !== null ? (comment.user as { login?: unknown }).login : undefined;
+      if (typeof author !== "string" || author.toLowerCase() !== botLogin || typeof comment.body !== "string") continue;
       const marker = parseBotMarker(comment.body);
       if (marker === null) continue;
       return {
-        id: String(comment.id),
+        id: providerId(comment.id, "review summary comment id"),
         body: comment.body,
         ...marker,
       };
+      }
     }
     return null;
   }
@@ -411,61 +1215,176 @@ export class GitHubAdapter implements VcsAdapter {
   }
 
   /**
-   * Posts the findings as inline review comments in ONE review
-   * (`POST /pulls/{n}/reviews`, `event: COMMENT`).
-   *
-   * Why one request and not one comment each: a single review groups the
-   * comments into a coherent unit in the GitHub UI and generates one
-   * notification instead of N. The cost is all-or-nothing — GitHub 422s the
-   * entire request if any single anchor is off the diff — which is exactly why
-   * `comments` must come from the diff-anchors filter, and why review() treats a
-   * rejection as "fall back to the summary comment", never as a lost finding.
-   *
-   * `side: RIGHT` pins each comment to the NEW file, which is the side our
-   * anchors are computed against; `commit_id` pins the review to the head SHA we
-   * actually reviewed, so the comments don't drift onto a newer commit.
-   *
-   * The payload goes over stdin (`--input -`), never argv: bodies are multi-line
-   * markdown, and there is no shell involved (execFile with an array).
+   * GitHub inline publishing is intentionally disabled until an authenticated
+   * marker lookup can recover a trustworthy identity for every created comment.
+   * The atomic review endpoint cannot correlate its response with client IDs;
+   * writing anyway would make summary fallback and retries duplicate comments.
    */
+  async prepareInlineReviewRecovery(
+    locator: ReviewLocator,
+    headSha: string,
+    comments: readonly InlineReviewComment[],
+    runIdentity: string,
+  ): Promise<InlineRecoveryState> {
+    validateInlinePublishInputs(comments as InlineReviewComment[]);
+    if (!SHA_RE.test(headSha) || typeof runIdentity !== "string" || runIdentity.length === 0 || runIdentity.length > 512) throw new Error("Invalid GitHub inline recovery identity");
+    const resolved = resolvePullLocator(locator);
+    const repo: GitHubRepositoryRef = resolved.repo ?? this.repository ?? await this.getRepoOwnerAndName().then(({ owner, name }): GitHubRepositoryRef => ({ provider: "github", host: "github.com", owner, repo: name, canonicalUrl: `https://github.com/${owner}/${name}` }));
+    const repositoryDigest = computeRepositoryDigest("github", repo.canonicalUrl);
+    const reviewNumber = Number(resolved.id);
+    const parentId = `act_${digest(`${runIdentity}\0${repositoryDigest}\0${reviewNumber}\0${headSha}`).slice(0, 32)}`;
+    const children: InlineRecoveryChild[] = comments.map((comment) => {
+      const contentDigest = computeContentDigest(canonicalInlineBody(comment.body));
+      const placementDigest = digest(JSON.stringify({ path: comment.path, line: comment.line, startLine: comment.startLine ?? null, side: "RIGHT", startSide: comment.startLine === undefined ? null : "RIGHT" }));
+      const childId = deriveInlineChildId(parentId, comment.clientId, contentDigest, placementDigest);
+      const child = { clientId: comment.clientId, kind: "finding" as const, parentId, childId, repositoryDigest, reviewNumber, contentDigest, headSha, placementDigest };
+      return { ...child, marker: formatInlineRecoveryMarker(child) };
+    });
+    return { children, noFallbackBody: "" };
+  }
+
   async createInlineReview(
     locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
+    recovery?: InlineRecoveryState,
   ): Promise<InlinePublishOutcome[]> {
     validateInlinePublishInputs(comments);
-    const { repo, id } = resolvePullLocator(locator);
     if (comments.length === 0) return [];
-
+    if (!SHA_RE.test(headSha)) throw new Error("Invalid GitHub inline review head SHA");
+    const resolved = resolvePullLocator(locator);
+    const repo: GitHubRepositoryRef = resolved.repo ?? this.repository ?? await this.getRepoOwnerAndName().then(({ owner, name }): GitHubRepositoryRef => ({
+      provider: "github" as const, host: "github.com" as const, owner, repo: name,
+      canonicalUrl: `https://github.com/${owner}/${name}`,
+    }));
+    const bot = await this.getBotLogin(repo);
+    const prepared = validateInlineRecoveryState(recovery ?? await this.prepareInlineReviewRecovery(locator, headSha, comments, "legacy-inline-publication"));
+    if (prepared.children.length !== comments.length || prepared.children.some((child, index) => {
+      const comment = comments[index]!;
+      const placementDigest = digest(JSON.stringify({ path: comment.path, line: comment.line, startLine: comment.startLine ?? null, side: "RIGHT", startSide: comment.startLine === undefined ? null : "RIGHT" }));
+      const exactMarker = formatInlineRecoveryMarker(child);
+      return child.clientId !== comment.clientId || child.headSha !== headSha || child.reviewNumber !== Number(resolved.id) || child.repositoryDigest !== computeRepositoryDigest("github", repo.canonicalUrl) || child.contentDigest !== computeContentDigest(canonicalInlineBody(comment.body)) || child.placementDigest !== placementDigest || child.marker !== exactMarker;
+    })) {
+      throw new Error("GitHub inline recovery manifest does not match publication inputs");
+    }
+    const markers = prepared.children.map((child) => child.marker);
+    const recover = async (): Promise<Array<ConversationItemIdentity | null>> => {
+      const rows: Record<string, unknown>[] = [];
+      const markerSet = new Set(markers);
+      for await (const pageRows of this.restCommentPages(repo, `${apiRepo(repo)}/pulls/${resolved.id}/comments`, "inline review recovery comments")) {
+        for (const row of pageRows) {
+          if (typeof row.body === "string" && markerSet.has(canonicalInlineBody(row.body).split("\n").at(-1) ?? "")) rows.push(row);
+        }
+      }
+      const matchedRows = markers.map((marker) => {
+        const expected = comments[markers.indexOf(marker)]!;
+        const expectedBody = `${canonicalInlineBody(expected.body)}\n${INLINE_COMMENT_MARKER}\n${marker}`;
+        const candidates = rows.filter((row) => {
+          const login = typeof row.user === "object" && row.user !== null ? (row.user as { login?: unknown }).login : undefined;
+          return typeof login === "string" && login.toLowerCase() === bot && typeof row.body === "string" && canonicalInlineBody(row.body).split("\n").at(-1) === marker;
+        });
+        const matches = candidates.filter((row) => canonicalInlineBody(row.body as string) === expectedBody);
+        if (candidates.length !== matches.length) throw new AmbiguousInlinePublishError("Authenticated inline marker body was edited or copied");
+        if (matches.length > 1) throw new AmbiguousInlinePublishError("Multiple authenticated comments matched one inline publication marker");
+        const row = matches[0];
+        if (!row) return null;
+        providerId(row.id, "inline recovery comment id");
+        if (row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${resolved.id}`) throw new AmbiguousInlinePublishError("Recovered inline comment belongs to another review");
+        if (row.path !== expected.path || row.line !== expected.line || row.side !== "RIGHT" || (row.start_line ?? null) !== (expected.startLine ?? null) || (row.start_side ?? null) !== (expected.startLine === undefined ? null : "RIGHT")) throw new AmbiguousInlinePublishError("Recovered inline comment placement mismatch");
+        if (row.commit_id !== headSha) throw new AmbiguousInlinePublishError("Recovered inline comment head mismatch");
+        return row;
+      });
+      if (matchedRows.every((row) => row === null)) return matchedRows as null[];
+      const review = await this.resolveReviewIdentity(repo, Number(resolved.id));
+      const threads = await this.threadMetadataForCommentIds(review, new Set(matchedRows.filter((row): row is Record<string, unknown> => row !== null).map((row) => providerId(row.id, "inline recovery comment id"))));
+      return matchedRows.map((row, index) => {
+        if (!row) return null;
+        const id = providerId(row.id, "inline recovery comment id");
+        const metadata = threads.get(id);
+        const expected = comments[index]!;
+        if (!metadata || metadata.placement.file !== expected.path || metadata.placement.line !== expected.line || metadata.placement.currentHeadSha !== headSha) {
+          throw new AmbiguousInlinePublishError("Recovered inline comment GraphQL binding mismatch");
+        }
+        const threadId = metadata.threadId;
+        if (!threadId) throw new AmbiguousInlinePublishError("Recovered inline comment has no GraphQL thread identity");
+        return validateConversationItemIdentity({ provider: "github", commentId: id, threadId,
+          url: textField(row.html_url, "inline recovery comment URL") }, { repo, reviewNumber: Number(resolved.id) });
+      });
+    };
+    const existing = await recover();
+    if (existing.every((identity) => identity !== null)) {
+      return comments.map((comment, index) => ({ clientId: comment.clientId, status: "posted", identity: existing[index]! }));
+    }
+    if (existing.some((identity) => identity !== null)) throw new AmbiguousInlinePublishError("Partial inline marker set exists before atomic review write");
     const payload = {
       commit_id: headSha,
       event: "COMMENT",
-      comments: comments.map((c) => ({
-        path: c.path,
-        line: c.line,
-        side: "RIGHT",
-        // ADR-007: a multi-line committable suggestion spans start_line..line.
-        // GitHub requires start_side alongside start_line, and start_line < line.
-        ...(typeof c.startLine === "number" && c.startLine < c.line
-          ? { start_line: c.startLine, start_side: "RIGHT" }
-          : {}),
-        body: c.body,
+      body: "tGD inline review",
+      comments: comments.map((comment, index) => ({
+        path: comment.path, line: comment.line, side: "RIGHT",
+        ...(comment.startLine === undefined ? {} : { start_line: comment.startLine, start_side: "RIGHT" }),
+        body: `${canonicalInlineBody(comment.body)}\n${INLINE_COMMENT_MARKER}\n${markers[index]}`,
       })),
     };
-
     try {
-      await this.execGh(
-        ["api", `${apiRepo(repo)}/pulls/${id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"],
-        JSON.stringify(payload),
-      );
-      return comments.map(({ clientId }) => ({ clientId, status: "posted" }));
-    } catch {
-      return comments.map(({ clientId }) => ({
-        clientId,
-        status: "failed",
-        reason: "GitHub rejected the inline review",
-      }));
+      await this.execGh(["api", `${apiRepo(repo)}/pulls/${resolved.id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"], JSON.stringify(payload));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      const status = /HTTP (4\d\d)/u.exec(message)?.[1];
+      if (status && !["408", "409", "425", "429"].includes(status)) {
+        return comments.map(({ clientId }) => ({ clientId, status: "failed", reason: `GitHub rejected the atomic inline review (HTTP ${status})` }));
+      }
+      // Response loss is indistinguishable from acceptance. Recovery below is
+      // authoritative; if incomplete, the typed error prevents fallback writes.
     }
+    let recovered: Array<ConversationItemIdentity | null>;
+    try { recovered = await recover(); } catch (cause) {
+      if (cause instanceof AmbiguousInlinePublishError) throw cause;
+      throw new AmbiguousInlinePublishError("Could not recover identities after atomic inline review write");
+    }
+    if (!recovered.every((identity) => identity !== null)) throw new AmbiguousInlinePublishError();
+    return comments.map((comment, index) => ({ clientId: comment.clientId, status: "posted", identity: recovered[index]! }));
+  }
+
+  async recoverInlineReview(locator: ReviewLocator, recovery: InlineRecoveryState): Promise<"complete" | "none" | "ambiguous"> {
+    let validated: InlineRecoveryState;
+    try {
+      validated = validateInlineRecoveryState(recovery);
+    } catch (cause) {
+      throw new Error("Invalid GitHub inline recovery manifest", { cause });
+    }
+    const resolved = resolvePullLocator(locator);
+    const reviewNumber = Number(resolved.id);
+    if (validated.children.some((child) => child.reviewNumber !== reviewNumber)) {
+      throw new Error("GitHub inline recovery review mismatch");
+    }
+    const repo: GitHubRepositoryRef = resolved.repo ?? this.repository ?? await this.getRepoOwnerAndName().then(({ owner, name }): GitHubRepositoryRef => ({ provider: "github", host: "github.com", owner, repo: name, canonicalUrl: `https://github.com/${owner}/${name}` }));
+    const expectedRepo = computeRepositoryDigest("github", repo.canonicalUrl);
+    if (validated.children.some((child) => child.repositoryDigest !== expectedRepo)) {
+      throw new Error("GitHub inline recovery repository mismatch");
+    }
+    const bot = await this.getBotLogin(repo);
+    const counts = new Map(validated.children.map((child) => [child.marker, 0]));
+    for await (const rows of this.restCommentPages(repo, `${apiRepo(repo)}/pulls/${resolved.id}/comments`, "inline recovery comments")) {
+      for (const row of rows) {
+      const login = typeof row.user === "object" && row.user !== null ? (row.user as { login?: unknown }).login : undefined;
+      if (typeof login !== "string" || login.toLowerCase() !== bot || typeof row.body !== "string") continue;
+      const marker = row.body.split(/\r?\n/u).at(-1) ?? "";
+      if (!counts.has(marker)) continue;
+      if (row.pull_request_url !== `https://api.github.com/${apiRepo(repo)}/pulls/${resolved.id}`) return "ambiguous";
+      const child = validated.children.find((candidate) => candidate.marker === marker)!;
+      const canonicalBody = canonicalInlineBody(row.body);
+      const suffix = `\n${INLINE_COMMENT_MARKER}\n${marker}`;
+      if (!canonicalBody.endsWith(suffix) || computeContentDigest(canonicalBody.slice(0, -suffix.length)) !== child.contentDigest) return "ambiguous";
+      const placementDigest = digest(JSON.stringify({ path: row.path, line: row.line, startLine: row.start_line ?? null, side: row.side, startSide: row.start_side ?? null }));
+      if (placementDigest !== child.placementDigest || row.commit_id !== child.headSha) return "ambiguous";
+      counts.set(marker, counts.get(marker)! + 1);
+      }
+    }
+    if ([...counts.values()].some((count) => count > 1)) return "ambiguous";
+    if ([...counts.values()].every((count) => count === 1)) return "complete";
+    if ([...counts.values()].every((count) => count === 0)) return "none";
+    return "ambiguous";
   }
 
   // Caches the resolved "owner/name" (same promise-caching pattern as
@@ -553,7 +1472,7 @@ export class GitHubAdapter implements VcsAdapter {
       for (const node of threads?.nodes ?? []) {
         if (node.isResolved) continue;
         const firstComment = node.comments?.nodes?.[0];
-        if (firstComment?.author?.login !== botLogin) continue;
+        if (firstComment?.author?.login?.toLowerCase() !== botLogin) continue;
         // Codex review (PR #6): author identity alone is NOT enough. A
         // developer running the CLI under their personal gh login also writes
         // MANUAL review comments as that same identity — those must never be

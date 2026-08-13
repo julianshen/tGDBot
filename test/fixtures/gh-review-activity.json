@@ -1,0 +1,4 @@
+{
+  "issueComments":[{"id":7,"body":"general edited","user":{"login":"alice"},"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z","html_url":"https://github.com/octo-org/octo-repo/pull/42#issuecomment-7"}],
+  "reviewComments":[{"id":8,"body":"inline","user":{"login":"octo-bot"},"created_at":"2026-08-02T00:00:00Z","updated_at":"2026-08-02T00:00:00Z","html_url":"https://github.com/octo-org/octo-repo/pull/42#discussion_r8","pull_request_url":"https://api.github.com/repos/octo-org/octo-repo/pulls/42","path":"src/a.ts","line":4,"side":"RIGHT","commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","original_commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","in_reply_to_id":null}]
+}
