@@ -46,6 +46,7 @@ export interface PublicationWriter {
 
 export interface PublicationExecutorHooks {
   beforePublication?: () => Promise<void>;
+  beforeFreeze?: (session: ConversationExclusiveSession, action: PublicationAction) => Promise<void>;
   beforeChildWrite?: (child: PublicationChild) => Promise<void>;
   afterChildWrite?: (child: PublicationChild) => Promise<void>;
   afterPublication?: (action: PublicationAction) => Promise<void>;
@@ -229,6 +230,22 @@ export function supersedePublication(action: PublicationAction, successorActionI
     throw new Error("superseded action cannot link to itself as successor");
   }
   return { ...cloneAction(action), state: "superseded", successorActionId, children: [] };
+}
+
+export function supersedeWithSuccessor(
+  action: PublicationAction,
+  successor: { readonly actionId: string; readonly identityDigest: string },
+): { readonly superseded: PublicationAction; readonly successor: PublicationAction } {
+  const next = observePublication({
+    actionId: successor.actionId,
+    identityDigest: successor.identityDigest,
+    reviewNumber: action.reviewNumber,
+    repository: action.repository,
+  });
+  return {
+    superseded: supersedePublication(action, successor.actionId),
+    successor: preparePublication(next),
+  };
 }
 
 export function latestPublication(
@@ -447,6 +464,17 @@ export async function executePublication(options: {
     }
     const binding = session.snapshot().cursor.repository;
     action = withRepository(action, binding);
+    const existing = latestPublication(session.snapshot().events, action.actionId);
+    if (existing !== undefined && (actionFromEvent(existing).state === "prepared") && options.hooks?.beforeFreeze) {
+      const incomingChildren = action.children;
+      await options.hooks.beforeFreeze(session, withRepository(actionFromEvent(existing), binding));
+      const after = latestPublication(session.snapshot().events, action.actionId);
+      if (after !== undefined && after.state !== "prepared") {
+        action = withRepository(actionFromEvent(after), binding);
+      } else {
+        action = { ...action, children: incomingChildren.length > 0 ? incomingChildren : action.children };
+      }
+    }
     action = await persistPrefix(session, action.state === "observed" || action.state === "prepared" ||
       action.state === "manifest-ready" || action.state === "published" || action.state === "completed" ||
       action.state === "superseded"

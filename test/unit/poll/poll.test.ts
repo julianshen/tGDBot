@@ -4,24 +4,40 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseCommandArgs, type PollArgs } from "../../../src/cli-args.js";
 import { MAX_COMMAND_BODY_SCALARS } from "../../../src/conversation/command-parser.js";
-import { computeRepositoryDigest } from "../../../src/conversation/markers.js";
+import {
+  computeContentDigest,
+  computeRepositoryDigest,
+  formatChildMarker,
+  parseChildMarker,
+} from "../../../src/conversation/markers.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
 import { createConversationStateStore } from "../../../src/conversation/state-store.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
 import type {
+  ChildMarkerLookup,
   ConversationAdapter,
+  GeneralReplyInput,
   OpenReviewPage,
   OpenReviewSummary,
   ReviewActivityEvent,
   ReviewEventCursor,
   ReviewEventPage,
   ReviewEventPageToken,
+  ReviewThreadSnapshot,
+  ThreadReplyInput,
 } from "../../../src/vcs/conversation-adapter.js";
-import type { ReviewIdentity } from "../../../src/conversation/types.js";
-import type { ConversationEventEntry } from "../../../src/conversation/state-schema.js";
+import type { ConversationItemIdentity, ReviewIdentity } from "../../../src/conversation/types.js";
+import {
+  prepareFindingLedgerEntry,
+  type ConversationEventEntry,
+  type FindingLedgerEntry,
+} from "../../../src/conversation/state-schema.js";
 import type { ConversationStateStore } from "../../../src/conversation/state-store.js";
 import { decodeReviewProgress } from "../../../src/poll/discovery.js";
 import { poll } from "../../../src/poll/poll.js";
+import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
+import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
+import type { RuleDefinition } from "../../../src/rules/types.js";
 
 const repo = parseRepositoryRef("owner/repo", "github");
 const repositoryDigest = computeRepositoryDigest("github", repo.canonicalUrl);
@@ -68,7 +84,12 @@ function summary(reviewNumber: number): OpenReviewSummary {
   };
 }
 
-function commentEvent(eventId: string, body: string, updatedAt = "2026-08-14T00:00:00.000Z"): ReviewActivityEvent {
+function commentEvent(
+  eventId: string,
+  body: string,
+  updatedAt = "2026-08-14T00:00:00.000Z",
+  extras: Partial<ReviewActivityEvent> = {},
+): ReviewActivityEvent {
   return {
     kind: "general-comment",
     provider: "github",
@@ -84,6 +105,7 @@ function commentEvent(eventId: string, body: string, updatedAt = "2026-08-14T00:
     body,
     url: `https://github.com/owner/repo/pull/1#issuecomment-${eventId}`,
     commentId: eventId,
+    ...extras,
   };
 }
 
@@ -221,22 +243,21 @@ async function journalEvents(store: ConversationStateStore): Promise<Conversatio
 }
 
 describe("classification-only poll", () => {
-  it("classifies irrelevant, oversized, invalid, and recognized events without posting replies", async () => {
+  it("classifies irrelevant and deferred commands without posting replies", async () => {
     const stateDir = await tempStateDir();
     const adapter = new ClassificationAdapter([]);
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
 
     adapter.replaceEvents([
       commentEvent("irr", "looks good"),
-      commentEvent("big", `${"x".repeat(MAX_COMMAND_BODY_SCALARS + 1)}`),
-      commentEvent("bad", "@tgdbot frobnicate"),
-      commentEvent("cmd", "@tgdbot explain"),
+      commentEvent("self", "@tgdbot explain", "2026-08-14T00:00:00.000Z", { authorLogin: "tgdbot", authorIsBot: true }),
+      commentEvent("cmd", "@tgdbot memories"),
     ]);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
       await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
       expect(adapter.writes).toEqual([]);
-      expect(log.mock.calls.flat().join("\n")).toMatch(/@tgdbot explain/i);
+      expect(log.mock.calls.flat().join("\n")).toMatch(/@tgdbot memories/i);
       expect(log.mock.calls.flat().join("\n")).toMatch(/executor unavailable/i);
     } finally {
       log.mockRestore();
@@ -251,8 +272,8 @@ describe("classification-only poll", () => {
     expect(prepared[0]?.manifest).toEqual([]);
     expect(snapshot.events.filter((entry) => entry.state === "completed")).toHaveLength(0);
     const journal = await journalEvents(store);
-    expect(journal.filter((entry) => entry.state === "observed")).toHaveLength(4);
-    expect(journal.filter((entry) => entry.state === "completed")).toHaveLength(3);
+    expect(journal.filter((entry) => entry.state === "observed")).toHaveLength(3);
+    expect(journal.filter((entry) => entry.state === "completed")).toHaveLength(2);
     expect(journal.filter((entry) => entry.state === "prepared")).toHaveLength(1);
   });
 
@@ -351,3 +372,565 @@ describe("classification-only poll", () => {
     expect(snapshot.events.filter((entry) => entry.state === "observed")).toHaveLength(0);
   }, 120_000);
 });
+
+const FINDING_ID = `finding_${"1".repeat(32)}`;
+const currentHunk = "@@ -12,3 +12,4 @@\n export function dump(user) {\n+  console.log(user.token);\n   return user;\n }";
+const currentRule: RuleDefinition = {
+  name: "no-token-logs",
+  provider: "anthropic",
+  model: "claude-opus-4-5",
+  dependsOn: [],
+  body: "Never log credentials, tokens, or secrets.",
+  sourcePath: "/rules/no-token-logs.md",
+};
+const visibleFindingBody = "_🔒 security_ | _🔴 Blocking_ | _`no-token-logs`_\n\n**Do not log tokens.**\n<!-- tgd-review-agent:inline -->";
+
+function sessionFor(text: string | undefined): ConversationSessionFactory {
+  return async () => createPiSessionStub(text).session;
+}
+
+function lastMarker(body: string): string {
+  const start = body.lastIndexOf("<!-- tgd-child:");
+  return start < 0 ? "" : body.slice(start).trim();
+}
+
+function threadComment(
+  eventId: string,
+  body: string,
+  extras: Partial<ReviewActivityEvent> & { readonly threadId?: string } = {},
+): ReviewActivityEvent {
+  const threadId = extras.threadId ?? "T1";
+  return {
+    kind: "thread-comment",
+    provider: "github",
+    repositoryDigest,
+    reviewNumber: 1,
+    eventId,
+    revisionId: `${eventId}:1`,
+    orderKey: `${extras.updatedAt ?? "2026-08-14T00:00:00.000Z"}|${eventId}`,
+    authorLogin: extras.authorLogin ?? "alice",
+    authorIsBot: extras.authorIsBot ?? false,
+    createdAt: extras.createdAt ?? extras.updatedAt ?? "2026-08-14T00:00:00.000Z",
+    updatedAt: extras.updatedAt ?? "2026-08-14T00:00:00.000Z",
+    body,
+    url: `https://github.com/owner/repo/pull/1#discussion_r${eventId}`,
+    commentId: eventId,
+    threadId,
+    ...extras,
+    kind: extras.kind === "comment-edit" ? "comment-edit" : "thread-comment",
+    threadId,
+  } as ReviewActivityEvent;
+}
+
+class ExecutionAdapter extends ClassificationAdapter {
+  readonly postedBodies: string[] = [];
+  readonly postedKinds: Array<"general" | "thread"> = [];
+  readonly publishedByMarker = new Map<string, ConversationItemIdentity>();
+  failNextWrite: "throw" | "accept-then-fail" | null = null;
+  threads = new Map<string, ReviewThreadSnapshot>();
+  headSha = "c".repeat(40);
+
+  override async postGeneralReply(_review: ReviewIdentity, input: GeneralReplyInput): Promise<ConversationItemIdentity> {
+    return this.recordWrite("general", input.body);
+  }
+
+  override async postThreadReply(_review: ReviewIdentity, input: ThreadReplyInput): Promise<ConversationItemIdentity> {
+    return this.recordWrite("thread", input.body, input.threadId);
+  }
+
+  override async findBotChildMarker(_review: ReviewIdentity, marker: ChildMarkerLookup): Promise<ConversationItemIdentity | null> {
+    const key = formatChildMarker({ version: 1, ...marker });
+    return this.publishedByMarker.get(key) ?? null;
+  }
+
+  override async getReviewThread(_review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
+    const thread = this.threads.get(threadId);
+    if (thread === undefined) throw new Error(`thread not found: ${threadId}`);
+    return thread;
+  }
+
+  private recordWrite(kind: "general" | "thread", body: string, threadId?: string): ConversationItemIdentity {
+    const marker = lastMarker(body);
+    const identity: ConversationItemIdentity = {
+      provider: "github",
+      commentId: `posted-${this.postedBodies.length + 1}`,
+      url: kind === "thread"
+        ? `https://github.com/owner/repo/pull/1#discussion_rposted-${this.postedBodies.length + 1}`
+        : `https://github.com/owner/repo/pull/1#issuecomment-posted-${this.postedBodies.length + 1}`,
+      ...(threadId === undefined ? {} : { threadId }),
+    };
+    if (this.failNextWrite === "throw") {
+      this.failNextWrite = null;
+      this.writes.push(kind);
+      throw new Error("provider write failed");
+    }
+    if (marker.length > 0) this.publishedByMarker.set(marker, identity);
+    if (this.failNextWrite === "accept-then-fail") {
+      this.failNextWrite = null;
+      this.writes.push(kind);
+      throw new Error("transport failed after accepted write");
+    }
+    this.writes.push(kind);
+    this.postedKinds.push(kind);
+    this.postedBodies.push(body);
+    return identity;
+  }
+}
+
+async function bootstrapAndSeed(
+  adapter: ExecutionAdapter,
+  options: { readonly seedFinding?: boolean } = {},
+): Promise<{ stateDir: string; ledger?: FindingLedgerEntry; findingMarker?: string }> {
+  const stateDir = await tempStateDir();
+  await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+  if (options.seedFinding !== true) return { stateDir };
+  const store = createConversationStateStore({ root: stateDir, repository: repo });
+  const binding = store.repositoryBinding;
+  const ledger = prepareFindingLedgerEntry({
+    repository: binding,
+    id: FINDING_ID,
+    reviewNumber: 1,
+    reviewId: "PR_1",
+    baseSha: "b".repeat(40),
+    headSha: "c".repeat(40),
+    finding: {
+      file: "src/auth.ts",
+      line: 14,
+      severity: "blocking",
+      category: "security",
+      message: "Tokens must not be logged.",
+      ruleName: "no-token-logs",
+      title: "Do not log tokens",
+    },
+    ruleSnapshot: "Never log credentials or session tokens.",
+    reviewOptions: {
+      advisor: "on",
+      suggestions: "off",
+      disableBuiltinRule: false,
+      trustLocalRules: false,
+      rulesDir: ".review/rules",
+      model: "anthropic/claude-opus-4-5",
+      dispatch: "direct",
+    },
+    placement: {
+      file: "src/auth.ts",
+      side: "new",
+      line: 14,
+      originalHeadSha: "c".repeat(40),
+      currentHeadSha: "c".repeat(40),
+      outdated: false,
+    },
+    body: visibleFindingBody,
+    at: "2026-08-14T00:00:00.000Z",
+  });
+  await store.transact((tx) => tx.appendFinding(ledger));
+  const findingMarker = formatChildMarker({
+    kind: "finding",
+    parentId: `act_${"2".repeat(32)}`,
+    childId: ledger.id,
+    repositoryDigest,
+    reviewNumber: 1,
+    contentDigest: ledger.contentDigest,
+  });
+  return { stateDir, ledger, findingMarker };
+}
+
+function installFindingThread(
+  adapter: ExecutionAdapter,
+  findingMarker: string,
+  command: ReviewActivityEvent,
+  extras: { readonly rootAuthorIsBot?: boolean } = {},
+): ReviewActivityEvent {
+  const root = threadComment("root", `${visibleFindingBody}\n${findingMarker}`, {
+    authorLogin: extras.rootAuthorIsBot === false ? "mallory" : "tgdbot",
+    authorIsBot: extras.rootAuthorIsBot !== false,
+    updatedAt: "2026-08-13T23:00:00.000Z",
+    threadId: command.threadId ?? "T1",
+  });
+  const reply = { ...command, threadId: command.threadId ?? "T1", parentCommentId: "root" };
+  adapter.threads.set(reply.threadId ?? "T1", {
+    provider: "github",
+    repositoryDigest,
+    reviewNumber: 1,
+    threadId: reply.threadId ?? "T1",
+    rootCommentId: "root",
+    url: "https://github.com/owner/repo/pull/1#discussion_rroot",
+    resolved: false,
+    outdated: false,
+    updatedAt: reply.updatedAt,
+    orderKey: reply.threadId ?? "T1",
+    events: [root, reply],
+  });
+  return reply;
+}
+
+function executionDeps(adapter: ExecutionAdapter, extras: {
+  readonly createSession?: ConversationSessionFactory;
+  readonly heads?: string[];
+  readonly rules?: readonly RuleDefinition[];
+  readonly ruleLoadError?: Error;
+} = {}) {
+  const heads = extras.heads === undefined ? undefined : [...extras.heads];
+  return {
+    conversationAdapter: adapter,
+    createSession: extras.createSession ?? sessionFor(JSON.stringify({ explanation: "The logger prints user.token." })),
+    getReviewMetadata: async () => ({
+      headSha: heads === undefined ? adapter.headSha : (heads.shift() ?? adapter.headSha),
+      baseSha: "b".repeat(40),
+      diff: currentHunk,
+    }),
+    loadConversationRules: async () => ({
+      rules: extras.rules ?? [currentRule],
+      ...(extras.ruleLoadError === undefined ? {} : { error: extras.ruleLoadError }),
+    }),
+  };
+}
+
+describe("event-to-action poll", () => {
+  it("records irrelevant and self-authored events without a reply or model call", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([
+      commentEvent("irr", "looks good"),
+      commentEvent("self", "@tgdbot explain", "2026-08-14T00:00:01.000Z", { authorLogin: "tgdbot", authorIsBot: true }),
+    ]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toEqual([]);
+    expect(createSession).not.toHaveBeenCalled();
+    const journal = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    expect(journal.filter((entry) => entry.state === "completed")).toHaveLength(2);
+    expect(journal.some((entry) => entry.state === "prepared")).toBe(false);
+  });
+
+  it("answers invalid command usage once and still processes later events", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    adapter.replaceEvents([
+      commentEvent("bad", "@tgdbot frobnicate"),
+      commentEvent("big", `${"x".repeat(MAX_COMMAND_BODY_SCALARS + 1)}`, "2026-08-14T00:00:01.000Z"),
+      commentEvent("later", "thanks", "2026-08-14T00:00:02.000Z"),
+    ]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(2);
+    expect(adapter.postedBodies.every((body) => body.includes("## Command usage"))).toBe(true);
+    expect(adapter.postedBodies.every((body) => parseChildMarker(lastMarker(body))?.kind === "action")).toBe(true);
+    const journal = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    expect(journal.filter((entry) => entry.state === "completed").length).toBeGreaterThanOrEqual(3);
+    expect(adapter.postedBodies).toHaveLength(2);
+  });
+
+  it("posts a deterministic scope error for explain or reconsider outside a marked bot thread", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([
+      commentEvent("gen", "@tgdbot explain"),
+      commentEvent("re", "@tgdbot reconsider because it is safe", "2026-08-14T00:00:01.000Z"),
+    ]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(2);
+    expect(adapter.postedBodies.every((body) => body.includes("## Out of scope"))).toBe(true);
+  });
+
+  it("executes explain and reconsider only in a marked bot-started finding thread", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const explain = installFindingThread(adapter, findingMarker!, threadComment("exp", "@tgdbot explain"));
+    const reconsider = installFindingThread(
+      adapter,
+      findingMarker!,
+      threadComment("rec", "@tgdbot reconsider because the logger redacts tokens", {
+        updatedAt: "2026-08-14T00:00:01.000Z",
+        threadId: "T2",
+      }),
+    );
+    adapter.threads.set("T2", {
+      ...adapter.threads.get("T2")!,
+    });
+    let sessionCalls = 0;
+    const sequenced: ConversationSessionFactory = async () => {
+      sessionCalls += 1;
+      const payload = sessionCalls === 1
+        ? { explanation: "The logger prints user.token on line 14." }
+        : {
+            outcome: "confirmed",
+            rationale: "The current hunk still logs the token.",
+            finding: {
+              file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+              message: "Tokens must not be logged.", ruleName: "no-token-logs", title: "Do not log tokens",
+              decision: "still-valid",
+            },
+          };
+      return createPiSessionStub(JSON.stringify(payload)).session;
+    };
+    adapter.replaceEvents([explain, reconsider]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: sequenced }),
+    })).resolves.toBe(0);
+    expect(sessionCalls).toBe(2);
+    expect(adapter.postedKinds).toEqual(["thread", "thread"]);
+    expect(adapter.postedBodies[0]).toMatch(/## Explanation/);
+    expect(adapter.postedBodies[1]).toMatch(/## Reconsideration/);
+    expect(adapter.postedBodies).toHaveLength(2);
+  });
+
+  it("treats a spoofed finding marker as a scope error without model work", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const spoofed = installFindingThread(
+      adapter,
+      findingMarker!,
+      threadComment("spoof", "@tgdbot explain"),
+      { rootAuthorIsBot: false },
+    );
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([spoofed]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/## Out of scope/);
+  });
+
+  it("posts unsupported history when the marked finding is missing from the ledger", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const orphanMarker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"2".repeat(32)}`,
+      childId: FINDING_ID,
+      repositoryDigest,
+      reviewNumber: 1,
+      contentDigest: computeContentDigest(visibleFindingBody),
+    });
+    const command = installFindingThread(adapter, orphanMarker, threadComment("lost", "@tgdbot explain"));
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([command]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/## History unavailable/);
+  });
+
+  it("re-executes a material edit and ignores a formatting-only edit", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const original = installFindingThread(adapter, findingMarker!, threadComment("cmd", "@tgdbot explain"));
+    adapter.replaceEvents([original]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(1);
+
+    const formatted = {
+      ...original,
+      kind: "comment-edit" as const,
+      revisionId: "cmd:2",
+      editedRevisionId: "cmd:2",
+      body: "@TGDBot   explain  ",
+      updatedAt: "2026-08-14T00:00:02.000Z",
+      orderKey: "2026-08-14T00:00:02.000Z|cmd",
+    };
+    adapter.threads.set("T1", {
+      ...adapter.threads.get("T1")!,
+      events: [adapter.threads.get("T1")!.events[0]!, formatted],
+    });
+    adapter.replaceEvents([formatted]);
+    const createSession = vi.fn(sessionFor(JSON.stringify({ explanation: "should not run" })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(1);
+
+    const material = {
+      ...original,
+      kind: "comment-edit" as const,
+      revisionId: "cmd:3",
+      editedRevisionId: "cmd:3",
+      body: "@tgdbot reconsider because the wrapper redacts the token",
+      updatedAt: "2026-08-14T00:00:03.000Z",
+      orderKey: "2026-08-14T00:00:03.000Z|cmd",
+    };
+    adapter.threads.set("T1", {
+      ...adapter.threads.get("T1")!,
+      events: [adapter.threads.get("T1")!.events[0]!, material],
+    });
+    adapter.replaceEvents([material]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: sessionFor(JSON.stringify({
+          outcome: "withdrawn",
+          rationale: "The wrapper redacts the token on this line.",
+        })),
+      }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(2);
+    expect(adapter.postedBodies[1]).toMatch(/## Reconsideration/);
+  });
+
+  it("treats a model transient failure as incomplete and exits nonzero", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const command = installFindingThread(adapter, findingMarker!, threadComment("fail", "@tgdbot explain"));
+    adapter.replaceEvents([command]);
+    const createSession = vi.fn(sessionFor(undefined));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+        ...executionDeps(adapter, { createSession }),
+      })).resolves.toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(adapter.postedBodies).toEqual([]);
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(snapshot.events.some((entry) => entry.state === "prepared" || entry.state === "observed")).toBe(true);
+    expect(snapshot.events.some((entry) => entry.state === "completed" && entry.manifest.length > 0)).toBe(false);
+  });
+
+  it("produces one response per recognized event", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const command = installFindingThread(adapter, findingMarker!, threadComment("once", "@tgdbot explain"));
+    adapter.replaceEvents([command, command]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(1);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(1);
+  });
+});
+
+describe("ambiguous-write recovery", () => {
+  it.each([
+    ["usage", commentEvent("bad", "@tgdbot frobnicate"), /## Command usage/, undefined],
+    ["scope", commentEvent("gen", "@tgdbot explain"), /## Out of scope/, undefined],
+  ] as const)("recovers a %s reply from the provider marker without a second write", async (_name, event, heading) => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    adapter.replaceEvents([event]);
+    adapter.failNextWrite = "accept-then-fail";
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(1);
+    expect(adapter.postedBodies).toEqual([]);
+    expect(adapter.writes).toEqual(["general"]);
+    expect(adapter.publishedByMarker.size).toBe(1);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
+      .resolves.toBe(0);
+    expect(adapter.writes).toEqual(["general"]);
+    expect(adapter.postedBodies).toEqual([]);
+    const journal = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    const completed = journal.find((entry) =>
+      entry.state === "completed" && entry.manifest.some((child) => child.status === "posted"));
+    expect(completed?.manifest[0]?.body).toMatch(heading);
+    expect(completed?.manifest[0]?.identity).toBeDefined();
+  });
+
+  it("recovers explain after an accepted write without a second model call", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const command = installFindingThread(adapter, findingMarker!, threadComment("exp", "@tgdbot explain"));
+    adapter.replaceEvents([command]);
+    adapter.failNextWrite = "accept-then-fail";
+    const createSession = vi.fn(sessionFor(JSON.stringify({ explanation: "The logger prints user.token." })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(1);
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(adapter.postedBodies).toEqual([]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(adapter.writes.filter((item) => item === "thread")).toHaveLength(1);
+    expect(adapter.postedBodies).toEqual([]);
+    const journal = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    const completed = journal.find((entry) =>
+      entry.state === "completed" && entry.manifest.some((child) => child.status === "posted"));
+    expect(completed?.manifest[0]?.body).toMatch(/## Explanation/);
+    expect(completed?.manifest[0]?.identity).toBeDefined();
+  });
+
+  it("recovers reconsider after an accepted write without a second model call", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const command = installFindingThread(
+      adapter,
+      findingMarker!,
+      threadComment("rec", "@tgdbot reconsider because the wrapper redacts the token"),
+    );
+    adapter.replaceEvents([command]);
+    adapter.failNextWrite = "accept-then-fail";
+    const createSession = vi.fn(sessionFor(JSON.stringify({
+      outcome: "withdrawn",
+      rationale: "The wrapper redacts the token on this line.",
+    })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(1);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(createSession).toHaveBeenCalledTimes(1);
+    expect(adapter.postedBodies).toEqual([]);
+    const journal = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    const completed = journal.find((entry) =>
+      entry.state === "completed" && entry.manifest.some((child) => child.status === "posted"));
+    expect(completed?.manifest[0]?.body).toMatch(/## Reconsideration/);
+    expect(completed?.manifest[0]?.identity).toBeDefined();
+  });
+});
+
+describe("stale-head successors", () => {
+  it("supersedes stale prepared work and does not publish until the head is stable", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const command = installFindingThread(adapter, findingMarker!, threadComment("stale", "@tgdbot explain"));
+    adapter.replaceEvents([command]);
+    const createSession = vi.fn(sessionFor(JSON.stringify({ explanation: "stale output must not publish" })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession,
+        heads: ["c".repeat(40), "d".repeat(40)],
+      }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toEqual([]);
+    const first = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    expect(first.some((entry) => entry.state === "superseded")).toBe(true);
+    expect(first.some((entry) => entry.state === "prepared" && entry.successorActionId === null)).toBe(true);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession,
+        heads: ["e".repeat(40), "f".repeat(40)],
+      }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toEqual([]);
+    const second = await journalEvents(createConversationStateStore({ root: stateDir, repository: repo }));
+    expect(second.filter((entry) => entry.state === "superseded").length).toBeGreaterThanOrEqual(2);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession,
+        heads: ["f".repeat(40), "f".repeat(40), "f".repeat(40)],
+      }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/## Explanation/);
+    expect(createSession.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+});
+

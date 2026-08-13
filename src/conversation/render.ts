@@ -215,6 +215,26 @@ export function renderFocusReply(
   ], marker);
 }
 
+export function renderUsageReply(marker: string): RenderedConversationBody {
+  return renderSections("## Command usage", [
+    "tGDBot accepts exactly one command per comment. Use one of:",
+    "- `@bot explain`",
+    "- `@bot reconsider <reason>`",
+    "- `@bot review focus: <direction>`",
+    "- `@bot check latest`",
+    "- `@bot remember <lesson>`",
+    "- `@bot forget <memory-id>`",
+    "- `@bot memories`",
+    "Replace `@bot` with the authenticated bot mention. Quoted, fenced, or multiple commands are ignored or rejected.",
+  ], marker);
+}
+
+export function renderScopeErrorReply(marker: string): RenderedConversationBody {
+  return renderSections("## Out of scope", [
+    "`explain` and `reconsider` only work inside a thread started by a marked tGDBot finding.",
+  ], marker);
+}
+
 export function renderUnsupportedHistoryReply(marker: string): RenderedConversationBody {
   return renderSections("## History unavailable", [
     "This thread's original finding is no longer in the local ledger, so tGDBot cannot explain or reconsider it.",

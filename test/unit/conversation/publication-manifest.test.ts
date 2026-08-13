@@ -12,6 +12,7 @@ import {
   preparePublication,
   startPublication,
   supersedePublication,
+  supersedeWithSuccessor,
   updatePublicationChild,
   type PublicationAction,
   type PublicationChild,
@@ -155,6 +156,25 @@ describe("publication manifest state machine", () => {
     expect(superseded.state).toBe("superseded");
     expect(superseded.successorActionId).toBe(successorId);
     expect(superseded.children).toEqual([]);
+  });
+
+  test("creates a prepared successor bound to a new identity", () => {
+    const prepared = preparePublication(observePublication({
+      actionId: ACTION_ID,
+      identityDigest: IDENTITY,
+      reviewNumber: 42,
+      repository: BINDING,
+    }));
+    const pair = supersedeWithSuccessor(prepared, {
+      actionId: `action_${"2".repeat(32)}`,
+      identityDigest: IDENTITY,
+    });
+    expect(pair.superseded.state).toBe("superseded");
+    expect(pair.superseded.successorActionId).toBe(pair.successor.actionId);
+    expect(pair.successor.state).toBe("prepared");
+    expect(pair.successor.actionId).not.toBe(prepared.actionId);
+    expect(pair.successor.identityDigest).toBe(IDENTITY);
+    expect(pair.successor.children).toEqual([]);
   });
 
   test("rejects skipped states", () => {

@@ -98,6 +98,7 @@ export interface ConversationStateStore {
   }>;
   findTerminalAction(identity: TerminalActionIdentity): Promise<TerminalActionSummary | undefined>;
   findTerminalActions(identities: readonly TerminalActionIdentity[]): Promise<ReadonlyMap<string, TerminalActionSummary>>;
+  findTerminalActionById(actionId: string): Promise<TerminalActionSummary | undefined>;
   findMemory(id: string): Promise<MemoryIndexSummary | undefined>;
   findFinding(id: string): Promise<FindingIndexSummary | undefined>;
   transact<T>(fn: (tx: ConversationStateTransaction) => T): Promise<T>;
@@ -1197,6 +1198,16 @@ class FileConversationStateStore implements ConversationStateStore {
   async findTerminalAction(identity: TerminalActionIdentity): Promise<TerminalActionSummary | undefined> {
     const found = await this.findTerminalActions([identity]);
     return found.get(identity.actionId);
+  }
+
+  async findTerminalActionById(actionId: string): Promise<TerminalActionSummary | undefined> {
+    return this.withLock(async (parentIdentity) => {
+      const loaded = await this.loadState(parentIdentity);
+      const found = [...loaded.journalHead.checkpoint.terminalActions]
+        .reverse()
+        .find((entry) => entry.actionId === actionId);
+      return found === undefined ? undefined : clone(found);
+    });
   }
 
   async findTerminalActions(

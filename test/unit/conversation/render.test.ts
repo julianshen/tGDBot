@@ -11,7 +11,9 @@ import {
   renderFocusReply,
   renderInactiveRuleReply,
   renderReconsiderReply,
+  renderScopeErrorReply,
   renderUnsupportedHistoryReply,
+  renderUsageReply,
   sanitizeMemoryText,
   validateBoundHttpsUrl,
   type RenderedConversationBody,
@@ -194,6 +196,15 @@ describe("conversation reply rendering", () => {
     expect(lastMarker(focus)).toBe(marker);
     expect(lastMarker(history)).toBe(marker);
     expect(lastMarker(inactive)).toBe(marker);
+  });
+
+  it("renders usage and scope errors with approved headings and a markers.ts marker", () => {
+    const usage = publicationBody(renderUsageReply(marker));
+    const scope = publicationBody(renderScopeErrorReply(marker));
+    expect(usage).toMatch(/^## Command usage\n/m);
+    expect(scope).toMatch(/^## Out of scope\n/m);
+    expect(lastMarker(usage)).toBe(marker);
+    expect(lastMarker(scope)).toBe(marker);
   });
 
   it("respects the 32,000-character public-body limit without cutting the marker", () => {

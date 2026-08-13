@@ -4,12 +4,20 @@ import {
   buildExplainPrompt,
   buildFocusPrompt,
   buildReconsiderPrompt,
+  conversationActionIdentity,
+  conversationCommandKey,
+  conversationSuccessorIdentity,
   explainFinding,
   focusReview,
+  isExecutableConversationCommand,
   reassessClarification,
   reconsiderFinding,
+  resolveMarkedFindingThread,
   type ReconsiderResult,
 } from "../../../src/conversation/actions.js";
+import { formatChildMarker, computeRepositoryDigest } from "../../../src/conversation/markers.js";
+import type { ReviewActivityEvent, ReviewThreadSnapshot } from "../../../src/vcs/conversation-adapter.js";
+import { parseConversationCommand } from "../../../src/conversation/command-parser.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
 import { MAX_CONVERSATION_RESPONSE_CHARS } from "../../../src/conversation/session.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
@@ -422,5 +430,119 @@ describe("rule-deletion and history failure behavior", () => {
     expect(JSON.stringify(loadFailure)).not.toMatch(/invalid_token|HTTP 401/i);
     expect(JSON.stringify(credentialFailure)).not.toMatch(/Authentication failed/i);
     warnSpy.mockRestore();
+  });
+});
+
+const botIdentity = { provider: "github" as const, login: "tgdbot", mention: "@tgdbot" };
+
+describe("conversation action identities and thread scope", () => {
+  it("keeps formatting-only command text on the same identity and splits material edits", () => {
+    const explain = parseConversationCommand({ authorIsBot: false, botIdentity, body: "@tGDBot explain" });
+    const spaced = parseConversationCommand({ authorIsBot: false, botIdentity, body: "@tgdbot   EXPLAIN  " });
+    const reconsider = parseConversationCommand({
+      authorIsBot: false, botIdentity, body: "@tGDBot reconsider because the logger redacts tokens",
+    });
+    const base = {
+      provider: "github" as const,
+      repositoryDigest: "a".repeat(64),
+      reviewNumber: 1,
+      eventId: "review-comment:99",
+    };
+
+    expect(conversationCommandKey(explain)).toBe(conversationCommandKey(spaced));
+    expect(conversationActionIdentity({ ...base, commandKey: conversationCommandKey(explain) }))
+      .toEqual(conversationActionIdentity({ ...base, commandKey: conversationCommandKey(spaced) }));
+    expect(conversationActionIdentity({ ...base, commandKey: conversationCommandKey(reconsider) }).actionId)
+      .not.toBe(conversationActionIdentity({ ...base, commandKey: conversationCommandKey(explain) }).actionId);
+    expect(isExecutableConversationCommand((explain as { command: { kind: "explain" } }).command)).toBe(true);
+  });
+
+  it("binds a successor to a new head without changing the lineage digest", () => {
+    const base = conversationActionIdentity({
+      provider: "github",
+      repositoryDigest: "a".repeat(64),
+      reviewNumber: 1,
+      eventId: "review-comment:99",
+      commandKey: "@tgdbot explain",
+    });
+    const successor = conversationSuccessorIdentity(base, "d".repeat(40));
+    expect(successor.actionId).not.toBe(base.actionId);
+    expect(successor.identityDigest).toBe(base.identityDigest);
+    expect(conversationSuccessorIdentity(base, "e".repeat(40)).actionId).not.toBe(successor.actionId);
+  });
+
+  it("requires a marked bot-started thread and treats spoofed or lost history distinctly", () => {
+    const publicDigest = computeRepositoryDigest("github", "https://github.com/acme/app");
+    const marker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"2".repeat(32)}`,
+      childId: ledger.id,
+      repositoryDigest: publicDigest,
+      reviewNumber: 42,
+      contentDigest: ledger.contentDigest,
+    });
+    const root: ReviewActivityEvent = {
+      kind: "thread-comment",
+      provider: "github",
+      repositoryDigest: ledger.repository.repositoryDigest,
+      reviewNumber: 42,
+      eventId: "review-comment:root",
+      revisionId: "rev-root",
+      orderKey: "2026-08-14T00:00:00.000Z|root",
+      authorLogin: "tgdbot",
+      authorIsBot: true,
+      createdAt: "2026-08-14T00:00:00.000Z",
+      updatedAt: "2026-08-14T00:00:00.000Z",
+      body: `Tokens must not be logged.\n${marker}`,
+      url: "https://github.com/acme/app/pull/42#discussion_rroot",
+      commentId: "root",
+      threadId: "T-finding",
+    };
+    const reply: ReviewActivityEvent = {
+      ...root,
+      eventId: "review-comment:reply",
+      commentId: "reply",
+      parentCommentId: "root",
+      authorLogin: "alice",
+      authorIsBot: false,
+      body: "@tgdbot explain",
+    };
+    const thread: ReviewThreadSnapshot = {
+      provider: "github",
+      repositoryDigest: ledger.repository.repositoryDigest,
+      reviewNumber: 42,
+      threadId: "T-finding",
+      rootCommentId: "root",
+      url: "https://github.com/acme/app/pull/42#discussion_rroot",
+      resolved: false,
+      outdated: false,
+      updatedAt: "2026-08-14T00:00:00.000Z",
+      orderKey: "T-finding",
+      events: [root, reply],
+    };
+
+    expect(resolveMarkedFindingThread({
+      event: reply, thread, findings: [ledger], repository: ledger.repository, markerRepositoryDigest: publicDigest,
+    })).toEqual({ status: "marked", ledger, root });
+
+    expect(resolveMarkedFindingThread({
+      event: { ...reply, kind: "general-comment", threadId: undefined },
+      thread: undefined,
+      findings: [ledger],
+      repository: ledger.repository,
+      markerRepositoryDigest: publicDigest,
+    })).toEqual({ status: "scope-error" });
+
+    expect(resolveMarkedFindingThread({
+      event: reply,
+      thread: { ...thread, events: [{ ...root, authorIsBot: false, authorLogin: "mallory" }, reply] },
+      findings: [ledger],
+      repository: ledger.repository,
+      markerRepositoryDigest: publicDigest,
+    })).toEqual({ status: "scope-error" });
+
+    expect(resolveMarkedFindingThread({
+      event: reply, thread, findings: [], repository: ledger.repository, markerRepositoryDigest: publicDigest,
+    })).toEqual({ status: "unsupported-history" });
   });
 });

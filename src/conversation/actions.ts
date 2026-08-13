@@ -13,7 +13,10 @@ import {
 } from "../review/dispatch-results.js";
 import type { Finding } from "../review/types.js";
 import type { RuleDefinition } from "../rules/types.js";
-import type { DiffSide } from "./types.js";
+import type { CommandParseResult, ConversationCommand, DiffSide, RepositoryBinding } from "./types.js";
+import { parseChildMarker } from "./markers.js";
+import { requireFindingLedgerRecord } from "./state-schema.js";
+import type { ReviewActivityEvent, ReviewThreadSnapshot } from "../vcs/conversation-adapter.js";
 
 export type ReconsiderResult =
   | { outcome: "confirmed"; finding: Finding; rationale: string }
@@ -321,6 +324,85 @@ export async function reassessClarification(
     input,
     parseReconsiderOutput,
   );
+}
+
+export function isExecutableConversationCommand(
+  command: ConversationCommand,
+): command is { readonly kind: "explain" } | { readonly kind: "reconsider"; readonly reason: string } {
+  return command.kind === "explain" || command.kind === "reconsider";
+}
+
+export function conversationCommandKey(parsed: CommandParseResult): string {
+  if (parsed.kind === "command") return parsed.normalized;
+  if (parsed.kind === "invalid") return `invalid:${parsed.reason}`;
+  return parsed.kind;
+}
+
+export function conversationActionIdentity(input: {
+  readonly provider: string;
+  readonly repositoryDigest: string;
+  readonly reviewNumber: number;
+  readonly eventId: string;
+  readonly commandKey: string;
+}): { readonly actionId: string; readonly identityDigest: string } {
+  const material = [
+    input.provider, input.repositoryDigest, String(input.reviewNumber), input.eventId, input.commandKey,
+  ].join("\0");
+  const identityDigest = createHash("sha256").update(`tgd:conversation-action:v1\0${material}`, "utf8").digest("hex");
+  return { actionId: `action_${identityDigest.slice(0, 32)}`, identityDigest };
+}
+
+export function conversationSuccessorIdentity(
+  base: { readonly identityDigest: string },
+  headSha: string,
+): { readonly actionId: string; readonly identityDigest: string } {
+  const actionDigest = createHash("sha256")
+    .update(`tgd:conversation-successor:v1\0${base.identityDigest}\0${headSha.toLowerCase()}`, "utf8")
+    .digest("hex");
+  return { actionId: `action_${actionDigest.slice(0, 32)}`, identityDigest: base.identityDigest };
+}
+
+export type ThreadFindingResolution =
+  | { readonly status: "marked"; readonly ledger: FindingLedgerEntry; readonly root: ReviewActivityEvent }
+  | { readonly status: "scope-error" }
+  | { readonly status: "unsupported-history" };
+
+function lastNonEmptyLine(body: string): string {
+  const lines = body.split(/\r?\n/u);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!.trim();
+    if (line.length > 0) return line;
+  }
+  return "";
+}
+
+export function resolveMarkedFindingThread(input: {
+  readonly event: ReviewActivityEvent;
+  readonly thread: ReviewThreadSnapshot | undefined;
+  readonly findings: readonly FindingLedgerEntry[];
+  readonly repository: RepositoryBinding;
+  readonly markerRepositoryDigest: string;
+}): ThreadFindingResolution {
+  if (input.event.kind === "general-comment" || input.event.threadId === undefined || input.thread === undefined) {
+    return { status: "scope-error" };
+  }
+  const root = input.thread.events.find((entry) =>
+    (entry.kind === "thread-comment" || entry.kind === "comment-edit") &&
+    entry.commentId === input.thread!.rootCommentId)
+    ?? input.thread.events.find((entry) => entry.kind === "thread-comment" || entry.kind === "comment-edit");
+  if (root === undefined || root.authorIsBot !== true) return { status: "scope-error" };
+  const marker = parseChildMarker(lastNonEmptyLine(root.body));
+  if (marker === null || marker.kind !== "finding") return { status: "scope-error" };
+  try {
+    const ledger = requireFindingLedgerRecord(lastNonEmptyLine(root.body), input.findings, {
+      repository: input.repository,
+      reviewNumber: input.event.reviewNumber,
+      markerRepositoryDigest: input.markerRepositoryDigest,
+    });
+    return { status: "marked", ledger, root };
+  } catch {
+    return { status: "unsupported-history" };
+  }
 }
 
 export async function focusReview(
