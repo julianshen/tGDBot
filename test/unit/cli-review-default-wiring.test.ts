@@ -269,6 +269,7 @@ describe("review — default dependency wiring", () => {
       true,
       undefined, // createSession → real default
       "x/y", // orchestratorModel
+      undefined, // conversationContext when none was loaded
     );
     expect(dispatchRulesDirect).not.toHaveBeenCalled();
     logSpy.mockRestore();

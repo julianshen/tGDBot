@@ -165,6 +165,30 @@ export interface MemoryTombstoneEntry {
 
 export type MemoryEntry = MemoryCreateEntry | MemoryTombstoneEntry;
 
+export interface FindingSnapshot {
+  readonly file: string;
+  readonly line?: number;
+  readonly severity: "blocking" | "warning" | "suggestion";
+  readonly category: string;
+  readonly message: string;
+  readonly ruleName: string;
+  readonly decision?: "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification";
+  readonly question?: string;
+  readonly title?: string;
+  readonly suggestion?: string;
+  readonly endLine?: number;
+}
+
+export interface FindingReviewOptions {
+  readonly advisor: "on" | "off";
+  readonly suggestions: "on" | "off";
+  readonly disableBuiltinRule: boolean;
+  readonly trustLocalRules: boolean;
+  readonly rulesDir: string;
+  readonly model?: string;
+  readonly dispatch: "direct" | "legacy";
+}
+
 export interface FindingLedgerEntry {
   readonly version: 1;
   readonly repository: RepositoryBinding;
@@ -174,10 +198,29 @@ export interface FindingLedgerEntry {
   readonly baseSha: string;
   readonly headSha: string;
   readonly contentDigest: string;
+  readonly bodyDigest: string;
   readonly ruleDigest: string;
   readonly ruleSnapshot: string;
+  readonly finding: FindingSnapshot;
+  readonly reviewOptions: FindingReviewOptions;
   readonly placement: ConversationPlacement | null;
-  readonly identity?: BotIdentity;
+  readonly identity?: ConversationItemIdentity;
+  readonly at: string;
+}
+
+export interface PreparedFindingInput {
+  readonly repository: RepositoryBinding;
+  readonly id: string;
+  readonly reviewNumber: number;
+  readonly reviewId: string;
+  readonly baseSha: string;
+  readonly headSha: string;
+  readonly finding: FindingSnapshot;
+  readonly ruleSnapshot: string;
+  readonly reviewOptions: FindingReviewOptions;
+  readonly placement: ConversationPlacement | null;
+  readonly body: string;
+  readonly publishedBody?: string;
   readonly at: string;
 }
 
@@ -862,6 +905,87 @@ export function materializeMemories(entries: readonly MemoryEntry[]): readonly M
   return [...active.values()];
 }
 
+function findingSnapshot(value: unknown, name: string): FindingSnapshot {
+  const object = exact(value, name, ["file", "severity", "category", "message", "ruleName"],
+    ["line", "decision", "question", "title", "suggestion", "endLine"]);
+  if (object.severity !== "blocking" && object.severity !== "warning" && object.severity !== "suggestion") {
+    throw new Error(`${name}.severity is invalid`);
+  }
+  if (object.decision !== undefined && object.decision !== "new" && object.decision !== "still-valid" &&
+    object.decision !== "addressed" && object.decision !== "disputed" && object.decision !== "needs-clarification") {
+    throw new Error(`${name}.decision is invalid`);
+  }
+  const result: FindingSnapshot = {
+    file: text(object.file, `${name}.file`, 4_096),
+    severity: object.severity,
+    category: text(object.category, `${name}.category`, 1_000),
+    message: text(object.message, `${name}.message`, 20_000),
+    ruleName: text(object.ruleName, `${name}.ruleName`, 1_000),
+  };
+  if (object.line !== undefined) result.line = positiveInteger(object.line, `${name}.line`);
+  if (object.endLine !== undefined) result.endLine = positiveInteger(object.endLine, `${name}.endLine`);
+  if (object.decision !== undefined) result.decision = object.decision;
+  if (object.question !== undefined) result.question = text(object.question, `${name}.question`, 4_096);
+  if (object.title !== undefined) result.title = text(object.title, `${name}.title`, 1_000);
+  if (object.suggestion !== undefined) result.suggestion = text(object.suggestion, `${name}.suggestion`, 20_000);
+  return result;
+}
+
+function findingReviewOptions(value: unknown, name: string): FindingReviewOptions {
+  const object = exact(value, name, ["advisor", "suggestions", "disableBuiltinRule", "trustLocalRules", "rulesDir", "dispatch"],
+    ["model"]);
+  if (object.advisor !== "on" && object.advisor !== "off") throw new Error(`${name}.advisor is invalid`);
+  if (object.suggestions !== "on" && object.suggestions !== "off") throw new Error(`${name}.suggestions is invalid`);
+  if (typeof object.disableBuiltinRule !== "boolean") throw new Error(`${name}.disableBuiltinRule must be boolean`);
+  if (typeof object.trustLocalRules !== "boolean") throw new Error(`${name}.trustLocalRules must be boolean`);
+  if (object.dispatch !== "direct" && object.dispatch !== "legacy") throw new Error(`${name}.dispatch is invalid`);
+  return {
+    advisor: object.advisor,
+    suggestions: object.suggestions,
+    disableBuiltinRule: object.disableBuiltinRule,
+    trustLocalRules: object.trustLocalRules,
+    rulesDir: text(object.rulesDir, `${name}.rulesDir`, 4_096),
+    dispatch: object.dispatch,
+    ...(object.model === undefined ? {} : { model: text(object.model, `${name}.model`, 256) }),
+  };
+}
+
+function samePreparedFinding(left: FindingLedgerEntry, right: FindingLedgerEntry): boolean {
+  return left.reviewNumber === right.reviewNumber && left.reviewId === right.reviewId &&
+    left.baseSha === right.baseSha && left.headSha === right.headSha &&
+    left.contentDigest === right.contentDigest && left.bodyDigest === right.bodyDigest &&
+    left.ruleDigest === right.ruleDigest && left.ruleSnapshot === right.ruleSnapshot &&
+    JSON.stringify(left.finding) === JSON.stringify(right.finding) &&
+    JSON.stringify(left.reviewOptions) === JSON.stringify(right.reviewOptions) &&
+    JSON.stringify(left.placement) === JSON.stringify(right.placement) &&
+    left.repository.provider === right.repository.provider &&
+    left.repository.repositoryDigest === right.repository.repositoryDigest;
+}
+
+function sameProviderIdentity(left: ConversationItemIdentity, right: ConversationItemIdentity): boolean {
+  return left.provider === right.provider && left.commentId === right.commentId && left.url === right.url &&
+    left.threadId === right.threadId;
+}
+
+export function materializeFindings(entries: readonly FindingLedgerEntry[]): readonly FindingLedgerEntry[] {
+  const byId = new Map<string, FindingLedgerEntry>();
+  for (const entry of entries) {
+    const previous = byId.get(entry.id);
+    if (previous === undefined) {
+      byId.set(entry.id, entry);
+      continue;
+    }
+    if (!samePreparedFinding(previous, entry)) throw new Error("finding ledger immutable fields changed");
+    if (previous.identity !== undefined) {
+      if (entry.identity === undefined || !sameProviderIdentity(previous.identity, entry.identity)) {
+        throw new Error("finding provider identity cannot change once bound");
+      }
+    }
+    byId.set(entry.id, entry);
+  }
+  return [...byId.values()];
+}
+
 export function validateFindingEntries(
   value: unknown,
   expected: RepositoryBinding,
@@ -869,25 +993,85 @@ export function validateFindingEntries(
 ): readonly FindingLedgerEntry[] {
   const entries = array(value, "findings", maximum).map((entry, index) => {
     const object = exact(entry, `findings[${index}]`, ["version", "repository", "id", "reviewNumber", "reviewId", "baseSha",
-      "headSha", "contentDigest", "ruleDigest", "ruleSnapshot", "placement", "at"], ["identity"]);
+      "headSha", "contentDigest", "bodyDigest", "ruleDigest", "ruleSnapshot", "finding", "reviewOptions", "placement", "at"],
+      ["identity"]);
     const repository = validateVersionAndBinding(object, expected, `findings[${index}]`);
     const parseSha = (candidate: unknown, name: string): string => {
       if (typeof candidate !== "string" || !SHA_RE.test(candidate)) throw new Error(`${name} is invalid`);
       return candidate.toLowerCase();
     };
-    const validatedIdentity = object.identity === undefined ? undefined : identity(object.identity, "identity");
+    const validatedIdentity = object.identity === undefined ? undefined :
+      conversationItemIdentity(object.identity, "identity");
     if (validatedIdentity !== undefined && validatedIdentity.provider !== expected.provider) {
       throw new Error("finding identity provider does not match repository");
     }
     return { version: 1 as const, repository, id: id(object.id, "finding id", "finding"),
       reviewNumber: positiveInteger(object.reviewNumber, "reviewNumber"), reviewId: text(object.reviewId, "reviewId", 1_000),
       baseSha: parseSha(object.baseSha, "baseSha"), headSha: parseSha(object.headSha, "headSha"),
-      contentDigest: digest(object.contentDigest, "contentDigest"), ruleDigest: digest(object.ruleDigest, "ruleDigest"),
-      ruleSnapshot: text(object.ruleSnapshot, "ruleSnapshot", 100_000), placement: placement(object.placement, "placement"),
+      contentDigest: digest(object.contentDigest, "contentDigest"), bodyDigest: digest(object.bodyDigest, "bodyDigest"),
+      ruleDigest: digest(object.ruleDigest, "ruleDigest"),
+      ruleSnapshot: text(object.ruleSnapshot, "ruleSnapshot", 100_000),
+      finding: findingSnapshot(object.finding, `findings[${index}].finding`),
+      reviewOptions: findingReviewOptions(object.reviewOptions, `findings[${index}].reviewOptions`),
+      placement: placement(object.placement, "placement"),
       ...(validatedIdentity === undefined ? {} : { identity: validatedIdentity }), at: date(object.at, "finding at") };
   });
-  if (new Set(entries.map((entry) => entry.id)).size !== entries.length) throw new Error("finding ledger contains duplicate IDs");
+  materializeFindings(entries);
   return entries;
+}
+
+export function prepareFindingLedgerEntry(input: PreparedFindingInput): FindingLedgerEntry {
+  const contentDigest = computeContentDigest(input.body);
+  const entry: FindingLedgerEntry = {
+    version: 1,
+    repository: input.repository,
+    id: input.id,
+    reviewNumber: input.reviewNumber,
+    reviewId: input.reviewId,
+    baseSha: input.baseSha,
+    headSha: input.headSha,
+    contentDigest,
+    bodyDigest: computeContentDigest(input.publishedBody ?? input.body),
+    ruleDigest: computeContentDigest(input.ruleSnapshot),
+    ruleSnapshot: input.ruleSnapshot,
+    finding: input.finding,
+    reviewOptions: input.reviewOptions,
+    placement: input.placement,
+    at: input.at,
+  };
+  return validateFindingEntries([entry], input.repository)[0]!;
+}
+
+export function bindFindingLedgerIdentity(
+  entry: FindingLedgerEntry,
+  identity: ConversationItemIdentity,
+): FindingLedgerEntry {
+  if (identity.provider !== entry.repository.provider) {
+    throw new Error("finding identity provider does not match repository");
+  }
+  const bound: FindingLedgerEntry = { ...entry, identity };
+  return validateFindingEntries([entry, bound], entry.repository)[1]!;
+}
+
+export function requireFindingLedgerRecord(
+  raw: string,
+  findings: readonly FindingLedgerEntry[],
+  expected: { readonly repository: RepositoryBinding; readonly reviewNumber: number; readonly markerRepositoryDigest: string },
+): FindingLedgerEntry {
+  const marker = parseChildMarker(raw);
+  if (marker === null || marker.kind !== "finding") {
+    throw new Error("finding marker has no matching repository/review ledger record");
+  }
+  if (marker.repositoryDigest !== expected.markerRepositoryDigest || marker.reviewNumber !== expected.reviewNumber) {
+    throw new Error("finding marker has no matching repository/review ledger record");
+  }
+  const entry = findings.find((item) => item.id === marker.childId &&
+    item.repository.provider === expected.repository.provider &&
+    item.repository.repositoryDigest === expected.repository.repositoryDigest &&
+    item.reviewNumber === expected.reviewNumber &&
+    item.contentDigest === marker.contentDigest);
+  if (entry === undefined) throw new Error("finding marker has no matching repository/review ledger record");
+  return entry;
 }
 
 export function validateTransactionIntent(

@@ -14,6 +14,7 @@ import {
   type PreparedConversationStatePaths,
 } from "./state-paths.js";
 import {
+  materializeFindings,
   materializeMemories,
   validateCursorSnapshot,
   validateEventEntries,
@@ -253,7 +254,8 @@ function validateLockMetadata(value: unknown): LockMetadata {
 
 function contextOf(state: LoadedState): ConversationContextSnapshot {
   return clone({ cursor: state.cursor, pending: state.pending, events: state.events,
-    memories: materializeMemories(state.memoryLedger), memoryLedger: state.memoryLedger, findings: state.findings });
+    memories: materializeMemories(state.memoryLedger), memoryLedger: state.memoryLedger,
+    findings: materializeFindings(state.findings) });
 }
 
 function emptyJournalHead(repository: RepositoryBinding): ConversationJournalHead {
@@ -1409,11 +1411,14 @@ class FileConversationStateStore implements ConversationStateStore {
         if (entry.operation === "create" && known !== undefined) throw new Error("duplicate memory create already recorded by index");
         if (entry.operation === "tombstone" && known?.status === "tombstoned") throw new Error("duplicate memory tombstone already recorded by index");
       }
+      const reboundFindings = new Set<string>();
       for (const entry of addedFindings) {
         const known = await this.findIndexValue("findings", loaded.journalHead.checkpoint.findingIndex,
           entry.id, parentIdentity) as FindingIndexSummary | undefined;
-        if (known !== undefined) throw new Error(known.contentDigest === entry.contentDigest
-          ? "duplicate finding already recorded by index" : "finding index digest conflict");
+        if (known === undefined) continue;
+        if (known.contentDigest !== entry.contentDigest) throw new Error("finding index digest conflict");
+        if (entry.identity === undefined) throw new Error("duplicate finding already recorded by index");
+        reboundFindings.add(entry.id);
       }
       const terminalActionIndex = await this.upsertIndex("terminal-actions",
         loaded.journalHead.checkpoint.terminalActionIndex, newlyTerminal, transactionId, replacements, parentIdentity);
@@ -1422,7 +1427,9 @@ class FileConversationStateStore implements ConversationStateStore {
         entryDigest: sha256(Buffer.from(JSON.stringify(entry), "utf8")), at: entry.at }));
       const memoryIndex = await this.upsertIndex("memories", loaded.journalHead.checkpoint.memoryIndex,
         memoryIndexValues, transactionId, replacements, parentIdentity);
-      const findingIndexValues: FindingIndexSummary[] = addedFindings.map((entry) => ({ key: entry.id, id: entry.id,
+      const findingIndexValues: FindingIndexSummary[] = addedFindings
+        .filter((entry) => !reboundFindings.has(entry.id))
+        .map((entry) => ({ key: entry.id, id: entry.id,
         contentDigest: entry.contentDigest, reviewNumber: entry.reviewNumber, reviewId: entry.reviewId,
         bindingDigest: sha256(Buffer.from(JSON.stringify({ repository: entry.repository, reviewNumber: entry.reviewNumber,
           reviewId: entry.reviewId, baseSha: entry.baseSha, headSha: entry.headSha }), "utf8")) }));

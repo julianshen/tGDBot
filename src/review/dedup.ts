@@ -51,7 +51,32 @@ export interface ReviewConfigForDedup {
  * The exact hash value is not a stable contract — it only needs to be
  * deterministic within a version and to change when any hashed field changes.
  */
-export function computeReviewConfigHash(config: ReviewConfigForDedup, relatedWorkFingerprint?: string): string {
+export function stateRootDomainIdentifier(root: string): string {
+  return createHash("sha256").update(`tgd:state-root:v1\0${root}`, "utf8").digest("hex");
+}
+
+export function conversationDedupFingerprint(input: {
+  readonly selectedDiscussion: readonly { readonly id: string; readonly revisionId: string }[];
+  readonly pending: readonly { readonly id: string; readonly headSha: string }[];
+  readonly directions: readonly { readonly id: string; readonly headSha: string }[];
+  readonly memories: readonly { readonly id: string; readonly revision: string }[];
+  readonly stateRootDomain: string;
+}): string {
+  const canonical = JSON.stringify([
+    input.selectedDiscussion.map((item) => [item.id, item.revisionId]),
+    input.pending.map((item) => [item.id, item.headSha]),
+    input.directions.map((item) => [item.id, item.headSha]),
+    input.memories.map((item) => [item.id, item.revision]),
+    input.stateRootDomain,
+  ]);
+  return createHash("sha256").update(`tgd:conversation-dedup:v1\0${canonical}`, "utf8").digest("hex");
+}
+
+export function computeReviewConfigHash(
+  config: ReviewConfigForDedup,
+  relatedWorkFingerprint?: string,
+  conversationFingerprint?: string,
+): string {
   // A positional array (not an object) so the serialization can't drift on key
   // ordering; every field that affects review output is included explicitly.
   // rulesDir separators are normalized to POSIX `/` so the SAME logical rules
@@ -71,6 +96,7 @@ export function computeReviewConfigHash(config: ReviewConfigForDedup, relatedWor
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,
+    ...(conversationFingerprint === undefined ? [] : [conversationFingerprint]),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
 }

@@ -236,6 +236,7 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
     // this is what lets resolveStaleReviewThreads recognize the tool's own
     // threads without touching a same-account human's comments.
     INLINE_COMMENT_MARKER,
+    ...(options.findingMarker ? [options.findingMarker] : []),
   );
 
   return parts.join("\n");
@@ -252,6 +253,8 @@ export interface RenderOptions {
    * want a one-click commit path from LLM-authored text.
    */
   suggestions?: boolean;
+  /** Versioned finding marker storing IDs and digests only. */
+  findingMarker?: string;
 }
 
 /**

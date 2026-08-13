@@ -25,6 +25,43 @@ function createStore(options: ConversationStateStoreOptions) {
   } });
 }
 
+function testFinding(
+  binding: { provider: "github" | "gitlab"; repositoryDigest: string },
+  index: number,
+  overrides: { id?: string; contentDigest?: string } = {},
+) {
+  return {
+    version: 1 as const,
+    repository: binding,
+    id: overrides.id ?? `finding_${index.toString(16).padStart(32, "0")}`,
+    reviewNumber: 1,
+    reviewId: "review-1",
+    baseSha: "a".repeat(40),
+    headSha: "b".repeat(40),
+    contentDigest: overrides.contentDigest ?? "c".repeat(64),
+    bodyDigest: "e".repeat(64),
+    ruleDigest: "d".repeat(64),
+    ruleSnapshot: "rule",
+    finding: {
+      file: "src/a.ts",
+      severity: "warning" as const,
+      category: "correctness",
+      message: `finding ${index}`,
+      ruleName: "rule",
+    },
+    reviewOptions: {
+      advisor: "on" as const,
+      suggestions: "on" as const,
+      disableBuiltinRule: false,
+      trustLocalRules: false,
+      rulesDir: ".review/rules",
+      dispatch: "direct" as const,
+    },
+    placement: null,
+    at: "2026-01-01T00:00:00.000Z",
+  };
+}
+
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
 });
@@ -599,11 +636,7 @@ describe("conversation state store", () => {
     const binding = store.repositoryBinding;
     await store.transact((tx) => {
       for (let index = 0; index < 205; index += 1) {
-        tx.appendFinding({ version: 1, repository: binding,
-          id: `finding_${index.toString(16).padStart(32, "0")}`, reviewNumber: 1, reviewId: "review-1",
-          baseSha: "a".repeat(40), headSha: "b".repeat(40), contentDigest: "c".repeat(64),
-          ruleDigest: "d".repeat(64), ruleSnapshot: "rule", placement: null,
-          at: "2026-01-01T00:00:00.000Z" });
+        tx.appendFinding(testFinding(binding, index));
       }
     });
     const names = await readdir(paths.repositoryRoot);
@@ -619,11 +652,7 @@ describe("conversation state store", () => {
     const store = createStore({ root: stateRoot, repository: repo });
     const binding = store.repositoryBinding;
     for (let index = 0; index < 8; index += 1) {
-      await store.transact((tx) => tx.appendFinding({ version: 1, repository: binding,
-        id: `finding_${index.toString(16).padStart(32, "0")}`, reviewNumber: 1, reviewId: "review-1",
-        baseSha: "a".repeat(40), headSha: "b".repeat(40), contentDigest: "c".repeat(64),
-        ruleDigest: "d".repeat(64), ruleSnapshot: "rule", placement: null,
-        at: "2026-01-01T00:00:00.000Z" }));
+      await store.transact((tx) => tx.appendFinding(testFinding(binding, index)));
     }
     expect((await store.readContextSnapshot()).findings).toHaveLength(8);
     const head = JSON.parse(await readFile(paths.journalHeadPath, "utf8")) as {
@@ -650,11 +679,7 @@ describe("conversation state store", () => {
     const binding = store.repositoryBinding;
     await expect(store.transact((tx) => {
       for (let index = 0; index < 101; index += 1) {
-        tx.appendFinding({ version: 1, repository: binding,
-          id: `finding_${index.toString(16).padStart(32, "0")}`, reviewNumber: 1, reviewId: "review-1",
-          baseSha: "a".repeat(40), headSha: "b".repeat(40), contentDigest: "c".repeat(64),
-          ruleDigest: "d".repeat(64), ruleSnapshot: "rule", placement: null,
-          at: "2026-01-01T00:00:00.000Z" });
+        tx.appendFinding(testFinding(binding, index));
       }
     })).rejects.toThrow("rollover crash");
     expect((await createStore({ root: stateRoot, repository: repo }).readContextSnapshot()).findings)
@@ -706,10 +731,7 @@ describe("conversation state store", () => {
         tx.appendMemory({ version: 1, repository: binding, operation: "create",
           id: `memory_${index.toString(16).padStart(32, "0")}`, text: `memory ${index}`, attribution: "test",
           source: "unit", at: "2026-01-01T00:00:00.000Z" });
-        tx.appendFinding({ version: 1, repository: binding, id: `finding_${index.toString(16).padStart(32, "0")}`,
-          reviewNumber: 1, reviewId: "review-1", baseSha: "a".repeat(40), headSha: "b".repeat(40),
-          contentDigest: index.toString(16).padStart(64, "0"), ruleDigest: "d".repeat(64), ruleSnapshot: "rule",
-          placement: null, at: "2026-01-01T00:00:00.000Z" });
+        tx.appendFinding(testFinding(binding, index, { contentDigest: index.toString(16).padStart(64, "0") }));
       }
     });
     expect(await store.findMemory(`memory_${"0".repeat(32)}`)).toMatchObject({ status: "active" });
@@ -725,10 +747,9 @@ describe("conversation state store", () => {
     const store = createStore({ root: stateRoot, repository: repo, dependencies: { indexLeafCapacity: 1 } });
     const binding = store.repositoryBinding;
     await store.transact((tx) => {
-      for (let index = 0; index < 16; index += 1) tx.appendFinding({ version: 1, repository: binding,
-        id: `finding_${index.toString(16).padStart(32, "0")}`, reviewNumber: 1, reviewId: "review-1",
-        baseSha: "a".repeat(40), headSha: "b".repeat(40), contentDigest: index.toString(16).padStart(64, "0"),
-        ruleDigest: "d".repeat(64), ruleSnapshot: "rule", placement: null, at: "2026-01-01T00:00:00.000Z" });
+      for (let index = 0; index < 16; index += 1) {
+        tx.appendFinding(testFinding(binding, index, { contentDigest: index.toString(16).padStart(64, "0") }));
+      }
     });
     const head = JSON.parse(await readFile(paths.journalHeadPath, "utf8")) as {
       checkpoint: { findingIndex: { target: string } };
@@ -776,11 +797,7 @@ describe("conversation state store", () => {
     const paths = deriveConversationStatePaths(stateRoot, repo);
     const store = createStore({ root: stateRoot, repository: repo });
     const binding = store.repositoryBinding;
-    await store.transact((tx) => tx.appendFinding({ version: 1, repository: binding,
-      id: `finding_${"e".repeat(32)}`, reviewNumber: 1, reviewId: "review-1",
-      baseSha: "a".repeat(40), headSha: "b".repeat(40), contentDigest: "c".repeat(64),
-      ruleDigest: "d".repeat(64), ruleSnapshot: "rule", placement: null,
-      at: "2026-01-01T00:00:00.000Z" }));
+    await store.transact((tx) => tx.appendFinding(testFinding(binding, 0, { id: `finding_${"e".repeat(32)}` })));
     const head = JSON.parse(await readFile(paths.journalHeadPath, "utf8")) as { findings: { target: string } };
     const manifestPath = path.join(paths.repositoryRoot, head.findings.target);
     const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as { segment: { target: string } };
@@ -796,11 +813,7 @@ describe("conversation state store", () => {
     const writer = createStore({ root: stateRoot, repository: repo });
     const binding = writer.repositoryBinding;
     for (let index = 0; index < 40; index += 1) {
-      await writer.transact((tx) => tx.appendFinding({ version: 1, repository: binding,
-        id: `finding_${index.toString(16).padStart(32, "0")}`, reviewNumber: 1, reviewId: "review-1",
-        baseSha: "a".repeat(40), headSha: "b".repeat(40), contentDigest: "c".repeat(64),
-        ruleDigest: "d".repeat(64), ruleSnapshot: "rule", placement: null,
-        at: "2026-01-01T00:00:00.000Z" }));
+      await writer.transact((tx) => tx.appendFinding(testFinding(binding, index)));
     }
     let readOpens = 0;
     const observed = createStore({ root: stateRoot, repository: repo, dependencies: { fileSystem: {
@@ -813,11 +826,10 @@ describe("conversation state store", () => {
     expect((await observed.readContextSnapshot()).findings).toHaveLength(40);
     expect(readOpens).toBeLessThanOrEqual(3);
     readOpens = 0;
-    await observed.transact((tx) => tx.appendFinding({ version: 1, repository: binding,
-      id: `finding_${"f".repeat(32)}`, reviewNumber: 1, reviewId: "review-1",
-      baseSha: "a".repeat(40), headSha: "b".repeat(40), contentDigest: "e".repeat(64),
-      ruleDigest: "d".repeat(64), ruleSnapshot: "rule", placement: null,
-      at: "2026-01-01T00:00:00.000Z" }));
+    await observed.transact((tx) => tx.appendFinding(testFinding(binding, 0, {
+      id: `finding_${"f".repeat(32)}`,
+      contentDigest: "e".repeat(64),
+    })));
     expect(readOpens).toBeLessThanOrEqual(25);
 
     const newest = await observed.readAuditPage("findings", null, 1);

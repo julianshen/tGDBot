@@ -19,15 +19,33 @@ import {
   type PublicationWriteResult,
   type PublicationWriter,
 } from "./conversation/publication-manifest.js";
-import { computeContentDigest, parseChildMarker } from "./conversation/markers.js";
-import type { ConversationAdapter } from "./vcs/conversation-adapter.js";
+import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "./conversation/markers.js";
+import {
+  bindFindingLedgerIdentity,
+  prepareFindingLedgerEntry,
+  type FindingLedgerEntry,
+  type FindingReviewOptions,
+} from "./conversation/state-schema.js";
+import {
+  buildConversationContext,
+  MAX_REVIEW_CONTEXT_PAGES,
+  rethrowIfIntegrityFailure,
+} from "./conversation/context.js";
+import type { ConversationAdapter, ReviewIdentity, ReviewThreadSnapshot } from "./vcs/conversation-adapter.js";
 import { selectConversationStateRoot } from "./conversation/state-paths.js";
 import {
   createConversationStateStore,
   type ConversationStateStore,
 } from "./conversation/state-store.js";
 import { poll } from "./poll/poll.js";
-import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
+import {
+  computeReviewConfigHash,
+  conversationDedupFingerprint,
+  decideDedup,
+  formatMarker,
+  stateRootDomainIdentifier,
+} from "./review/dedup.js";
+import { changedFiles } from "./review/diff-anchors.js";
 import {
   deriveInlineChildId,
   formatInlineRecoveryMarker,
@@ -117,7 +135,12 @@ export interface ReviewDependencies {
   orchestrate: (
     dispatchResult: DispatchResult,
     diff?: string,
-    options?: { inline?: boolean; suggestions?: boolean; relatedWork?: readonly RelatedWorkItem[] },
+    options?: {
+      inline?: boolean;
+      suggestions?: boolean;
+      relatedWork?: readonly RelatedWorkItem[];
+      contextUnavailable?: readonly string[];
+    },
   ) => OrchestrationResult;
   createStateStore?: typeof createConversationStateStore;
   publicationHooks?: PublicationExecutorHooks;
@@ -142,6 +165,163 @@ function repositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): Repos
     owner: "ambient",
     repo: "review",
     canonicalUrl: "https://github.com/ambient/review",
+  };
+}
+
+function repositoryDigestOf(repository: RepositoryRef): string {
+  return createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex");
+}
+
+function reviewIdentityFor(repository: RepositoryRef, pr: PullRequestInfo): ReviewIdentity {
+  const provider = repository.provider;
+  return {
+    provider,
+    repositoryDigest: repositoryDigestOf(repository),
+    reviewNumber: Number(pr.id),
+    reviewId: String(pr.id),
+    url: pr.url ?? `${repository.canonicalUrl}${provider === "gitlab" ? "/-/merge_requests/" : "/pull/"}${Number(pr.id)}`,
+  };
+}
+
+function reviewOptionsSnapshot(config: ResolvedConfig): FindingReviewOptions {
+  return {
+    advisor: config.advisor,
+    suggestions: config.suggestions,
+    disableBuiltinRule: config.disableBuiltinRule,
+    trustLocalRules: config.trustLocalRules,
+    rulesDir: config.rulesDir,
+    dispatch: config.dispatch,
+    ...(config.model === undefined ? {} : { model: config.model }),
+  };
+}
+
+function openConversationStore(
+  createStore: typeof createConversationStateStore,
+  config: ResolvedConfig,
+  repository: RepositoryRef,
+): ConversationStateStore | undefined {
+  try {
+    return createStore({
+      root: selectConversationStateRoot({ explicitStateDir: config.stateDir }),
+      repository,
+    });
+  } catch (error) {
+    rethrowIfIntegrityFailure(error);
+    return undefined;
+  }
+}
+
+async function fetchReviewDiscussion(
+  adapter: Partial<ConversationAdapter>,
+  identity: ReviewIdentity,
+): Promise<{ threads: readonly ReviewThreadSnapshot[]; unavailable?: "discussion" }> {
+  if (typeof adapter.listReviewThreads !== "function" || typeof adapter.getReviewThread !== "function") {
+    return { threads: [] };
+  }
+  try {
+    const summaries = [];
+    let pageToken = undefined;
+    let pages = 0;
+    do {
+      pages += 1;
+      if (pages > MAX_REVIEW_CONTEXT_PAGES) {
+        return { threads: [], unavailable: "discussion" };
+      }
+      const page = await adapter.listReviewThreads(identity, pageToken);
+      summaries.push(...page.threads);
+      pageToken = page.nextPageToken;
+    } while (pageToken !== undefined);
+
+    if (typeof adapter.listReviewEvents === "function") {
+      let eventToken = undefined;
+      let eventPages = 0;
+      do {
+        eventPages += 1;
+        if (eventPages > MAX_REVIEW_CONTEXT_PAGES) {
+          return { threads: [], unavailable: "discussion" };
+        }
+        const page = await adapter.listReviewEvents(identity, undefined, eventToken);
+        eventToken = page.nextPageToken;
+      } while (eventToken !== undefined);
+    }
+
+    const threads: ReviewThreadSnapshot[] = [];
+    for (const summary of summaries) {
+      threads.push(await adapter.getReviewThread(identity, summary.threadId));
+    }
+    return { threads };
+  } catch (error) {
+    rethrowIfIntegrityFailure(error);
+    return { threads: [], unavailable: "discussion" };
+  }
+}
+
+async function loadOptionalReviewContext(options: {
+  readonly adapter: Partial<ConversationAdapter>;
+  readonly store: ConversationStateStore | undefined;
+  readonly missingStore: boolean;
+  readonly repository: RepositoryRef;
+  readonly pr: PullRequestInfo;
+  readonly diff: string;
+  readonly stateRoot?: string;
+}): Promise<{
+  conversationContext?: { text: string; digest: string };
+  fingerprint?: string;
+  unavailable: string[];
+}> {
+  const unavailable: string[] = [];
+  const identity = reviewIdentityFor(options.repository, options.pr);
+  const discussion = await fetchReviewDiscussion(options.adapter, identity);
+  if (discussion.unavailable !== undefined) unavailable.push("discussion");
+
+  let memories: readonly import("./conversation/state-schema.js").MemoryCreateEntry[] = [];
+  let pending: readonly import("./conversation/state-schema.js").PendingClarification[] = [];
+  let directions: readonly import("./conversation/state-schema.js").PendingDirection[] = [];
+  if (options.missingStore || options.store === undefined) {
+    unavailable.push("memory");
+  } else {
+    try {
+      const snapshot = await options.store.readContextSnapshot();
+      memories = snapshot.memories;
+      pending = snapshot.pending.clarifications.filter((item) => item.reviewNumber === Number(options.pr.id));
+      directions = snapshot.pending.directions.filter((item) => item.reviewNumber === Number(options.pr.id));
+    } catch (error) {
+      rethrowIfIntegrityFailure(error);
+      unavailable.push("memory");
+    }
+  }
+
+  const changedLines = changedFiles(options.diff).map((file) => ({ file }));
+  const built = buildConversationContext({
+    currentHeadSha: options.pr.headSha,
+    changedLines,
+    threads: discussion.threads,
+    directions,
+    pending,
+    memories,
+  });
+  const fingerprintItems = {
+    selectedDiscussion: built.selectedIds.flatMap((id) => {
+      const thread = discussion.threads.find((item) => item.threadId === id);
+      if (thread === undefined) return [];
+      return (thread.events ?? [])
+        .filter((event) => event.kind !== "thread-resolution")
+        .map((event) => ({ id: thread.threadId, revisionId: event.revisionId }));
+    }),
+    pending: pending.map((item) => ({ id: item.id, headSha: item.headSha })),
+    directions: directions.map((item) => ({ id: item.id, headSha: item.headSha })),
+    memories: memories.map((item) => ({ id: item.id, revision: item.at })),
+    stateRootDomain: options.stateRoot === undefined ? "" : stateRootDomainIdentifier(options.stateRoot),
+  };
+  const hasFingerprint = fingerprintItems.selectedDiscussion.length > 0 ||
+    fingerprintItems.pending.length > 0 || fingerprintItems.directions.length > 0 ||
+    fingerprintItems.memories.length > 0;
+  return {
+    ...(built.text.length > 0 ? { conversationContext: { text: built.text, digest: built.digest } } : {}),
+    ...(hasFingerprint && options.stateRoot !== undefined
+      ? { fingerprint: conversationDedupFingerprint(fingerprintItems) }
+      : {}),
+    unavailable,
   };
 }
 
@@ -379,6 +559,7 @@ async function publishReviewFromManifest(options: {
   ) => string;
   readonly terminalResult?: TerminalReviewResult;
   readonly inlineRecovery?: InlineRecoveryState;
+  readonly preparedFindings?: readonly FindingLedgerEntry[];
 }): Promise<number> {
   const {
     store, config, pr, configHash, provider, hooks, now, orchestration, buildBody,
@@ -730,6 +911,21 @@ async function publishReviewFromManifest(options: {
     throw error;
   }
 
+  const preparedFindings = options.preparedFindings ?? [];
+  if (preparedFindings.length > 0) {
+    const existing = (await store.readContextSnapshot()).findings;
+    await store.transact((tx) => {
+      for (const child of published.children) {
+        if (child.kind !== "inline" || child.identity === undefined) continue;
+        const prepared = preparedFindings.find((entry) => entry.id === child.id);
+        if (prepared === undefined) continue;
+        const already = existing.find((entry) => entry.id === prepared.id);
+        if (already?.identity !== undefined) continue;
+        tx.appendFinding(bindFindingLedgerIdentity(prepared, child.identity));
+      }
+    });
+  }
+
   if ((published.state === "completed" || published.state === "superseded") &&
     published.children.length === 0) {
     if (
@@ -803,6 +999,7 @@ export async function review(
             input.useAdvisor,
             undefined,
             input.orchestratorModel,
+            input.conversationContext,
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
@@ -836,12 +1033,6 @@ export async function review(
 
   const botComment = await config.vcsAdapter.findBotComment(config.locator);
 
-  // Config-aware dedup: a run is skipped only when this exact head SHA was
-  // already reviewed WITH THE SAME review configuration. Computed from CLI flags
-  // alone (no rule fetch), so the skip decision stays as cheap as before — see
-  // computeReviewConfigHash for what is and isn't captured.
-  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted));
-
   if (botComment?.invalidPendingState === true) {
     throw new Error(
       "Invalid pending review recovery metadata; refusing to dispatch or write",
@@ -849,16 +1040,31 @@ export async function review(
   }
 
   const repository = repositoryForReview(config, pr);
-  const stateStore = config.dryRun
-    ? undefined
-    : createStore({
-        root: selectConversationStateRoot({ explicitStateDir: config.stateDir }),
-        repository,
-      });
+  let missingStore = false;
+  let stateRoot: string | undefined;
+  try {
+    stateRoot = selectConversationStateRoot({ explicitStateDir: config.stateDir });
+  } catch (error) {
+    rethrowIfIntegrityFailure(error);
+    missingStore = true;
+  }
+  const stateStore = missingStore ? undefined : openConversationStore(createStore, config, repository);
+  if (stateStore === undefined) missingStore = true;
+
+  let loadedContext = await loadOptionalReviewContext({
+    adapter: config.vcsAdapter as Partial<ConversationAdapter>,
+    store: stateStore,
+    missingStore,
+    repository,
+    pr,
+    diff: "",
+    stateRoot,
+  });
+  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);
   const publicationIdentity = reviewPublicationIdentity({
     repository: {
       provider: repository.provider,
-      repositoryDigest: createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex"),
+      repositoryDigest: repositoryDigestOf(repository),
     },
     reviewNumber: Number(pr.id),
     headSha: pr.headSha,
@@ -954,14 +1160,6 @@ export async function review(
     return EXIT_OK;
   }
 
-  // Codex review fix (PR #5): a diff can be too large to even FETCH — the
-  // GitHub adapter's execFile buffer is capped (10 MiB), and a bigger diff
-  // makes getDiff() reject with a maxBuffer error BEFORE the length check
-  // below could ever run. With --max-diff-chars set, that rejection is proof
-  // positive the diff is over any expressible ceiling, so it gets the same
-  // graceful skip the flag promises — hitting exactly the largest PRs the
-  // ceiling exists to guard. Without the flag, the rejection stays fatal
-  // (the pre-existing behavior: the user asked for no ceiling).
   let diff: string;
   try {
     diff = await config.vcsAdapter.getDiff(config.locator);
@@ -981,13 +1179,6 @@ export async function review(
     });
     return EXIT_OK;
   }
-
-  // Design-review #13: hard cost ceiling. The dispatch prompt embeds the diff
-  // once per rule (O(rules × diff) tokens); warnIfDiffCostRisk in dispatch.ts
-  // only WARNS. When the user set a ceiling and this diff is over it, skip
-  // loudly BEFORE fetching rules or spending a single model token — nothing is
-  // posted (so no marker is written: a later run with a higher ceiling reviews
-  // normally), and the status line says why.
   if (config.maxDiffChars !== undefined && diff.length > config.maxDiffChars) {
     console.warn(
       `tgd-review-agent: diff is ${diff.length} chars, over the --max-diff-chars ceiling of ` +
@@ -1003,6 +1194,16 @@ export async function review(
     });
     return EXIT_OK;
   }
+
+  loadedContext = await loadOptionalReviewContext({
+    adapter: config.vcsAdapter as Partial<ConversationAdapter>,
+    store: stateStore,
+    missingStore,
+    repository,
+    pr,
+    diff,
+    stateRoot,
+  });
 
   if (stateStore !== undefined) {
     const existing = loadPublicationAction(
@@ -1078,6 +1279,9 @@ export async function review(
     diff,
     useAdvisor: config.advisor === "on",
     orchestratorModel: config.model,
+    ...(loadedContext.conversationContext === undefined
+      ? {}
+      : { conversationContext: loadedContext.conversationContext }),
   });
 
   if (extracted.omittedCount > 0) {
@@ -1102,7 +1306,12 @@ export async function review(
   // Only an explicit "off" disables them — an absent value means the documented
   // default (on), never a silent downgrade.
   const renderOpts = { suggestions: config.suggestions !== "off" };
-  const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts, relatedWork });
+  const orchestration = orchestrateFn(dispatchResult, diff, {
+    inline: true,
+    ...renderOpts,
+    relatedWork,
+    ...(loadedContext.unavailable.length === 0 ? {} : { contextUnavailable: loadedContext.unavailable }),
+  });
   const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
   const terminalResult = {
     status: hasFailure ? "partial" as const : "posted" as const,
@@ -1186,6 +1395,9 @@ export async function review(
     }
 
     const parentId = `act_${publicationIdentity.actionId.slice("action_".length)}`;
+    const publicRepositoryDigest = computeRepositoryDigest(repository.provider, repository.canonicalUrl);
+    const storeBinding = { provider: repository.provider, repositoryDigest: repositoryDigestOf(repository) };
+    const preparedFindings: FindingLedgerEntry[] = [];
     const inlines = orchestration.inlineComments.map((comment, index) => {
       const recovered = inlineRecovery?.children[index];
       const contentDigest = recovered?.contentDigest ?? computeContentDigest(comment.body);
@@ -1193,7 +1405,7 @@ export async function review(
         path: comment.path, line: comment.line, startLine: comment.startLine ?? null,
       }), "utf8").digest("hex");
       const childId = recovered?.childId ?? deriveInlineChildId(parentId, comment.clientId, contentDigest, placementDigest);
-      const marker = recovered?.marker ?? formatInlineRecoveryMarker({
+      const recoveryMarker = recovered?.marker ?? formatInlineRecoveryMarker({
         kind: "finding",
         parentId,
         childId,
@@ -1203,11 +1415,46 @@ export async function review(
         headSha: pr.headSha,
         placementDigest,
       });
+      const findingMarker = formatChildMarker({
+        kind: "finding",
+        parentId,
+        childId,
+        repositoryDigest: publicRepositoryDigest,
+        reviewNumber: Number(pr.id),
+        contentDigest,
+      });
+      const publishedBody = `${comment.body}${comment.body.endsWith("\n") ? "" : "\n"}${findingMarker}`;
+      const finding = orchestration.findingByClientId?.get(comment.clientId);
+      if (finding !== undefined) {
+        const rule = rules.find((item) => item.name === finding.ruleName);
+        preparedFindings.push(prepareFindingLedgerEntry({
+          repository: storeBinding,
+          id: childId,
+          reviewNumber: Number(pr.id),
+          reviewId: String(pr.id),
+          baseSha: pr.baseSha,
+          headSha: pr.headSha,
+          finding,
+          ruleSnapshot: rule?.body ?? finding.ruleName,
+          reviewOptions: reviewOptionsSnapshot(config),
+          placement: {
+            file: comment.path,
+            line: comment.line,
+            side: "new",
+            originalHeadSha: pr.headSha,
+            currentHeadSha: pr.headSha,
+            outdated: false,
+          },
+          body: comment.body,
+          publishedBody,
+          at: now(),
+        }));
+      }
       return {
         clientId: comment.clientId,
         childId,
-        body: comment.body,
-        marker,
+        body: publishedBody,
+        marker: recoveryMarker,
         file: comment.path,
         line: comment.line,
         startLine: comment.startLine,
@@ -1228,12 +1475,21 @@ export async function review(
       reviewNumber: Number(pr.id),
       repository: {
         provider: repository.provider,
-        repositoryDigest: createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex"),
+        repositoryDigest: repositoryDigestOf(repository),
       },
       state: "manifest-ready",
       successorActionId: null,
       children: frozenChildren,
     };
+    if (preparedFindings.length > 0) {
+      const existing = (await stateStore.readContextSnapshot()).findings;
+      await stateStore.transact((tx) => {
+        tx.initializeIfAbsent();
+        for (const entry of preparedFindings) {
+          if (!existing.some((item) => item.id === entry.id)) tx.appendFinding(entry);
+        }
+      });
+    }
     return publishReviewFromManifest({
       action: preparedAction,
       store: stateStore,
@@ -1249,6 +1505,7 @@ export async function review(
       buildBody,
       terminalResult,
       inlineRecovery,
+      preparedFindings,
     });
   }
 

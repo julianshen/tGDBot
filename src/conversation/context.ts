@@ -376,3 +376,86 @@ export function buildConversationContext(input: ConversationContextInput): Conve
     omittedCounts: omitted,
   };
 }
+
+export const MAX_REVIEW_CONTEXT_PAGES = 1_000;
+
+export type ConversationContextUnavailableKind =
+  | "auth"
+  | "network"
+  | "rate-limit"
+  | "timeout"
+  | "missing-store"
+  | "partial-pagination";
+
+export type ConversationContextIntegrityKind =
+  | "corrupt"
+  | "oversized"
+  | "unknown-schema"
+  | "path"
+  | "permission"
+  | "impossible-transition"
+  | "cross-repository";
+
+export type ConversationContextClassification =
+  | { readonly class: "unavailable"; readonly kind: ConversationContextUnavailableKind }
+  | { readonly class: "integrity"; readonly kind: ConversationContextIntegrityKind };
+
+function errorText(error: unknown): { readonly message: string; readonly code: string } {
+  const err = error as { message?: unknown; code?: unknown } | undefined;
+  return {
+    message: error instanceof Error ? error.message : String(error),
+    code: typeof err?.code === "string" ? err.code : "",
+  };
+}
+
+export function classifyConversationContextError(error: unknown): ConversationContextClassification {
+  const { message, code } = errorText(error);
+  const text = `${code} ${message}`;
+  if (/partial thread pagination/i.test(text)) return { class: "unavailable", kind: "partial-pagination" };
+  if (/rate.?limit|HTTP 429/i.test(text)) return { class: "unavailable", kind: "rate-limit" };
+  if (/ETIMEDOUT|ETIME|timed out|timeout/i.test(text)) return { class: "unavailable", kind: "timeout" };
+  if (/ENOTFOUND|ECONNRESET|ECONNREFUSED|EAI_AGAIN|network/i.test(text)) return { class: "unavailable", kind: "network" };
+  if (/HTTP 401|HTTP 403|unauthorized|authentication|auth|forbidden|login/i.test(text)) {
+    return { class: "unavailable", kind: "auth" };
+  }
+  if (/state store is not available|not available/i.test(text) && /store|state/i.test(text)) {
+    return { class: "unavailable", kind: "missing-store" };
+  }
+  if (/impossible action transition/i.test(text)) return { class: "integrity", kind: "impossible-transition" };
+  if (/repository binding does not match|cross-repository/i.test(text)) {
+    return { class: "integrity", kind: "cross-repository" };
+  }
+  if (/unsupported schema version|unknown schema/i.test(text)) return { class: "integrity", kind: "unknown-schema" };
+  if (/too large|exceeds the state file size|oversized/i.test(text)) return { class: "integrity", kind: "oversized" };
+  if (/symlink/i.test(text)) return { class: "integrity", kind: "path" };
+  if (/permissions must be|permission/i.test(text) && /state|conversation/i.test(text)) {
+    return { class: "integrity", kind: "permission" };
+  }
+  if (/malformed|corrupt|ledger JSON/i.test(text)) return { class: "integrity", kind: "corrupt" };
+  if (/conversation state path|escapes|inode|identity changed/i.test(text)) return { class: "integrity", kind: "path" };
+  if (/resource limit|pagination/i.test(text)) return { class: "unavailable", kind: "partial-pagination" };
+  if (/conversation|schema|journal|cursor|pending|state file/i.test(text)) {
+    return { class: "integrity", kind: "corrupt" };
+  }
+  return { class: "unavailable", kind: "network" };
+}
+
+export class ConversationContextIntegrityError extends Error {
+  readonly classification: Extract<ConversationContextClassification, { class: "integrity" }>;
+  constructor(cause: unknown) {
+    const classified = classifyConversationContextError(cause);
+    const kind = classified.class === "integrity" ? classified.kind : "corrupt";
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "ConversationContextIntegrityError";
+    this.classification = { class: "integrity", kind };
+  }
+}
+
+export function rethrowIfIntegrityFailure(error: unknown): void {
+  const classified = classifyConversationContextError(error);
+  if (classified.class === "integrity") {
+    throw error instanceof ConversationContextIntegrityError
+      ? error
+      : new ConversationContextIntegrityError(error);
+  }
+}

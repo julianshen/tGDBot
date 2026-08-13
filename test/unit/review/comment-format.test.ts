@@ -7,6 +7,7 @@ import {
   renderInlineComment,
   renderSummaryComment,
 } from "../../../src/review/comment-format.js";
+import { formatChildMarker } from "../../../src/conversation/markers.js";
 import type { Finding } from "../../../src/review/types.js";
 import type { RelatedWorkItem } from "../../../src/review/related-work.js";
 
@@ -113,6 +114,24 @@ describe("renderInlineComment — injection hardening", () => {
     expect(renderInlineComment(makeFinding({})).trimEnd().endsWith(INLINE_COMMENT_MARKER)).toBe(
       true,
     );
+  });
+
+  it("keeps the generic bot marker and appends a structured finding marker", () => {
+    const findingMarker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"1".repeat(32)}`,
+      childId: `finding_${"2".repeat(32)}`,
+      repositoryDigest: "a".repeat(64),
+      reviewNumber: 42,
+      contentDigest: "b".repeat(64),
+    });
+    const body = renderInlineComment(makeFinding(), { findingMarker });
+    expect(body).toContain(INLINE_COMMENT_MARKER);
+    expect(body).toContain(findingMarker);
+    expect(body.indexOf(INLINE_COMMENT_MARKER)).toBeLessThan(body.indexOf(findingMarker));
+    expect(body).not.toContain(makeFinding().message + findingMarker);
+    expect(findingMarker).not.toContain("Something is wrong.");
+    expect(findingMarker).not.toContain("src/a.ts");
   });
 
   it("cannot escape the <details> container or inject HTML", () => {

@@ -13,7 +13,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { main, parseArgs, review } from "../../src/cli.js";
 import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
-import { computeReviewConfigHash, formatMarker } from "../../src/review/dedup.js";
+import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
 import { deriveInlineChildId, formatInlineRecoveryMarker, formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
@@ -25,6 +25,12 @@ import type { RuleDefinition } from "../../src/rules/types.js";
 import type { DispatchResult } from "../../src/review/types.js";
 import { orchestrate as buildPresentation } from "../../src/review/orchestrate.js";
 import type { OrchestrationResult } from "../../src/review/orchestrate.js";
+import { parseChildMarker } from "../../src/conversation/markers.js";
+import { createConversationStateStore } from "../../src/conversation/state-store.js";
+import { deriveConversationStatePaths } from "../../src/conversation/state-paths.js";
+import { parseRepositoryRef } from "../../src/target/review-target.js";
+import type { ReviewThreadSnapshot } from "../../src/vcs/conversation-adapter.js";
+import { INLINE_COMMENT_MARKER } from "../../src/review/comment-format.js";
 
 const temporaryStateRoots: string[] = [];
 
@@ -227,6 +233,9 @@ interface Harness {
     resolveStaleReviewThreads: ReturnType<typeof vi.fn>;
     findPublishedMarker: ReturnType<typeof vi.fn>;
     findBotChildMarker: ReturnType<typeof vi.fn>;
+    listReviewThreads?: ReturnType<typeof vi.fn>;
+    listReviewEvents?: ReturnType<typeof vi.fn>;
+    getReviewThread?: ReturnType<typeof vi.fn>;
   };
   resolveConfig: ReturnType<typeof vi.fn>;
   loadRules: ReturnType<typeof vi.fn>;
@@ -1568,7 +1577,15 @@ describe("inline review comments", () => {
     const [prId, headSha, comments] = h.vcsAdapter.createInlineReview.mock.calls[0];
     expect(prId).toEqual(h.config.locator);
     expect(headSha).toBe("cafef00d"); // makePr()'s head sha
-    expect(comments).toEqual(withInline.inlineComments);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({
+      clientId: withInline.inlineComments[0]!.clientId,
+      path: "x.ts",
+      line: 2,
+      position: withInline.inlineComments[0]!.position,
+    });
+    expect(String(comments[0]?.body)).toContain(withInline.inlineComments[0]!.body);
+    expect(parseChildMarker(String(comments[0]?.body).trim().split("\n").at(-1) ?? "")?.kind).toBe("finding");
     // The summary is STILL upserted — that's what carries the dedup marker.
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(4);
   });
@@ -2428,4 +2445,466 @@ describe("review publication crash-matrix", () => {
     expect(inlineCalls).toBe(1);
   });
 });
+
+const CONVERSATION_HEAD = "cafef00d";
+const CONVERSATION_PR_URL = "https://github.com/acme/app/pull/42";
+const conversationRepo = parseRepositoryRef("acme/app", "github");
+
+function conversationBinding() {
+  return {
+    provider: "github" as const,
+    repositoryDigest: createHash("sha256").update(conversationRepo.canonicalUrl, "utf8").digest("hex"),
+    reviewNumber: 42,
+  };
+}
+
+function conversationThread(overrides: Partial<ReviewThreadSnapshot> & Pick<ReviewThreadSnapshot, "threadId" | "events">): ReviewThreadSnapshot {
+  const binding = conversationBinding();
+  const root = overrides.events[0];
+  const rootCommentId = root && "commentId" in root && root.commentId ? root.commentId : `${overrides.threadId}-root`;
+  return {
+    ...binding,
+    rootCommentId,
+    url: `${CONVERSATION_PR_URL}#discussion_r${rootCommentId}`,
+    resolved: false,
+    outdated: false,
+    updatedAt: "2026-08-14T00:00:00.000Z",
+    orderKey: `thread:${overrides.threadId}`,
+    placement: {
+      file: "src/changed.ts",
+      line: 10,
+      side: "new",
+      originalHeadSha: CONVERSATION_HEAD,
+      currentHeadSha: CONVERSATION_HEAD,
+      outdated: false,
+    },
+    ...overrides,
+    threadId: overrides.threadId,
+    events: overrides.events,
+  };
+}
+
+function conversationComment(threadId: string, commentId: string, body: string, extras: Record<string, unknown> = {}) {
+  const binding = conversationBinding();
+  return {
+    ...binding,
+    kind: "thread-comment" as const,
+    eventId: `review-comment:${commentId}`,
+    revisionId: `rev-${commentId}`,
+    orderKey: `comment:${commentId}`,
+    authorLogin: extras.authorLogin ?? "tgdbot",
+    authorIsBot: extras.authorIsBot ?? true,
+    createdAt: "2026-08-14T00:00:00.000Z",
+    updatedAt: "2026-08-14T00:00:00.000Z",
+    url: `${CONVERSATION_PR_URL}#discussion_r${commentId}`,
+    commentId,
+    threadId,
+    body,
+    ...extras,
+  };
+}
+
+function emptyEventPage() {
+  const binding = conversationBinding();
+  return {
+    events: [],
+    nextCursor: {
+      scope: "review-events" as const,
+      provider: "github" as const,
+      repositoryDigest: binding.repositoryDigest,
+      reviewNumber: 42,
+      opaque: "hw-0",
+      orderKey: "2026-08-14T00:00:00.000Z",
+    },
+  };
+}
+
+function installConversationReads(
+  h: Harness,
+  threads: readonly ReviewThreadSnapshot[],
+  options: { extraUnrelated?: ReviewThreadSnapshot } = {},
+) {
+  const binding = conversationBinding();
+  const all = options.extraUnrelated === undefined ? threads : [...threads, options.extraUnrelated];
+  h.vcsAdapter.listReviewThreads = vi.fn().mockResolvedValue({
+    threads: all.map(({ events: _events, ...summary }) => summary),
+  });
+  h.vcsAdapter.getReviewThread = vi.fn().mockImplementation((_review, threadId: string) => {
+    const match = all.find((thread) => thread.threadId === threadId);
+    return match === undefined ? Promise.reject(new Error(`missing thread ${threadId}`)) : Promise.resolve(match);
+  });
+  h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
+  void binding;
+}
+
+async function seedConversationState(stateDir: string, options: {
+  memoryText?: string;
+  directionText?: string;
+  pendingQuestion?: string;
+} = {}): Promise<void> {
+  const store = createConversationStateStore({ root: stateDir, repository: conversationRepo });
+  await store.transact((tx) => {
+    tx.initializeIfAbsent();
+    if (options.memoryText !== undefined) {
+      tx.appendMemory({
+        version: 1,
+        repository: tx.snapshot.cursor.repository,
+        operation: "create",
+        id: `memory_${"a".repeat(32)}`,
+        text: options.memoryText,
+        attribution: "reviewer",
+        source: `${CONVERSATION_PR_URL}#discussion_r9`,
+        at: "2026-08-14T00:00:00.000Z",
+      });
+    }
+    if (options.directionText !== undefined || options.pendingQuestion !== undefined) {
+      tx.replacePending({
+        version: 1,
+        repository: tx.snapshot.cursor.repository,
+        clarifications: options.pendingQuestion === undefined ? [] : [{
+          id: `clarification_${"b".repeat(32)}`,
+          reviewNumber: 42,
+          headSha: CONVERSATION_HEAD,
+          question: options.pendingQuestion,
+          createdAt: "2026-08-14T00:00:00.000Z",
+        }],
+        directions: options.directionText === undefined ? [] : [{
+          id: `clarification_${"c".repeat(32)}`,
+          reviewNumber: 42,
+          headSha: CONVERSATION_HEAD,
+          text: options.directionText,
+          createdAt: "2026-08-14T00:00:00.000Z",
+        }],
+      });
+    }
+  });
+}
+
+function conversationHarness(options: {
+  dispatch?: "direct" | "legacy";
+  botComment?: BotComment | null;
+  threads?: readonly ReviewThreadSnapshot[];
+} = {}) {
+  const h = makeHarness({
+    args: makeArgs({ dispatch: options.dispatch ?? "direct" }),
+    pr: makePr({ url: CONVERSATION_PR_URL }),
+    botComment: options.botComment ?? null,
+  });
+  if (options.threads) installConversationReads(h, options.threads);
+  return h;
+}
+
+function captureFindingAppends(h: Harness) {
+  const appended: Array<{ identity?: unknown }> = [];
+  const original = h.config as ResolvedConfig;
+  void original;
+  const createStateStore: ReviewDependencies["createStateStore"] = (opts) => {
+    const store = createConversationStateStore(opts);
+    const wrap = <T>(tx: T): T => {
+      const record = tx as { appendFinding: (entry: { identity?: unknown }) => void };
+      const originalAppend = record.appendFinding.bind(record);
+      record.appendFinding = (entry) => {
+        appended.push(structuredClone(entry));
+        return originalAppend(entry);
+      };
+      return tx;
+    };
+    return {
+      ...store,
+      repositoryBinding: store.repositoryBinding,
+      readContextSnapshot: store.readContextSnapshot.bind(store),
+      readAuditPage: store.readAuditPage.bind(store),
+      findTerminalAction: store.findTerminalAction.bind(store),
+      findTerminalActions: store.findTerminalActions.bind(store),
+      findMemory: store.findMemory.bind(store),
+      findFinding: store.findFinding.bind(store),
+      transact: (fn) => store.transact((tx) => fn(wrap(tx))),
+      withExclusiveLock: (fn) => store.withExclusiveLock(async (session) => {
+        const originalCommit = session.commit.bind(session);
+        return fn({
+          snapshot: session.snapshot.bind(session),
+          findTerminalAction: session.findTerminalAction.bind(session),
+          commit: (txFn) => originalCommit((tx) => txFn(wrap(tx))),
+        });
+      }),
+    };
+  };
+  return { appended, createStateStore };
+}
+
+describe("conversation-aware review", () => {
+  const relevant = conversationThread({
+    threadId: "changed-line",
+    events: [conversationComment("changed-line", "c1", "RELEVANT still open on the changed line")],
+  });
+  const unrelated = conversationThread({
+    threadId: "unrelated-human",
+    placement: {
+      file: "src/unrelated.ts",
+      line: 1,
+      side: "new",
+      originalHeadSha: CONVERSATION_HEAD,
+      currentHeadSha: CONVERSATION_HEAD,
+      outdated: false,
+    },
+    events: [conversationComment("unrelated-human", "u1", "UNRELATED chatter that must not affect review", {
+      authorLogin: "alice",
+      authorIsBot: false,
+    })],
+  });
+
+  it("fetches current discussion even when no poll state exists and passes it to both dispatch modes", async () => {
+    for (const dispatch of ["direct", "legacy"] as const) {
+      const h = conversationHarness({ dispatch, threads: [relevant] });
+      await seedConversationState(h.args.stateDir!, {
+        memoryText: "ACTIVE_MEMORY prefer explicit types",
+        directionText: "DIRECTION_NOW focus on auth",
+      });
+      const paths = deriveConversationStatePaths(h.args.stateDir!, conversationRepo);
+
+      await review(h.args, depsFrom(h));
+
+      expect(h.vcsAdapter.listReviewThreads).toHaveBeenCalled();
+      expect(h.vcsAdapter.getReviewThread).toHaveBeenCalled();
+      const input = h.dispatchRules.mock.calls[0]?.[0];
+      expect(input.conversationContext?.text).toContain("RELEVANT still open");
+      expect(input.conversationContext?.text).toContain("ACTIVE_MEMORY prefer explicit types");
+      expect(input.conversationContext?.text).toContain("DIRECTION_NOW focus on auth");
+      expect(input.conversationContext?.text).not.toContain("UNRELATED chatter");
+      expect(input.conversationContext?.digest).toMatch(/^[0-9a-f]{64}$/u);
+      const cursor = JSON.parse(readFileSync(paths.cursorPath, "utf8")) as { initialized?: boolean; reviews?: unknown[] };
+      expect(cursor.reviews ?? []).toEqual([]);
+      expect(cursor.initialized === true ? cursor.reviews : []).toEqual([]);
+    }
+  });
+
+  it("includes the conversation digest in dedup, re-reviews relevant changes, and ignores unrelated comments", async () => {
+    const first = conversationHarness({ threads: [relevant] });
+    await seedConversationState(first.args.stateDir!, { memoryText: "ACTIVE_MEMORY prefer explicit types" });
+    await review(first.args, depsFrom(first));
+    const posted = String(first.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    const parsed = parseBotMarker(posted)!;
+    const fingerprint = conversationDedupFingerprint({
+      selectedDiscussion: [{ id: "changed-line", revisionId: "rev-c1" }],
+      pending: [],
+      directions: [],
+      memories: [{ id: `memory_${"a".repeat(32)}`, revision: "2026-08-14T00:00:00.000Z" }],
+      stateRootDomain: stateRootDomainIdentifier(first.args.stateDir!),
+    });
+    expect(parsed.reviewedConfig).toBe(computeReviewConfigHash(first.config, undefined, fingerprint));
+
+    const unchanged = conversationHarness({
+      botComment: { id: "999", body: posted, lastReviewedSha: CONVERSATION_HEAD, reviewedConfig: parsed.reviewedConfig },
+      threads: [relevant],
+    });
+    unchanged.args.stateDir = first.args.stateDir;
+    unchanged.config = { ...unchanged.config, stateDir: first.args.stateDir };
+    unchanged.resolveConfig.mockReturnValue(unchanged.config);
+    installConversationReads(unchanged, [relevant], { extraUnrelated: unrelated });
+    await review(unchanged.args, depsFrom(unchanged));
+    expect(unchanged.dispatchRules).not.toHaveBeenCalled();
+
+    const edited = conversationThread({
+      threadId: "changed-line",
+      events: [conversationComment("changed-line", "c1", "RELEVANT still open on the changed line", { revisionId: "rev-c1-edited" })],
+    });
+    const changed = conversationHarness({
+      botComment: { id: "999", body: posted, lastReviewedSha: CONVERSATION_HEAD, reviewedConfig: parsed.reviewedConfig },
+      threads: [edited],
+    });
+    changed.args.stateDir = first.args.stateDir;
+    changed.config = { ...changed.config, stateDir: first.args.stateDir };
+    changed.resolveConfig.mockReturnValue(changed.config);
+    await review(changed.args, depsFrom(changed));
+    expect(changed.dispatchRules).toHaveBeenCalledOnce();
+  });
+
+  it("renders a visible notice when optional discussion context cannot load", async () => {
+    const h = conversationHarness();
+    h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(new Error("GitHub authentication failed (HTTP 401)"));
+    h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
+    h.vcsAdapter.getReviewThread = vi.fn();
+    h.orchestrate.mockImplementation(buildPresentation);
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.dispatchRules).toHaveBeenCalledOnce();
+    expect(h.dispatchRules.mock.calls[0]?.[0].conversationContext).toBeUndefined();
+    expect(h.orchestrate.mock.calls[0]?.[2]?.contextUnavailable).toEqual(expect.arrayContaining(["discussion"]));
+    expect(String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1])).toMatch(/discussion context was unavailable/i);
+  });
+
+  it("discards partial thread pagination instead of dispatching a truncated snapshot", async () => {
+    const h = conversationHarness();
+    const binding = conversationBinding();
+    const token = {
+      scope: "review-thread-page" as const,
+      provider: "github" as const,
+      repositoryDigest: binding.repositoryDigest,
+      reviewNumber: 42,
+      opaque: "page-2",
+    };
+    h.vcsAdapter.listReviewThreads = vi.fn()
+      .mockResolvedValueOnce({ threads: [relevant].map(({ events: _events, ...summary }) => summary), nextPageToken: token })
+      .mockRejectedValueOnce(new Error("GitHub lookup exceeded its bounded resource limit"));
+    h.vcsAdapter.getReviewThread = vi.fn().mockResolvedValue(relevant);
+    h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
+    h.orchestrate.mockImplementation(buildPresentation);
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.dispatchRules.mock.calls[0]?.[0].conversationContext?.text ?? "").not.toContain("RELEVANT still open");
+    expect(h.orchestrate.mock.calls[0]?.[2]?.contextUnavailable).toEqual(expect.arrayContaining(["discussion"]));
+  });
+
+  it("prepares a finding ledger record before publication and binds provider identity after", async () => {
+    const finding = {
+      ruleName: "rule-a",
+      severity: "blocking" as const,
+      category: "correctness",
+      file: "x.ts",
+      line: 2,
+      message: "Boom.",
+    };
+    const h = makeHarness({
+      pr: makePr({ url: CONVERSATION_PR_URL }),
+      orchestrationResult: {
+        commentBody: "**Actionable comments posted: 1**",
+        inlineComments: [{
+          clientId: "finding-0",
+          path: "x.ts",
+          line: 2,
+          position: {
+            oldPath: "x.ts",
+            newPath: "x.ts",
+            start: { type: "new", newLine: 2 },
+            end: { type: "new", newLine: 2 },
+            sameHunk: true,
+          },
+          body: "_🔴 Blocking_\n\n**Boom.**\n<!-- tgd-review-agent:inline -->",
+        }],
+        findingsCount: 1,
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+        findingByClientId: new Map([["finding-0", finding]]),
+        summaryInput: {
+          rulesRun: ["rule-a"],
+          rulesFailed: [],
+          allFindings: [finding],
+          unanchored: [],
+          filesReviewed: ["x.ts"],
+          inlineCount: 1,
+        },
+      },
+    });
+    const { appended, createStateStore } = captureFindingAppends(h);
+    let preparedBeforeWrite: { identity?: unknown } | undefined;
+    h.vcsAdapter.createInlineReview.mockImplementation(async (locator, headSha, comments) => {
+      preparedBeforeWrite = appended.find((entry) => entry.identity === undefined);
+      return (comments as Array<{ clientId: string }>).map(({ clientId }) => postedInline(clientId));
+    });
+
+    await review(h.args, { ...depsFrom(h), createStateStore });
+
+    expect(preparedBeforeWrite).toMatchObject({
+      id: expect.stringMatching(/^finding_[0-9a-f]{32}$/u),
+      finding,
+      reviewOptions: expect.objectContaining({ dispatch: "direct", suggestions: "on" }),
+      baseSha: "deadbeef",
+      headSha: CONVERSATION_HEAD,
+      placement: expect.objectContaining({ file: "x.ts", line: 2 }),
+    });
+    expect(typeof (preparedBeforeWrite as { bodyDigest?: string } | undefined)?.bodyDigest).toBe("string");
+    expect(typeof (preparedBeforeWrite as { ruleDigest?: string } | undefined)?.ruleDigest).toBe("string");
+    expect(typeof (preparedBeforeWrite as { ruleSnapshot?: string } | undefined)?.ruleSnapshot).toBe("string");
+    expect(appended.some((entry) => entry.identity !== undefined)).toBe(true);
+    expect(appended.find((entry) => entry.identity !== undefined)?.identity).toMatchObject({
+      provider: "github",
+      commentId: "comment-finding-0",
+    });
+
+    const postedInlineBody = String((h.vcsAdapter.createInlineReview.mock.calls[0]?.[2] as Array<{ body: string }>)[0]?.body ?? "");
+    expect(postedInlineBody).toContain(INLINE_COMMENT_MARKER);
+    const markerLine = postedInlineBody.trim().split("\n").at(-1) ?? "";
+    expect(parseChildMarker(markerLine)?.kind).toBe("finding");
+  });
+
+  it("continues a dry-run with a visible notice when the state store is missing", async () => {
+    const h = conversationHarness();
+    h.args = makeArgs({ dryRun: true, dispatch: "direct" });
+    h.config = { ...h.config, dryRun: true };
+    h.resolveConfig.mockReturnValue(h.config);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    h.orchestrate.mockImplementation(buildPresentation);
+
+    await review(h.args, {
+      ...depsFrom(h),
+      createStateStore: () => {
+        throw new Error("Conversation state store is not available");
+      },
+    });
+
+    expect(h.dispatchRules).toHaveBeenCalledOnce();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(log.mock.calls.map((call) => String(call[0])).join("\n")).toMatch(/memory context was unavailable|discussion context was unavailable/i);
+    log.mockRestore();
+  });
+});
+
+describe("conversation context integrity fail-closed", () => {
+  it.each([
+    ["corrupt", "Malformed conversation ledger JSON"],
+    ["oversized", "Conversation state file is too large"],
+    ["unknown-schema", "cursor has an unsupported schema version"],
+    ["path", "Conversation state path is a symlink"],
+    ["permission", "Conversation state file permissions must be 0600"],
+    ["impossible-transition", "Impossible action transition from observed to published"],
+    ["cross-repository", "State repository binding does not match the requested repository"],
+  ])("aborts before provider writes for %s integrity failures", async (_name, message) => {
+    const h = conversationHarness({ threads: [conversationThread({
+      threadId: "changed-line",
+      events: [conversationComment("changed-line", "c1", "RELEVANT")],
+    })] });
+    await expect(review(h.args, {
+      ...depsFrom(h),
+      createStateStore: () => {
+        throw new Error(message);
+      },
+    })).rejects.toThrow(message);
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["auth", "GitHub authentication failed (HTTP 401)"],
+    ["network", Object.assign(new Error("getaddrinfo ENOTFOUND api.github.com"), { code: "ENOTFOUND" })],
+    ["rate-limit", "HTTP 429 rate limit exceeded"],
+    ["timeout", Object.assign(new Error("request timed out"), { code: "ETIMEDOUT" })],
+  ])("continues a normal review when optional discussion is unavailable because of %s", async (_name, error) => {
+    const h = conversationHarness();
+    h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(typeof error === "string" ? new Error(error) : error);
+    h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
+    h.vcsAdapter.getReviewThread = vi.fn();
+    h.orchestrate.mockImplementation(buildPresentation);
+    await review(h.args, depsFrom(h));
+    expect(h.dispatchRules).toHaveBeenCalledOnce();
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalled();
+    expect(String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1])).toMatch(/discussion context was unavailable/i);
+  });
+
+  it("does not treat an integrity failure as optional unavailability when both occur", async () => {
+    const h = conversationHarness();
+    h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(new Error("GitHub authentication failed (HTTP 401)"));
+    await expect(review(h.args, {
+      ...depsFrom(h),
+      createStateStore: () => {
+        throw new Error("State repository binding does not match the requested repository");
+      },
+    })).rejects.toThrow(/repository binding/i);
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+  });
+});
+
 
