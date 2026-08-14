@@ -51,12 +51,18 @@ export function formatInlineRecoveryMarker(child: Omit<InlineRecoveryChild, "cli
   return `<!-- tgd-inline-child:v=3;kind=finding;parent=${child.parentId};child=${child.childId};repo=${child.repositoryDigest};review=${child.reviewNumber};content=${child.contentDigest};head=${child.headSha};placement=${child.placementDigest} -->`;
 }
 
+/**
+ * Structurally identical to state-schema's PublicationTerminalResult, which is
+ * what the manifest hands back; the arrays are readonly on both sides so a
+ * validated-from-JSON result stays assignable here. Callers build these from
+ * local mutable arrays, which remain assignable to readonly ones.
+ */
 export interface TerminalReviewResult {
   readonly status: "posted" | "partial";
   readonly findingsCount: number;
-  readonly rulesRun: string[];
-  readonly rulesFailed: string[];
-  readonly loadErrors?: string[];
+  readonly rulesRun: readonly string[];
+  readonly rulesFailed: readonly string[];
+  readonly loadErrors?: readonly string[];
   readonly exitCode: 0 | 2;
 }
 

@@ -546,7 +546,6 @@ async function executeConversationEvent(input: {
     plan: planned.plan,
     reviewIdentity,
     options,
-    rerun: planned.rerun,
   });
 }
 

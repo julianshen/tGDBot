@@ -45,6 +45,15 @@ export const MAX_FINDING_QUESTION_CHARS = 500;
 const FINDING_DECISION_SET = new Set<string>(FINDING_DECISIONS);
 
 /**
+ * `Set<string>.has()` is not a type guard, so membership alone leaves the value
+ * as `string`. This predicate is what carries the narrowing to the callers that
+ * return a FindingDecision.
+ */
+function isFindingDecision(value: string): value is FindingDecision {
+  return FINDING_DECISION_SET.has(value);
+}
+
+/**
  * Shared decision/question contract for both dispatch engines.
  * Missing/null decision defaults to `new`. Inconsistent shapes reject.
  */
@@ -54,7 +63,7 @@ export function readFindingDecision(
   const decisionRaw = raw.decision;
   const questionRaw = raw.question;
   const decision = decisionRaw === undefined || decisionRaw === null ? "new" : decisionRaw;
-  if (typeof decision !== "string" || !FINDING_DECISION_SET.has(decision)) return { ok: false };
+  if (typeof decision !== "string" || !isFindingDecision(decision)) return { ok: false };
 
   const hasQuestion = questionRaw !== undefined && questionRaw !== null;
   if (decision === "needs-clarification") {

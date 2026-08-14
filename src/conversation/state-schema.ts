@@ -378,6 +378,13 @@ function indexNodeReference(value: unknown, name: string): JournalFileReference 
 
 type Plain = Record<string, unknown>;
 
+/**
+ * Build-time view of a validated record. The exported schema types are readonly
+ * because callers must not mutate stored state, but a validator that attaches
+ * optional properties one at a time needs a writable target first.
+ */
+type Mutable<T> = { -readonly [K in keyof T]: T[K] };
+
 function plain(value: unknown, name: string): Plain {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
   const prototype = Object.getPrototypeOf(value);
@@ -653,14 +660,22 @@ function conversationItemIdentity(value: unknown, name: string): ConversationIte
   };
 }
 
+// Returns the literal side rather than validating in place: the property comes
+// off a Record<string, unknown>, where inequality checks never narrow to the
+// literal union the position type requires.
+function endpointSide(value: unknown, name: string): "old" | "new" {
+  if (value === "old") return "old";
+  if (value === "new") return "new";
+  throw new Error(`${name}.type is invalid`);
+}
+
 function publicationInlinePosition(value: unknown, name: string): PublicationInlinePosition {
   const object = exact(value, name, ["oldPath", "newPath", "start", "end", "sameHunk"]);
   if (object.sameHunk !== true) throw new Error(`${name}.sameHunk is invalid`);
   const endpoint = (candidate: unknown, endpointName: string) => {
     const point = exact(candidate, endpointName, ["type", "newLine"], ["oldLine"]);
-    if (point.type !== "old" && point.type !== "new") throw new Error(`${endpointName}.type is invalid`);
     return {
-      type: point.type,
+      type: endpointSide(point.type, endpointName),
       newLine: positiveInteger(point.newLine, `${endpointName}.newLine`),
       ...(point.oldLine === undefined ? {} : { oldLine: positiveInteger(point.oldLine, `${endpointName}.oldLine`) }),
     };
@@ -989,7 +1004,7 @@ function findingSnapshot(value: unknown, name: string): FindingSnapshot {
     object.decision !== "addressed" && object.decision !== "disputed" && object.decision !== "needs-clarification") {
     throw new Error(`${name}.decision is invalid`);
   }
-  const result: FindingSnapshot = {
+  const result: Mutable<FindingSnapshot> = {
     file: text(object.file, `${name}.file`, 4_096),
     severity: object.severity,
     category: text(object.category, `${name}.category`, 1_000),

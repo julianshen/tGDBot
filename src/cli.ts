@@ -512,8 +512,11 @@ const EXIT_PARTIAL = 2;
 interface StatusLog {
   status: "skipped" | "posted" | "partial";
   findingsCount: number;
-  rulesRun: string[];
-  rulesFailed: string[];
+  // Readonly because these are forwarded straight from a recovered
+  // TerminalReviewResult, whose arrays are readonly; this shape is only ever
+  // serialized, never mutated.
+  rulesRun: readonly string[];
+  rulesFailed: readonly string[];
   // Design-review #13: distinguishes WHY a run was skipped. Only present for
   // the --max-diff-chars ceiling skip ("diff-too-large"); the original dedup
   // skip keeps its exact pre-existing shape (no reason field) so anyone
@@ -524,7 +527,7 @@ interface StatusLog {
   // from `rulesFailed`, which is dispatch-time-only. Omitted entirely
   // (via JSON.stringify dropping `undefined` values) when there were no
   // load errors, so the "skipped"/all-succeeded log shape is unchanged.
-  loadErrors?: string[];
+  loadErrors?: readonly string[];
 }
 
 // Task 8 review fix #2: the final structured status line is always the
