@@ -364,9 +364,15 @@ export interface PullRequestInfo {
    * Carries the RESOLVED owner/repo identity: adapters infer the repo from
    * ambient context (`gh`'s git-remote / GH_REPO inference), so review() logs
    * this URL at the start of every run — making a mis-inferred target visible
-   * instead of silently reviewing the wrong repo. Optional so a minimal future
-   * adapter (or an old test double) without it still works; the log then falls
-   * back to the bare PR number.
+   * instead of silently reviewing the wrong repo.
+   *
+   * Still optional in the type, but only for a locator that already names its
+   * repository — there the identity comes from the locator and the log merely
+   * falls back to the bare PR number. An AMBIENT locator has no owner/repo of
+   * its own, so this URL is the sole source of the canonical repository
+   * identity that conversation state and every published marker bind to;
+   * adapters must populate it there, and GitHubAdapter rejects an ambient
+   * response that omits it rather than deferring the failure to review().
    */
   url?: string;
 }

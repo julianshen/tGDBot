@@ -315,6 +315,26 @@ describe("GitHubAdapter", () => {
     ]);
   });
 
+  // An ambient locator carries no owner/repo of its own, so the response `url`
+  // is the ONLY source of the canonical repository identity that conversation
+  // state and every published marker bind to. The explicit-repo branch can fall
+  // back to a constructed URL; this branch cannot, so a missing `url` has to
+  // fail here with a named cause rather than surfacing 600 lines later in
+  // review() as an unexplained "cannot resolve a canonical repository identity".
+  it("rejects an ambient gh pr view response that omits the resolved url", async () => {
+    const execGh = vi.fn().mockResolvedValue(JSON.stringify({
+      headRefOid: "abc1234567890abc1234567890abc1234567890",
+      baseRefOid: "def4567890def4567890def4567890def4567890",
+      title: "Add feature X",
+      body: "This PR adds feature X.",
+    }));
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getPullRequest(locator42)).rejects.toThrow(
+      /invalid response from gh pr view: missing url/i,
+    );
+  });
+
   it("normalizes a null PR body to an empty description for both locator forms", async () => {
     const execGh = vi.fn(async (args: string[]) => JSON.stringify({
       headRefOid: "abc123",
@@ -832,7 +852,16 @@ describe("GitHubAdapter", () => {
           _opts: object,
           callback: (error: Error | null, stdout: string, stderr: string) => void,
         ) => {
-          callback(null, JSON.stringify({ login: "tgd-review-agent[bot]" }), "");
+          // A realistic `pr view` payload: this test asserts only on the argv
+          // that reaches execFile, but getPullRequest still has to parse the
+          // response, and an ambient locator requires the resolved `url`.
+          callback(null, JSON.stringify({
+            headRefOid: "abc1234567890abc1234567890abc1234567890",
+            baseRefOid: "def4567890def4567890def4567890def4567890",
+            title: "Add feature X",
+            body: "This PR adds feature X.",
+            url: "https://github.com/octo-org/octo-repo/pull/1",
+          }), "");
           return { stdin: { end: vi.fn() } };
         },
       );

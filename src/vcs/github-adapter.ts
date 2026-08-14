@@ -1183,6 +1183,14 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         url: parsed.url ?? `https://github.com/${repo.owner}/${repo.repo}/pull/${id}`,
       };
     }
+    // The explicit-repo branch above can rebuild this URL from the locator; an
+    // ambient locator has no owner/repo, so this response is the only place the
+    // resolved identity exists. Conversation state and every published marker
+    // bind to that identity, so an absent url is a fatal response defect here
+    // rather than an undefined that fails confusingly further downstream.
+    if (typeof parsed.url !== "string" || parsed.url.length === 0) {
+      throw new Error("invalid response from gh pr view: missing url");
+    }
     return {
       id,
       headSha: parsed.headRefOid,

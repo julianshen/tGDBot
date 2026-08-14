@@ -108,12 +108,17 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
 
 describe("review — default dependency wiring", () => {
   it("with no injected deps, resolves the real config/loadRules/dispatchRules/orchestrate wiring against mocked modules (never real gh/network/LLM)", async () => {
+    // `url` is what carries the resolved owner/repo for an ambient locator, so
+    // GitHubAdapter always asks `gh pr view` for it. The double has to supply it
+    // too: conversation state and every published marker bind to the canonical
+    // repository identity, which ambient mode can only derive from this URL.
     hoisted.getPullRequest.mockResolvedValue({
       id: "42",
       headSha: "abc12345",
       baseSha: "base0000",
       title: "Real wiring PR",
       description: "desc",
+      url: "https://github.com/owner/repo/pull/42",
     });
     hoisted.getDiff.mockResolvedValue("diff --git a/x b/x");
     hoisted.findBotComment.mockResolvedValue(null);
