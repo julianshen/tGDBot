@@ -545,6 +545,50 @@ describe("renderSummaryComment", () => {
     expect(body).not.toContain("**Actionable comments posted:");
     expect(body).not.toContain("Additional comments");
   });
+
+  it("shows the exact answer syntax and withholds a link while publication is pending", () => {
+    const id = `clar_${"c".repeat(26)}`;
+    const body = renderSummaryComment({
+      ...base,
+      clarification: {
+        id,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Is the fallback path intentional?" }),
+        publicationPending: true,
+      },
+    });
+
+    expect(body).toContain(`answer ${id}: <your answer>`);
+    expect(body).toMatch(/publication is pending/i);
+    expect(body).not.toContain("](https://");
+  });
+
+  it("links only a validated published identity", () => {
+    const id = `clar_${"d".repeat(26)}`;
+    const linked = renderSummaryComment({
+      ...base,
+      clarification: {
+        id,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Is the fallback path intentional?" }),
+        publishedUrl: "https://github.com/acme/app/pull/42#discussion_r99",
+      },
+    });
+    const rejected = renderSummaryComment({
+      ...base,
+      clarification: {
+        id,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Is the fallback path intentional?" }),
+        publishedUrl: "javascript:alert(1)",
+      },
+    });
+
+    expect(linked).toContain("[Open the question](https://github.com/acme/app/pull/42#discussion_r99)");
+    expect(linked).not.toMatch(/publication is pending/i);
+    expect(rejected).not.toContain("javascript:");
+    expect(rejected).not.toContain("](javascript:alert(1))");
+  });
 });
 
 // ADR-007: committable suggestions. THE SECURITY BOUNDARY of this feature.

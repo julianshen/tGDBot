@@ -7,7 +7,7 @@
 // module is a plain formatting/safety-net layer on top of its output.
 import { selectClarification } from "../conversation/clarification.js";
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
-import type { RenderOptions } from "./comment-format.js";
+import type { ClarificationPresentation, RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
 import {
   changedFiles,
@@ -59,6 +59,9 @@ export type OrchestrateOptions = {
   ruleOrder?: readonly string[];
   reviewBinding?: ReviewBindingOptions;
   contextUnavailable?: readonly string[];
+  clarification?: ClarificationPresentation;
+  excludeClarificationIds?: readonly string[];
+  deferredClarificationCount?: number;
 } & RenderOptions;
 
 function decisionOf(finding: Finding): FindingDecision {
@@ -176,13 +179,16 @@ export function orchestrate(
     (finding) => isActionableDecision(decisionOf(finding)) && !addressedKeys.has(dedupeKey(finding)),
   );
   const disputed = dispatchResult.findings.filter((finding) => decisionOf(finding) === "disputed");
-  const clarification = selectClarification({
-    repositoryDigest: options.reviewBinding?.repositoryDigest ?? "0".repeat(64),
-    reviewNumber: options.reviewBinding?.reviewNumber ?? 1,
-    headSha: options.reviewBinding?.headSha ?? "0".repeat(40),
-    findings: dispatchResult.findings,
-    ruleOrder: options.ruleOrder ?? dispatchResult.rulesRun,
-  });
+  const clarification = options.clarification === undefined
+    ? selectClarification({
+        repositoryDigest: options.reviewBinding?.repositoryDigest ?? "0".repeat(64),
+        reviewNumber: options.reviewBinding?.reviewNumber ?? 1,
+        headSha: options.reviewBinding?.headSha ?? "0".repeat(40),
+        findings: dispatchResult.findings,
+        ruleOrder: options.ruleOrder ?? dispatchResult.rulesRun,
+        excludeIds: options.excludeClarificationIds,
+      })
+    : { selected: options.clarification, deferredCount: options.deferredClarificationCount ?? 0 };
 
   // Severity order is load-bearing, not cosmetic: a reader must meet the
   // blocking findings before the nits, whether they're reading the summary or

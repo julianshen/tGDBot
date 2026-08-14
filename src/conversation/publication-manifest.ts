@@ -1,8 +1,15 @@
 import { createHash } from "node:crypto";
-import { computeContentDigest } from "./markers.js";
+import {
+  clarificationQuestionIdentity,
+  createPreparedClarification,
+  transitionClarification,
+} from "./clarification.js";
+import { computeContentDigest, formatChildMarker, parseChildMarker } from "./markers.js";
+import { childMarkerSuffix, createConversationPublicationChild, renderClarificationQuestion } from "./render.js";
 import type {
   ActionState,
   ConversationEventEntry,
+  PendingClarification,
   PublicationChildKind,
   PublicationChildStatus,
   PublicationInlinePosition,
@@ -10,11 +17,15 @@ import type {
   PublicationPlacement,
   PublicationTerminalResult,
 } from "./state-schema.js";
-import type {
-  ConversationExclusiveSession,
-  ConversationStateStore,
+import {
+  replacePendingClarification,
+  type ConversationExclusiveSession,
+  type ConversationStateStore,
 } from "./state-store.js";
-import type { ConversationItemIdentity, RepositoryBinding } from "./types.js";
+import type { ConversationItemIdentity, RepositoryBinding, ReviewIdentity } from "./types.js";
+import type { ConversationAdapter } from "../vcs/conversation-adapter.js";
+
+export { clarificationQuestionIdentity };
 
 export type {
   PublicationChildKind,
@@ -677,3 +688,190 @@ export async function executeReviewPublication(options: {
     return action;
   });
 }
+
+export function clarificationQuestionWriter(input: {
+  readonly adapter: Pick<ConversationAdapter, "postGeneralReply" | "findBotChildMarker">;
+  readonly reviewIdentity: ReviewIdentity;
+  readonly writeInline?: (child: PublicationChild) => Promise<PublicationWriteResult | null>;
+}): PublicationWriter {
+  return {
+    async lookupChild(child) {
+      const parsed = parseChildMarker((child.body.split(/\r?\n/u).at(-1) ?? "").trim())
+        ?? parseChildMarker(child.marker);
+      if (parsed === null) return null;
+      return input.adapter.findBotChildMarker(input.reviewIdentity, {
+        provider: input.reviewIdentity.provider,
+        repositoryDigest: parsed.repositoryDigest,
+        reviewNumber: parsed.reviewNumber,
+        kind: parsed.kind,
+        parentId: parsed.parentId,
+        childId: parsed.childId,
+        contentDigest: parsed.contentDigest,
+      });
+    },
+    async writeChild(child) {
+      if (child.placement.kind === "general-question" && child.placement.file !== undefined &&
+        child.placement.line !== undefined && input.writeInline !== undefined) {
+        const inline = await input.writeInline(child);
+        if (inline !== null) return inline;
+      }
+      const identity = await input.adapter.postGeneralReply(input.reviewIdentity, {
+        provider: input.reviewIdentity.provider,
+        repositoryDigest: input.reviewIdentity.repositoryDigest,
+        reviewNumber: input.reviewIdentity.reviewNumber,
+        body: child.body,
+      });
+      return { status: "posted", identity };
+    },
+  };
+}
+
+export function buildClarificationQuestionChild(input: {
+  readonly actionId: string;
+  readonly pendingId: string;
+  readonly question: string;
+  readonly repositoryDigest: string;
+  readonly reviewNumber: number;
+  readonly file?: string;
+  readonly line?: number;
+}): PublicationChild {
+  const childHex = createHash("sha256")
+    .update(`tgd:clarification-question:v1\0${input.actionId}\0${input.pendingId}`, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  const childId = `clarification_${childHex}`;
+  const markerChildId = `clar_${childHex}`;
+  const parentId = `act_${input.actionId.slice("action_".length)}`;
+  const provisional = formatChildMarker({
+    kind: "clarification",
+    parentId,
+    childId: markerChildId,
+    repositoryDigest: input.repositoryDigest,
+    reviewNumber: input.reviewNumber,
+    contentDigest: "0".repeat(64),
+  });
+  const first = renderClarificationQuestion({ question: input.question, pendingId: input.pendingId }, provisional);
+  const suffix = childMarkerSuffix(provisional);
+  const visible = first.text.endsWith(suffix) ? first.text.slice(0, -suffix.length) : first.text;
+  const marker = formatChildMarker({
+    kind: "clarification",
+    parentId,
+    childId: markerChildId,
+    repositoryDigest: input.repositoryDigest,
+    reviewNumber: input.reviewNumber,
+    contentDigest: computeContentDigest(visible),
+  });
+  return createConversationPublicationChild({
+    id: childId,
+    kind: "general-question",
+    placement: input.file === undefined || input.line === undefined
+      ? { kind: "general-question" }
+      : { kind: "general-question", file: input.file, line: input.line },
+    body: renderClarificationQuestion({ question: input.question, pendingId: input.pendingId }, marker),
+    marker: `<!-- tgd-clarification:${input.actionId}:${childId} -->`,
+  });
+}
+
+export async function publishClarificationQuestion(options: {
+  readonly store: ConversationStateStore;
+  readonly pending: PendingClarification;
+  readonly repository: RepositoryBinding;
+  readonly publicRepositoryDigest: string;
+  readonly writer: PublicationWriter;
+  readonly hooks?: PublicationExecutorHooks;
+  readonly now?: () => string;
+  readonly file?: string;
+  readonly line?: number;
+}): Promise<{ readonly action: PublicationAction; readonly pending: PendingClarification }> {
+  const now = options.now ?? (() => new Date().toISOString());
+  const identity = clarificationQuestionIdentity({
+    repository: options.repository,
+    reviewNumber: options.pending.reviewNumber,
+    headSha: options.pending.headSha,
+    clarificationId: options.pending.id,
+  });
+  const child = buildClarificationQuestionChild({
+    actionId: identity.actionId,
+    pendingId: options.pending.id,
+    question: options.pending.question,
+    repositoryDigest: options.publicRepositoryDigest,
+    reviewNumber: options.pending.reviewNumber,
+    file: options.file,
+    line: options.line,
+  });
+  const prepared = options.pending.state === undefined
+    ? createPreparedClarification({
+        id: options.pending.id,
+        reviewNumber: options.pending.reviewNumber,
+        headSha: options.pending.headSha,
+        question: options.pending.question,
+        createdAt: options.pending.createdAt,
+        finding: options.pending.finding ?? {
+          file: "unknown",
+          severity: "warning",
+          category: "correctness",
+          message: options.pending.question,
+          ruleName: options.pending.ruleName ?? "clarification",
+          decision: "needs-clarification",
+          question: options.pending.question,
+        },
+        actionId: identity.actionId,
+        identityDigest: identity.identityDigest,
+      })
+    : {
+        ...options.pending,
+        actionId: options.pending.actionId ?? identity.actionId,
+        identityDigest: options.pending.identityDigest ?? identity.identityDigest,
+      };
+
+  await options.store.transact((tx) => {
+    tx.initializeIfAbsent();
+    const existing = tx.snapshot.pending.clarifications.find((entry) => entry.id === prepared.id);
+    if (existing === undefined || existing.state === undefined) {
+      tx.replacePending(replacePendingClarification(tx.snapshot.pending, prepared));
+    }
+  });
+
+  const latest = latestPublication((await options.store.readContextSnapshot()).events, identity.actionId);
+  const action: PublicationAction = {
+    actionId: identity.actionId,
+    identityDigest: identity.identityDigest,
+    reviewNumber: options.pending.reviewNumber,
+    repository: options.repository,
+    state: latest?.state === "manifest-ready" || latest?.state === "published" || latest?.state === "completed"
+      ? latest.state
+      : "prepared",
+    successorActionId: null,
+    children: latest !== undefined && latest.manifest.length > 0 ? latest.manifest : [child],
+  };
+  const published = await executePublication({
+    store: options.store,
+    action,
+    writer: options.writer,
+    hooks: options.hooks,
+    now,
+  });
+  const posted = published.children.find((entry) =>
+    entry.kind === "general-question" && (entry.status === "posted" || entry.identity !== undefined));
+  const current = (await options.store.readContextSnapshot()).pending.clarifications.find((entry) =>
+    entry.id === prepared.id) ?? prepared;
+  if (posted?.identity !== undefined && current.state !== "published" && current.state !== "answer-observed" &&
+    current.state !== "terminal") {
+    const next = current.state === "prepared" || current.state === undefined
+      ? transitionClarification({ ...current, state: "prepared" }, "published", { identity: posted.identity })
+      : current;
+    await options.store.transact((tx) => {
+      tx.replacePending(replacePendingClarification(tx.snapshot.pending, next));
+    });
+    return { action: published, pending: next };
+  }
+  if (posted?.identity !== undefined && current.state === "published" && current.identity === undefined) {
+    const next = { ...current, identity: posted.identity };
+    await options.store.transact((tx) => {
+      tx.replacePending(replacePendingClarification(tx.snapshot.pending, next));
+    });
+    return { action: published, pending: next };
+  }
+  return { action: published, pending: current };
+}
+

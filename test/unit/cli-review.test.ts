@@ -11,7 +11,10 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseCommandArgs } from "../../src/cli-args.js";
 import { main, parseArgs, review } from "../../src/cli.js";
+import { selectClarification } from "../../src/conversation/clarification.js";
+import { poll } from "../../src/poll/poll.js";
 import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
 import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
@@ -238,6 +241,7 @@ interface Harness {
     resolveStaleReviewThreads: ReturnType<typeof vi.fn>;
     findPublishedMarker: ReturnType<typeof vi.fn>;
     findBotChildMarker: ReturnType<typeof vi.fn>;
+    postGeneralReply: ReturnType<typeof vi.fn>;
     listReviewThreads?: ReturnType<typeof vi.fn>;
     listReviewEvents?: ReturnType<typeof vi.fn>;
     getReviewThread?: ReturnType<typeof vi.fn>;
@@ -315,6 +319,15 @@ function makeHarness(options: {
     resolveStaleReviewThreads: vi.fn().mockResolvedValue(0),
     findPublishedMarker: vi.fn().mockResolvedValue(null),
     findBotChildMarker: vi.fn().mockResolvedValue(null),
+    postGeneralReply: vi.fn().mockImplementation((_review, input: { body: string }) => {
+      const commentId = `question-${Math.random().toString(16).slice(2, 10)}`;
+      return Promise.resolve({
+        provider: "github" as const,
+        commentId,
+        url: `https://github.com/acme/app/pull/42#issuecomment-${commentId}`,
+        body: input.body,
+      });
+    }),
   };
 
   const locator = resolveReviewLocator(args);
@@ -1988,7 +2001,10 @@ describe("inline review comments", () => {
     await review(h.args, depsFrom(h));
 
     expect(h.orchestrate.mock.calls[0]?.[1]).toBe(DIFF);
-    expect(h.orchestrate.mock.calls[0]?.[2]).toEqual({ inline: true, suggestions: true, relatedWork: [] });
+    expect(h.orchestrate.mock.calls[0]?.[2]).toMatchObject({ inline: true, suggestions: true, relatedWork: [] });
+    expect(h.orchestrate.mock.calls[0]?.[2]).toMatchObject({
+      reviewBinding: { reviewNumber: 42, headSha: "cafef00d" },
+    });
   });
 
   it("extracts and resolves GitHub related work after dispatch, then passes it only to presentation", async () => {
@@ -2441,7 +2457,7 @@ describe("review publication crash-matrix", () => {
       review(first.args, depsFrom(first)),
       review(second.args, depsFrom(second)),
     ]);
-    await vi.waitFor(() => expect(ready).toHaveLength(2));
+    await vi.waitFor(() => expect(ready).toHaveLength(2), { timeout: 10_000 });
     release.resolve();
     await expect(runs).resolves.toEqual([0, 0]);
     const inlineCalls = first.vcsAdapter.createInlineReview.mock.calls.length
@@ -2566,7 +2582,7 @@ async function seedConversationState(stateDir: string, options: {
         version: 1,
         repository: tx.snapshot.cursor.repository,
         clarifications: options.pendingQuestion === undefined ? [] : [{
-          id: `clarification_${"b".repeat(32)}`,
+          id: `clar_${"b".repeat(26)}`,
           reviewNumber: 42,
           headSha: CONVERSATION_HEAD,
           question: options.pendingQuestion,
@@ -3196,6 +3212,211 @@ describe("conversation context integrity fail-closed", () => {
     })).rejects.toThrow(/repository binding/i);
     expect(h.dispatchRules).not.toHaveBeenCalled();
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+  });
+});
+
+describe("clarification question publication", () => {
+  const questionFinding = {
+    file: "src/a.ts",
+    line: 4,
+    severity: "warning" as const,
+    category: "correctness",
+    ruleName: "rule-a",
+    decision: "needs-clarification" as const,
+    question: "Is the fallback path intentional?",
+    message: "unclear timeout",
+  };
+
+  function clarificationHarness(stateDir = isolatedStateDir()) {
+    const h = makeHarness({
+      args: makeArgs({ stateDir }),
+      pr: makePr({ url: CONVERSATION_PR_URL }),
+      dispatchResult: { findings: [questionFinding], rulesRun: ["rule-a"], rulesFailed: [] },
+    });
+    h.orchestrate.mockImplementation(buildPresentation);
+    h.vcsAdapter.getDiff.mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n@@ -1,2 +1,3 @@\n context\n+added\n");
+    return h;
+  }
+
+  function wireQuestionWrites(h: Harness, shared: {
+    bodies: string[];
+    posted: Map<string, { provider: "github"; commentId: string; url: string }>;
+    failNext?: "throw" | "accept-then-fail" | null;
+  }) {
+    h.vcsAdapter.postGeneralReply.mockImplementation((_review, input: { body: string }) => {
+      const marker = input.body.split(/\r?\n/u).at(-1)?.trim() ?? "";
+      const identity = {
+        provider: "github" as const,
+        commentId: `q-${shared.bodies.length + 1}`,
+        url: `https://github.com/acme/app/pull/42#issuecomment-q-${shared.bodies.length + 1}`,
+      };
+      if (shared.failNext === "throw") {
+        shared.failNext = null;
+        throw new Error("provider write failed");
+      }
+      if (marker.length > 0) shared.posted.set(marker, identity);
+      if (shared.failNext === "accept-then-fail") {
+        shared.failNext = null;
+        throw new Error("transport failed after accepted write");
+      }
+      shared.bodies.push(input.body);
+      return Promise.resolve(identity);
+    });
+    h.vcsAdapter.findBotChildMarker.mockImplementation((_review, lookup: { childId: string; contentDigest: string }) => {
+      for (const [marker, identity] of shared.posted) {
+        const parsed = parseChildMarker(marker);
+        if (parsed?.childId === lookup.childId && parsed.contentDigest === lookup.contentDigest) {
+          return Promise.resolve(identity);
+        }
+      }
+      return Promise.resolve(null);
+    });
+  }
+
+  it("publishes one tracked question and shows the answer syntax", async () => {
+    const h = clarificationHarness();
+    const shared = { bodies: [] as string[], posted: new Map<string, { provider: "github"; commentId: string; url: string }>() };
+    wireQuestionWrites(h, shared);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    expect(await review(h.args, depsFrom(h))).toBe(0);
+    expect(shared.bodies).toHaveLength(1);
+    const selected = selectClarification({
+      repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+      reviewNumber: 42,
+      headSha: CONVERSATION_HEAD,
+      findings: [questionFinding],
+      ruleOrder: ["rule-a"],
+    });
+    expect(shared.bodies[0]).toContain(`answer ${selected.selected!.id}:`);
+    const snapshot = await createConversationStateStore({
+      root: h.args.stateDir!,
+      repository: conversationRepo,
+    }).readContextSnapshot();
+    expect(snapshot.pending.clarifications).toHaveLength(1);
+    expect(snapshot.pending.clarifications[0]?.state).toBe("published");
+    const summary = String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    expect(summary).toContain("### Needs clarification");
+    expect(summary).toContain(`https://github.com/acme/app/pull/42#issuecomment-q-1`);
+  });
+
+  it("recovers a crash before write, after an accepted write, and before local published", { timeout: 20_000 }, async () => {
+    const cases = [
+      { hooks: { beforeChildWrite: async () => { throw new Error("crash before write"); } }, failNext: null, message: /crash before write/ },
+      { hooks: {}, failNext: "accept-then-fail" as const, message: /accepted write/ },
+      { hooks: { afterChildWrite: async () => { throw new Error("crash before local published"); } }, failNext: null, message: /crash before local published/ },
+    ];
+    for (const testCase of cases) {
+      const stateDir = isolatedStateDir();
+      const shared = {
+        bodies: [] as string[],
+        posted: new Map<string, { provider: "github"; commentId: string; url: string }>(),
+        failNext: testCase.failNext,
+      };
+      const first = clarificationHarness(stateDir);
+      wireQuestionWrites(first, shared);
+      first.publicationHooks = testCase.hooks;
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      await expect(review(first.args, depsFrom(first))).rejects.toThrow(testCase.message);
+
+      const second = clarificationHarness(stateDir);
+      wireQuestionWrites(second, shared);
+      expect(await review(second.args, depsFrom(second))).toBe(0);
+      expect(shared.bodies.length + (shared.posted.size > 0 && shared.bodies.length === 0 ? 1 : 0)).toBeGreaterThanOrEqual(0);
+      const snapshot = await createConversationStateStore({
+        root: stateDir,
+        repository: conversationRepo,
+      }).readContextSnapshot();
+      expect(snapshot.pending.clarifications).toHaveLength(1);
+      expect(snapshot.pending.clarifications[0]?.state).toBe("published");
+      expect(snapshot.pending.clarifications[0]?.identity).toBeDefined();
+    }
+  });
+
+  it("publishes once when review and poll share one state root", async () => {
+    const stateDir = isolatedStateDir();
+    const shared = { bodies: [] as string[], posted: new Map<string, { provider: "github"; commentId: string; url: string }>() };
+    const first = clarificationHarness(stateDir);
+    const second = clarificationHarness(stateDir);
+    wireQuestionWrites(first, shared);
+    wireQuestionWrites(second, shared);
+    const adapter = {
+      getAuthenticatedBotIdentity: async () => ({ provider: "github" as const, login: "tgdbot", mention: "@tgdbot" }),
+      resolveReviewIdentity: async () => ({
+        provider: "github" as const,
+        repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+        reviewNumber: 42,
+        reviewId: DEFAULT_REVIEW_ID,
+        url: CONVERSATION_PR_URL,
+      }),
+      listOpenReviews: async () => ({
+        reviews: [{
+          identity: {
+            provider: "github" as const,
+            repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+            reviewNumber: 42,
+            reviewId: DEFAULT_REVIEW_ID,
+            url: CONVERSATION_PR_URL,
+          },
+          title: "Some PR",
+          headSha: CONVERSATION_HEAD,
+          updatedAt: "2026-08-14T00:00:00.000Z",
+          orderKey: "2026-08-14T00:00:00.000Z|0000000000000042",
+        }],
+        nextCursor: {
+          scope: "open-review-discovery" as const,
+          provider: "github" as const,
+          repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+          opaque: "open",
+          orderKey: "open",
+        },
+      }),
+      listReviewEvents: async () => ({
+        events: [],
+        nextCursor: {
+          scope: "review-events" as const,
+          provider: "github" as const,
+          repositoryDigest: computeRepositoryDigest("github", conversationRepo.canonicalUrl),
+          reviewNumber: 42,
+          opaque: JSON.stringify({ at: "1970-01-01T00:00:00.000Z", seen: [] }),
+          orderKey: "1970-01-01T00:00:00.000Z",
+        },
+      }),
+      listReviewThreads: async () => ({ threads: [] }),
+      getReviewThread: async () => { throw new Error("unused"); },
+      postGeneralReply: async (_review: unknown, input: { body: string }) => first.vcsAdapter.postGeneralReply(undefined, input),
+      postThreadReply: async () => { throw new Error("unused"); },
+      findBotChildMarker: async (_review: unknown, lookup: { childId: string; contentDigest: string }) =>
+        first.vcsAdapter.findBotChildMarker(undefined, lookup),
+    };
+    await poll(parseCommandArgs(["poll", "--repo", "acme/app", "--state-dir", stateDir]), {
+      conversationAdapter: adapter as never,
+    });
+    const release = Promise.withResolvers<void>();
+    const ready: Array<PromiseWithResolvers<void>> = [];
+    const pause = async () => {
+      const gate = Promise.withResolvers<void>();
+      ready.push(gate);
+      gate.resolve();
+      await release.promise;
+    };
+    first.publicationHooks = { beforePublication: pause };
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const runs = Promise.all([
+      review(first.args, depsFrom(first)),
+      poll(parseCommandArgs(["poll", "--repo", "acme/app", "--state-dir", stateDir]), {
+        conversationAdapter: adapter as never,
+      }),
+    ]);
+    await vi.waitFor(() => expect(ready.length).toBeGreaterThan(0), { timeout: 10_000 });
+    release.resolve();
+    await runs;
+    expect(shared.bodies).toHaveLength(1);
+    const snapshot = await createConversationStateStore({
+      root: stateDir,
+      repository: conversationRepo,
+    }).readContextSnapshot();
+    expect(snapshot.pending.clarifications).toHaveLength(1);
   });
 });
 

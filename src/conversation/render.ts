@@ -184,9 +184,19 @@ export function renderReconsiderReply(
   ], marker);
 }
 
+export function renderClarificationQuestion(
+  input: { readonly question: string; readonly pendingId: string },
+  marker: string,
+): RenderedConversationBody {
+  return renderSections("## Needs clarification", [
+    sanitizeMultiline(input.question),
+    `Reply in this thread, or post: \`answer ${input.pendingId.replace(/`/gu, "")}: <your answer>\``,
+  ], marker);
+}
+
 export function renderClarificationReply(
   input: {
-    readonly outcome: "confirmed" | "revised" | "withdrawn";
+    readonly outcome: "confirmed" | "revised" | "withdrawn" | "stale";
     readonly rationale: string;
     readonly question?: string;
     readonly answer?: string;
@@ -200,12 +210,14 @@ export function renderClarificationReply(
     ? "Confirmed."
     : input.outcome === "revised"
       ? "Revised."
-      : "Withdrawn.";
+      : input.outcome === "stale"
+        ? "This question applied to an earlier review head and will not be turned into a current finding."
+        : "Withdrawn.";
   return renderSections("## Clarification", [
     input.question ? `Question: ${sanitizeMultiline(input.question)}` : undefined,
     input.answer ? `Answer: ${sanitizeMultiline(input.answer)}` : undefined,
     outcome,
-    sanitizeMultiline(input.rationale),
+    input.outcome === "stale" ? undefined : sanitizeMultiline(input.rationale),
   ], marker);
 }
 

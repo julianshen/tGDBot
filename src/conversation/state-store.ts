@@ -195,6 +195,14 @@ export function createEmptyPendingSnapshot(repository: RepositoryBinding): Conve
   return { version: 1, repository: clone(repository), clarifications: [], directions: [] };
 }
 
+export function replacePendingClarification(
+  snapshot: ConversationPendingSnapshot,
+  entry: import("./state-schema.js").PendingClarification,
+): ConversationPendingSnapshot {
+  const remaining = snapshot.clarifications.filter((item) => item.id !== entry.id);
+  return { ...snapshot, clarifications: [...remaining, entry] };
+}
+
 interface LoadedState {
   readonly cursor: ConversationCursorSnapshot;
   readonly pending: ConversationPendingSnapshot;

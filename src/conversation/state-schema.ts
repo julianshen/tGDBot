@@ -4,6 +4,7 @@ import { computeContentDigest, parseChildMarker } from "./markers.js";
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{7,64}$/iu;
 const ID_RE = /^(?:action|output|finding|clarification|memory)_[0-9a-f]{32}$/u;
+const CLAR_PUBLIC_ID_RE = /^clar_[abcdefghijklmnopqrstuvwxyz234567]{12,32}$/u;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u;
 const MAX_COLLECTION = 10_000;
 const MAX_TEXT = 20_000;
@@ -27,12 +28,26 @@ export interface ConversationCursorSnapshot {
   readonly reviews: readonly ReviewCursorRecord[];
 }
 
+export type ClarificationLifecycleState = "prepared" | "published" | "answer-observed" | "terminal";
+export type ClarificationTerminalOutcome = "confirmed" | "revised" | "withdrawn" | "stale";
+
 export interface PendingClarification {
   readonly id: string;
   readonly reviewNumber: number;
   readonly headSha: string;
   readonly question: string;
   readonly createdAt: string;
+  readonly state?: ClarificationLifecycleState;
+  readonly ruleName?: string;
+  readonly ruleSnapshot?: string;
+  readonly finding?: FindingSnapshot;
+  readonly identity?: ConversationItemIdentity;
+  readonly answerIdentity?: ConversationItemIdentity;
+  readonly answerText?: string;
+  readonly answerEventId?: string;
+  readonly terminalOutcome?: ClarificationTerminalOutcome;
+  readonly actionId?: string;
+  readonly identityDigest?: string;
 }
 
 export interface PendingDirection {
@@ -524,20 +539,79 @@ export function validateCursorSnapshot(value: unknown, expected: RepositoryBindi
     nextRoundRobinKey: nullableText(object.nextRoundRobinKey, "nextRoundRobinKey"), reviews };
 }
 
+function clarificationPublicId(value: unknown, name: string): string {
+  const result = text(value, name, 64);
+  if (!CLAR_PUBLIC_ID_RE.test(result)) throw new Error(`${name} is not a stable ID`);
+  return result;
+}
+
+function clarificationState(value: unknown, name: string): ClarificationLifecycleState {
+  if (value !== "prepared" && value !== "published" && value !== "answer-observed" && value !== "terminal") {
+    throw new Error(`${name} is invalid`);
+  }
+  return value;
+}
+
+function clarificationOutcome(value: unknown, name: string): ClarificationTerminalOutcome {
+  if (value !== "confirmed" && value !== "revised" && value !== "withdrawn" && value !== "stale") {
+    throw new Error(`${name} is invalid`);
+  }
+  return value;
+}
+
 export function validatePendingSnapshot(value: unknown, expected: RepositoryBinding): ConversationPendingSnapshot {
   const object = exact(value, "pending", ["version", "repository", "clarifications", "directions"]);
   const repository = validateVersionAndBinding(object, expected, "pending");
-  const parse = (entry: unknown, index: number, kind: "clarifications" | "directions") => {
-    const contentKey = kind === "clarifications" ? "question" : "text";
-    const item = exact(entry, `pending.${kind}[${index}]`, ["id", "reviewNumber", "headSha", contentKey, "createdAt"]);
-    if (typeof item.headSha !== "string" || !SHA_RE.test(item.headSha)) throw new Error("pending headSha is invalid");
-    return { id: id(item.id, "pending id", "clarification"), reviewNumber: positiveInteger(item.reviewNumber, "reviewNumber"),
-      headSha: item.headSha.toLowerCase(), [contentKey]: text(item[contentKey], contentKey), createdAt: date(item.createdAt, "createdAt") };
-  };
   const clarifications = array(object.clarifications, "pending.clarifications", 1_000)
-    .map((entry, index) => parse(entry, index, "clarifications") as unknown as PendingClarification);
+    .map((entry, index) => {
+      const item = exact(entry, `pending.clarifications[${index}]`,
+        ["id", "reviewNumber", "headSha", "question", "createdAt"],
+        ["state", "ruleName", "ruleSnapshot", "finding", "identity", "answerIdentity", "answerText",
+          "answerEventId", "terminalOutcome", "actionId", "identityDigest"]);
+      if (typeof item.headSha !== "string" || !SHA_RE.test(item.headSha)) throw new Error("pending headSha is invalid");
+      const validatedIdentity = item.identity === undefined ? undefined :
+        conversationItemIdentity(item.identity, "pending clarification identity");
+      const answerIdentity = item.answerIdentity === undefined ? undefined :
+        conversationItemIdentity(item.answerIdentity, "pending clarification answer identity");
+      if (validatedIdentity !== undefined && validatedIdentity.provider !== expected.provider) {
+        throw new Error("publication identity provider does not match repository");
+      }
+      if (answerIdentity !== undefined && answerIdentity.provider !== expected.provider) {
+        throw new Error("publication identity provider does not match repository");
+      }
+      return {
+        id: clarificationPublicId(item.id, "pending clarification id"),
+        reviewNumber: positiveInteger(item.reviewNumber, "reviewNumber"),
+        headSha: item.headSha.toLowerCase(),
+        question: text(item.question, "question"),
+        createdAt: date(item.createdAt, "createdAt"),
+        ...(item.state === undefined ? {} : { state: clarificationState(item.state, "pending clarification state") }),
+        ...(item.ruleName === undefined ? {} : { ruleName: text(item.ruleName, "ruleName", 1_000) }),
+        ...(item.ruleSnapshot === undefined ? {} : { ruleSnapshot: text(item.ruleSnapshot, "ruleSnapshot", 100_000) }),
+        ...(item.finding === undefined ? {} : { finding: findingSnapshot(item.finding, "pending clarification finding") }),
+        ...(validatedIdentity === undefined ? {} : { identity: validatedIdentity }),
+        ...(answerIdentity === undefined ? {} : { answerIdentity }),
+        ...(item.answerText === undefined ? {} : { answerText: text(item.answerText, "answerText") }),
+        ...(item.answerEventId === undefined ? {} : { answerEventId: text(item.answerEventId, "answerEventId", 256) }),
+        ...(item.terminalOutcome === undefined ? {} : {
+          terminalOutcome: clarificationOutcome(item.terminalOutcome, "terminalOutcome"),
+        }),
+        ...(item.actionId === undefined ? {} : { actionId: id(item.actionId, "actionId", "action") }),
+        ...(item.identityDigest === undefined ? {} : { identityDigest: digest(item.identityDigest, "identityDigest") }),
+      } satisfies PendingClarification;
+    });
   const directions = array(object.directions, "pending.directions", 1_000)
-    .map((entry, index) => parse(entry, index, "directions") as unknown as PendingDirection);
+    .map((entry, index) => {
+      const item = exact(entry, `pending.directions[${index}]`, ["id", "reviewNumber", "headSha", "text", "createdAt"]);
+      if (typeof item.headSha !== "string" || !SHA_RE.test(item.headSha)) throw new Error("pending headSha is invalid");
+      return {
+        id: id(item.id, "pending id", "clarification"),
+        reviewNumber: positiveInteger(item.reviewNumber, "reviewNumber"),
+        headSha: item.headSha.toLowerCase(),
+        text: text(item.text, "text"),
+        createdAt: date(item.createdAt, "createdAt"),
+      } satisfies PendingDirection;
+    });
   const ids = [...clarifications, ...directions].map((entry) => entry.id);
   if (new Set(ids).size !== ids.length) throw new Error("pending contains duplicate IDs");
   return { version: 1, repository, clarifications, directions };

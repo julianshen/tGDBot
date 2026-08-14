@@ -37,6 +37,10 @@ import {
 } from "../../../src/conversation/state-schema.js";
 import type { ConversationStateStore } from "../../../src/conversation/state-store.js";
 import { decodeReviewProgress } from "../../../src/poll/discovery.js";
+import {
+  createPreparedClarification,
+  transitionClarification,
+} from "../../../src/conversation/clarification.js";
 import { poll } from "../../../src/poll/poll.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
@@ -1055,6 +1059,215 @@ describe("default trusted poll rule loading", () => {
     expect(createSession).toHaveBeenCalled();
     expect(adapter.postedBodies).toHaveLength(1);
     expect(adapter.postedBodies[0]).toMatch(/## Explanation/);
+  });
+});
+
+describe("clarification answer lifecycle", () => {
+  const CLAR_ID = `clar_${"b".repeat(26)}`;
+  const questionIdentity = {
+    provider: "github" as const,
+    commentId: "question-1",
+    threadId: "Q1",
+    url: "https://github.com/owner/repo/pull/1#discussion_rquestion-1",
+  };
+
+  async function seedPublishedQuestion(stateDir: string, extras: { readonly headSha?: string } = {}) {
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const prepared = createPreparedClarification({
+      id: CLAR_ID,
+      reviewNumber: 1,
+      headSha: extras.headSha ?? "c".repeat(40),
+      question: "Is token logging required by audit?",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      finding: {
+        file: "src/auth.ts",
+        line: 14,
+        severity: "blocking",
+        category: "security",
+        message: "Tokens must not be logged.",
+        ruleName: "no-token-logs",
+        decision: "needs-clarification",
+        question: "Is token logging required by audit?",
+        title: "Do not log tokens",
+      },
+      ruleSnapshot: currentRule.body,
+    });
+    const published = transitionClarification(prepared, "published", { identity: questionIdentity });
+    await store.transact((tx) => {
+      tx.initializeIfAbsent();
+      tx.replacePending({
+        ...tx.snapshot.pending,
+        clarifications: [published],
+      });
+    });
+    return store;
+  }
+
+  function installQuestionThread(
+    adapter: ExecutionAdapter,
+    reply: ReviewActivityEvent,
+  ): ReviewActivityEvent {
+    const root = threadComment("question-1", "Is token logging required by audit?", {
+      authorLogin: "tgdbot",
+      authorIsBot: true,
+      updatedAt: "2026-08-13T23:00:00.000Z",
+      threadId: "Q1",
+    });
+    const event = { ...reply, threadId: "Q1", parentCommentId: "question-1" };
+    adapter.threads.set("Q1", {
+      provider: "github",
+      repositoryDigest,
+      reviewNumber: 1,
+      threadId: "Q1",
+      rootCommentId: "question-1",
+      url: questionIdentity.url,
+      resolved: false,
+      outdated: false,
+      updatedAt: event.updatedAt,
+      orderKey: "Q1",
+      events: [root, event],
+    });
+    return event;
+  }
+
+  it("reassesses the first human reply on the question thread without a mention", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: sessionFor(JSON.stringify({
+          outcome: "withdrawn",
+          rationale: "The answer says audit does not require raw tokens.",
+        })),
+      }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/## Clarification/);
+    expect(adapter.postedBodies[0]).toMatch(/Withdrawn/);
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(snapshot.pending.clarifications[0]?.state).toBe("terminal");
+    expect(snapshot.pending.clarifications[0]?.answerIdentity?.commentId).toBe("human-1");
+  });
+
+  it("accepts an unthreaded answer clar_id: without a mention", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("ans", `answer ${CLAR_ID}: keep the current logger`)]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The logger still prints the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            decision: "still-valid",
+          },
+        })),
+      }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/## Clarification/);
+    expect(adapter.postedBodies[0]).toMatch(/Confirmed/);
+  });
+
+  it("ignores a mentionless general comment that is not answer clar_id:", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([commentEvent("noise", "looks good")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toEqual([]);
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
+  it("does not disclose a question for the wrong repository or review", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([
+      commentEvent("other-repo", `answer ${CLAR_ID}: yes`, "2026-08-14T00:00:00.000Z", {
+        repositoryDigest: "f".repeat(64),
+      }),
+      commentEvent("other-review", `answer ${CLAR_ID}: yes`, "2026-08-14T00:00:01.000Z", {
+        reviewNumber: 99,
+      }),
+    ]);
+    const createSession = vi.fn(sessionFor("{}"));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toEqual([]);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies.join("\n")).not.toMatch(/clar_|question|pending/i);
+  });
+
+  it("acknowledges a stale-head answer without promoting a current finding", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir, { headSha: "a".repeat(40) });
+    adapter.headSha = "c".repeat(40);
+    adapter.replaceEvents([commentEvent("stale", `answer ${CLAR_ID}: still needed`)]);
+    const createSession = vi.fn(sessionFor(JSON.stringify({
+      outcome: "confirmed",
+      rationale: "should not run",
+      finding: {
+        file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+        message: "Tokens must not be logged.", ruleName: "no-token-logs",
+      },
+    })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession, heads: ["c".repeat(40)] }),
+    })).resolves.toBe(0);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/earlier review head|stale/i);
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(snapshot.pending.clarifications[0]?.terminalOutcome).toBe("stale");
+    expect(snapshot.findings.some((entry) => entry.finding.message === "Tokens must not be logged.")).toBe(false);
+  });
+
+  it("stays silent after a terminal result until a new mention", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const first = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([first]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: sessionFor(JSON.stringify({
+          outcome: "withdrawn",
+          rationale: "The answer withdraws the concern.",
+        })),
+      }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toHaveLength(1);
+
+    const later = installQuestionThread(
+      adapter,
+      threadComment("human-2", "one more thought", { updatedAt: "2026-08-14T00:00:02.000Z" }),
+    );
+    const unthreaded = commentEvent("again", `answer ${CLAR_ID}: wait no`, "2026-08-14T00:00:03.000Z");
+    adapter.replaceEvents([later, unthreaded]);
+    const createSession = vi.fn(sessionFor("{}"));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(1);
   });
 });
 

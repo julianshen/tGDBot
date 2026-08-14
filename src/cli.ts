@@ -8,10 +8,17 @@ import type { PollArgs, ReviewArgs } from "./cli-args.js";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
 import {
+  clarificationLifecycleState,
+  createPreparedClarification,
+  selectClarification,
+} from "./conversation/clarification.js";
+import {
   buildReviewPublicationGraph,
   childIsTerminal,
+  clarificationQuestionWriter,
   executePublication,
   loadPublicationAction,
+  publishClarificationQuestion,
   reviewPublicationIdentity,
   type PublicationAction,
   type PublicationChild,
@@ -19,6 +26,8 @@ import {
   type PublicationWriteResult,
   type PublicationWriter,
 } from "./conversation/publication-manifest.js";
+import type { ClarificationPresentation } from "./review/comment-format.js";
+import type { PendingClarification } from "./conversation/state-schema.js";
 import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "./conversation/markers.js";
 import {
   bindFindingLedgerIdentity,
@@ -46,7 +55,7 @@ import {
   formatMarker,
   stateRootDomainIdentifier,
 } from "./review/dedup.js";
-import { changedFiles } from "./review/diff-anchors.js";
+import { changedFiles, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
 import {
   deriveInlineChildId,
   formatInlineRecoveryMarker,
@@ -141,6 +150,10 @@ export interface ReviewDependencies {
       suggestions?: boolean;
       relatedWork?: readonly RelatedWorkItem[];
       contextUnavailable?: readonly string[];
+      reviewBinding?: { repositoryDigest: string; reviewNumber: number; headSha: string };
+      clarification?: ClarificationPresentation;
+      deferredClarificationCount?: number;
+      excludeClarificationIds?: readonly string[];
     },
   ) => OrchestrationResult;
   createStateStore?: typeof createConversationStateStore;
@@ -368,6 +381,127 @@ async function loadOptionalReviewContext(options: {
       ? { fingerprint: conversationDedupFingerprint(fingerprintItems) }
       : {}),
     unavailable,
+  };
+}
+
+async function persistAndPublishReviewClarification(options: {
+  readonly store: ConversationStateStore;
+  readonly dispatchResult: DispatchResult;
+  readonly reviewBinding: { readonly repositoryDigest: string; readonly reviewNumber: number; readonly headSha: string };
+  readonly publicDigest: string;
+  readonly reviewIdentity: ReviewIdentity;
+  readonly adapter: Partial<ConversationAdapter>;
+  readonly locator: import("./vcs/adapter.js").ReviewLocator;
+  readonly diff: string;
+  readonly now: () => string;
+  readonly hooks?: PublicationExecutorHooks;
+}): Promise<ClarificationPresentation | undefined> {
+  if (!options.dispatchResult.findings.some((finding) => finding.decision === "needs-clarification")) {
+    return undefined;
+  }
+  const snapshot = await options.store.readContextSnapshot();
+  const existing = snapshot.pending.clarifications.filter((item) =>
+    item.reviewNumber === options.reviewBinding.reviewNumber);
+  const active = existing.find((item) =>
+    item.headSha.toLowerCase() === options.reviewBinding.headSha.toLowerCase() &&
+    clarificationLifecycleState(item) !== "terminal");
+  const selected = active === undefined
+    ? selectClarification({
+        repositoryDigest: options.reviewBinding.repositoryDigest,
+        reviewNumber: options.reviewBinding.reviewNumber,
+        headSha: options.reviewBinding.headSha,
+        findings: options.dispatchResult.findings,
+        ruleOrder: options.dispatchResult.rulesRun,
+        excludeIds: existing.filter((item) => clarificationLifecycleState(item) === "terminal").map((item) => item.id),
+      })
+    : {
+        selected: {
+          id: active.id,
+          question: active.question,
+          finding: active.finding ?? {
+            file: "unknown",
+            severity: "warning" as const,
+            category: "correctness",
+            message: active.question,
+            ruleName: active.ruleName ?? "clarification",
+            decision: "needs-clarification" as const,
+            question: active.question,
+          },
+        },
+        deferredCount: 0,
+      };
+  if (selected.selected === undefined) return undefined;
+
+  const prepared: PendingClarification = active ?? createPreparedClarification({
+    id: selected.selected.id,
+    reviewNumber: options.reviewBinding.reviewNumber,
+    headSha: options.reviewBinding.headSha,
+    question: selected.selected.question,
+    createdAt: options.now(),
+    finding: selected.selected.finding,
+    ruleName: selected.selected.finding.ruleName,
+  });
+  const conversation = options.adapter;
+  if (typeof conversation.postGeneralReply !== "function" || typeof conversation.findBotChildMarker !== "function") {
+    return {
+      id: prepared.id,
+      question: prepared.question,
+      finding: selected.selected.finding,
+      publicationPending: true,
+    };
+  }
+  const finding = selected.selected.finding;
+  const anchors = options.diff === "" ? undefined : commentableLines(parseDiffPositions(options.diff));
+  const inline = finding.line !== undefined && anchors !== undefined &&
+    isCommentable(anchors, finding.file, finding.line);
+  const published = await publishClarificationQuestion({
+    store: options.store,
+    pending: prepared,
+    repository: options.store.repositoryBinding,
+    publicRepositoryDigest: options.publicDigest,
+    writer: clarificationQuestionWriter({
+      adapter: conversation as Pick<ConversationAdapter, "postGeneralReply" | "findBotChildMarker">,
+      reviewIdentity: options.reviewIdentity,
+      writeInline: async (child) => {
+        const adapter = options.adapter as Partial<import("./vcs/adapter.js").VcsAdapter>;
+        if (typeof adapter.createInlineReview !== "function" || child.placement.kind !== "general-question" ||
+          child.placement.file === undefined || child.placement.line === undefined) {
+          return null;
+        }
+        try {
+          const outcomes = await adapter.createInlineReview(
+            options.locator,
+            options.reviewBinding.headSha,
+            [{
+              clientId: child.id,
+              path: child.placement.file,
+              line: child.placement.line,
+              position: {
+                oldPath: child.placement.file,
+                newPath: child.placement.file,
+                start: { type: "new", newLine: child.placement.line },
+                end: { type: "new", newLine: child.placement.line },
+                sameHunk: true,
+              },
+              body: child.body,
+            }],
+          );
+          const posted = outcomes.find((outcome) => outcome.clientId === child.id && outcome.status === "posted");
+          return posted?.status === "posted" ? { status: "posted", identity: posted.identity } : null;
+        } catch {
+          return null;
+        }
+      },
+    }),
+    hooks: options.hooks,
+    now: options.now,
+    ...(inline ? { file: finding.file, line: finding.line } : {}),
+  });
+  return {
+    id: published.pending.id,
+    question: published.pending.question,
+    finding: selected.selected.finding,
+    ...(published.pending.identity?.url === undefined ? { publicationPending: true } : { publishedUrl: published.pending.identity.url }),
   };
 }
 
@@ -1345,10 +1479,32 @@ export async function review(
   // Only an explicit "off" disables them — an absent value means the documented
   // default (on), never a silent downgrade.
   const renderOpts = { suggestions: config.suggestions !== "off" };
+  const publicDigest = computeRepositoryDigest(repository.provider, repository.canonicalUrl);
+  const reviewBinding = {
+    repositoryDigest: publicDigest,
+    reviewNumber: Number(pr.id),
+    headSha: pr.headSha,
+  };
+  const clarificationPresentation = stateStore === undefined || config.dryRun
+    ? undefined
+    : await persistAndPublishReviewClarification({
+        store: stateStore,
+        dispatchResult,
+        reviewBinding,
+        publicDigest,
+        reviewIdentity,
+        adapter: config.vcsAdapter as Partial<ConversationAdapter>,
+        locator: config.locator,
+        diff,
+        now,
+        hooks: publicationHooks,
+      });
   const orchestration = orchestrateFn(dispatchResult, diff, {
     inline: true,
     ...renderOpts,
     relatedWork,
+    reviewBinding,
+    ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
     ...(loadedContext.unavailable.length === 0 ? {} : { contextUnavailable: loadedContext.unavailable }),
   });
   const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
@@ -1517,11 +1673,10 @@ export async function review(
       children: frozenChildren,
     };
     if (preparedFindings.length > 0) {
-      const existing = (await stateStore.readContextSnapshot()).findings;
       await stateStore.transact((tx) => {
         tx.initializeIfAbsent();
         for (const entry of preparedFindings) {
-          if (!existing.some((item) => item.id === entry.id)) tx.appendFinding(entry);
+          if (!tx.snapshot.findings.some((item) => item.id === entry.id)) tx.appendFinding(entry);
         }
       });
     }

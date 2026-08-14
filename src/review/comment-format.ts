@@ -320,6 +320,8 @@ export interface ClarificationPresentation {
   readonly id: string;
   readonly question: string;
   readonly finding: Finding;
+  readonly publishedUrl?: string;
+  readonly publicationPending?: boolean;
 }
 
 export interface SummaryInput {
@@ -477,6 +479,18 @@ function renderContextUnavailable(input: SummaryInput): string | undefined {
   return `> [!NOTE]\n${notes.join("\n")}`;
 }
 
+function safeClarificationUrl(url: string | undefined): string | undefined {
+  if (url === undefined) return undefined;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "") return undefined;
+    if (/[\s)]/u.test(url)) return undefined;
+    return url;
+  } catch {
+    return undefined;
+  }
+}
+
 function renderClarificationSection(input: SummaryInput): string | undefined {
   if (input.clarification === undefined) return undefined;
   const question = sanitizeText(input.clarification.question);
@@ -488,12 +502,19 @@ function renderClarificationSection(input: SummaryInput): string | undefined {
       : deferred > 1
         ? `_${deferred} additional clarifications deferred._`
         : undefined;
+  const publishedUrl = safeClarificationUrl(input.clarification.publishedUrl);
+  const publicationLine = publishedUrl !== undefined
+    ? `[Open the question](${publishedUrl})`
+    : input.clarification.publicationPending === true
+      ? "_Publication is pending._"
+      : undefined;
   return [
     "### Needs clarification",
     "",
     question,
     "",
-    `\`${id}\``,
+    `\`answer ${id}: <your answer>\``,
+    ...(publicationLine === undefined ? [] : ["", publicationLine]),
     ...(deferredLine === undefined ? [] : ["", deferredLine]),
   ].join("\n");
 }

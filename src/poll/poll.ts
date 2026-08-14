@@ -9,9 +9,16 @@ import {
   conversationSuccessorIdentity,
   explainFinding,
   isExecutableConversationCommand,
+  reassessClarification,
   reconsiderFinding,
   resolveMarkedFindingThread,
 } from "../conversation/actions.js";
+import {
+  associateClarificationEvent,
+  clarificationLifecycleState,
+  mayBeClarificationAnswer,
+  transitionClarification,
+} from "../conversation/clarification.js";
 import { parseConversationCommand } from "../conversation/command-parser.js";
 import {
   computeContentDigest,
@@ -21,10 +28,12 @@ import {
 } from "../conversation/markers.js";
 import {
   actionFromEvent,
+  clarificationQuestionWriter,
   eventFromAction,
   executePublication,
   latestPublication,
   observePublication,
+  publishClarificationQuestion,
   supersedeWithSuccessor,
   type PublicationAction,
   type PublicationWriter,
@@ -33,6 +42,7 @@ import {
   childMarkerSuffix,
   createConversationPublicationChild,
   publicationBody,
+  renderClarificationReply,
   renderExplainReply,
   renderInactiveRuleReply,
   renderReconsiderReply,
@@ -44,9 +54,10 @@ import {
 import type { ConversationSessionFactory } from "../conversation/session.js";
 import {
   createConversationStateStore,
+  replacePendingClarification,
   type ConversationStateStore,
 } from "../conversation/state-store.js";
-import type { ConversationEventEntry } from "../conversation/state-schema.js";
+import { prepareFindingLedgerEntry, type ConversationEventEntry } from "../conversation/state-schema.js";
 import type { BotIdentity, CommandParseResult, RepositoryBinding } from "../conversation/types.js";
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
@@ -121,6 +132,11 @@ export async function poll(args: PollArgs, deps: PollDependencies = {}): Promise
   await synchronizeOpenReviews({
     adapter, binding, store, now, dryRun: config.dryRun,
   });
+  if (!config.dryRun) {
+    await recoverPreparedClarificationQuestions({
+      adapter, binding, store, now, config,
+    });
+  }
   return classifyOpenReviewEvents({
     adapter, binding, store, dryRun: config.dryRun, now, config, deps,
   });
@@ -205,7 +221,7 @@ async function classifyOpenReviewEvents(options: {
         }
       }
     } else {
-      const pending = [];
+      const pending: typeof classified = [];
       for (const item of classified) {
         const live = latestPublication(snapshot.events, item.identity.actionId)
           ?? snapshot.events.findLast?.((entry) => entry.identityDigest === item.identity.identityDigest)
@@ -221,7 +237,11 @@ async function classifyOpenReviewEvents(options: {
         await options.store.transact((tx) => {
           for (const item of pending) {
             appendObservation(tx, item.identity, item.event.reviewNumber, options.now());
-            if (item.parsed.kind === "command" || item.parsed.kind === "invalid") {
+            const pendingForReview = tx.snapshot.pending.clarifications.filter((entry) =>
+              entry.reviewNumber === item.event.reviewNumber);
+            const answerCommand = item.parsed.kind === "command" && item.parsed.command.kind === "answer";
+            if (item.parsed.kind === "command" || item.parsed.kind === "invalid" || answerCommand ||
+              mayBeClarificationAnswer({ event: item.event, pending: pendingForReview })) {
               appendPrepared(tx, item.identity, item.event.reviewNumber, options.now());
             } else {
               appendClassifiedAndIgnored(tx, item.identity, item.event.reviewNumber, options.now());
@@ -234,11 +254,15 @@ async function classifyOpenReviewEvents(options: {
     for (const item of classified) {
       if (options.dryRun) continue;
 
-      if (knownActionIds.has(item.identity.actionId) || item.parsed.kind === "irrelevant") {
-        if (item.parsed.kind === "irrelevant") knownActionIds.add(item.identity.actionId);
+      const pendingForReview = (options.dryRun ? snapshot : await options.store.readContextSnapshot())
+        .pending.clarifications.filter((entry) => entry.reviewNumber === item.event.reviewNumber);
+      const maybeAnswer = mayBeClarificationAnswer({ event: item.event, pending: pendingForReview });
+      if (knownActionIds.has(item.identity.actionId) || (item.parsed.kind === "irrelevant" && !maybeAnswer)) {
+        if (item.parsed.kind === "irrelevant" && !maybeAnswer) knownActionIds.add(item.identity.actionId);
         continue;
       }
-      if (item.parsed.kind === "command" && !isExecutableConversationCommand(item.parsed.command)) {
+      if (item.parsed.kind === "command" && item.parsed.command.kind !== "answer" &&
+        !isExecutableConversationCommand(item.parsed.command)) {
         console.log(
           `tgd-review-agent: recognized ${item.parsed.normalized} on review #${item.event.reviewNumber} (executor unavailable)`,
         );
@@ -465,6 +489,14 @@ type ReplyPlan =
       readonly outcome: "confirmed" | "revised" | "withdrawn";
       readonly rationale: string;
       readonly headSha: string;
+    }
+  | {
+      readonly kind: "clarification";
+      readonly outcome: "confirmed" | "revised" | "withdrawn" | "stale";
+      readonly rationale: string;
+      readonly question?: string;
+      readonly answer?: string;
+      readonly headSha: string;
     };
 
 async function executeConversationEvent(input: {
@@ -484,14 +516,21 @@ async function executeConversationEvent(input: {
   if (latest?.state === "completed") return "completed";
 
   if (latest !== undefined && (latest.state === "manifest-ready" || latest.state === "published")) {
-    return publishPreparedReply({
+    const result = await publishPreparedReply({
       event: item.event,
       identity,
       latest,
       reviewIdentity,
       options,
     });
+    if (result === "completed") {
+      await finalizeClarificationIfAnswered(item.event, options.store);
+    }
+    return result;
   }
+
+  const clarificationOutcome = await maybeExecuteClarification({ item, reviewIdentity, options, latest });
+  if (clarificationOutcome !== undefined) return clarificationOutcome;
 
   const planned = await planConversationReply({ item, reviewIdentity, options });
   if (planned.status === "transient") return "transient";
@@ -618,7 +657,10 @@ async function publishReplyPlan(input: {
     const latest = await resolveLatestAction(input.options.store, identity);
     if (latest?.state === "completed") return "completed";
     const actionIdentity = latest === undefined ? identity : { actionId: latest.actionId, identityDigest: latest.identityDigest };
-    const capturedHead = plan.kind === "explain" || plan.kind === "reconsider" ? plan.headSha : undefined;
+    const capturedHead = plan.kind === "explain" || plan.kind === "reconsider" ||
+      (plan.kind === "clarification" && plan.outcome !== "stale")
+      ? plan.headSha
+      : undefined;
     if (capturedHead !== undefined) {
       const metadata = await loadReviewMetadata(input.event.reviewNumber, input.options);
       if (metadata !== undefined && metadata.headSha.toLowerCase() !== capturedHead.toLowerCase()) {
@@ -797,6 +839,14 @@ function buildReplyChild(input: {
     if (input.plan.kind === "explain") {
       return renderExplainReply({ explanation: input.plan.explanation }, marker, input.renderBinding);
     }
+    if (input.plan.kind === "clarification") {
+      return renderClarificationReply({
+        outcome: input.plan.outcome,
+        rationale: input.plan.rationale,
+        question: input.plan.question,
+        answer: input.plan.answer,
+      }, marker, input.renderBinding);
+    }
     return renderReconsiderReply({
       outcome: input.plan.outcome,
       rationale: input.plan.rationale,
@@ -922,6 +972,283 @@ async function loadActiveRules(
 function extractFileHunk(diff: string, file: string): string {
   if (diff.includes(file)) return diff;
   return diff;
+}
+
+async function finalizeClarificationIfAnswered(
+  event: ReviewActivityEvent,
+  store: ConversationStateStore,
+): Promise<void> {
+  const snapshot = await store.readContextSnapshot();
+  const current = snapshot.pending.clarifications.find((entry) =>
+    entry.reviewNumber === event.reviewNumber &&
+    clarificationLifecycleState(entry) === "answer-observed" &&
+    entry.answerEventId === event.eventId);
+  if (current === undefined) return;
+  await store.transact((tx) => {
+    tx.replacePending(replacePendingClarification(tx.snapshot.pending, transitionClarification(current, "terminal", {
+      terminalOutcome: current.terminalOutcome ?? "confirmed",
+    })));
+  });
+}
+
+async function recoverPreparedClarificationQuestions(options: {
+  readonly adapter: ConversationAdapter;
+  readonly binding: RepositoryBinding;
+  readonly store: ConversationStateStore;
+  readonly now: () => string;
+  readonly config: ResolvedPollConfig;
+}): Promise<void> {
+  const snapshot = await options.store.readContextSnapshot();
+  const publicDigest = computeRepositoryDigest(options.config.repository.provider, options.config.repository.canonicalUrl);
+  for (const pending of snapshot.pending.clarifications) {
+    const state = clarificationLifecycleState(pending);
+    if (state === "terminal" || state === "answer-observed") continue;
+    if (state === "published" && pending.identity !== undefined) continue;
+    const review = snapshot.cursor.reviews.find((entry) => entry.reviewNumber === pending.reviewNumber && !entry.retired);
+    if (review === undefined) continue;
+    const progress = decodeReviewProgress(review.cursor);
+    if (progress === null) continue;
+    const identity = reviewIdentityFrom(options.binding, pending.reviewNumber, progress);
+    await publishClarificationQuestion({
+      store: options.store,
+      pending,
+      repository: options.store.repositoryBinding,
+      publicRepositoryDigest: publicDigest,
+      writer: clarificationQuestionWriter({ adapter: options.adapter, reviewIdentity: identity }),
+      now: options.now,
+    });
+  }
+}
+
+async function maybeExecuteClarification(input: {
+  readonly item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult; readonly identity: { actionId: string; identityDigest: string } };
+  readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  readonly options: {
+    readonly adapter: ConversationAdapter;
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  };
+  readonly latest: ConversationEventEntry | undefined;
+}): Promise<"completed" | "transient" | "stale" | undefined> {
+  const snapshot = await input.options.store.readContextSnapshot();
+  const pending = snapshot.pending.clarifications.filter((entry) => entry.reviewNumber === input.item.event.reviewNumber);
+  const answerCommand = input.item.parsed.kind === "command" && input.item.parsed.command.kind === "answer";
+  if (pending.length === 0 && !answerCommand) return undefined;
+
+  let thread: ReviewThreadSnapshot | undefined;
+  if (input.item.event.threadId !== undefined) {
+    try {
+      thread = await input.options.adapter.getReviewThread(input.reviewIdentity, input.item.event.threadId);
+    } catch (error) {
+      if (answerCommand || mayBeClarificationAnswer({ event: input.item.event, pending })) {
+        console.warn(`tgd-review-agent: could not load clarification thread (${(error as Error).message})`);
+        return "transient";
+      }
+    }
+  }
+  const metadata = await loadReviewMetadata(input.item.event.reviewNumber, input.options);
+  const publicDigest = computeRepositoryDigest(
+    input.options.config.repository.provider,
+    input.options.config.repository.canonicalUrl,
+  );
+  const association = associateClarificationEvent({
+    event: input.item.event,
+    pending,
+    thread,
+    repositoryDigest: publicDigest,
+    reviewNumber: input.item.event.reviewNumber,
+    headSha: metadata?.headSha ?? input.item.event.repositoryDigest.slice(0, 40),
+    mentioned: input.item.parsed.kind === "command",
+  });
+  if (association.kind === "ignore") {
+    const preparedAsAnswer = input.latest?.state === "prepared" && (
+      answerCommand || mayBeClarificationAnswer({ event: input.item.event, pending })
+    );
+    if (preparedAsAnswer) return completeEmptyPrepared(input);
+    return undefined;
+  }
+  return executeClarificationAnswer({
+    item: input.item,
+    reviewIdentity: input.reviewIdentity,
+    options: input.options,
+    association,
+    metadata,
+  });
+}
+
+async function completeEmptyPrepared(input: {
+  readonly item: { readonly event: ReviewActivityEvent; readonly identity: { actionId: string; identityDigest: string } };
+  readonly options: { readonly store: ConversationStateStore; readonly now: () => string };
+  readonly latest: ConversationEventEntry | undefined;
+}): Promise<"completed" | "transient"> {
+  const identity = input.latest === undefined
+    ? input.item.identity
+    : { actionId: input.latest.actionId, identityDigest: input.latest.identityDigest };
+  try {
+    const published = await executePublication({
+      store: input.options.store,
+      action: {
+        actionId: identity.actionId,
+        identityDigest: identity.identityDigest,
+        reviewNumber: input.item.event.reviewNumber,
+        repository: input.options.store.repositoryBinding,
+        state: "prepared",
+        successorActionId: null,
+        children: [],
+      },
+      writer: {
+        lookupChild: async () => null,
+        writeChild: async () => ({ status: "posted" }),
+      },
+      now: input.options.now,
+    });
+    return published.state === "completed" ? "completed" : "transient";
+  } catch (error) {
+    console.warn(`tgd-review-agent: could not close ignored clarification event (${(error as Error).message})`);
+    return "transient";
+  }
+}
+
+async function executeClarificationAnswer(input: {
+  readonly item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult; readonly identity: { actionId: string; identityDigest: string } };
+  readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  readonly options: {
+    readonly adapter: ConversationAdapter;
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  };
+  readonly association: Exclude<ReturnType<typeof associateClarificationEvent>, { kind: "ignore" }>;
+  readonly metadata: PollReviewMetadata | undefined;
+}): Promise<"completed" | "transient" | "stale"> {
+  const pending = input.association.pending;
+  const observed = clarificationLifecycleState(pending) === "published"
+    ? transitionClarification(pending, "answer-observed", {
+        answerIdentity: input.association.answerIdentity,
+        answerText: input.association.answerText,
+        answerEventId: input.item.event.eventId,
+      })
+    : pending;
+  if (clarificationLifecycleState(pending) === "published") {
+    await input.options.store.transact((tx) => {
+      tx.replacePending(replacePendingClarification(tx.snapshot.pending, observed));
+    });
+  }
+
+  let plan: Extract<ReplyPlan, { kind: "clarification" }>;
+  if (input.association.kind === "stale") {
+    plan = {
+      kind: "clarification",
+      outcome: "stale",
+      rationale: "This question applied to an earlier review head and will not be turned into a current finding.",
+      question: pending.question,
+      answer: input.association.answerText,
+      headSha: input.metadata?.headSha ?? pending.headSha,
+    };
+  } else {
+    if (input.metadata === undefined) return "transient";
+    const rules = await loadActiveRules(input.item.event.reviewNumber, input.metadata, input.options);
+    if (rules.error !== undefined) {
+      console.warn(`tgd-review-agent: conversation rule loading failed (${rules.error.message})`);
+      return "transient";
+    }
+    const ruleName = observed.finding?.ruleName ?? observed.ruleName;
+    const currentRule = rules.rules.find((rule) => rule.name === ruleName);
+    const ledger = observed.finding === undefined ? undefined : prepareFindingLedgerEntry({
+      repository: input.options.store.repositoryBinding,
+      id: `finding_${createHash("sha256").update(`tgd:clarification-finding:v1\0${observed.id}`, "utf8").digest("hex").slice(0, 32)}`,
+      reviewNumber: observed.reviewNumber,
+      reviewId: input.reviewIdentity.reviewId,
+      baseSha: input.metadata.baseSha ?? "0".repeat(40),
+      headSha: observed.headSha,
+      finding: observed.finding,
+      ruleSnapshot: observed.ruleSnapshot ?? currentRule?.body ?? ruleName ?? observed.question,
+      reviewOptions: {
+        advisor: "on",
+        suggestions: "off",
+        disableBuiltinRule: input.options.config.disableBuiltinRule,
+        trustLocalRules: input.options.config.trustLocalRules,
+        rulesDir: input.options.config.rulesDir,
+        dispatch: "direct",
+        ...(input.options.config.model === undefined ? {} : { model: input.options.config.model }),
+      },
+      placement: {
+        file: observed.finding.file,
+        outdated: false,
+        ...(observed.finding.line === undefined ? {} : { line: observed.finding.line, side: "new" }),
+        originalHeadSha: observed.headSha,
+        currentHeadSha: observed.headSha,
+      },
+      body: observed.question,
+      at: observed.createdAt,
+    });
+    const model = input.options.config.model ?? currentRule?.model;
+    if (model === undefined) {
+      console.warn("tgd-review-agent: conversation model is not configured");
+      return "transient";
+    }
+    const result = await reassessClarification({
+      ledger,
+      currentRule,
+      currentCodeHunk: extractFileHunk(input.metadata.diff, observed.finding?.file ?? ""),
+      model,
+      createSession: input.options.deps.createSession,
+      originalQuestion: observed.question,
+      selectedAnswer: input.association.answerText,
+      currentDiffPosition: observed.finding === undefined ? undefined : {
+        file: observed.finding.file,
+        ...(observed.finding.line === undefined ? {} : { line: observed.finding.line }),
+      },
+    });
+    if (result.status === "transient-error") return "transient";
+    if (result.status === "unsupported-history") {
+      plan = { kind: "clarification", outcome: "withdrawn", rationale: "The original finding is no longer available.", question: observed.question, answer: input.association.answerText, headSha: input.metadata.headSha };
+    } else if (result.status === "inactive-rule") {
+      plan = { kind: "clarification", outcome: "withdrawn", rationale: `The trusted rule ${result.ruleName} is no longer active.`, question: observed.question, answer: input.association.answerText, headSha: input.metadata.headSha };
+    } else {
+      plan = {
+        kind: "clarification",
+        outcome: result.result.outcome,
+        rationale: result.result.rationale,
+        question: observed.question,
+        answer: input.association.answerText,
+        headSha: input.metadata.headSha,
+      };
+      if (result.result.outcome !== "withdrawn") {
+        try {
+          const existing = (await input.options.store.readContextSnapshot()).findings;
+          if (ledger !== undefined && !existing.some((entry) => entry.id === ledger.id)) {
+            await input.options.store.transact((tx) => tx.appendFinding(ledger));
+          }
+        } catch (error) {
+          console.warn(`tgd-review-agent: could not persist clarified finding (${(error as Error).message})`);
+        }
+      }
+    }
+  }
+
+  const published = await publishReplyPlan({
+    event: input.item.event,
+    identity: input.item.identity,
+    plan,
+    reviewIdentity: input.reviewIdentity,
+    options: input.options,
+  });
+  if (published === "completed") {
+    const current = (await input.options.store.readContextSnapshot()).pending.clarifications.find((entry) =>
+      entry.id === observed.id) ?? observed;
+    if (clarificationLifecycleState(current) === "answer-observed") {
+      await input.options.store.transact((tx) => {
+        tx.replacePending(replacePendingClarification(tx.snapshot.pending, transitionClarification(current, "terminal", {
+          terminalOutcome: plan.outcome,
+        })));
+      });
+    }
+  }
+  return published;
 }
 
 function formatAddressedThread(thread: ReviewThreadSnapshot | undefined): string {
