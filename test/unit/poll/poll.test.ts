@@ -324,7 +324,7 @@ describe("classification-only poll", () => {
     expect((await journalEvents(secondStore)).filter((entry) => entry.state === "observed")).toHaveLength(250);
     expect(second.events.filter((entry) => entry.state === "observed")).toHaveLength(0);
     expect(second.cursor.reviews[0]).not.toHaveProperty("eventPageToken");
-  }, 30_000);
+  });
 
   it("does not persist classified activity during dry-run after initialization", async () => {
     const stateDir = await tempStateDir();

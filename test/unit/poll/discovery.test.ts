@@ -608,7 +608,7 @@ describe("poll discovery and bootstrap", () => {
     adapter.eventCalls.length = 0;
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.eventCalls[0]?.reviewNumber).toBe(3);
-  }, 30_000);
+  });
 
   it("resumes after review 9 at review 10, not review 8", async () => {
     const stateDir = await tempStateDir();
@@ -637,7 +637,7 @@ describe("poll discovery and bootstrap", () => {
     adapter.eventCalls.length = 0;
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.eventCalls[0]?.reviewNumber).toBe(10);
-  }, 30_000);
+  });
 
   it("retires reviews that disappear from a completed open-review scan", async () => {
     const stateDir = await tempStateDir();
@@ -700,7 +700,7 @@ describe("poll discovery and bootstrap", () => {
     expect((await journalEvents(recoveredStore)).filter((entry) => entry.state === "observed")).toHaveLength(150);
     expect(recovered.cursor.reviews.find((review) => review.reviewNumber === 1)).not.toHaveProperty("eventPageToken");
     expect(decodeReviewProgress(recovered.cursor.reviews[0]?.cursor ?? null)?.eventOpaque).not.toBe(startAfter);
-  }, 30_000);
+  });
 
   it("resumes a 250-event review from the same after cursor and next page token", async () => {
     const stateDir = await tempStateDir();
@@ -741,7 +741,7 @@ describe("poll discovery and bootstrap", () => {
     const second = await secondStore.readContextSnapshot();
     expect((await journalEvents(secondStore)).filter((entry) => entry.state === "observed")).toHaveLength(250);
     expect(second.cursor.reviews[0]).not.toHaveProperty("eventPageToken");
-  }, 30_000);
+  });
 
   it("does not advance a review cursor when that review's fetch fails after another review succeeds", async () => {
     const stateDir = await tempStateDir();

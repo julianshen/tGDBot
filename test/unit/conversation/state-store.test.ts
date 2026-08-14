@@ -720,7 +720,7 @@ describe("conversation state store", () => {
       actionId: `action_${"0".repeat(32)}`, identityDigest: "0".repeat(64), reviewNumber: 1, state: "observed",
       at: "2026-01-01T00:00:00.000Z", successorActionId: null, manifest: [] })))
       .rejects.toThrow(/already terminal/i);
-  }, 15_000);
+  });
 
   test("uses bounded persistent indexes for old memory and finding identities", async () => {
     const stateRoot = await root();
@@ -844,5 +844,5 @@ describe("conversation state store", () => {
     await writeFile(path.join(path.dirname(olderManifestPath), olderManifest.segment.target), "corrupt\n");
     expect((await observed.readContextSnapshot()).findings).toHaveLength(41);
     await expect(observed.readAuditPage("findings", newest.nextCursor, 1)).rejects.toThrow(/audit|segment|corrupt/i);
-  }, 20_000);
+  });
 });
