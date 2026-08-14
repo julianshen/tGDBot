@@ -625,3 +625,67 @@ describe("question publication crash recovery", () => {
     expect(typeof executePublication).toBe("function");
   });
 });
+
+describe("confirmed clarification finding graph", () => {
+  it("builds inline and fallback children and ledgers the confirmed finding", async () => {
+    const { prepareReviewFindingPublication } = await import("../../../src/review/review-publication.js");
+    const { orchestrate } = await import("../../../src/review/orchestrate.js");
+    const { reviewPublicationIdentity } = await import("../../../src/conversation/publication-manifest.js");
+    const confirmed = finding({
+      file: "src/a.ts",
+      line: 2,
+      message: "Tokens must not be logged after the answer.",
+      decision: "still-valid",
+      question: undefined,
+      title: "Do not log tokens",
+    });
+    const orchestration = orchestrate({
+      findings: [confirmed],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    }, [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,2 +1,3 @@",
+      " context",
+      "+added",
+      " keep",
+    ].join("\n"), { inline: true });
+    expect(orchestration.inlineComments).toHaveLength(1);
+    const identity = reviewPublicationIdentity({
+      repository: { provider: "github", repositoryDigest: publicDigest },
+      reviewNumber: 7,
+      headSha: BINDING.headSha,
+      configHash: "abc123",
+    });
+    const prepared = prepareReviewFindingPublication({
+      publicationIdentity: identity,
+      orchestration,
+      storeBinding: { provider: "github", repositoryDigest: publicDigest },
+      reviewNumber: 7,
+      reviewId: "PR_7",
+      baseSha: "b".repeat(40),
+      headSha: BINDING.headSha,
+      rules: [{ name: "rule-a", body: "rule body" }],
+      reviewOptions: {
+        advisor: "on",
+        suggestions: "off",
+        disableBuiltinRule: false,
+        trustLocalRules: false,
+        rulesDir: ".review/rules",
+        dispatch: "direct",
+      },
+      now: "2026-08-14T00:00:00.000Z",
+      publicRepositoryDigest: publicDigest,
+      configHash: "abc123",
+      summaryBody: orchestration.commentBody,
+    });
+    expect(prepared.children.some((child) => child.kind === "inline")).toBe(true);
+    expect(prepared.children.some((child) => child.kind === "fallback")).toBe(true);
+    expect(prepared.preparedFindings).toHaveLength(1);
+    expect(prepared.preparedFindings[0]?.finding.decision).toBe("still-valid");
+    expect(prepared.preparedFindings[0]?.finding.decision).not.toBe("needs-clarification");
+    expect(prepared.preparedFindings[0]?.finding.message).toBe(confirmed.message);
+  });
+});

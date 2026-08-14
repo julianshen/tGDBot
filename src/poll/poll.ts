@@ -28,6 +28,7 @@ import {
 } from "../conversation/markers.js";
 import {
   actionFromEvent,
+  clarificationFindingPublicationIdentity,
   clarificationQuestionWriter,
   eventFromAction,
   executePublication,
@@ -36,8 +37,12 @@ import {
   publishClarificationQuestion,
   supersedeWithSuccessor,
   type PublicationAction,
+  type PublicationExecutorHooks,
   type PublicationWriter,
 } from "../conversation/publication-manifest.js";
+import {
+  publishConfirmedClarificationFinding,
+} from "../review/review-publication.js";
 import {
   childMarkerSuffix,
   createConversationPublicationChild,
@@ -106,6 +111,7 @@ export interface PollDependencies {
     readonly headSha: string;
     readonly baseSha?: string;
   }) => Promise<{ readonly rules: readonly RuleDefinition[]; readonly error?: Error }>;
+  readonly publicationHooks?: PublicationExecutorHooks;
 }
 
 export async function poll(args: PollArgs, deps: PollDependencies = {}): Promise<number> {
@@ -1157,7 +1163,7 @@ async function executeClarificationAnswer(input: {
     }
     const ruleName = observed.finding?.ruleName ?? observed.ruleName;
     const currentRule = rules.rules.find((rule) => rule.name === ruleName);
-    const ledger = observed.finding === undefined ? undefined : prepareFindingLedgerEntry({
+    const sessionLedger = observed.finding === undefined ? undefined : prepareFindingLedgerEntry({
       repository: input.options.store.repositoryBinding,
       id: `finding_${createHash("sha256").update(`tgd:clarification-finding:v1\0${observed.id}`, "utf8").digest("hex").slice(0, 32)}`,
       reviewNumber: observed.reviewNumber,
@@ -1167,12 +1173,12 @@ async function executeClarificationAnswer(input: {
       finding: observed.finding,
       ruleSnapshot: observed.ruleSnapshot ?? currentRule?.body ?? ruleName ?? observed.question,
       reviewOptions: {
-        advisor: "on",
-        suggestions: "off",
+        advisor: input.options.config.advisor,
+        suggestions: input.options.config.suggestions,
         disableBuiltinRule: input.options.config.disableBuiltinRule,
         trustLocalRules: input.options.config.trustLocalRules,
         rulesDir: input.options.config.rulesDir,
-        dispatch: "direct",
+        dispatch: input.options.config.dispatch,
         ...(input.options.config.model === undefined ? {} : { model: input.options.config.model }),
       },
       placement: {
@@ -1191,7 +1197,7 @@ async function executeClarificationAnswer(input: {
       return "transient";
     }
     const result = await reassessClarification({
-      ledger,
+      ledger: sessionLedger,
       currentRule,
       currentCodeHunk: extractFileHunk(input.metadata.diff, observed.finding?.file ?? ""),
       model,
@@ -1217,14 +1223,57 @@ async function executeClarificationAnswer(input: {
         answer: input.association.answerText,
         headSha: input.metadata.headSha,
       };
-      if (result.result.outcome !== "withdrawn") {
+      if (result.result.outcome === "confirmed" || result.result.outcome === "revised") {
+        if (!("finding" in result.result) || result.result.finding === undefined) return "transient";
         try {
-          const existing = (await input.options.store.readContextSnapshot()).findings;
-          if (ledger !== undefined && !existing.some((entry) => entry.id === ledger.id)) {
-            await input.options.store.transact((tx) => tx.appendFinding(ledger));
-          }
+          const publishedFinding = await publishConfirmedClarificationFinding({
+            store: input.options.store,
+            finding: result.result.finding,
+            rules: rules.rules,
+            reviewOptions: {
+              advisor: input.options.config.advisor,
+              suggestions: input.options.config.suggestions,
+              disableBuiltinRule: input.options.config.disableBuiltinRule,
+              trustLocalRules: input.options.config.trustLocalRules,
+              rulesDir: input.options.config.rulesDir,
+              dispatch: input.options.config.dispatch,
+              ...(input.options.config.model === undefined ? {} : { model: input.options.config.model }),
+            },
+            publicationIdentity: clarificationFindingPublicationIdentity({
+              repository: input.options.store.repositoryBinding,
+              reviewNumber: observed.reviewNumber,
+              clarificationId: observed.id,
+              answerEventId: input.item.event.eventId,
+              headSha: input.metadata.headSha,
+            }),
+            reviewIdentity: input.reviewIdentity,
+            context: {
+              vcsAdapter: input.options.config.vcsAdapter,
+              locator: {
+                kind: "repository",
+                repo: input.options.config.repository,
+                number: input.item.event.reviewNumber,
+              },
+              provider: input.options.config.repository.provider,
+              repository: input.options.config.repository,
+            },
+            pr: {
+              id: String(input.item.event.reviewNumber),
+              reviewId: input.reviewIdentity.reviewId,
+              headSha: input.metadata.headSha,
+              baseSha: input.metadata.baseSha ?? "0".repeat(40),
+              title: "",
+              description: "",
+              url: input.reviewIdentity.url,
+            },
+            diff: input.metadata.diff,
+            now: input.options.now,
+            hooks: input.options.deps.publicationHooks,
+          });
+          if (publishedFinding !== 0) return "transient";
         } catch (error) {
-          console.warn(`tgd-review-agent: could not persist clarified finding (${(error as Error).message})`);
+          console.warn(`tgd-review-agent: could not publish clarified finding (${(error as Error).message})`);
+          return "transient";
         }
       }
     }

@@ -13,28 +13,23 @@ import {
   selectClarification,
 } from "./conversation/clarification.js";
 import {
-  buildReviewPublicationGraph,
   childIsTerminal,
   clarificationQuestionWriter,
   executePublication,
   loadPublicationAction,
   publishClarificationQuestion,
   reviewPublicationIdentity,
-  type PublicationAction,
-  type PublicationChild,
   type PublicationExecutorHooks,
-  type PublicationWriteResult,
-  type PublicationWriter,
 } from "./conversation/publication-manifest.js";
-import type { ClarificationPresentation } from "./review/comment-format.js";
-import type { PendingClarification } from "./conversation/state-schema.js";
-import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "./conversation/markers.js";
 import {
-  bindFindingLedgerIdentity,
-  prepareFindingLedgerEntry,
-  type FindingLedgerEntry,
-  type FindingReviewOptions,
-} from "./conversation/state-schema.js";
+  persistPreparedFindings,
+  prepareReviewFindingPublication,
+  publishReviewFromManifest,
+  type ReviewPublicationContext,
+} from "./review/review-publication.js";
+import type { ClarificationPresentation } from "./review/comment-format.js";
+import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
+import { computeRepositoryDigest } from "./conversation/markers.js";
 import {
   buildConversationContext,
   MAX_REVIEW_CONTEXT_PAGES,
@@ -57,8 +52,6 @@ import {
 } from "./review/dedup.js";
 import { changedFiles, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
 import {
-  deriveInlineChildId,
-  formatInlineRecoveryMarker,
   formatPendingMarker,
   replacePendingMarker,
 } from "./review/comment-marker.js";
@@ -76,7 +69,7 @@ import type { LoadResult } from "./rules/loader.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
 import type { RepositoryRef } from "./target/types.js";
 import type { BotComment, PullRequestInfo, VcsAdapter } from "./vcs/adapter.js";
-import { AmbiguousInlinePublishError, validateInlinePublishOutcomes } from "./vcs/adapter.js";
+
 
 export type { CommandArgs, PollArgs, ReviewArgs, SharedReviewOptions } from "./cli-args.js";
 export { parseCommandArgs } from "./cli-args.js";
@@ -550,58 +543,17 @@ function logStatus(log: StatusLog): void {
   console.log(`${STATUS_LOG_PREFIX}${JSON.stringify(log)}`);
 }
 
-function selectedFallbackIds(action: PublicationAction): Set<string> {
-  const ids = new Set<string>();
-  for (const child of action.children) {
-    if (child.kind !== "fallback" || child.status !== "fallback-selected") continue;
-    const inline = child.replacesId === undefined
-      ? undefined
-      : action.children.find((entry) => entry.id === child.replacesId);
-    ids.add(inline === undefined ? child.replacesId ?? child.id : clientIdOf(inline));
-  }
-  return ids;
-}
-
-function clientIdOf(child: PublicationChild): string {
-  return child.placement.kind === "inline" && child.placement.clientId !== undefined
-    ? child.placement.clientId
-    : child.id;
-}
-
-function composeFrozenSummary(action: PublicationAction, fallbackIds: ReadonlySet<string>, marker: string): string {
-  const summary = action.children.find((child) => child.kind === "summary");
-  if (summary === undefined) throw new Error("publication manifest is missing the summary child");
-  const extras = action.children
-    .filter((child) => {
-      if (child.kind !== "fallback") return false;
-      if (child.status === "fallback-selected") return true;
-      const inline = child.replacesId === undefined
-        ? undefined
-        : action.children.find((entry) => entry.id === child.replacesId);
-      const key = inline === undefined ? child.replacesId : clientIdOf(inline);
-      return key !== undefined && fallbackIds.has(key);
-    })
-    .map((child) => child.body);
-  const suffix = extras.length === 0 ? marker : `${extras.join("\n\n")}\n\n${marker}`;
-  return extras.length === 0 ? `${summary.body}${summary.body.endsWith("\n") ? "" : "\n\n"}${marker}` :
-    `${summary.body.trimEnd()}\n\n${suffix}`;
-}
-
-function sameTerminalResult(
-  actual: TerminalReviewResult | undefined,
-  expected: TerminalReviewResult,
-): boolean {
-  return actual?.status === expected.status &&
-    actual.findingsCount === expected.findingsCount &&
-    actual.exitCode === expected.exitCode &&
-    actual.rulesRun.length === expected.rulesRun.length &&
-    actual.rulesRun.every((rule, index) => rule === expected.rulesRun[index]) &&
-    actual.rulesFailed.length === expected.rulesFailed.length &&
-    actual.rulesFailed.every((rule, index) => rule === expected.rulesFailed[index]) &&
-    (actual.loadErrors?.length ?? 0) === (expected.loadErrors?.length ?? 0) &&
-    (actual.loadErrors ?? []).every(
-      (error, index) => error === expected.loadErrors?.[index],
-    );
+function publicationContext(
+  config: ResolvedConfig,
+  pr: PullRequestInfo,
+  provider: "github" | "gitlab",
+): ReviewPublicationContext {
+  return {
+    vcsAdapter: config.vcsAdapter,
+    locator: config.locator,
+    provider,
+    repository: repositoryForReview(config, pr),
+  };
 }
 
 // Task 8 review fix #1: renders a visible section naming every rule file
@@ -717,435 +669,6 @@ async function loadRulesForReview(
       );
     });
   }
-}
-
-async function bindPublishedFindingIdentities(
-  store: ConversationStateStore,
-  published: PublicationAction,
-  preparedFindings?: readonly FindingLedgerEntry[],
-): Promise<void> {
-  const existing = (await store.readContextSnapshot()).findings;
-  const prepared = preparedFindings ?? existing;
-  const bound: FindingLedgerEntry[] = [];
-  for (const child of published.children) {
-    if (child.kind !== "inline" || child.identity === undefined) continue;
-    const source = prepared.find((entry) => entry.id === child.id) ?? existing.find((entry) => entry.id === child.id);
-    if (source === undefined || source.identity !== undefined) continue;
-    if (existing.find((entry) => entry.id === source.id)?.identity !== undefined) continue;
-    bound.push(bindFindingLedgerIdentity(source, child.identity));
-  }
-  if (bound.length === 0) return;
-  await store.transact((tx) => {
-    for (const entry of bound) tx.appendFinding(entry);
-  });
-}
-
-async function publishReviewFromManifest(options: {
-  readonly action: PublicationAction;
-  readonly store: ConversationStateStore;
-  readonly config: ResolvedConfig;
-  readonly pr: PullRequestInfo;
-  readonly configHash: string;
-  readonly botComment: BotComment | null;
-  readonly provider: "github" | "gitlab";
-  readonly hooks?: PublicationExecutorHooks;
-  readonly now: () => string;
-  readonly orchestration?: OrchestrationResult;
-  readonly loadErrors?: LoadResult["errors"];
-  readonly buildBody?: (
-    o: OrchestrationResult,
-    failedIds: ReadonlySet<string>,
-    marker?: string,
-    providerLimit?: boolean,
-  ) => string;
-  readonly terminalResult?: TerminalReviewResult;
-  readonly inlineRecovery?: InlineRecoveryState;
-  readonly preparedFindings?: readonly FindingLedgerEntry[];
-  readonly identity?: ReviewIdentity;
-}): Promise<number> {
-  const {
-    store, config, pr, configHash, provider, hooks, now, orchestration, buildBody,
-  } = options;
-  const reviewIdentity = options.identity ?? reviewIdentityFor(repositoryForReview(config, pr), pr);
-  let botComment = options.botComment;
-  const summaryPlacement = options.action.children.find((child) => child.kind === "summary")?.placement;
-  const terminalResult = options.terminalResult ??
-    (summaryPlacement?.kind === "summary" ? summaryPlacement.terminalResult : undefined) ??
-    botComment?.pendingState?.terminalResult ?? {
-      status: "posted" as const,
-      findingsCount: options.action.children.filter((child) => child.kind === "inline").length,
-      rulesRun: [],
-      rulesFailed: [],
-      exitCode: 0 as const,
-    };
-  const inlineRecovery = options.inlineRecovery ?? botComment?.pendingState?.inlineRecovery;
-  const githubInlineResults = new Map<string, PublicationWriteResult>();
-  let staleCleaned = false;
-
-  const bodyFor = (action: PublicationAction, failedIds: ReadonlySet<string>, marker: string): string => {
-    if (orchestration !== undefined && buildBody !== undefined) {
-      return buildBody(orchestration, failedIds, marker);
-    }
-    return composeFrozenSummary(action, failedIds, marker);
-  };
-
-  const summaryIdentityOf = (comment: BotComment) => ({
-    provider,
-    commentId: comment.id,
-    url: provider === "github"
-      ? `${repositoryUrl(config, pr)}/pull/${Number(pr.id)}#issuecomment-${comment.id}`
-      : `${repositoryUrl(config, pr)}/-/merge_requests/${Number(pr.id)}#note_${comment.id}`,
-  });
-
-  async function cleanStaleThreads(): Promise<void> {
-    if (staleCleaned) return;
-    staleCleaned = true;
-    try {
-      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.locator);
-      if (resolved > 0) {
-        console.log(`tgd-review-agent: resolved ${resolved} stale inline comment thread(s) from previous runs`);
-      }
-    } catch (err) {
-      console.warn(
-        `tgd-review-agent: could not resolve stale inline comment threads (${(err as Error).message}); ` +
-          `continuing — old threads stay expanded but this run is unaffected`,
-      );
-    }
-  }
-
-  function toInlineComment(child: PublicationChild) {
-    const markerSuffix = provider === "gitlab" ? `\n${child.marker}` : "";
-    return {
-      clientId: clientIdOf(child),
-      path: child.placement.kind === "inline" ? child.placement.file : "",
-      line: child.placement.kind === "inline" ? child.placement.line : 1,
-      ...(child.placement.kind === "inline" && child.placement.startLine !== undefined
-        ? { startLine: child.placement.startLine }
-        : {}),
-      position: child.placement.kind === "inline" && child.placement.position !== undefined
-        ? child.placement.position
-        : {
-            oldPath: child.placement.kind === "inline" ? child.placement.file : "",
-            newPath: child.placement.kind === "inline" ? child.placement.file : "",
-            start: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
-            end: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
-            sameHunk: true as const,
-          },
-      body: `${child.body}${markerSuffix}`,
-    };
-  }
-
-  async function publishInlines(
-    action: PublicationAction,
-    children: readonly PublicationChild[],
-  ): Promise<Map<string, PublicationWriteResult>> {
-    const comments = children.map(toInlineComment);
-    const results = new Map<string, PublicationWriteResult>();
-    try {
-      const outcomes = await config.vcsAdapter.createInlineReview(
-        config.locator,
-        pr.headSha,
-        comments,
-        inlineRecovery,
-      );
-      try {
-        const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
-          if (typeof outcome !== "object" || outcome === null) return false;
-          const candidate = outcome as Record<string, unknown>;
-          return typeof candidate.clientId === "string" &&
-            (candidate.status === "posted" || candidate.status === "failed") &&
-            (candidate.reason === undefined || typeof candidate.reason === "string");
-        });
-        if (!shapesValid) throw new Error("malformed inline publish outcome");
-        const validated = validateInlinePublishOutcomes(
-          comments,
-          outcomes,
-          config.locator.kind === "repository"
-            ? { repo: repositoryForReview(config, pr), reviewNumber: config.locator.number }
-            : undefined,
-        );
-        for (const child of children) {
-          const outcome = validated.find((entry) => entry.clientId === clientIdOf(child));
-          results.set(child.id, outcome?.status === "posted"
-            ? { status: "posted", identity: outcome.identity }
-            : { status: "failed" });
-        }
-      } catch (err) {
-        console.warn(
-          `tgd-review-agent: inline review returned invalid outcomes (${(err as Error).message}); ` +
-            `rewriting the summary comment to carry every inline finding instead`,
-        );
-        for (const child of children) results.set(child.id, { status: "failed" });
-      }
-    } catch (err) {
-      if (err instanceof AmbiguousInlinePublishError && inlineRecovery !== undefined) {
-        console.warn(
-          `tgd-review-agent: GitHub may have accepted the inline review (${err.message}); ` +
-            `not duplicating those findings into the summary; a later run will reconcile markers`,
-        );
-        if (botComment === null) throw new Error("Review publication is missing the summary identity");
-        const ambiguousCheckpoint = await config.vcsAdapter.upsertComment(
-          config.locator,
-          bodyFor(action, new Set(children.map((child) => clientIdOf(child))), formatPendingMarker({
-            phase: "ambiguous",
-            headSha: pr.headSha,
-            configHash,
-            noteId: botComment.id,
-            terminalResult,
-            inlineRecovery,
-          })),
-          botComment,
-        );
-        if (ambiguousCheckpoint.id !== botComment.id || ambiguousCheckpoint.pendingState?.phase !== "ambiguous") {
-          throw new Error("Could not persist ambiguous inline recovery checkpoint");
-        }
-        throw Object.assign(err, { publicationHalt: true });
-      }
-      console.warn(
-        `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
-          `rewriting the summary comment to carry every finding instead`,
-      );
-      throw err;
-    }
-    return results;
-  }
-
-  const writer: PublicationWriter = {
-    async lookupChild(child) {
-      if (config.vcsAdapter.findPublishedMarker !== undefined) {
-        const found = await config.vcsAdapter.findPublishedMarker(config.locator, child.marker);
-        if (found !== null) return found;
-      }
-      const findBotChildMarker = (config.vcsAdapter as VcsAdapter & Partial<ConversationAdapter>).findBotChildMarker;
-      const parsed = parseChildMarker(child.marker)
-        ?? parseChildMarker((child.body.split(/\r?\n/u).at(-1) ?? "").trim());
-      if (typeof findBotChildMarker === "function" && parsed !== null) {
-        const found = await findBotChildMarker(reviewIdentity, {
-          provider: reviewIdentity.provider,
-          repositoryDigest: parsed.repositoryDigest,
-          reviewNumber: parsed.reviewNumber,
-          kind: parsed.kind,
-          parentId: parsed.parentId,
-          childId: parsed.childId,
-          contentDigest: parsed.contentDigest,
-        });
-        if (found !== null) return found;
-      }
-      if (
-        child.kind === "summary" &&
-        botComment !== null &&
-        botComment.pendingState?.headSha === pr.headSha &&
-        botComment.pendingState.configHash === configHash
-      ) {
-        return summaryIdentityOf(botComment);
-      }
-      return null;
-    },
-    async writeChild(child, action) {
-      if (child.kind === "summary") {
-        const inlineChildren = action.children.filter((entry) => entry.kind === "inline");
-        const noFallbackIds = new Set<string>();
-        const allInlineIds = new Set(inlineChildren.map((entry) => clientIdOf(entry)));
-        if (inlineChildren.length > 0 && provider === "github") {
-          if (inlineChildren.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
-          const payloadChars = inlineChildren.reduce((total, entry, index) =>
-            total + entry.body.length + (inlineRecovery?.children[index]?.marker.length ?? entry.marker.length) + 256, 0);
-          if (payloadChars > 1_000_000 || inlineChildren.some((entry, index) =>
-            entry.body.length + (inlineRecovery?.children[index]?.marker.length ?? entry.marker.length) + 128 > 65_536)) {
-            throw new Error("GitHub inline review exceeds the safe atomic payload size");
-          }
-        }
-        const writtenSummary = await config.vcsAdapter.upsertComment(
-          config.locator,
-          bodyFor(action, noFallbackIds, formatPendingMarker({ phase: "publishing", headSha: pr.headSha, configHash })),
-          botComment,
-        );
-        if (
-          !writtenSummary ||
-          typeof writtenSummary.id !== "string" ||
-          writtenSummary.id.length === 0 ||
-          writtenSummary.lastReviewedSha !== "" ||
-          writtenSummary.reviewedConfig !== "" ||
-          writtenSummary.pendingState?.phase !== "publishing" ||
-          writtenSummary.pendingState.headSha !== pr.headSha ||
-          writtenSummary.pendingState.configHash !== configHash
-        ) {
-          throw new Error("The VCS adapter did not return the exact identity of the pending summary note");
-        }
-        let summaryIdentity = writtenSummary;
-        botComment = writtenSummary;
-        if (inlineChildren.length > 0) {
-          const checkpoint = await config.vcsAdapter.upsertComment(
-            config.locator,
-            bodyFor(action, allInlineIds, formatPendingMarker({
-              phase: "ready",
-              headSha: pr.headSha,
-              configHash,
-              noteId: writtenSummary.id,
-              terminalResult,
-              inlineRecovery,
-            })),
-            writtenSummary,
-          );
-          if (
-            checkpoint.id !== writtenSummary.id ||
-            checkpoint.lastReviewedSha !== "" ||
-            checkpoint.reviewedConfig !== "" ||
-            checkpoint.pendingState?.phase !== "ready" ||
-            checkpoint.pendingState.headSha !== pr.headSha ||
-            checkpoint.pendingState.configHash !== configHash ||
-            checkpoint.pendingState.noteId !== writtenSummary.id ||
-            !sameTerminalResult(checkpoint.pendingState.terminalResult, terminalResult)
-          ) {
-            throw new Error("The VCS adapter could not confirm the exact ready recovery checkpoint");
-          }
-          summaryIdentity = checkpoint;
-          botComment = checkpoint;
-        }
-        await cleanStaleThreads();
-        return { status: "posted", identity: summaryIdentityOf(summaryIdentity) };
-      }
-      if (child.kind === "inline") {
-        await cleanStaleThreads();
-        if (provider === "github") {
-          const cached = githubInlineResults.get(child.id);
-          if (cached !== undefined) return cached;
-          const pending = action.children.filter((entry) =>
-            entry.kind === "inline" && entry.status === "pending" && !githubInlineResults.has(entry.id));
-          const posted = await publishInlines(action, pending);
-          for (const [id, result] of posted) githubInlineResults.set(id, result);
-          return githubInlineResults.get(child.id) ?? { status: "failed" };
-        }
-        const posted = await publishInlines(action, [child]);
-        return posted.get(child.id) ?? { status: "failed" };
-      }
-      return { status: "failed" };
-    },
-  };
-
-  const finalizePublishedSummary = async (action: PublicationAction): Promise<void> => {
-    const finalFallbackIds = selectedFallbackIds(action);
-    if (botComment === null) {
-      const postedSummary = action.children.find((child) => child.kind === "summary" && child.identity !== undefined);
-      if (postedSummary?.identity !== undefined) {
-        botComment = {
-          id: postedSummary.identity.commentId,
-          body: postedSummary.body,
-          lastReviewedSha: "",
-          reviewedConfig: "",
-        };
-      }
-    }
-    if (botComment === null) {
-      if (action.state === "completed" || action.state === "superseded") return;
-      throw new Error("Review publication is missing the summary identity");
-    }
-    if (action.children.some((child) => child.kind === "inline")) {
-      const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
-        config.locator,
-        bodyFor(action, finalFallbackIds, formatPendingMarker({
-          phase: "ready",
-          headSha: pr.headSha,
-          configHash,
-          noteId: botComment.id,
-          terminalResult,
-        })),
-        botComment,
-      );
-      if (
-        selectiveCheckpoint.id !== botComment.id ||
-        selectiveCheckpoint.lastReviewedSha !== "" ||
-        selectiveCheckpoint.reviewedConfig !== "" ||
-        selectiveCheckpoint.pendingState?.phase !== "ready" ||
-        selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
-        selectiveCheckpoint.pendingState.configHash !== configHash ||
-        selectiveCheckpoint.pendingState.noteId !== botComment.id ||
-        !sameTerminalResult(selectiveCheckpoint.pendingState.terminalResult, terminalResult)
-      ) {
-        throw new Error("The VCS adapter could not confirm the exact selective recovery checkpoint");
-      }
-      botComment = selectiveCheckpoint;
-    }
-    const finalizedSummary = await config.vcsAdapter.upsertComment(
-      config.locator,
-      bodyFor(action, finalFallbackIds, formatMarker(pr.headSha, configHash)),
-      botComment,
-    );
-    if (
-      !finalizedSummary ||
-      finalizedSummary.id !== botComment.id ||
-      finalizedSummary.lastReviewedSha !== pr.headSha ||
-      finalizedSummary.reviewedConfig !== configHash
-    ) {
-      throw new Error("The VCS adapter could not confirm finalization of the exact completed summary note");
-    }
-    botComment = finalizedSummary;
-  };
-
-  let published: PublicationAction;
-  try {
-    published = await executePublication({
-      store,
-      action: options.action,
-      writer,
-      hooks,
-      now,
-      strategy: provider === "github" ? "github-atomic" : "gitlab-selective",
-      finalize: finalizePublishedSummary,
-    });
-  } catch (error) {
-    if (error instanceof AmbiguousInlinePublishError) {
-      logStatus({
-        status: "partial",
-        findingsCount: terminalResult.findingsCount,
-        rulesRun: [...terminalResult.rulesRun],
-        rulesFailed: [...terminalResult.rulesFailed],
-        reason: "inline-publication-ambiguous",
-      });
-      return EXIT_PARTIAL;
-    }
-    throw error;
-  }
-
-  await bindPublishedFindingIdentities(store, published, options.preparedFindings);
-
-  if ((published.state === "completed" || published.state === "superseded") &&
-    published.children.length === 0) {
-    if (
-      botComment !== null &&
-      botComment.lastReviewedSha === pr.headSha &&
-      botComment.reviewedConfig === configHash
-    ) {
-      logStatus({
-        status: terminalResult.status,
-        findingsCount: terminalResult.findingsCount,
-        rulesRun: [...terminalResult.rulesRun],
-        rulesFailed: [...terminalResult.rulesFailed],
-        loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
-        ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
-      });
-      return terminalResult.exitCode;
-    }
-    throw new Error("completed publication is missing its frozen manifest; refusing to finalize a conservative ready summary");
-  }
-
-  const completed = published.state === "completed" ||
-    published.children.every((child) => child.status === "posted" || child.status === "failed" ||
-      child.status === "fallback-selected");
-  if (!completed) return EXIT_PARTIAL;
-  logStatus({
-    status: terminalResult.status,
-    findingsCount: terminalResult.findingsCount,
-    rulesRun: [...terminalResult.rulesRun],
-    rulesFailed: [...terminalResult.rulesFailed],
-    loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
-    ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
-  });
-  return terminalResult.exitCode;
-}
-
-function repositoryUrl(config: ResolvedConfig, pr: PullRequestInfo): string {
-  return repositoryForReview(config, pr).canonicalUrl;
 }
 
 /**
@@ -1299,14 +822,14 @@ export async function review(
       return publishReviewFromManifest({
         action: existing,
         store: stateStore,
-        config,
+        context: publicationContext(config, pr, provider),
         pr,
         configHash,
         botComment,
-        provider,
         hooks: publicationHooks,
         now,
         identity: reviewIdentity,
+        logStatus,
       });
     }
   }
@@ -1386,14 +909,14 @@ export async function review(
       return publishReviewFromManifest({
         action: existing,
         store: stateStore,
-        config,
+        context: publicationContext(config, pr, provider),
         pr,
         configHash,
         botComment,
-        provider,
         hooks: publicationHooks,
         now,
         identity: reviewIdentity,
+        logStatus,
       });
     }
   }
@@ -1589,105 +1112,38 @@ export async function review(
       }
     }
 
-    const parentId = `act_${publicationIdentity.actionId.slice("action_".length)}`;
-    const publicRepositoryDigest = computeRepositoryDigest(repository.provider, repository.canonicalUrl);
-    const preparedFindings: FindingLedgerEntry[] = [];
-    const inlines = orchestration.inlineComments.map((comment, index) => {
-      const recovered = inlineRecovery?.children[index];
-      const contentDigest = recovered?.contentDigest ?? computeContentDigest(comment.body);
-      const placementDigest = recovered?.placementDigest ?? createHash("sha256").update(JSON.stringify({
-        path: comment.path, line: comment.line, startLine: comment.startLine ?? null,
-      }), "utf8").digest("hex");
-      const childId = recovered?.childId ?? deriveInlineChildId(parentId, comment.clientId, contentDigest, placementDigest);
-      const recoveryMarker = recovered?.marker ?? formatInlineRecoveryMarker({
-        kind: "finding",
-        parentId,
-        childId,
-        repositoryDigest: publicationIdentity.identityDigest,
-        reviewNumber: Number(pr.id),
-        contentDigest,
-        headSha: pr.headSha,
-        placementDigest,
-      });
-      const findingMarker = formatChildMarker({
-        kind: "finding",
-        parentId,
-        childId,
-        repositoryDigest: publicRepositoryDigest,
-        reviewNumber: Number(pr.id),
-        contentDigest,
-      });
-      const publishedBody = `${comment.body}${comment.body.endsWith("\n") ? "" : "\n"}${findingMarker}`;
-      const finding = orchestration.findingByClientId?.get(comment.clientId);
-      if (finding !== undefined) {
-        const rule = rules.find((item) => item.name === finding.ruleName);
-        preparedFindings.push(prepareFindingLedgerEntry({
-          repository: storeBinding,
-          id: childId,
-          reviewNumber: Number(pr.id),
-          reviewId: reviewIdentity.reviewId,
-          baseSha: pr.baseSha,
-          headSha: pr.headSha,
-          finding,
-          ruleSnapshot: rule?.body ?? finding.ruleName,
-          reviewOptions: reviewOptionsSnapshot(config),
-          placement: {
-            file: comment.path,
-            line: comment.line,
-            side: "new",
-            originalHeadSha: pr.headSha,
-            currentHeadSha: pr.headSha,
-            outdated: false,
-          },
-          body: comment.body,
-          publishedBody,
-          at: now(),
-        }));
-      }
-      return {
-        clientId: comment.clientId,
-        childId,
-        body: publishedBody,
-        marker: recoveryMarker,
-        file: comment.path,
-        line: comment.line,
-        startLine: comment.startLine,
-        position: comment.position,
-      };
-    });
-    const frozenChildren = buildReviewPublicationGraph({
-      actionId: publicationIdentity.actionId,
-      summaryBody: buildBody(orchestration, noFallbackIds, ""),
-      headSha: pr.headSha,
-      configHash,
-      terminalResult,
-      inlines,
-      fallbacks: inlines.map((inline) => ({ replacesId: inline.childId, body: inline.body })),
-    });
-    const preparedAction: PublicationAction = {
-      ...publicationIdentity,
+    const prepared = prepareReviewFindingPublication({
+      publicationIdentity,
+      orchestration,
+      storeBinding,
       reviewNumber: Number(pr.id),
-      repository: storeBinding,
-      state: "manifest-ready",
-      successorActionId: null,
-      children: frozenChildren,
-    };
-    if (preparedFindings.length > 0) {
-      await stateStore.transact((tx) => {
-        tx.initializeIfAbsent();
-        for (const entry of preparedFindings) {
-          if (!tx.snapshot.findings.some((item) => item.id === entry.id)) tx.appendFinding(entry);
-        }
-      });
-    }
+      reviewId: reviewIdentity.reviewId,
+      baseSha: pr.baseSha,
+      headSha: pr.headSha,
+      rules,
+      reviewOptions: reviewOptionsSnapshot(config),
+      now: now(),
+      publicRepositoryDigest: computeRepositoryDigest(repository.provider, repository.canonicalUrl),
+      configHash,
+      summaryBody: buildBody(orchestration, noFallbackIds, ""),
+      terminalResult,
+      inlineRecovery,
+    });
+    await persistPreparedFindings(stateStore, prepared.preparedFindings);
     return publishReviewFromManifest({
-      action: preparedAction,
+      action: {
+        ...publicationIdentity,
+        reviewNumber: Number(pr.id),
+        repository: storeBinding,
+        state: "manifest-ready",
+        successorActionId: null,
+        children: prepared.children,
+      },
       store: stateStore,
-      config,
+      context: publicationContext(config, pr, provider),
       pr,
       configHash,
       botComment,
-      provider,
       hooks: publicationHooks,
       now,
       orchestration,
@@ -1695,8 +1151,9 @@ export async function review(
       buildBody,
       terminalResult,
       inlineRecovery,
-      preparedFindings,
+      preparedFindings: prepared.preparedFindings,
       identity: reviewIdentity,
+      logStatus,
     });
   }
 

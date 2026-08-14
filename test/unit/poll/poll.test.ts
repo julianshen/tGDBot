@@ -45,6 +45,10 @@ import { poll } from "../../../src/poll/poll.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
+import { parseBotMarker } from "../../../src/review/comment-marker.js";
+import { validateConversationItemIdentity } from "../../../src/vcs/adapter.js";
+import type { BotComment } from "../../../src/vcs/adapter.js";
+import type { PublicationExecutorHooks } from "../../../src/conversation/publication-manifest.js";
 
 const repo = parseRepositoryRef("owner/repo", "github");
 const repositoryDigest = computeRepositoryDigest("github", repo.canonicalUrl);
@@ -382,6 +386,87 @@ describe("classification-only poll", () => {
 
 const FINDING_ID = `finding_${"1".repeat(32)}`;
 const currentHunk = "@@ -12,3 +12,4 @@\n export function dump(user) {\n+  console.log(user.token);\n   return user;\n }";
+const commentableAuthDiff = [
+  "diff --git a/src/auth.ts b/src/auth.ts",
+  "--- a/src/auth.ts",
+  "+++ b/src/auth.ts",
+  "@@ -12,3 +12,4 @@",
+  " export function dump(user) {",
+  "+  console.log(user.token);",
+  "   return user;",
+  " }",
+].join("\n");
+
+function postedInlineIdentity(commentId: string) {
+  return validateConversationItemIdentity({
+    provider: "github",
+    commentId,
+    threadId: `thread-${commentId}`,
+    url: `https://github.com/owner/repo/pull/1#discussion_r${commentId}`,
+  }, { repo, reviewNumber: 1 });
+}
+
+function silentReviewVcs(options: {
+  readonly failNextInline?: "throw" | "accept-then-fail" | null;
+} = {}) {
+  let stored: BotComment | null = null;
+  const postedInlines: Array<{ clientId: string; path: string; line: number; body: string }> = [];
+  const summaries: string[] = [];
+  const publishedByMarker = new Map<string, ReturnType<typeof postedInlineIdentity>>();
+  let failNextInline = options.failNextInline ?? null;
+  const adapter = {
+    createInlineReview: vi.fn(async (
+      _locator: unknown,
+      _head: string,
+      comments: Array<{ clientId: string; path: string; line: number; body: string }>,
+    ) => {
+      if (failNextInline === "throw") {
+        failNextInline = null;
+        throw new Error("inline publish failed");
+      }
+      return comments.map((comment) => {
+        postedInlines.push(comment);
+        const commentId = `inline-${postedInlines.length}`;
+        const identity = postedInlineIdentity(commentId);
+        const marker = comment.body.split(/\r?\n/u).findLast?.((line) => line.includes("<!-- tgd-"))
+          ?? comment.body.split(/\r?\n/u).at(-1)?.trim()
+          ?? "";
+        if (marker.includes("<!--")) publishedByMarker.set(marker, identity);
+        if (failNextInline === "accept-then-fail") {
+          failNextInline = null;
+          throw new Error("transport failed after accepted write");
+        }
+        return { clientId: comment.clientId, status: "posted" as const, identity };
+      });
+    }),
+    findBotComment: vi.fn(async () => stored),
+    upsertComment: vi.fn(async (_locator: unknown, body: string, existing: BotComment | null) => {
+      summaries.push(body);
+      const parsed = parseBotMarker(body);
+      stored = {
+        id: existing?.id ?? "written-summary-1",
+        body,
+        ...(parsed ?? { lastReviewedSha: "", reviewedConfig: "" }),
+      };
+      return stored;
+    }),
+    findPublishedMarker: vi.fn(async (_locator: unknown, marker: string) => publishedByMarker.get(marker) ?? null),
+    resolveStaleReviewThreads: vi.fn(async () => 0),
+    getPullRequest: vi.fn(async () => ({
+      id: "1",
+      reviewId: "PR_1",
+      headSha: "c".repeat(40),
+      baseSha: "b".repeat(40),
+      title: "Review",
+      description: "",
+      url: "https://github.com/owner/repo/pull/1",
+    })),
+    getDiff: vi.fn(async () => commentableAuthDiff),
+    getRuleFilesFromBase: vi.fn(async () => []),
+    resolveRelatedWork: vi.fn(async (references: unknown) => references),
+  };
+  return { adapter, postedInlines, summaries, publishedByMarker, get stored() { return stored; } };
+}
 const currentRule: RuleDefinition = {
   name: "no-token-logs",
   provider: "anthropic",
@@ -578,20 +663,30 @@ function executionDeps(adapter: ExecutionAdapter, extras: {
   readonly heads?: string[];
   readonly rules?: readonly RuleDefinition[];
   readonly ruleLoadError?: Error;
+  readonly diff?: string;
+  readonly vcs?: ReturnType<typeof silentReviewVcs>;
+  readonly publicationHooks?: PublicationExecutorHooks;
 } = {}) {
   const heads = extras.heads === undefined ? undefined : [...extras.heads];
+  const vcs = extras.vcs ?? silentReviewVcs();
   return {
     conversationAdapter: adapter,
     createSession: extras.createSession ?? sessionFor(JSON.stringify({ explanation: "The logger prints user.token." })),
+    publicationHooks: extras.publicationHooks,
+    resolvePollConfig: (pollInput: PollArgs) => ({
+      ...resolvePollConfig(pollInput),
+      vcsAdapter: vcs.adapter as unknown as VcsAdapter,
+    }),
     getReviewMetadata: async () => ({
       headSha: heads === undefined ? adapter.headSha : (heads.shift() ?? adapter.headSha),
       baseSha: "b".repeat(40),
-      diff: currentHunk,
+      diff: extras.diff ?? currentHunk,
     }),
     loadConversationRules: async () => ({
       rules: extras.rules ?? [currentRule],
       ...(extras.ruleLoadError === undefined ? {} : { error: extras.ruleLoadError }),
     }),
+    vcs,
   };
 }
 
@@ -1268,6 +1363,150 @@ describe("clarification answer lifecycle", () => {
     })).resolves.toBe(0);
     expect(createSession).not.toHaveBeenCalled();
     expect(adapter.postedBodies).toHaveLength(1);
+  });
+
+  const confirmedFinding = {
+    file: "src/auth.ts",
+    line: 14,
+    severity: "blocking" as const,
+    category: "security",
+    message: "Tokens must not be logged even after audit review.",
+    ruleName: "no-token-logs",
+    decision: "still-valid" as const,
+    title: "Do not log tokens",
+  };
+
+  it("publishes a commentable confirmed finding through createInlineReview and ledgers that finding", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("ans", `answer ${CLAR_ID}: keep the current logger`)]);
+    const vcs = silentReviewVcs();
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "revised",
+          rationale: "The logger still prints the token.",
+          finding: confirmedFinding,
+        })),
+      }),
+    })).resolves.toBe(0);
+
+    expect(vcs.adapter.createInlineReview).toHaveBeenCalledTimes(1);
+    const inlineComments = vcs.adapter.createInlineReview.mock.calls[0]?.[2] as Array<{ path: string; line: number; body: string }>;
+    expect(inlineComments[0]?.path).toBe("src/auth.ts");
+    expect(inlineComments[0]?.line).toBe(14);
+    expect(inlineComments[0]?.body).toMatch(/Tokens must not be logged even after audit review/);
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/## Clarification/);
+    expect(adapter.postedBodies[0]).toMatch(/Revised|Confirmed/);
+
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const snapshot = await store.readContextSnapshot();
+    expect(snapshot.findings.some((entry) => entry.finding.decision === "needs-clarification")).toBe(false);
+    const ledgers = snapshot.findings.filter((entry) =>
+      entry.finding.message === confirmedFinding.message);
+    expect(ledgers).toHaveLength(1);
+    expect(ledgers[0]?.finding.decision).toBe("still-valid");
+    const fallbackAction = (await journalEvents(store)).find((entry) =>
+      entry.manifest.some((child) => child.kind === "inline") &&
+      entry.manifest.some((child) => child.kind === "fallback"));
+    expect(fallbackAction).toBeDefined();
+    expect(fallbackAction?.manifest.some((child) => child.kind === "summary")).toBe(true);
+  });
+
+  it("puts an unanchored confirmed finding in the managed summary instead of dropping it", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("ans", `answer ${CLAR_ID}: keep the current logger`)]);
+    const vcs = silentReviewVcs();
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: "diff --git a/src/other.ts b/src/other.ts\n--- a/src/other.ts\n+++ b/src/other.ts\n@@ -1,1 +1,2 @@\n keep\n+added\n",
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The logger still prints the token.",
+          finding: { ...confirmedFinding, line: undefined },
+        })),
+      }),
+    })).resolves.toBe(0);
+
+    expect(vcs.adapter.createInlineReview).not.toHaveBeenCalled();
+    expect(vcs.summaries.some((body) => body.includes("Tokens must not be logged even after audit review."))).toBe(true);
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toMatch(/Confirmed/);
+  });
+
+  it("does not publish a finding when the clarification is withdrawn", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("ans", `answer ${CLAR_ID}: audit does not require raw tokens`)]);
+    const vcs = silentReviewVcs();
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "withdrawn",
+          rationale: "The answer withdraws the concern.",
+        })),
+      }),
+    })).resolves.toBe(0);
+
+    expect(vcs.adapter.createInlineReview).not.toHaveBeenCalled();
+    expect(vcs.summaries).toEqual([]);
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(snapshot.findings.some((entry) => entry.finding.message.includes("Tokens must not be logged"))).toBe(false);
+    expect(adapter.postedBodies[0]).toMatch(/Withdrawn/);
+  });
+
+  it("does not duplicate a confirmed inline after a crash between accept and persist", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("ans", `answer ${CLAR_ID}: keep the current logger`)]);
+    const vcs = silentReviewVcs();
+    const session = sessionFor(JSON.stringify({
+      outcome: "confirmed",
+      rationale: "The logger still prints the token.",
+      finding: confirmedFinding,
+    }));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: session,
+        publicationHooks: {
+          afterChildWrite: async (child) => {
+            if (child.kind === "inline") throw new Error("crash after inline accept before persist");
+          },
+        },
+      }),
+    })).resolves.toBe(1);
+    expect(vcs.adapter.createInlineReview).toHaveBeenCalledTimes(1);
+    expect(vcs.postedInlines).toHaveLength(1);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: session,
+      }),
+    })).resolves.toBe(0);
+    expect(vcs.adapter.createInlineReview).toHaveBeenCalledTimes(1);
+    expect(vcs.postedInlines).toHaveLength(1);
+    expect(adapter.postedBodies).toHaveLength(1);
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(snapshot.findings.filter((entry) =>
+      entry.finding.message === confirmedFinding.message)).toHaveLength(1);
+    expect(snapshot.pending.clarifications[0]?.state).toBe("terminal");
   });
 });
 

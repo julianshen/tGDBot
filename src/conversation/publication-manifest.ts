@@ -310,6 +310,23 @@ export function reviewPublicationIdentity(input: {
   return { actionId: `action_${identityDigest.slice(0, 32)}`, identityDigest };
 }
 
+export function clarificationFindingPublicationIdentity(input: {
+  readonly repository: RepositoryBinding;
+  readonly reviewNumber: number;
+  readonly clarificationId: string;
+  readonly answerEventId: string;
+  readonly headSha: string;
+}): { readonly actionId: string; readonly identityDigest: string } {
+  const material = [
+    input.repository.provider, input.repository.repositoryDigest, String(input.reviewNumber),
+    input.clarificationId, input.answerEventId, input.headSha.toLowerCase(),
+  ].join("\0");
+  const identityDigest = createHash("sha256")
+    .update(`tgd:clarification-finding-publication:v1\0${material}`, "utf8")
+    .digest("hex");
+  return { actionId: `action_${identityDigest.slice(0, 32)}`, identityDigest };
+}
+
 function withRepository(action: PublicationAction, repository: RepositoryBinding): PublicationAction {
   return { ...action, repository };
 }
