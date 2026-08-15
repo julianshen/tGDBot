@@ -123,15 +123,15 @@ export async function runConversationSession(
   if (!model) return transient("conversation model spec is malformed");
 
   let resolvedModel: CreateAgentSessionOptions["model"] | undefined;
-  if (!options.createSession) {
-    const resolved = await resolveCredentialedModel(options.model);
-    if ("error" in resolved) return transient(resolved.error);
-    resolvedModel = resolved.model;
-  }
-
   let cwd: string | undefined;
   let session: DispatchSession | undefined;
   try {
+    if (!options.createSession) {
+      const resolved = await resolveCredentialedModel(options.model);
+      if ("error" in resolved) return transient(resolved.error);
+      resolvedModel = resolved.model;
+    }
+
     cwd = await mkdtemp(path.join(os.tmpdir(), "tgd-conversation-session-"));
     const request: ConversationSessionRequest = {
       cwd,
