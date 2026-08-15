@@ -37,6 +37,12 @@ export interface ConversationCursorSnapshot {
 export type ClarificationLifecycleState = "prepared" | "published" | "answer-observed" | "terminal";
 export type ClarificationTerminalOutcome = "confirmed" | "revised" | "withdrawn" | "stale";
 
+export interface FrozenClarificationOutcome {
+  readonly outcome: Exclude<ClarificationTerminalOutcome, "stale">;
+  readonly rationale: string;
+  readonly finding?: FindingSnapshot;
+}
+
 export interface PendingClarification {
   readonly id: string;
   readonly reviewNumber: number;
@@ -54,6 +60,7 @@ export interface PendingClarification {
   readonly terminalOutcome?: ClarificationTerminalOutcome;
   readonly actionId?: string;
   readonly identityDigest?: string;
+  readonly frozenOutcome?: FrozenClarificationOutcome;
 }
 
 export interface PendingDirection {
@@ -86,7 +93,7 @@ export type PublicationStatus = PublicationChildStatus;
 
 export type PublicationPlacement =
   | { readonly kind: "summary"; readonly headSha?: string; readonly configHash?: string; readonly terminalResult?: PublicationTerminalResult }
-  | { readonly kind: "group-reply"; readonly threadId?: string }
+  | { readonly kind: "group-reply"; readonly threadId?: string; readonly headSha?: string }
   | { readonly kind: "inline"; readonly file: string; readonly line: number; readonly startLine?: number; readonly side?: "old" | "new"; readonly clientId?: string; readonly position?: PublicationInlinePosition }
   | { readonly kind: "general-question"; readonly file?: string; readonly line?: number }
   | { readonly kind: "fallback" };
@@ -579,12 +586,31 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
       const item = exact(entry, `pending.clarifications[${index}]`,
         ["id", "reviewNumber", "headSha", "question", "createdAt"],
         ["state", "ruleName", "ruleSnapshot", "finding", "identity", "answerIdentity", "answerText",
-          "answerEventId", "terminalOutcome", "actionId", "identityDigest"]);
+          "answerEventId", "terminalOutcome", "actionId", "identityDigest", "frozenOutcome"]);
       if (typeof item.headSha !== "string" || !SHA_RE.test(item.headSha)) throw new Error("pending headSha is invalid");
       const validatedIdentity = item.identity === undefined ? undefined :
         conversationItemIdentity(item.identity, "pending clarification identity");
       const answerIdentity = item.answerIdentity === undefined ? undefined :
         conversationItemIdentity(item.answerIdentity, "pending clarification answer identity");
+      const frozenOutcome = item.frozenOutcome === undefined ? undefined : (() => {
+        const frozen = exact(item.frozenOutcome, "pending clarification frozenOutcome", ["outcome", "rationale"], ["finding"]);
+        if (frozen.outcome !== "confirmed" && frozen.outcome !== "revised" && frozen.outcome !== "withdrawn") {
+          throw new Error("pending clarification frozenOutcome.outcome is invalid");
+        }
+        const finding = frozen.finding === undefined ? undefined :
+          findingSnapshot(frozen.finding, "pending clarification frozenOutcome.finding");
+        if ((frozen.outcome === "confirmed" || frozen.outcome === "revised") && finding === undefined) {
+          throw new Error("confirmed clarification frozenOutcome requires a finding");
+        }
+        if (frozen.outcome === "withdrawn" && finding !== undefined) {
+          throw new Error("withdrawn clarification frozenOutcome cannot contain a finding");
+        }
+        return {
+          outcome: frozen.outcome,
+          rationale: text(frozen.rationale, "pending clarification frozenOutcome.rationale"),
+          ...(finding === undefined ? {} : { finding }),
+        } satisfies FrozenClarificationOutcome;
+      })();
       if (validatedIdentity !== undefined && validatedIdentity.provider !== expected.provider) {
         throw new Error("publication identity provider does not match repository");
       }
@@ -610,6 +636,7 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
         }),
         ...(item.actionId === undefined ? {} : { actionId: id(item.actionId, "actionId", "action") }),
         ...(item.identityDigest === undefined ? {} : { identityDigest: digest(item.identityDigest, "identityDigest") }),
+        ...(frozenOutcome === undefined ? {} : { frozenOutcome }),
       } satisfies PendingClarification;
     });
   const directions = array(object.directions, "pending.directions", 1_000)
@@ -737,6 +764,7 @@ function publicationPlacement(value: unknown, name: string): PublicationPlacemen
     return {
       kind: "group-reply",
       ...(object.threadId === undefined ? {} : { threadId: text(object.threadId, `${name}.threadId`, 256) }),
+      ...(object.headSha === undefined ? {} : { headSha: text(object.headSha, `${name}.headSha`, 64) }),
     };
   }
   if (object.kind === "inline") {

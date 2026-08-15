@@ -703,12 +703,15 @@ async function storeReviewDirection(input: {
   await input.options.store.transact((tx) => {
     const pending = tx.snapshot.pending;
     if (pending.directions.some((entry) => entry.id === directionId)) return;
+    const currentHead = metadata.headSha.toLowerCase();
+    const retainedDirections = pending.directions.filter((entry) =>
+      entry.reviewNumber !== input.event.reviewNumber || entry.headSha === currentHead).slice(-999);
     tx.replacePending({
       ...pending,
-      directions: [...pending.directions, {
+      directions: [...retainedDirections, {
         id: directionId,
         reviewNumber: input.event.reviewNumber,
-        headSha: metadata.headSha.toLowerCase(),
+        headSha: currentHead,
         text: input.direction,
         createdAt: input.options.now(),
         actionId: input.identity.actionId,
@@ -1054,12 +1057,31 @@ async function publishPreparedReply(input: {
     readonly store: ConversationStateStore;
     readonly now: () => string;
     readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
   };
-}): Promise<"completed" | "transient"> {
+}): Promise<"completed" | "transient" | "stale"> {
   try {
+    const action = actionFromEvent(input.latest);
+    const capturedHead = action.children.find((child) =>
+      child.placement.kind === "group-reply" && child.placement.headSha !== undefined)
+      ?.placement;
+    if (capturedHead?.kind === "group-reply" && capturedHead.headSha !== undefined) {
+      const metadata = await loadReviewMetadata(input.event.reviewNumber, input.options);
+      if (metadata === undefined) return "transient";
+      if (metadata.headSha.toLowerCase() !== capturedHead.headSha.toLowerCase()) {
+        const successor = conversationSuccessorIdentity(action, metadata.headSha);
+        const pair = supersedeWithSuccessor(action, successor);
+        await input.options.store.transact((tx) => {
+          tx.appendEvent(eventFromAction(pair.superseded, input.options.now()));
+          tx.appendEvent(eventFromAction(observePublication(pair.successor), input.options.now()));
+          tx.appendEvent(eventFromAction(pair.successor, input.options.now()));
+        });
+        return "stale";
+      }
+    }
     const published = await executePublication({
       store: input.options.store,
-      action: actionFromEvent(input.latest),
+      action,
       writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event),
       now: input.options.now,
     });
@@ -1172,9 +1194,16 @@ function buildReplyChild(input: {
   return createConversationPublicationChild({
     id: childId,
     kind: "group-reply",
-    placement: input.event.threadId === undefined
-      ? { kind: "group-reply" }
-      : { kind: "group-reply", threadId: input.event.threadId },
+    placement: {
+      kind: "group-reply",
+      ...(input.event.threadId === undefined ? {} : { threadId: input.event.threadId }),
+      ...(
+        input.plan.kind === "explain" || input.plan.kind === "reconsider" ||
+        (input.plan.kind === "clarification" && input.plan.outcome !== "stale")
+          ? { headSha: input.plan.headSha }
+          : {}
+      ),
+    },
     body: render(marker),
     marker: `<!-- tgd-conversation:${input.actionId}:${childId} -->`,
   });
@@ -1213,6 +1242,9 @@ async function loadTrustedBaseRules(
   const includeBuiltin = !options.config.disableBuiltinRule;
   if (options.config.trustLocalRules) {
     const loaded = await loadRules(options.config.rulesDir, includeBuiltin);
+    if (loaded.errors.length > 0) {
+      throw new Error(`trusted rule loading failed: ${loaded.errors.map((entry) => `${entry.sourcePath}: ${entry.message}`).join("; ")}`);
+    }
     return { rules: loaded.rules };
   }
   if (metadata.baseSha === undefined || metadata.baseSha.length === 0) {
@@ -1238,6 +1270,9 @@ async function loadTrustedBaseRules(
       await writeFile(dest, file.content, "utf-8");
     }));
     const loaded = await loadRules(tempRulesDir, includeBuiltin);
+    if (loaded.errors.length > 0) {
+      throw new Error(`trusted rule loading failed: ${loaded.errors.map((entry) => `${entry.sourcePath}: ${entry.message}`).join("; ")}`);
+    }
     return { rules: loaded.rules };
   } finally {
     await rm(tempRulesDir, { recursive: true, force: true }).catch((err: unknown) => {
@@ -1375,6 +1410,8 @@ async function maybeExecuteClarification(input: {
     }
   }
   const metadata = await loadReviewMetadata(input.item.event.reviewNumber, input.options);
+  const potentialAnswer = answerCommand || mayBeClarificationAnswer({ event: input.item.event, pending });
+  if (metadata === undefined) return potentialAnswer ? "transient" : undefined;
   const publicDigest = computeRepositoryDigest(
     input.options.config.repository.provider,
     input.options.config.repository.canonicalUrl,
@@ -1385,7 +1422,7 @@ async function maybeExecuteClarification(input: {
     thread,
     repositoryDigest: publicDigest,
     reviewNumber: input.item.event.reviewNumber,
-    headSha: metadata?.headSha ?? input.item.event.repositoryDigest.slice(0, 40),
+    headSha: metadata.headSha,
     mentioned: input.item.parsed.kind === "command",
   });
   if (association.kind === "ignore") {
@@ -1511,44 +1548,60 @@ async function executeClarificationAnswer(input: {
       body: observed.question,
       at: observed.createdAt,
     });
-    const model = input.options.config.model ?? currentRule?.model;
-    if (model === undefined) {
-      console.warn("tgd-review-agent: conversation model is not configured");
-      return "transient";
-    }
-    const result = await reassessClarification({
-      ledger: sessionLedger,
-      currentRule,
-      currentCodeHunk: extractFileHunk(input.metadata.diff, observed.finding?.file ?? ""),
-      model,
-      createSession: input.options.deps.createSession,
-      originalQuestion: observed.question,
-      selectedAnswer: input.association.answerText,
-      currentDiffPosition: observed.finding === undefined ? undefined : {
-        file: observed.finding.file,
-        ...(observed.finding.line === undefined ? {} : { line: observed.finding.line }),
-      },
-    });
-    if (result.status === "transient-error") return "transient";
-    if (result.status === "unsupported-history") {
-      plan = { kind: "clarification", outcome: "withdrawn", rationale: "The original finding is no longer available.", question: observed.question, answer: input.association.answerText, headSha: input.metadata.headSha };
-    } else if (result.status === "inactive-rule") {
-      plan = { kind: "clarification", outcome: "withdrawn", rationale: `The trusted rule ${result.ruleName} is no longer active.`, question: observed.question, answer: input.association.answerText, headSha: input.metadata.headSha };
-    } else {
-      plan = {
-        kind: "clarification",
-        outcome: result.result.outcome,
-        rationale: result.result.rationale,
-        question: observed.question,
-        answer: input.association.answerText,
-        headSha: input.metadata.headSha,
-      };
-      if (result.result.outcome === "confirmed" || result.result.outcome === "revised") {
+    let frozenOutcome = observed.frozenOutcome;
+    if (frozenOutcome === undefined) {
+      const model = input.options.config.model ?? currentRule?.model;
+      if (model === undefined) {
+        console.warn("tgd-review-agent: conversation model is not configured");
+        return "transient";
+      }
+      const result = await reassessClarification({
+        ledger: sessionLedger,
+        currentRule,
+        currentCodeHunk: extractFileHunk(input.metadata.diff, observed.finding?.file ?? ""),
+        model,
+        createSession: input.options.deps.createSession,
+        originalQuestion: observed.question,
+        selectedAnswer: input.association.answerText,
+        currentDiffPosition: observed.finding === undefined ? undefined : {
+          file: observed.finding.file,
+          ...(observed.finding.line === undefined ? {} : { line: observed.finding.line }),
+        },
+      });
+      if (result.status === "transient-error") return "transient";
+      if (result.status === "unsupported-history") {
+        frozenOutcome = { outcome: "withdrawn", rationale: "The original finding is no longer available." };
+      } else if (result.status === "inactive-rule") {
+        frozenOutcome = { outcome: "withdrawn", rationale: `The trusted rule ${result.ruleName} is no longer active.` };
+      } else if (result.result.outcome === "confirmed" || result.result.outcome === "revised") {
         if (!("finding" in result.result) || result.result.finding === undefined) return "transient";
+        frozenOutcome = {
+          outcome: result.result.outcome,
+          rationale: result.result.rationale,
+          finding: result.result.finding,
+        };
+      } else {
+        frozenOutcome = { outcome: "withdrawn", rationale: result.result.rationale };
+      }
+      await input.options.store.transact((tx) => {
+        const current = tx.snapshot.pending.clarifications.find((entry) => entry.id === observed.id) ?? observed;
+        tx.replacePending(replacePendingClarification(tx.snapshot.pending, { ...current, frozenOutcome }));
+      });
+    }
+    plan = {
+      kind: "clarification",
+      outcome: frozenOutcome.outcome,
+      rationale: frozenOutcome.rationale,
+      question: observed.question,
+      answer: input.association.answerText,
+      headSha: input.metadata.headSha,
+    };
+    if (frozenOutcome.outcome === "confirmed" || frozenOutcome.outcome === "revised") {
+      if (frozenOutcome.finding === undefined) return "transient";
         try {
           const publishedFinding = await publishConfirmedClarificationFinding({
             store: input.options.store,
-            finding: result.result.finding,
+            finding: frozenOutcome.finding,
             rules: rules.rules,
             reviewOptions: {
               advisor: input.options.config.advisor,
@@ -1595,7 +1648,6 @@ async function executeClarificationAnswer(input: {
           console.warn(`tgd-review-agent: could not publish clarified finding (${redactedMessage(error)})`);
           return "transient";
         }
-      }
     }
   }
 

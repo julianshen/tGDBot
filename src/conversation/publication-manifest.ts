@@ -216,13 +216,20 @@ export function completePublication(action: PublicationAction): PublicationActio
 }
 
 export function supersedePublication(action: PublicationAction, successorActionId: string): PublicationAction {
-  if (action.state !== "prepared") {
+  const frozenButUnwritten = (action.state === "manifest-ready" || action.state === "published") &&
+    action.children.every((child) => child.status === "pending" && child.identity === undefined);
+  if (action.state !== "prepared" && !frozenButUnwritten) {
     throw new Error(`Impossible action transition from ${action.state} to superseded`);
   }
   if (successorActionId === action.actionId) {
     throw new Error("superseded action cannot link to itself as successor");
   }
-  return { ...cloneAction(action), state: "superseded", successorActionId, children: [] };
+  return {
+    ...cloneAction(action),
+    state: "superseded",
+    successorActionId,
+    children: action.state === "prepared" ? [] : action.children.map((child) => ({ ...child })),
+  };
 }
 
 export function supersedeWithSuccessor(

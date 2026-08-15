@@ -931,6 +931,63 @@ describe("event-to-action poll", () => {
     });
   });
 
+  it("retires obsolete focus directions before appending at the pending-state cap", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    await store.transact((tx) => {
+      tx.replacePending({
+        ...tx.snapshot.pending,
+        directions: Array.from({ length: 1_000 }, (_, index) => ({
+          id: `direction_${index.toString(16).padStart(32, "0")}`,
+          reviewNumber: 1,
+          headSha: "a".repeat(40),
+          text: `old focus ${index}`,
+          createdAt: "2026-08-13T00:00:00.000Z",
+        })),
+      });
+    });
+    adapter.replaceEvents([commentEvent("focus-cap", "@tgdbot review focus: current head only")]);
+
+    await expect(poll(pollArgs(stateDir), {
+      ...executionDeps(adapter),
+      runReview: vi.fn(async () => 0),
+    })).resolves.toBe(0);
+
+    const directions = (await store.readContextSnapshot()).pending.directions;
+    expect(directions).toHaveLength(1);
+    expect(directions[0]).toMatchObject({ headSha: adapter.headSha, text: "current head only" });
+  });
+
+  it("evicts the oldest direction when other reviews already fill the repository cap", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    await store.transact((tx) => {
+      tx.replacePending({
+        ...tx.snapshot.pending,
+        directions: Array.from({ length: 1_000 }, (_, index) => ({
+          id: `direction_${index.toString(16).padStart(32, "0")}`,
+          reviewNumber: index + 2,
+          headSha: "a".repeat(40),
+          text: `other review ${index}`,
+          createdAt: new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString(),
+        })),
+      });
+    });
+    adapter.replaceEvents([commentEvent("focus-global-cap", "@tgdbot review focus: newest direction")]);
+
+    await expect(poll(pollArgs(stateDir), {
+      ...executionDeps(adapter),
+      runReview: vi.fn(async () => 0),
+    })).resolves.toBe(0);
+
+    const directions = (await store.readContextSnapshot()).pending.directions;
+    expect(directions).toHaveLength(1_000);
+    expect(directions.some((entry) => entry.text === "other review 0")).toBe(false);
+    expect(directions.at(-1)).toMatchObject({ reviewNumber: 1, text: "newest direction" });
+  });
+
   // The provider keeps returning a comment forever; what stops a second review
   // is that the review's cursor advanced past it. Verified here for a focus
   // command specifically, since it both dispatches a review AND writes a
@@ -1404,6 +1461,28 @@ describe("default trusted poll rule loading", () => {
     expect(adapter.postedBodies).toHaveLength(1);
     expect(adapter.postedBodies[0]).toMatch(/## Explanation/);
   });
+
+  it("retries instead of treating a malformed trusted rule as inactive", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    adapter.replaceEvents([installFindingThread(adapter, findingMarker!, threadComment("exp-bad-rule", "@tgdbot explain"))]);
+    const createSession = vi.fn(sessionFor(JSON.stringify({ explanation: "must not run" })));
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      conversationAdapter: adapter,
+      createSession,
+      getReviewMetadata: async () => ({ headSha: adapter.headSha, baseSha: "b".repeat(40), diff: currentHunk }),
+      resolvePollConfig: (pollInput) => ({
+        ...resolvePollConfig(pollInput),
+        vcsAdapter: {
+          getRuleFilesFromBase: vi.fn().mockResolvedValue([{ path: "broken.md", content: "not valid rule frontmatter" }]),
+        } as unknown as VcsAdapter,
+      }),
+    })).resolves.toBe(1);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toEqual([]);
+  });
 });
 
 describe("clarification answer lifecycle", () => {
@@ -1581,6 +1660,46 @@ describe("clarification answer lifecycle", () => {
     expect(snapshot.findings.some((entry) => entry.finding.message === "Tokens must not be logged.")).toBe(false);
   });
 
+  it("retries a clarification answer when current review metadata is unavailable", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("metadata-down", `answer ${CLAR_ID}: keep the logger`)]);
+    const createSession = vi.fn(sessionFor("{}"));
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+      getReviewMetadata: async () => undefined,
+    })).resolves.toBe(1);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toEqual([]);
+    const clarification = (await createConversationStateStore({ root: stateDir, repository: repo })
+      .readContextSnapshot()).pending.clarifications[0];
+    expect(clarification?.state).toBe("published");
+    expect(clarification?.terminalOutcome).toBeUndefined();
+  });
+
+  it("revalidates a frozen head-bound reply before recovery", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const command = installFindingThread(adapter, findingMarker!, threadComment("frozen-exp", "@tgdbot explain"));
+    adapter.replaceEvents([command]);
+    const postThreadReply = vi.spyOn(adapter, "postThreadReply").mockRejectedValueOnce(new Error("crash after freeze"));
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(1);
+    expect(adapter.postedBodies).toEqual([]);
+
+    postThreadReply.mockRestore();
+    adapter.headSha = "d".repeat(40);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { heads: [adapter.headSha] }),
+    })).resolves.toBe(0);
+    expect(adapter.postedBodies).toEqual([]);
+  });
+
   it("stays silent after a terminal result until a new mention", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);
@@ -1756,5 +1875,45 @@ describe("clarification answer lifecycle", () => {
     expect(snapshot.findings.filter((entry) =>
       entry.finding.message === confirmedFinding.message)).toHaveLength(1);
     expect(snapshot.pending.clarifications[0]?.state).toBe("terminal");
+  });
+
+  it("reuses the frozen clarification outcome after a finding publication crash", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("frozen-answer", `answer ${CLAR_ID}: keep the current logger`)]);
+    const vcs = silentReviewVcs();
+    const confirmedSession = vi.fn(sessionFor(JSON.stringify({
+      outcome: "confirmed",
+      rationale: "The logger still prints the token.",
+      finding: confirmedFinding,
+    })));
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: confirmedSession,
+        publicationHooks: {
+          afterChildWrite: async (child) => {
+            if (child.kind === "inline") throw new Error("crash after clarified finding write");
+          },
+        },
+      }),
+    })).resolves.toBe(1);
+
+    const changedSession = vi.fn(sessionFor(JSON.stringify({
+      outcome: "withdrawn",
+      rationale: "A nondeterministic retry changed its mind.",
+    })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { vcs, diff: commentableAuthDiff, createSession: changedSession }),
+    })).resolves.toBe(0);
+
+    expect(confirmedSession).toHaveBeenCalledOnce();
+    expect(changedSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies.at(-1)).toMatch(/Confirmed/);
+    expect(adapter.postedBodies.at(-1)).not.toMatch(/Withdrawn/);
   });
 });
