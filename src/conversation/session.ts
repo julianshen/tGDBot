@@ -70,12 +70,13 @@ function parseExplicitModel(spec: string): ConversationSessionModel | undefined 
   };
 }
 
-function resolveCredentialedModel(spec: string):
+async function resolveCredentialedModel(spec: string): Promise<
   | { readonly model: CreateAgentSessionOptions["model"] }
-  | { readonly error: string } {
+  | { readonly error: string }
+> {
   const parsed = parseModelSpec(spec);
   if (!parsed) return { error: "conversation model spec is malformed" };
-  const resolved = resolveRuleSessionModel(parsed.provider, parsed.modelId);
+  const resolved = await resolveRuleSessionModel(parsed.provider, parsed.modelId);
   if (!resolved.model) return { error: "the requested conversation model is not available on this machine" };
   return { model: resolved.model };
 }
@@ -123,7 +124,7 @@ export async function runConversationSession(
 
   let resolvedModel: CreateAgentSessionOptions["model"] | undefined;
   if (!options.createSession) {
-    const resolved = resolveCredentialedModel(options.model);
+    const resolved = await resolveCredentialedModel(options.model);
     if ("error" in resolved) return transient(resolved.error);
     resolvedModel = resolved.model;
   }
