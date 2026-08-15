@@ -220,6 +220,15 @@ export function orchestrate(
   const contributingRules = new Map<Finding, readonly string[]>(
     clusters.map((cluster) => [cluster.representative, cluster.rules]),
   );
+  // The members a cluster did NOT promote still have to be rendered somewhere,
+  // or a similarity heuristic silently deletes a finding (Codex review of
+  // PR #23, P1). Every surface that shows a representative shows these too.
+  const mergedMembers = new Map<Finding, readonly Finding[]>(
+    clusters.map((cluster) => [
+      cluster.representative,
+      cluster.members.filter((member) => member !== cluster.representative),
+    ]),
+  );
   const dedupedFindings = clusters
     .map((cluster) => cluster.representative)
     .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
@@ -285,9 +294,10 @@ export function orchestrate(
     const showFix =
       suggestion !== undefined && !rangeMalformed && !rangeInverted && (!wantsRange || rangeOk);
 
+    const alsoReported = mergedMembers.get(finding) ?? [];
     const rendered = renderInlineComment(
       showFix ? { ...finding, suggestion } : { ...finding, suggestion: undefined },
-      { suggestions: committable },
+      { suggestions: committable, ...(alsoReported.length > 0 ? { alsoReported } : {}) },
     );
 
     // Only anchor across a range when a COMMITTABLE suggestion will actually use it —
@@ -331,6 +341,10 @@ export function orchestrate(
         ...(() => {
           const rules = contributingRules.get(finding);
           return rules && rules.length > 1 ? { rules } : {};
+        })(),
+        ...(() => {
+          const members = mergedMembers.get(finding);
+          return members && members.length > 0 ? { alsoReported: members } : {};
         })(),
       },
     ]),

@@ -894,3 +894,27 @@ describe("renderSummaryComment — diff context", () => {
     expect(body).not.toContain("```diff");
   });
 });
+
+// Codex review of PR #23 (P2): compact mode is a SIZE fallback, so it must not
+// also be an ATTRIBUTION fallback — it previously merged both groups into one
+// undifferentiated list and dropped the provider's reason entirely.
+describe("renderSummaryComment — compact mode keeps attribution", () => {
+  it("labels publication failures and keeps the reason when compacted", () => {
+    const rejected = makeFinding({ file: "a.go", line: 10, message: "x".repeat(400) });
+    const unanchorable = makeFinding({ file: "b.go", line: undefined, message: "y".repeat(400) });
+
+    const body = renderSummaryComment({
+      allFindings: [rejected, unanchorable],
+      inlineCount: 0,
+      unanchored: [unanchorable],
+      publishFailed: [rejected],
+      publishFailureReason: "GitHub rejected the atomic inline review (HTTP 422)",
+      filesReviewed: [],
+      rulesRun: [],
+      rulesFailed: [],
+    } as never, 900);
+
+    expect(body).toContain("HTTP 422");
+    expect(body.toLowerCase()).toContain("publication failed");
+  });
+});

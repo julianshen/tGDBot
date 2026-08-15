@@ -986,3 +986,64 @@ describe("orchestrate — outcome groups and clustering", () => {
     expect(body).toContain("+added");
   });
 });
+
+// Codex review of PR #23 (P1): clusterFindings documents itself as
+// presentation-only and "retains every member", but orchestrate mapped each
+// cluster to its representative and nothing ever rendered the rest — so a
+// merged finding's message vanished from both surfaces. The safety property
+// that justifies tuning the similarity threshold for recall only holds if the
+// other members are actually SHOWN.
+describe("orchestrate — clustering never loses a member", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "r", ...overrides };
+  }
+
+  it("shows a merged member's claim in the inline comment body", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          // The LONGER message wins the representative slot, so the assertion
+          // below is about the member that clustering actually discards.
+          f({ ruleName: "mongodb", message: "Set followed by Get is not atomic because the two calls are separate operations that interleave." }),
+          f({ ruleName: "nats", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["mongodb", "nats"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]!.body).toContain("under retry");
+  });
+
+  it("shows a merged member's claim in a summary fallback entry", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ line: 999, ruleName: "mongodb", message: "Set followed by Get is not atomic because the two calls are separate operations that interleave." }),
+          f({ line: 999, ruleName: "nats", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["mongodb", "nats"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.unanchored).toHaveLength(1);
+    expect(result.commentBody).toContain("under retry");
+  });
+});

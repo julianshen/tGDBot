@@ -35,9 +35,11 @@ export type BatchAttempt = (
  * once a batch containing it is accepted, that batch is never revisited — so
  * this cannot duplicate a published comment.
  *
- * Inconclusive attempts propagate to the caller untouched, which keeps the
- * adapter's existing marker-recovery path responsible for deciding what
- * actually landed.
+ * Inconclusive attempts propagate to the caller untouched. NOTE for callers:
+ * by then an earlier batch may already be live, so the rejection thrown here
+ * must NOT be turned into "the whole batch failed" — that would duplicate
+ * posted comments into the summary. Run marker recovery and let it decide what
+ * landed (see GitHubAdapter.createInlineReview).
  */
 export async function bisectRejected(
   count: number,

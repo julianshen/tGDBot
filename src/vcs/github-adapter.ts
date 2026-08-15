@@ -1499,18 +1499,31 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         // the batch — including the ones GitHub would have been happy to take.
         // Bisect to find the actual offender(s) and publish the rest, instead of
         // relocating a whole review's worth of findings over one bad anchor.
-        rejectedIndices = await bisectRejected(comments.length, async (indices) => {
-          // The full batch was just proven to fail; re-sending it would be a
-          // wasted request with a known answer.
-          if (indices.length === comments.length) return "rejected";
-          try {
-            await postBatch(indices);
-            return "accepted";
-          } catch (cause) {
-            if (definiteRejection(cause) === undefined) throw cause;
-            return "rejected";
-          }
-        });
+        // Tracked alongside bisectRejected's own bookkeeping so a mid-bisect
+        // abort still knows which comments were DEFINITELY refused.
+        const provenRejected = new Set<number>();
+        try {
+          rejectedIndices = await bisectRejected(comments.length, async (indices) => {
+            // The full batch was just proven to fail; re-sending it would be a
+            // wasted request with a known answer.
+            if (indices.length === comments.length) return "rejected";
+            try {
+              await postBatch(indices);
+              return "accepted";
+            } catch (cause) {
+              if (definiteRejection(cause) === undefined) throw cause;
+              if (indices.length === 1) provenRejected.add(indices[0]!);
+              return "rejected";
+            }
+          });
+        } catch {
+          // Inconclusive mid-bisect. An earlier half may already be live, so
+          // reporting a blanket failure would duplicate those comments into the
+          // summary while they sit on the diff. Marker recovery below is the
+          // only authority on what landed; if it comes back incomplete, the
+          // typed ambiguous error stops any fallback write.
+          rejectedIndices = provenRejected;
+        }
       }
     }
     let recovered: Array<ConversationItemIdentity | null>;

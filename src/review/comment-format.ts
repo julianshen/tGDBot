@@ -193,7 +193,10 @@ function splitHeadline(message: string): { headline: string; body: string } {
  * already names the file and line, so acting on the finding doesn't require
  * re-deriving the context.
  */
-export function renderInlineComment(finding: Finding, options: RenderOptions = {}): string {
+export function renderInlineComment(
+  finding: Finding,
+  options: RenderOptions & { alsoReported?: readonly Finding[] } = {},
+): string {
   const full = sanitizeText(finding.message);
   const file = sanitizeInline(finding.file);
   const { headline, body } = resolveHeadline(finding, full);
@@ -218,6 +221,10 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
     // delete the fix: the reviewer who picked the safe mode is the last person who
     // should lose information (caught in review — the first draft dropped it).
     parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
+  }
+
+  if (options.alsoReported && options.alsoReported.length > 0) {
+    parts.push("", renderAlsoReported(options.alsoReported));
   }
 
   const prompt = `In \`${file}\`${lineRef}: ${full}\n\nFix only this issue, keep the change minimal, and make sure the tests still pass.`;
@@ -330,6 +337,14 @@ export interface FindingContext {
   readonly snippet?: HunkSnippet;
   /** Every rule that reported this root cause, when clustering merged several. */
   readonly rules?: readonly string[];
+  /**
+   * The other members of this finding's cluster. Clustering keeps ONE entry per
+   * root cause, and these must still be rendered: a merge is a judgement call
+   * made by a similarity heuristic, and silently deleting the losing member's
+   * text would turn a presentation choice into data loss. (Codex review of
+   * PR #23, P1 — the invariant was documented but never actually honoured.)
+   */
+  readonly alsoReported?: readonly Finding[];
 }
 
 export interface ClarificationPresentation {
@@ -475,6 +490,19 @@ function renderDiffExcerpt(snippet: HunkSnippet): string {
   return `${fence}diff\n${body}\n${fence}`;
 }
 
+// Collapsed so one entry stays scannable, present so nothing is lost.
+function renderAlsoReported(members: readonly Finding[]): string {
+  const items = members.map((member) => {
+    const rule = sanitizeInline(member.ruleName);
+    const loc = typeof member.line === "number" ? `:${member.line}` : "";
+    return `- **\`${rule}\`**${loc}: ${sanitizeText(member.message)}`;
+  });
+  return detailsBlock(
+    `Also reported by ${members.length} other rule${members.length === 1 ? "" : "s"}`,
+    items,
+  );
+}
+
 function renderUnanchoredFinding(
   finding: Finding,
   includeSuggestion = true,
@@ -510,6 +538,9 @@ function renderUnanchoredFinding(
         ? renderSuggestionBlock(suggestion, false)
         : "> Proposed fix omitted because the summary size budget was exhausted.",
     );
+  }
+  if (context?.alsoReported && context.alsoReported.length > 0) {
+    parts.push("", renderAlsoReported(context.alsoReported));
   }
   return parts.join("\n");
 }
@@ -694,9 +725,19 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   const header =
     `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
+  const publishFailedSet = new Set(input.publishFailed ?? []);
   const notice =
     "> [!WARNING]\n" +
-    "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+    "> Review details were compacted to fit the provider limit; proposed fixes were omitted." +
+    // Compact mode is a SIZE fallback, not an ATTRIBUTION fallback: a large
+    // review must not lose WHY its findings are not inline (Codex review of
+    // PR #23, P2). The reason is bounded like every other compact field.
+    (publishFailedSet.size > 0
+      ? `\n> ${publishFailedSet.size} inline comment(s) had valid anchors but publication failed` +
+        (input.publishFailureReason
+          ? `: ${truncate(sanitizeInline(input.publishFailureReason), 240)}`
+          : ".")
+      : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);
   const disputed = renderDisputedSection(input);
@@ -721,7 +762,8 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const rule = truncate(sanitizeInline(finding.ruleName), 80);
     const message = sanitizeInline(finding.message);
-    return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
+    const group = publishFailedSet.has(finding) ? " 📌" : "";
+    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${group} \`${loc}\` (\`${rule}\`): `, message };
   });
   const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
