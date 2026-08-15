@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import type { PollArgs } from "../cli-args.js";
+import type { PollArgs, SharedReviewOptions } from "../cli-args.js";
+import type { ReviewInvocation } from "../cli.js";
 import {
   conversationActionIdentity,
   conversationCommandKey,
@@ -129,7 +130,18 @@ export interface PollDependencies {
     readonly baseSha?: string;
   }) => Promise<{ readonly rules: readonly RuleDefinition[]; readonly error?: Error }>;
   readonly publicationHooks?: PublicationExecutorHooks;
+  /**
+   * Injected rather than imported: cli.ts already imports poll(), so importing
+   * review() back would close a module cycle. main() supplies the real one.
+   */
+  readonly runReview?: (
+    args: ReviewCommandArgs,
+    deps: { readonly invocation: ReviewInvocation },
+  ) => Promise<number>;
 }
+
+/** The subset of review CliArgs poll constructs from its own resolved options. */
+export type ReviewCommandArgs = Omit<SharedReviewOptions, "command"> & { readonly pr: string };
 
 export async function poll(args: PollArgs, deps: PollDependencies = {}): Promise<number> {
   const config = (deps.resolvePollConfig ?? resolvePollConfig)(args);
@@ -286,6 +298,7 @@ async function classifyOpenReviewEvents(options: {
       }
       if (item.parsed.kind === "command" && item.parsed.command.kind !== "answer" &&
         !isMemoryCommand(item.parsed.command) &&
+        !isReviewCommand(item.parsed.command) &&
         !isExecutableConversationCommand(item.parsed.command)) {
         console.log(
           `tgd-review-agent: recognized ${item.parsed.normalized} on review #${item.event.reviewNumber} (executor unavailable)`,
@@ -559,6 +572,10 @@ async function executeConversationEvent(input: {
     return result;
   }
 
+  if (item.parsed.kind === "command" && isReviewCommand(item.parsed.command)) {
+    return executeReviewCommand({ item, command: item.parsed.command, options });
+  }
+
   const clarificationOutcome = await maybeExecuteClarification({ item, reviewIdentity, options, latest });
   if (clarificationOutcome !== undefined) return clarificationOutcome;
 
@@ -571,6 +588,175 @@ async function executeConversationEvent(input: {
     reviewIdentity,
     options,
   });
+}
+
+/** Commands that re-run the review itself rather than posting a composed reply. */
+function isReviewCommand(command: ConversationCommand): command is
+  | { readonly kind: "check-latest" }
+  | { readonly kind: "review-focus"; readonly direction: string } {
+  return command.kind === "check-latest" || command.kind === "review-focus";
+}
+
+/**
+ * Builds the review configuration from poll's OWN resolved options so a command
+ * runs under the same rules, model, and dispatch engine as the poll that saw
+ * it. Reading ambient review defaults here would silently review under a
+ * different configuration than the operator asked for.
+ */
+function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): ReviewCommandArgs {
+  return {
+    pr: String(reviewNumber),
+    vcs: config.vcs,
+    repo: config.repo,
+    rulesDir: config.rulesDir,
+    disableBuiltinRule: config.disableBuiltinRule,
+    advisor: config.advisor,
+    suggestions: config.suggestions,
+    dryRun: config.dryRun,
+    trustLocalRules: config.trustLocalRules,
+    dispatch: config.dispatch,
+    ...(config.model === undefined ? {} : { model: config.model }),
+    ...(config.maxDiffChars === undefined ? {} : { maxDiffChars: config.maxDiffChars }),
+    ...(config.stateDir === undefined ? {} : { stateDir: config.stateDir }),
+  };
+}
+
+async function executeReviewCommand(input: {
+  readonly item: { readonly event: ReviewActivityEvent; readonly identity: { actionId: string; identityDigest: string } };
+  readonly command: { readonly kind: "check-latest" } | { readonly kind: "review-focus"; readonly direction: string };
+  readonly options: {
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  };
+}): Promise<"completed" | "transient" | "stale"> {
+  const { item, command, options } = input;
+  const runReview = options.deps.runReview;
+  if (runReview === undefined) {
+    console.warn("tgd-review-agent: review command executor is not configured");
+    return "transient";
+  }
+  const invocation: ReviewInvocation = command.kind === "check-latest"
+    ? { kind: "forced-command", actionId: item.identity.actionId }
+    : { kind: "focused-command", actionId: item.identity.actionId, direction: command.direction };
+
+  // The direction is durable BEFORE the supplemental run. If the review fails
+  // transiently, the retry still knows what was asked; and a later normal
+  // review on the same head picks it up as additive context. It never becomes a
+  // trusted rule — every trusted rule still runs unchanged.
+  if (command.kind === "review-focus") {
+    const stored = await storeReviewDirection({
+      identity: item.identity,
+      event: item.event,
+      direction: command.direction,
+      options,
+    });
+    if (stored === "transient") return "transient";
+    // The supplemental publication path — results replying beneath the command,
+    // leaving the managed summary and prior threads untouched — is not built
+    // yet. Running an ordinary review here would do the opposite: overwrite the
+    // summary and resolve the previous head's threads. So the direction is
+    // recorded and steers the next review of this head, and nothing is
+    // published until the supplemental path exists.
+    await completeReviewCommandAction(item, options);
+    return "completed";
+  }
+
+  let exitCode: number;
+  try {
+    exitCode = await runReview(reviewArgsFor(options.config, item.event.reviewNumber), { invocation });
+  } catch (error) {
+    console.warn(`tgd-review-agent: review command failed (${(error as Error).message})`);
+    return "transient";
+  }
+  if (exitCode !== 0 && exitCode !== 2) return "transient";
+  // This action carries no manifest of its own — review() owns and recovers the
+  // one that publishes its output — so it walks the remaining states with an
+  // empty manifest: nothing to freeze, nothing to write, every child terminal.
+  // Failing before this leaves the action incomplete, and the retry re-runs the
+  // review, whose own dedup and pending-summary recovery make that safe.
+  await completeReviewCommandAction(item, options);
+  return "completed";
+}
+
+/**
+ * Idempotent in the action identity: a retry recomputes the same direction ID
+ * and finds its own earlier record rather than steering the review twice.
+ */
+async function storeReviewDirection(input: {
+  readonly identity: { actionId: string; identityDigest: string };
+  readonly event: ReviewActivityEvent;
+  readonly direction: string;
+  readonly options: {
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  };
+}): Promise<"stored" | "transient"> {
+  const metadata = await loadReviewMetadata(input.event.reviewNumber, input.options);
+  if (metadata === undefined) return "transient";
+  const directionId = `direction_${createHash("sha256")
+    .update("tgd:direction:v1\0", "utf8")
+    .update(input.identity.actionId)
+    .digest("hex")
+    .slice(0, 32)}`;
+  await input.options.store.transact((tx) => {
+    const pending = tx.snapshot.pending;
+    if (pending.directions.some((entry) => entry.id === directionId)) return;
+    tx.replacePending({
+      ...pending,
+      directions: [...pending.directions, {
+        id: directionId,
+        reviewNumber: input.event.reviewNumber,
+        headSha: metadata.headSha.toLowerCase(),
+        text: input.direction,
+        createdAt: input.options.now(),
+        actionId: input.identity.actionId,
+        ...(input.event.authorLogin === undefined ? {} : { author: input.event.authorLogin }),
+        source: input.event.url,
+      }],
+    });
+  });
+  return "stored";
+}
+
+/**
+ * Walks the remaining states with an empty manifest: this action publishes
+ * nothing of its own, so there is nothing to freeze, nothing to write, and
+ * every (zero) child is terminal.
+ */
+async function completeReviewCommandAction(
+  item: { readonly event: ReviewActivityEvent; readonly identity: { actionId: string; identityDigest: string } },
+  options: { readonly store: ConversationStateStore; readonly now: () => string },
+): Promise<void> {
+  await options.store.transact((tx) => {
+    for (const state of ["manifest-ready", "published", "completed"] as const) {
+      tx.appendEvent(pollActionEvent(item.identity, item.event.reviewNumber,
+        options.store.repositoryBinding, state, options.now()));
+    }
+  });
+}
+
+function pollActionEvent(
+  identity: { actionId: string; identityDigest: string },
+  reviewNumber: number,
+  repository: RepositoryBinding,
+  state: "manifest-ready" | "published" | "completed",
+  at: string,
+): ConversationEventEntry {
+  return {
+    version: 1,
+    repository,
+    actionId: identity.actionId,
+    state,
+    at,
+    successorActionId: null,
+    manifest: [],
+    identityDigest: identity.identityDigest,
+    reviewNumber,
+  };
 }
 
 async function planConversationReply(input: {

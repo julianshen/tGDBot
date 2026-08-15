@@ -255,7 +255,10 @@ async function journalEvents(store: ConversationStateStore): Promise<Conversatio
 }
 
 describe("classification-only poll", () => {
-  it("classifies irrelevant and deferred commands without posting replies", async () => {
+  // Every recognized command now has an executor, so the only events that are
+  // classified without a reply are the ones that are not commands at all:
+  // ordinary prose, and anything tGDBot itself authored.
+  it("classifies irrelevant and self-authored events without posting replies", async () => {
     const stateDir = await tempStateDir();
     const adapter = new ClassificationAdapter([]);
     await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
@@ -263,30 +266,17 @@ describe("classification-only poll", () => {
     adapter.replaceEvents([
       commentEvent("irr", "looks good"),
       commentEvent("self", "@tgdbot explain", "2026-08-14T00:00:00.000Z", { authorLogin: "tgdbot", authorIsBot: true }),
-      commentEvent("cmd", "@tgdbot check latest"),
     ]);
-    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
-    try {
-      await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
-      expect(adapter.writes).toEqual([]);
-      expect(log.mock.calls.flat().join("\n")).toMatch(/@tgdbot check latest/i);
-      expect(log.mock.calls.flat().join("\n")).toMatch(/executor unavailable/i);
-    } finally {
-      log.mockRestore();
-    }
+    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    expect(adapter.writes).toEqual([]);
 
     const store = createConversationStateStore({ root: stateDir, repository: repo });
     const snapshot = await store.readContextSnapshot();
-    const observed = snapshot.events.filter((entry) => entry.state === "observed");
-    const prepared = snapshot.events.filter((entry) => entry.state === "prepared");
-    expect(observed).toHaveLength(1);
-    expect(prepared).toHaveLength(1);
-    expect(prepared[0]?.manifest).toEqual([]);
-    expect(snapshot.events.filter((entry) => entry.state === "completed")).toHaveLength(0);
+    expect(snapshot.events.filter((entry) => entry.state === "prepared")).toHaveLength(0);
     const journal = await journalEvents(store);
-    expect(journal.filter((entry) => entry.state === "observed")).toHaveLength(3);
+    expect(journal.filter((entry) => entry.state === "observed")).toHaveLength(2);
     expect(journal.filter((entry) => entry.state === "completed")).toHaveLength(2);
-    expect(journal.filter((entry) => entry.state === "prepared")).toHaveLength(1);
+    expect(journal.filter((entry) => entry.state === "prepared")).toHaveLength(0);
   });
 
   it("stops after 200 events, exits 0, and continues on the next invocation", async () => {
@@ -791,6 +781,83 @@ describe("event-to-action poll", () => {
     expect(forgotten).toContain("## Memory forgotten");
     expect(secondList).toContain("no active memories");
     expect((await store.readContextSnapshot()).memories).toHaveLength(0);
+  });
+
+  // Config parity: the forced review must run with the flags poll itself was
+  // given, never with ambient review defaults, or `check latest` would silently
+  // review under a different rule set than the poll it came from.
+  it("check latest runs a forced review with poll's own resolved options", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const runReview = vi.fn(async () => 0);
+    adapter.replaceEvents([commentEvent("force", "@tgdbot check latest")]);
+
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      rulesDir: ".custom/rules",
+      advisor: "off",
+      suggestions: "off",
+      dispatch: "legacy",
+      disableBuiltinRule: true,
+      trustLocalRules: true,
+      maxDiffChars: 4242,
+    }), { ...executionDeps(adapter), runReview })).resolves.toBe(0);
+
+    expect(runReview).toHaveBeenCalledTimes(1);
+    const [reviewArgs, reviewDeps] = runReview.mock.calls[0] as [Record<string, unknown>, Record<string, unknown>];
+    expect(reviewArgs).toMatchObject({
+      pr: "1",
+      repo: "owner/repo",
+      vcs: "github",
+      model: "anthropic/claude-opus-4-5",
+      rulesDir: ".custom/rules",
+      advisor: "off",
+      suggestions: "off",
+      dispatch: "legacy",
+      disableBuiltinRule: true,
+      trustLocalRules: true,
+      maxDiffChars: 4242,
+      stateDir,
+    });
+    expect(reviewDeps.invocation).toMatchObject({ kind: "forced-command" });
+  });
+
+  // The direction has to be durable BEFORE the supplemental run: if the review
+  // fails transiently, the retry must still know what was asked, and a later
+  // normal review on the same head has to be able to pick it up as context.
+  it("review focus records the direction bound to the review head and publishes nothing yet", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    let directionsAtRunTime: readonly { text: string; headSha: string }[] = [];
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const runReview = vi.fn(async () => {
+      directionsAtRunTime = (await store.readContextSnapshot()).pending.directions
+        .map((item) => ({ text: item.text, headSha: item.headSha }));
+      return 0;
+    });
+    adapter.replaceEvents([
+      commentEvent("focus", "@tgdbot review focus: check the error handling"),
+    ]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter), runReview,
+    })).resolves.toBe(0);
+
+    // The supplemental publication path does not exist yet, and running an
+    // ordinary review would overwrite the managed summary and resolve the prior
+    // head's threads — the opposite of what a focused run must do. So nothing
+    // is reviewed or published; the direction is recorded to steer the next
+    // review of this head.
+    expect(runReview).not.toHaveBeenCalled();
+    expect(directionsAtRunTime).toEqual([]);
+    expect(adapter.postedBodies).toEqual([]);
+    const stored = (await store.readContextSnapshot()).pending.directions;
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toMatchObject({
+      reviewNumber: 1,
+      author: "alice",
+      text: "check the error handling",
+    });
   });
 
   it("executes explain and reconsider only in a marked bot-started finding thread", async () => {

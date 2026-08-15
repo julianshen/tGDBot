@@ -3,7 +3,7 @@ import { computeContentDigest, parseChildMarker } from "./markers.js";
 
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{7,64}$/iu;
-const ID_RE = /^(?:action|output|finding|clarification|memory)_[0-9a-f]{32}$/u;
+const ID_RE = /^(?:action|output|finding|clarification|memory|direction)_[0-9a-f]{32}$/u;
 const CLAR_PUBLIC_ID_RE = /^clar_[abcdefghijklmnopqrstuvwxyz234567]{12,32}$/u;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u;
 /**
@@ -62,6 +62,14 @@ export interface PendingDirection {
   readonly headSha: string;
   readonly text: string;
   readonly createdAt: string;
+  /**
+   * Attribution for the command that asked for the direction. Optional so a
+   * record written before this existed still loads, but always written now: a
+   * direction steers a review, so who asked and where has to stay auditable.
+   */
+  readonly actionId?: string;
+  readonly author?: string;
+  readonly source?: string;
 }
 
 export interface ConversationPendingSnapshot {
@@ -615,14 +623,21 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
     });
   const directions = array(object.directions, "pending.directions", 1_000)
     .map((entry, index) => {
-      const item = exact(entry, `pending.directions[${index}]`, ["id", "reviewNumber", "headSha", "text", "createdAt"]);
+      const item = exact(entry, `pending.directions[${index}]`,
+        ["id", "reviewNumber", "headSha", "text", "createdAt"], ["actionId", "author", "source"]);
       if (typeof item.headSha !== "string" || !SHA_RE.test(item.headSha)) throw new Error("pending headSha is invalid");
       return {
-        id: id(item.id, "pending id", "clarification"),
+        // A direction is not a clarification; validating it under that prefix
+        // was a copy of the block above and would reject every ID actually
+        // minted for one.
+        id: id(item.id, "pending id", "direction"),
         reviewNumber: positiveInteger(item.reviewNumber, "reviewNumber"),
         headSha: item.headSha.toLowerCase(),
         text: text(item.text, "text"),
         createdAt: date(item.createdAt, "createdAt"),
+        ...(item.actionId === undefined ? {} : { actionId: id(item.actionId, "direction actionId", "action") }),
+        ...(item.author === undefined ? {} : { author: text(item.author, "direction author", 1_000) }),
+        ...(item.source === undefined ? {} : { source: text(item.source, "direction source", 2_000) }),
       } satisfies PendingDirection;
     });
   const ids = [...clarifications, ...directions].map((entry) => entry.id);

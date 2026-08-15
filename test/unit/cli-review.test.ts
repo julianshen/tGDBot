@@ -394,6 +394,36 @@ describe("review", () => {
     logSpy.mockRestore();
   });
 
+  // `check latest` exists precisely to overrule dedup: a human asking for a
+  // fresh review on an unchanged head must get one. Only an explicit forced
+  // invocation may do this — a normal run on the same head still skips.
+  it("a forced-command invocation reviews a head that normal dedup would skip", async () => {
+    const pr = makePr({ headSha: "cafef00d" });
+    // A forced run reaches the full publication flow, so it needs its own state
+    // root: without one it resolves the real user-level root and every parallel
+    // worker contends on that single lock.
+    const args = makeArgs({ stateDir: isolatedStateDir() });
+    const cfg = computeReviewConfigHash(args);
+    const botComment: BotComment = {
+      id: "999",
+      body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
+      lastReviewedSha: "cafef00d",
+      reviewedConfig: cfg,
+    };
+    const h = makeHarness({ args, pr, botComment });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, {
+      ...depsFrom(h),
+      invocation: { kind: "forced-command", actionId: `action_${"4".repeat(32)}` },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(h.dispatchRules).toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
   it("applies head/config dedup to an explicit GitLab merge request", async () => {
     const args = makeArgs({
       pr: "https://gitlab.example.com/group/project/-/merge_requests/42",
@@ -2589,7 +2619,7 @@ async function seedConversationState(stateDir: string, options: {
           createdAt: "2026-08-14T00:00:00.000Z",
         }],
         directions: options.directionText === undefined ? [] : [{
-          id: `clarification_${"c".repeat(32)}`,
+          id: `direction_${"c".repeat(32)}`,
           reviewNumber: 42,
           headSha: CONVERSATION_HEAD,
           text: options.directionText,

@@ -57,10 +57,17 @@ describe("strict state schemas", () => {
 
   test("validates pending head-bound directions with bounded text", () => {
     const pending = { version: 1, repository: binding, clarifications: [], directions: [{
-      id: `clarification_${"1".repeat(32)}`, reviewNumber: 7, headSha: "f".repeat(40),
+      id: `direction_${"1".repeat(32)}`, reviewNumber: 7, headSha: "f".repeat(40),
       text: "Use the compatibility path", createdAt: "2026-01-01T00:00:00.000Z",
+      actionId: `action_${"2".repeat(32)}`, author: "alice",
+      source: "https://github.com/owner/repo/pull/7#issuecomment-1",
     }] };
     expect(validatePendingSnapshot(pending, binding)).toEqual(pending);
+    // A direction is not a clarification. Validating it under that prefix would
+    // reject every ID actually minted for one.
+    expect(() => validatePendingSnapshot({ ...pending, directions: [
+      { ...pending.directions[0], id: `clarification_${"1".repeat(32)}` },
+    ] }, binding)).toThrow(/stable ID/i);
     expect(() => validatePendingSnapshot({ ...pending, directions: [{ ...pending.directions[0], text: "x".repeat(20_001) }] }, binding))
       .toThrow(/large|length|text/i);
   });

@@ -131,7 +131,20 @@ export function parseArgs(argv: string[]): CliArgs {
  * never has to shell out to `gh`, hit the network, or construct a real pi
  * SDK session.
  */
+/**
+ * Why this run is happening, rather than a bare `force` boolean. Only an
+ * explicit command may overrule dedup, and a focused run needs to carry its
+ * direction and the action that requested it, so the reason has to be a value
+ * the review flow can branch on — not a flag whose meaning is lost at the call
+ * site.
+ */
+export type ReviewInvocation =
+  | { readonly kind: "normal" }
+  | { readonly kind: "forced-command"; readonly actionId: string }
+  | { readonly kind: "focused-command"; readonly actionId: string; readonly direction: string };
+
 export interface ReviewDependencies {
+  invocation: ReviewInvocation;
   resolveConfig: (args: CliArgs) => ResolvedConfig;
   loadRules: (rulesDir: string, includeBuiltin: boolean) => Promise<LoadResult>;
   dispatchRules: (input: ReviewDispatchInput) => Promise<DispatchResult>;
@@ -686,6 +699,7 @@ export async function review(
   args: CliArgs,
   deps: Partial<ReviewDependencies> = {},
 ): Promise<number> {
+  const invocation: ReviewInvocation = deps.invocation ?? { kind: "normal" };
   const resolveConfigFn = deps.resolveConfig ?? resolveConfigReal;
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
   // Task 3: both engines share one object-shaped CLI seam. The legacy adapter
@@ -898,7 +912,11 @@ export async function review(
   }
 
   // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
-  if (decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
+  // A forced command is the one exception: it was issued against this exact
+  // head on purpose. Focused runs do not bypass it — they publish supplemental
+  // output rather than redoing the normal review.
+  if (invocation.kind !== "forced-command" &&
+    decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
     logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
     return EXIT_OK;
   }

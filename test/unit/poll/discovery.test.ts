@@ -480,7 +480,7 @@ describe("poll discovery and bootstrap", () => {
       commentEvent(1, "new-1", "later on one", "2026-08-14T00:00:00.000Z"),
     ]);
     eventsByReview.set(2, [
-      commentEvent(2, "created-1", "@tgdbot check latest", "2026-08-14T00:00:00.000Z"),
+      commentEvent(2, "created-1", "a comment on the newly created review", "2026-08-14T00:00:00.000Z"),
     ]);
     adapter["options"].openReviewPages = [[summary(1), summary(2)]];
 
@@ -490,7 +490,10 @@ describe("poll discovery and bootstrap", () => {
     const journal = await journalEvents(store);
     expect(journal.some((entry) => entry.reviewNumber === 2)).toBe(true);
     expect(journal.some((entry) => entry.reviewNumber === 1)).toBe(true);
-    expect(snapshot.events.some((entry) => entry.reviewNumber === 2)).toBe(true);
+    // The later-created review is tracked with its own cursor. Asserting on
+    // snapshot.events instead would only hold while some action for it stayed
+    // non-terminal, which is incidental to what this test is about.
+    expect(snapshot.cursor.reviews.some((entry) => entry.reviewNumber === 2)).toBe(true);
     const reviewOneAfter = adapter.eventCalls.filter((call) => call.reviewNumber === 1 && call.after !== undefined);
     expect(reviewOneAfter.length).toBeGreaterThan(0);
     const reviewTwoFromStart = adapter.eventCalls.filter((call) => call.reviewNumber === 2);
