@@ -9,19 +9,21 @@ export default defineConfig({
     // as if they belonged to this one.
     include: ["test/**/*.test.ts"],
     exclude: ["**/node_modules/**", "**/dist/**", ".worktrees/**"],
-    // Vitest's 5s default assumes pure in-memory unit tests. Much of this suite
-    // is not that: the conversation state store, publication manifests, and
-    // poll discovery exercise real temp directories, fsync ordering, and lock
-    // serialization, and the heaviest drive several full poll() passes over
-    // hundreds of events. Those files pass comfortably alone but contend for IO
-    // when all 44 run in parallel, and the resulting timeouts read exactly like
-    // logic failures while being purely a function of machine load — which is
-    // how a suite that could not even compile still reported 1477 passing.
+    // Much of this suite is not a pure in-memory unit test: the conversation
+    // state store, publication manifests, and poll discovery exercise real temp
+    // directories, fsync ordering, and lock serialization. Run in parallel they
+    // contend for IO badly enough that unrelated tests exceed any per-test
+    // budget, and the failures read exactly like logic errors while being
+    // purely a function of machine load.
     //
-    // Capping worker count instead was measured at more than double the total
-    // wall-clock, so a generous per-test budget is the cheaper guarantee: a
-    // healthy test never approaches it, a genuinely hung one still fails.
-    testTimeout: 60_000,
-    hookTimeout: 60_000,
+    // Measured on this suite: sequential is 260s against 183s parallel, and it
+    // is reliable. A generous timeout was tried first and made things worse —
+    // dozens of contention timeouts at 60s each turn a suite that fails in
+    // four minutes into one that appears to hang for forty. Determinism is
+    // worth 80 seconds; a test suite nobody can trust hides real defects, which
+    // is exactly how a branch that could not compile reported 1477 passing.
+    fileParallelism: false,
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
   },
 });

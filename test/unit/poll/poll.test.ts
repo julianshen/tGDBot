@@ -330,6 +330,49 @@ describe("classification-only poll", () => {
     expect(after.cursor).toEqual(before.cursor);
   });
 
+  // Dry-run is the only way to inspect what tGDBot would do against a real
+  // repository, so it has to be trustworthy across EVERY command, not just the
+  // one that happened to be implemented when it was written. Each of these can
+  // otherwise write: to the provider, to the memory ledger, to pending
+  // directions, or by dispatching a review.
+  it("dry-run writes nothing for any recognized command", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const before = await store.readContextSnapshot();
+    const createSession = vi.fn(sessionFor("{}"));
+    const runReview = vi.fn(async () => 0);
+    adapter.replaceEvents([
+      commentEvent("irr", "looks good", "2026-08-14T00:00:01.000Z"),
+      commentEvent("bad", "@tgdbot frobnicate", "2026-08-14T00:00:02.000Z"),
+      commentEvent("rem", "@tgdbot remember prefer explicit null checks", "2026-08-14T00:00:03.000Z"),
+      commentEvent("forget", `@tgdbot forget mem_${"a".repeat(26)}`, "2026-08-14T00:00:04.000Z"),
+      commentEvent("list", "@tgdbot memories", "2026-08-14T00:00:05.000Z"),
+      commentEvent("focus", "@tgdbot review focus: the error handling", "2026-08-14T00:00:06.000Z"),
+      commentEvent("force", "@tgdbot check latest", "2026-08-14T00:00:07.000Z"),
+      commentEvent("exp", "@tgdbot explain", "2026-08-14T00:00:08.000Z"),
+    ]);
+
+    await expect(poll(pollArgs(stateDir, { dryRun: true, model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }), runReview,
+    })).resolves.toBe(0);
+
+    // Nothing reached the provider, the model, or the review flow.
+    expect(adapter.postedBodies).toEqual([]);
+    expect(adapter.writes).toEqual([]);
+    expect(createSession).not.toHaveBeenCalled();
+    expect(runReview).not.toHaveBeenCalled();
+    // ...and no local domain state moved, including the ledgers the memory and
+    // focus commands would otherwise append to.
+    const after = await store.readContextSnapshot();
+    expect(after.events).toEqual(before.events);
+    expect(after.cursor).toEqual(before.cursor);
+    expect(after.memories).toEqual(before.memories);
+    expect(after.memoryLedger).toEqual(before.memoryLedger);
+    expect(after.pending).toEqual(before.pending);
+    expect(after.findings).toEqual(before.findings);
+  });
+
   it("returns 0 after first-run bootstrap with no historical handling", async () => {
     const stateDir = await tempStateDir();
     const adapter = new ClassificationAdapter([commentEvent("old", "@tgdbot explain", "2026-08-01T00:00:00.000Z")]);
