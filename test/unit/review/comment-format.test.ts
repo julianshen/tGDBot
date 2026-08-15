@@ -9,6 +9,7 @@ import {
 } from "../../../src/review/comment-format.js";
 import { formatChildMarker } from "../../../src/conversation/markers.js";
 import type { Finding } from "../../../src/review/types.js";
+import type { SummaryInput } from "../../../src/review/comment-format.js";
 import type { RelatedWorkItem } from "../../../src/review/related-work.js";
 
 // Every inline body ends with the tool's trailing marker (what stale-thread
@@ -755,12 +756,27 @@ describe("ADR-007/008: review fixes", () => {
 // with the note "These couldn't be anchored to a line in the diff" — while zero
 // review comments existed on the PR and every anchor had in fact been valid.
 // Both statements were false, and they pointed a reader at the wrong problem.
+// Typed on purpose: `as never` would disable field-name checking, and a
+// renamed SummaryInput key would then make assertions like "the publication
+// section is absent" pass because the key was never recognised.
+function summaryInput(overrides: Partial<SummaryInput> = {}): SummaryInput {
+  return {
+    allFindings: [],
+    inlineCount: 0,
+    unanchored: [],
+    filesReviewed: [],
+    rulesRun: [],
+    rulesFailed: [],
+    ...overrides,
+  };
+}
+
 describe("renderSummaryComment — failure attribution", () => {
   const anchored = makeFinding({ file: "a.go", line: 10, message: "Rejected by the provider." });
   const unanchorable = makeFinding({ file: "b.go", line: undefined, message: "No line at all." });
 
   function summary(overrides: Record<string, unknown> = {}) {
-    return renderSummaryComment({
+    return renderSummaryComment(summaryInput({
       allFindings: [anchored, unanchorable],
       inlineCount: 0,
       unanchored: [unanchorable],
@@ -770,7 +786,7 @@ describe("renderSummaryComment — failure attribution", () => {
       rulesRun: ["rule-a"],
       rulesFailed: [],
       ...overrides,
-    } as never);
+    }));
   }
 
   it("separates publication failures from findings with no valid anchor", () => {
@@ -803,7 +819,7 @@ describe("renderSummaryComment — headline", () => {
       makeFinding({ file: "a.go", line: 1, message: "One." }),
       makeFinding({ file: "a.go", line: 2, message: "Two." }),
     ];
-    const body = renderSummaryComment({
+    const body = renderSummaryComment(summaryInput({
       allFindings: findings,
       inlineCount: 0,
       unanchored: [],
@@ -813,21 +829,21 @@ describe("renderSummaryComment — headline", () => {
       filesReviewed: ["a.go"],
       rulesRun: ["rule-a"],
       rulesFailed: [],
-    } as never);
+    }));
 
     expect(body.split("\n")[0]).toContain("2 findings · 1 unique issue · 0 inline comments posted");
   });
 
   it("never claims comments were posted when none were", () => {
     const finding = makeFinding();
-    const body = renderSummaryComment({
+    const body = renderSummaryComment(summaryInput({
       allFindings: [finding],
       inlineCount: 0,
       unanchored: [finding],
       filesReviewed: [],
       rulesRun: [],
       rulesFailed: [],
-    } as never);
+    }));
 
     expect(body).not.toContain("Actionable comments posted: 1");
     expect(body.split("\n")[0]).toContain("0 inline comments posted");
@@ -838,7 +854,7 @@ describe("renderSummaryComment — diff context", () => {
   const finding = makeFinding({ file: "a.go", line: 11, severity: "blocking", message: "Race." });
 
   it("renders the diff excerpt for a finding that fell back to the summary", () => {
-    const body = renderSummaryComment({
+    const body = renderSummaryComment(summaryInput({
       allFindings: [finding],
       inlineCount: 0,
       unanchored: [],
@@ -857,7 +873,7 @@ describe("renderSummaryComment — diff context", () => {
       filesReviewed: ["a.go"],
       rulesRun: [],
       rulesFailed: [],
-    } as never);
+    }));
 
     expect(body).toContain("```diff");
     expect(body).toContain("+boom()");
@@ -865,7 +881,7 @@ describe("renderSummaryComment — diff context", () => {
   });
 
   it("lists the contributing rules when several rules found one issue", () => {
-    const body = renderSummaryComment({
+    const body = renderSummaryComment(summaryInput({
       allFindings: [finding],
       inlineCount: 0,
       unanchored: [finding],
@@ -873,7 +889,7 @@ describe("renderSummaryComment — diff context", () => {
       filesReviewed: [],
       rulesRun: [],
       rulesFailed: [],
-    } as never);
+    }));
 
     expect(body).toContain("`mongodb`");
     expect(body).toContain("`nats`");
@@ -881,14 +897,14 @@ describe("renderSummaryComment — diff context", () => {
   });
 
   it("renders without context when none is supplied", () => {
-    const body = renderSummaryComment({
+    const body = renderSummaryComment(summaryInput({
       allFindings: [finding],
       inlineCount: 0,
       unanchored: [finding],
       filesReviewed: [],
       rulesRun: [],
       rulesFailed: [],
-    } as never);
+    }));
 
     expect(body).toContain("a.go:11");
     expect(body).not.toContain("```diff");
@@ -903,7 +919,7 @@ describe("renderSummaryComment — compact mode keeps attribution", () => {
     const rejected = makeFinding({ file: "a.go", line: 10, message: "x".repeat(400) });
     const unanchorable = makeFinding({ file: "b.go", line: undefined, message: "y".repeat(400) });
 
-    const body = renderSummaryComment({
+    const body = renderSummaryComment(summaryInput({
       allFindings: [rejected, unanchorable],
       inlineCount: 0,
       unanchored: [unanchorable],
@@ -912,7 +928,7 @@ describe("renderSummaryComment — compact mode keeps attribution", () => {
       filesReviewed: [],
       rulesRun: [],
       rulesFailed: [],
-    } as never, 900);
+    }), 900);
 
     expect(body).toContain("HTTP 422");
     expect(body.toLowerCase()).toContain("publication failed");

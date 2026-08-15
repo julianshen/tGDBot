@@ -1487,6 +1487,10 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     const allIndices = comments.map((_, index) => index);
     let rejectedIndices = new Set<number>();
     let rejectionStatus: string | undefined;
+    // The whole-batch status is not necessarily an individual comment's status:
+    // the batch may fail 422 while one member is refused with a different 4xx.
+    // The reason claims to name THIS comment, so it must be exact.
+    const statusByIndex = new Map<number, string>();
     try {
       await postBatch(allIndices);
     } catch (error) {
@@ -1511,8 +1515,12 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
               await postBatch(indices);
               return "accepted";
             } catch (cause) {
-              if (definiteRejection(cause) === undefined) throw cause;
-              if (indices.length === 1) provenRejected.add(indices[0]!);
+              const status = definiteRejection(cause);
+              if (status === undefined) throw cause;
+              if (indices.length === 1) {
+                provenRejected.add(indices[0]!);
+                statusByIndex.set(indices[0]!, status);
+              }
               return "rejected";
             }
           });
@@ -1541,7 +1549,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
           status: "failed" as const,
           // Isolated to THIS comment by bisection, so the reason can name it
           // rather than blaming the batch it happened to travel in.
-          reason: `GitHub rejected this inline comment (HTTP ${rejectionStatus ?? "4xx"}) at ${comment.path}:${comment.line}`,
+          reason: `GitHub rejected this inline comment (HTTP ${statusByIndex.get(index) ?? rejectionStatus ?? "4xx"}) at ${comment.path}:${comment.line}`,
         }
       : { clientId: comment.clientId, status: "posted" as const, identity: recovered[index]! });
   }

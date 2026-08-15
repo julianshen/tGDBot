@@ -698,18 +698,23 @@ export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
 ): string {
-  const includedSuggestions = new Set<number>();
+  const includedSuggestions = new Set<Finding>();
   let best = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
   if (best.length > maxLength) return renderCompactSummary(input, maxLength);
 
-  for (const [index, finding] of input.unanchored.entries()) {
+  // BOTH relocated groups are charged against the budget. Previously only
+  // `unanchored` was, while publication failures rendered their fixes
+  // unconditionally — so one large suggestion on a rejected finding could push
+  // the render over the limit and drop the whole thing into compact mode, which
+  // loses every excerpt and every fix.
+  for (const finding of [...input.unanchored, ...(input.publishFailed ?? [])]) {
     if (!finding.suggestion?.trim() || !capSuggestion(finding.suggestion)) continue;
-    includedSuggestions.add(index);
+    includedSuggestions.add(finding);
     const candidate = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
     if (candidate.length <= maxLength) {
       best = candidate;
     } else {
-      includedSuggestions.delete(index);
+      includedSuggestions.delete(finding);
     }
   }
   return best;
@@ -831,7 +836,7 @@ function allocateCompactMessageBudgets(lengths: number[], available: number): nu
 
 function renderSummaryCommentWithIncludedSuggestions(
   input: SummaryInput,
-  includedSuggestions: ReadonlySet<number>,
+  includedSuggestions: ReadonlySet<Finding>,
 ): string {
   const publishFailed = input.publishFailed ?? [];
   const total = input.inlineCount + input.unanchored.length + publishFailed.length;
@@ -872,7 +877,13 @@ function renderSummaryCommentWithIncludedSuggestions(
         `\n_These anchor to lines that ARE in the diff, but the provider rejected the inline comment.${reason}_\n`,
         "",
         publishFailed
-          .map((finding) => renderUnanchoredFinding(finding, true, input.context?.get(finding)))
+          .map((finding) =>
+            renderUnanchoredFinding(
+              finding,
+              !finding.suggestion?.trim() || includedSuggestions.has(finding),
+              input.context?.get(finding),
+            ),
+          )
           .join("\n\n---\n\n"),
       ].join("\n"),
     );
@@ -887,11 +898,11 @@ function renderSummaryCommentWithIncludedSuggestions(
     const note = input.inlineUnavailable
       ? ""
       : "\n_These couldn't be anchored to a line in the diff (no line number, or the line isn't part of this PR's changes)._\n";
-    const findings = input.unanchored.map((finding, index) => {
+    const findings = input.unanchored.map((finding) => {
       const suggestion = finding.suggestion?.trim()
         ? capSuggestion(finding.suggestion)
         : undefined;
-      const includeSuggestion = suggestion === undefined || includedSuggestions.has(index);
+      const includeSuggestion = suggestion === undefined || includedSuggestions.has(finding);
       return renderUnanchoredFinding(finding, includeSuggestion, input.context?.get(finding));
     });
     parts.push(

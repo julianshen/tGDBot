@@ -939,7 +939,7 @@ describe("orchestrate — outcome groups and clustering", () => {
     expect(result.summaryInput.uniqueIssueCount).toBe(2);
   });
 
-  it("attaches a diff excerpt to findings that fall back to the summary", () => {
+  it("still renders a fallback finding when the diff has no excerpt for it", () => {
     const result = orchestrate(
       { findings: [f({ line: 999, message: "Off the diff." })], rulesRun: ["a"], rulesFailed: [] } as never,
       DIFF,

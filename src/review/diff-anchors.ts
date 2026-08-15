@@ -139,7 +139,11 @@ export function hunkSnippet(
 
   let newPath: string | undefined;
   let newLine = 0;
-  let inHunk = false;
+  // Two separate facts. `insideHunk` says we are in SOME file's hunk body, where
+  // `--- `/`+++ ` are content rather than headers; `capturing` narrows that to
+  // the file being searched.
+  let insideHunk = false;
+  let capturing = false;
   let lines: SnippetLine[] = [];
 
   // The excerpt is whichever hunk contains the range's FIRST line: a finding's
@@ -162,33 +166,53 @@ export function hunkSnippet(
   };
 
   for (const raw of diff.split("\n")) {
-    if (raw.startsWith("diff --git ") || raw.startsWith("--- ")) {
-      if (inHunk) {
+    // `diff --git ` is the only header that stays unambiguous inside a hunk: a
+    // removed line renders as `-` + content and an added one as `+` + content,
+    // so neither can ever produce this prefix.
+    if (raw.startsWith("diff --git ")) {
+      if (capturing) {
         const found = finish();
         if (found) return found;
       }
-      inHunk = false;
-      if (raw.startsWith("diff --git ")) newPath = undefined;
+      insideHunk = false;
+      capturing = false;
+      newPath = undefined;
       continue;
     }
-    if (raw.startsWith("+++ ")) {
-      const path = raw.slice(4).trim();
-      newPath = path === "/dev/null" ? undefined : stripDiffPathPrefix(path);
-      inHunk = false;
-      continue;
+    // `--- ` and `+++ ` are file headers ONLY outside a hunk body. Inside one
+    // they are ordinary content: a removed line whose text starts "-- " renders
+    // as "--- ", and an added line starting "++ " renders as "+++ ". Markdown
+    // rules and SQL comments produce these constantly, and reading them as
+    // headers truncated the hunk and lost the excerpt.
+    if (!insideHunk) {
+      if (raw.startsWith("--- ")) continue;
+      if (raw.startsWith("+++ ")) {
+        const path = raw.slice(4).trim();
+        newPath = path === "/dev/null" ? undefined : stripDiffPathPrefix(path);
+        continue;
+      }
     }
+    // A hunk header is likewise unambiguous: content would carry a leading
+    // marker character before the `@@`.
     const hunk = HUNK_RE.exec(raw);
     if (hunk) {
-      if (inHunk) {
+      if (capturing) {
         const found = finish();
         if (found) return found;
       }
       newLine = Number(hunk[3]);
-      inHunk = newPath === file;
+      insideHunk = true;
+      capturing = newPath === file;
       lines = [];
       continue;
     }
-    if (!inHunk) continue;
+    if (!insideHunk) continue;
+    if (!capturing) {
+      // Still consume the body so a later hunk header is read in the right
+      // state, but nothing from another file is ever recorded.
+      if (!/^[-+ \\]/u.test(raw)) insideHunk = false;
+      continue;
+    }
 
     const marker = raw[0];
     if (marker === "+" || marker === " ") {
@@ -206,10 +230,11 @@ export function hunkSnippet(
     } else {
       const found = finish();
       if (found) return found;
-      inHunk = false;
+      insideHunk = false;
+      capturing = false;
     }
   }
-  return inHunk ? finish() : undefined;
+  return capturing ? finish() : undefined;
 }
 
 /**

@@ -156,16 +156,27 @@ function exactKey(finding: Finding): string {
  * sentence at the very same line is not a judgement call, and resolving it here
  * keeps the similarity pass from having to reason about exact ties.
  */
-function collapseExactDuplicates(findings: readonly Finding[]): Finding[] {
+function collapseExactDuplicates(
+  findings: readonly Finding[],
+): { unique: Finding[]; rulesByFinding: Map<Finding, string[]> } {
   const bestByKey = new Map<string, Finding>();
+  // Collapsing happens before clustering, so without this the SECOND rule to
+  // report an identical sentence lost its name — and independent corroboration
+  // is precisely what the rules metadata is for.
+  const rulesByKey = new Map<string, string[]>();
   for (const finding of findings) {
     const key = exactKey(finding);
+    const rules = rulesByKey.get(key) ?? [];
+    if (!rules.includes(finding.ruleName)) rules.push(finding.ruleName);
+    rulesByKey.set(key, rules);
     const existing = bestByKey.get(key);
     if (!existing || SEVERITY_RANK[finding.severity] < SEVERITY_RANK[existing.severity]) {
       bestByKey.set(key, finding);
     }
   }
-  return [...bestByKey.values()];
+  const rulesByFinding = new Map<Finding, string[]>();
+  for (const [key, finding] of bestByKey) rulesByFinding.set(finding, rulesByKey.get(key) ?? [finding.ruleName]);
+  return { unique: [...bestByKey.values()], rulesByFinding };
 }
 
 /**
@@ -182,7 +193,7 @@ function collapseExactDuplicates(findings: readonly Finding[]): Finding[] {
  * comment body.
  */
 export function clusterFindings(findings: readonly Finding[]): FindingCluster[] {
-  const unique = collapseExactDuplicates(findings);
+  const { unique, rulesByFinding } = collapseExactDuplicates(findings);
   const tokens = unique.map(claimTokens);
 
   // Union-find over finding indices.
@@ -240,7 +251,7 @@ export function clusterFindings(findings: readonly Finding[]): FindingCluster[] 
       return {
         representative: ordered[0]!,
         members: ordered,
-        rules: [...new Set(members.map((member) => member.ruleName))],
+        rules: [...new Set(members.flatMap((member) => rulesByFinding.get(member) ?? [member.ruleName]))],
         lines,
       };
     });

@@ -101,3 +101,28 @@ describe("bisectRejected", () => {
     expect(attempt.mock.calls.length).toBeLessThanOrEqual(11);
   });
 });
+
+// CodeRabbit review of PR #23: if EVERY comment is rejected the recursion walks
+// the whole binary tree — about 2n-1 requests. With the caller's cap of 100
+// inline comments a global cause (a stale head SHA, say) would fire ~199
+// sequential API calls before giving up.
+describe("bisectRejected — request budget", () => {
+  it("stops splitting once the attempt budget is spent", async () => {
+    const attempt = vi.fn(async () => "rejected" as const);
+
+    const rejected = await bisectRejected(64, attempt, 12);
+
+    // Everything unresolved is reported rejected, so the summary still carries
+    // every finding — the budget bounds cost, it never loses a finding.
+    expect(rejected.size).toBe(64);
+    expect(attempt.mock.calls.length).toBeLessThanOrEqual(12);
+  });
+
+  it("still isolates a single offender well within the default budget", async () => {
+    const attempt = vi.fn(async (indices: readonly number[]) =>
+      indices.includes(9) ? ("rejected" as const) : ("accepted" as const),
+    );
+
+    expect(await bisectRejected(16, attempt)).toEqual(new Set([9]));
+  });
+});

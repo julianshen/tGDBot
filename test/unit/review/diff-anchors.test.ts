@@ -395,6 +395,79 @@ describe("hunkSnippet", () => {
     expect(snippet?.lines.map((l) => l.text)).toEqual(["c", "d", "target", "e", "f"]);
   });
 
+  // A REMOVED line whose content begins "-- " renders as "--- " in the diff, and
+  // an ADDED line beginning "++ " renders as "+++ ". Markdown rules and SQL
+  // comments hit this constantly. Treating them as file headers truncated the
+  // hunk and lost the excerpt. (CodeRabbit review of PR #23.)
+  it("treats a removed \"--- \" line as content, not a file header", () => {
+    const md = [
+      "diff --git a/doc.md b/doc.md",
+      "--- a/doc.md",
+      "+++ b/doc.md",
+      "@@ -1,4 +1,4 @@",
+      " intro",
+      "--- ",
+      "+***",
+      " outro",
+      "",
+    ].join("\n");
+
+    const snippet = hunkSnippet(md, "doc.md", 2);
+
+    expect(snippet?.lines.map((l) => l.marker + l.text)).toEqual([
+      " intro",
+      "--- ",
+      "+***",
+      " outro",
+    ]);
+    // The removed line is content: marker "-", text "-- ".
+    expect(snippet?.lines[1]).toMatchObject({ marker: "-", text: "-- ", target: false });
+  });
+
+  it("treats an added \"+++ \" line as content, not a file header", () => {
+    const md = [
+      "diff --git a/doc.md b/doc.md",
+      "--- a/doc.md",
+      "+++ b/doc.md",
+      "@@ -1,2 +1,3 @@",
+      " intro",
+      "+++ nested bullet",
+      " outro",
+      "",
+    ].join("\n");
+
+    const snippet = hunkSnippet(md, "doc.md", 2);
+
+    expect(snippet?.lines.map((l) => l.marker + l.text)).toEqual([
+      " intro",
+      "+++ nested bullet",
+      " outro",
+    ]);
+    expect(snippet?.lines[1]).toMatchObject({ marker: "+", text: "++ nested bullet", newLine: 2 });
+  });
+
+  it("does not let another file\x27s hunk content redirect the search", () => {
+    const multi = [
+      "diff --git a/other.md b/other.md",
+      "--- a/other.md",
+      "+++ b/other.md",
+      "@@ -1,2 +1,2 @@",
+      " x",
+      "+++ b/target.md",
+      "diff --git a/target.md b/target.md",
+      "--- a/target.md",
+      "+++ b/target.md",
+      "@@ -10,1 +10,2 @@",
+      " real",
+      "+wanted",
+      "",
+    ].join("\n");
+
+    const snippet = hunkSnippet(multi, "target.md", 11);
+
+    expect(snippet?.lines.map((l) => l.text)).toEqual(["real", "wanted"]);
+  });
+
   it("returns undefined for a line that is not in the diff", () => {
     expect(hunkSnippet(SIMPLE, "src/a.go", 999)).toBeUndefined();
     expect(hunkSnippet(SIMPLE, "src/missing.go", 11)).toBeUndefined();

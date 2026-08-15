@@ -99,6 +99,20 @@ describe("clusterFindings", () => {
     expect(clusters[0]!.members).toHaveLength(1);
   });
 
+  // CodeRabbit review of PR #23: exact-duplicate collapsing runs BEFORE
+  // clustering, so two rules emitting the very same sentence lost one of the
+  // rule names — and corroboration by an independent rule is exactly what the
+  // metadata exists to show.
+  it("credits every rule that reported an exact duplicate", () => {
+    const clusters = clusterFindings([
+      finding({ ruleName: "mongodb", message: "Identical claim." }),
+      finding({ ruleName: "nats", message: "Identical claim." }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0]!.rules).toEqual(["mongodb", "nats"]);
+  });
+
   // A Jaccard ratio over two- or three-token claims is noise: these two reduce
   // to the same token set once the single-letter distinguisher is dropped.
   it("keeps short claims apart when they share too little vocabulary", () => {

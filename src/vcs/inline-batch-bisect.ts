@@ -16,6 +16,18 @@
 // I/O and the recursion is testable on its own.
 
 /**
+ * Ceiling on provider requests per bisection.
+ *
+ * Isolating ONE offender costs about 2·log2(n) attempts, so this is generous
+ * for the case bisection exists to serve. It bounds the opposite case: when
+ * every comment is refused for a global reason (a stale head SHA, a repo-wide
+ * permission change), the recursion would otherwise walk the whole binary tree
+ * — roughly 2n-1 requests, ~199 at the caller's 100-comment cap — learning
+ * nothing it did not already know from the first rejection.
+ */
+const DEFAULT_ATTEMPT_BUDGET = 32;
+
+/**
  * Posts the given batch. Resolves `"accepted"` when the provider took every
  * comment in it, `"rejected"` when it definitively refused the batch.
  *
@@ -44,12 +56,22 @@ export type BatchAttempt = (
 export async function bisectRejected(
   count: number,
   attempt: BatchAttempt,
+  maxAttempts = DEFAULT_ATTEMPT_BUDGET,
 ): Promise<Set<number>> {
   const rejected = new Set<number>();
   if (count <= 0) return rejected;
 
+  let attempts = 0;
   const publish = async (indices: readonly number[]): Promise<void> => {
     if (indices.length === 0) return;
+    if (attempts >= maxAttempts) {
+      // Budget spent. Report the remainder as rejected: those findings then
+      // travel to the summary, which is the same place they were headed before
+      // bisection existed. Cost is bounded; no finding is lost.
+      for (const index of indices) rejected.add(index);
+      return;
+    }
+    attempts += 1;
     if (await attempt(indices) === "accepted") return;
 
     // A rejected batch of one names its own offender; there is nothing left to

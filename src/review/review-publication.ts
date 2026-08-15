@@ -326,7 +326,11 @@ export async function publishReviewFromManifest(options: {
       exitCode: 0 as const,
     };
   const inlineRecovery = options.inlineRecovery ?? botComment?.pendingState?.inlineRecovery;
-  const githubInlineResults = new Map<string, PublicationWriteResult>();
+  // Named for what it holds, not for one provider: GitLab results are recorded
+  // here too, so the summary can report a GitLab failure reason as readily as a
+  // GitHub one. Only the GitHub path READS it for batching — GitLab publishes
+  // one child at a time and keeps its existing per-child semantics.
+  const inlineResults = new Map<string, PublicationWriteResult>();
   let staleCleaned = options.cleanStale === false;
 
   const emitStatus = (log: ReviewPublicationStatusLog): void => {
@@ -336,7 +340,7 @@ export async function publishReviewFromManifest(options: {
   // Any one provider reason explains the batch: an atomic review fails for a
   // single cause, and bisection reports each isolated comment with its own.
   const firstFailureReason = (): string | undefined => {
-    for (const result of githubInlineResults.values()) {
+    for (const result of inlineResults.values()) {
       if (result.status === "failed" && result.reason !== undefined) return result.reason;
     }
     return undefined;
@@ -546,15 +550,16 @@ export async function publishReviewFromManifest(options: {
       if (child.kind === "inline") {
         await cleanStaleThreads();
         if (provider === "github") {
-          const cached = githubInlineResults.get(child.id);
+          const cached = inlineResults.get(child.id);
           if (cached !== undefined) return cached;
           const pending = action.children.filter((entry) =>
-            entry.kind === "inline" && entry.status === "pending" && !githubInlineResults.has(entry.id));
+            entry.kind === "inline" && entry.status === "pending" && !inlineResults.has(entry.id));
           const posted = await publishInlines(action, pending);
-          for (const [id, result] of posted) githubInlineResults.set(id, result);
-          return githubInlineResults.get(child.id) ?? { status: "failed" };
+          for (const [id, result] of posted) inlineResults.set(id, result);
+          return inlineResults.get(child.id) ?? { status: "failed" };
         }
         const posted = await publishInlines(action, [child]);
+        for (const [id, result] of posted) inlineResults.set(id, result);
         return posted.get(child.id) ?? { status: "failed" };
       }
       return { status: "failed" };
