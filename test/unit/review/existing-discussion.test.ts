@@ -90,4 +90,47 @@ describe("summarizeExistingDiscussion", () => {
       url: "https://github.com/acme/app/pull/7#discussion_r1",
     }]);
   });
+
+  it("turns a human thumbs-up on a bot finding into advisory feedback", () => {
+    const botRoot = {
+      ...thread().events[0]!,
+      authorLogin: "tgd-bot",
+      authorIsBot: true,
+      body: "Missing nil guard can crash the request handler.",
+      reactions: [{
+        id: "reaction-7",
+        content: "thumbs-up" as const,
+        authorLogin: "alice",
+        authorIsBot: false,
+        createdAt: "2026-08-15T00:01:00Z",
+      }],
+    };
+    const result = summarizeExistingDiscussion([thread({ events: [botRoot] })]);
+
+    expect(result.discussionMemories).toContainEqual({
+      threadId: "thread-1",
+      file: "src/foo.ts",
+      line: 10,
+      author: "alice",
+      summary: "👍 Endorsed tGDBot finding: Missing nil guard can crash the request handler.",
+      url: "https://github.com/acme/app/pull/7#discussion_r1",
+    });
+  });
+
+  it("ignores thumbs-up reactions authored by the bot itself", () => {
+    const botRoot = {
+      ...thread().events[0]!,
+      authorLogin: "tgd-bot",
+      authorIsBot: true,
+      reactions: [{
+        id: "reaction-self",
+        content: "thumbs-up" as const,
+        authorLogin: "tgd-bot",
+        authorIsBot: true,
+        createdAt: "2026-08-15T00:01:00Z",
+      }],
+    };
+
+    expect(summarizeExistingDiscussion([thread({ events: [botRoot] })]).discussionMemories).toEqual([]);
+  });
 });

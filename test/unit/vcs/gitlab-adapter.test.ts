@@ -1390,6 +1390,7 @@ describe("GitLab conversation activity", () => {
         return openMrsFixture;
       }
       if (endpoint?.match(/merge_requests\/\d+$/u)) return mr;
+      if (endpoint?.endsWith("/award_emoji")) return "";
       const perPage = Number(field(args, "per_page") ?? "100");
       const page = Number(field(args, "page") ?? "1");
       if (endpoint?.includes("/notes") && !endpoint.includes("/discussions")) {
@@ -1724,6 +1725,35 @@ describe("GitLab conversation activity", () => {
     const snapshot = await adapter.getReviewThread(review, "T1");
     expect(snapshot.events).toHaveLength(1);
     expect(snapshot.events[0]).toMatchObject({ kind: "thread-comment", threadId: "T1", commentId: "8" });
+  });
+
+  it("normalizes human thumbs-up award emoji on discussion notes", async () => {
+    const fallback = activityExec();
+    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/merge_requests/42/notes/8/award_emoji")) {
+        return toNdjson([{
+          id: 77,
+          name: "thumbsup",
+          user: { username: "alice" },
+          created_at: "2026-08-01T00:01:00Z",
+        }]);
+      }
+      return fallback(args, stdin);
+    });
+    const snapshot = await new GitLabAdapter(execGlab, repo)
+      .getReviewThread(review, "T1");
+
+    expect(snapshot.events[0]?.reactions).toEqual([{
+      id: "77",
+      content: "thumbs-up",
+      authorLogin: "alice",
+      authorIsBot: false,
+      createdAt: "2026-08-01T00:01:00.000Z",
+    }]);
+    expect(execGlab.mock.calls.some(([args]) =>
+      (args as string[]).some((arg) => arg.endsWith("/merge_requests/42/notes/8/award_emoji"))))
+      .toBe(true);
   });
 
   it("keeps a still-applicable thread current when only the review head moved", async () => {

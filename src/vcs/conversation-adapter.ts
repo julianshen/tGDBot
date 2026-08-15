@@ -271,6 +271,16 @@ interface ReviewActivityEventBase extends ReviewBinding {
   readonly resolved?: boolean;
   readonly outdated?: boolean;
   readonly placement?: ConversationAnchor;
+  /** Provider-authenticated reactions, normalized for review feedback. */
+  readonly reactions?: readonly ReviewReaction[];
+}
+
+export interface ReviewReaction {
+  readonly id: string;
+  readonly content: "thumbs-up";
+  readonly authorLogin: string;
+  readonly authorIsBot: boolean;
+  readonly createdAt: string;
 }
 
 export type ReviewActivityEvent =

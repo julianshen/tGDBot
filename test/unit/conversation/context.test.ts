@@ -123,6 +123,38 @@ function section(label: string, text: string): { token: string; body: string } {
 }
 
 describe("buildConversationContext selection", () => {
+  it("includes human thumbs-up feedback in the next review context and digest", () => {
+    const withoutReaction = thread({
+      threadId: "bot-finding",
+      events: [comment({
+        commentId: "bot-root",
+        threadId: "bot-finding",
+        body: "Missing nil guard",
+        authorLogin: "tgd-bot",
+        authorIsBot: true,
+      })],
+    });
+    const withReaction = thread({
+      ...withoutReaction,
+      events: [{
+        ...withoutReaction.events[0]!,
+        reactions: [{
+          id: "reaction-7",
+          content: "thumbs-up" as const,
+          authorLogin: "alice",
+          authorIsBot: false,
+          createdAt: "2026-08-15T00:01:00Z",
+        }],
+      }],
+    });
+
+    const before = buildConversationContext({ currentHeadSha: CURRENT, threads: [withoutReaction] });
+    const after = buildConversationContext({ currentHeadSha: CURRENT, threads: [withReaction] });
+
+    expect(after.text).toContain("reaction: thumbs-up by alice");
+    expect(after.digest).not.toBe(before.digest);
+  });
+
   it("selects items in exact priority order and excludes unrelated, resolved, outdated, and older items unless addressed", () => {
     const addressed = thread({
       threadId: "addressed",

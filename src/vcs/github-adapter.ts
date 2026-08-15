@@ -38,6 +38,7 @@ import {
   type ReviewDiscoveryCursor,
   type ReviewEventCursor,
   type ReviewActivityEvent,
+  type ReviewReaction,
   type ReviewEventPage,
   type ReviewEventPageToken,
   type ReviewThreadPage,
@@ -45,6 +46,30 @@ import {
   type ReviewThreadSnapshot,
   type ThreadReplyInput,
 } from "./conversation-adapter.js";
+
+function githubThumbsUpReactions(node: Record<string, unknown>, bot: string): readonly ReviewReaction[] {
+  if (node.reactions === undefined || node.reactions === null) return [];
+  const connection = object(node.reactions, "review comment reactions");
+  const pageInfo = object(connection.pageInfo, "review comment reaction page info");
+  if (pageInfo.hasNextPage !== false) {
+    throw new Error("GitHub review comment exceeds the 100-reaction feedback limit");
+  }
+  if (!Array.isArray(connection.nodes)) throw new Error("Invalid GitHub review comment reactions");
+  return connection.nodes.map((value): ReviewReaction => {
+    const reaction = object(value, "review comment reaction");
+    if (reaction.content !== "THUMBS_UP") throw new Error("Invalid GitHub review comment reaction content");
+    const authorLogin = textField(object(reaction.user, "review comment reaction user").login,
+      "review comment reaction user login").toLowerCase();
+    if (!LOGIN_RE.test(authorLogin)) throw new Error("Invalid GitHub review comment reaction user login");
+    return {
+      id: providerId(reaction.id, "review comment reaction id"),
+      content: "thumbs-up",
+      authorLogin,
+      authorIsBot: authorLogin === bot,
+      createdAt: timestamp(reaction.createdAt, "review comment reaction timestamp"),
+    };
+  });
+}
 
 /**
  * Seam for shelling out to the `gh` CLI. GitHubAdapter accepts an ExecGh
@@ -834,7 +859,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
 
   private async reviewThreadsResponse(review: ReviewIdentity, cursor?: string): Promise<Record<string, unknown>> {
     const repo = this.repositoryForReview(review);
-    const query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){id url headRefOid updatedAt reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated subjectType diffSide path line originalLine comments(first:1){pageInfo{hasNextPage endCursor} nodes{databaseId body author{login} createdAt updatedAt url commit{oid} originalCommit{oid} replyTo{databaseId}}}}}}}}";
+    const query = "query($owner:String!,$name:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$name){pullRequest(number:$number){id url headRefOid updatedAt reviewThreads(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{id isResolved isOutdated subjectType diffSide path line originalLine comments(first:1){pageInfo{hasNextPage endCursor} nodes{databaseId body author{login} createdAt updatedAt url commit{oid} originalCommit{oid} replyTo{databaseId} reactions(first:100,content:THUMBS_UP){pageInfo{hasNextPage endCursor} nodes{id content createdAt user{login}}}}}}}}}}";
     const args = ["api", "graphql", ...apiHost(repo), "-f", `query=${query}`, "-F", `owner=${repo.owner}`, "-F", `name=${repo.repo}`, "-F", `number=${review.reviewNumber}`];
     if (cursor) args.push("-f", `cursor=${cursor}`);
     let parsed: unknown;
@@ -882,7 +907,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
 
   private async remainingThreadComments(review: ReviewIdentity, threadId: string, cursor: string): Promise<Record<string, unknown>[]> {
     const repo = this.repositoryForReview(review);
-    const query = "query($threadId:ID!,$cursor:String!){node(id:$threadId){... on PullRequestReviewThread{id pullRequest{id number url headRefOid repository{nameWithOwner}} comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{databaseId body author{login} createdAt updatedAt url commit{oid} originalCommit{oid} replyTo{databaseId}}}}}}";
+    const query = "query($threadId:ID!,$cursor:String!){node(id:$threadId){... on PullRequestReviewThread{id pullRequest{id number url headRefOid repository{nameWithOwner}} comments(first:100,after:$cursor){pageInfo{hasNextPage endCursor} nodes{databaseId body author{login} createdAt updatedAt url commit{oid} originalCommit{oid} replyTo{databaseId} reactions(first:100,content:THUMBS_UP){pageInfo{hasNextPage endCursor} nodes{id content createdAt user{login}}}}}}}}";
     const result: Record<string, unknown>[] = [];
     const seen = new Set<string>();
     let next: string | undefined = cursor;
@@ -973,17 +998,19 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       const commentId = providerId(node.databaseId, "review thread comment id");
       const authorLogin = textField(object(node.author, "review thread comment author").login, "review thread comment author login").toLowerCase();
       const createdAt = timestamp(node.createdAt, "review thread comment created timestamp");
-      const updatedAt = timestamp(node.updatedAt, "review thread comment updated timestamp");
+      const commentUpdatedAt = timestamp(node.updatedAt, "review thread comment updated timestamp");
       const body = typeof node.body === "string" ? node.body : (() => { throw new Error("Invalid GitHub review thread comment body"); })();
-      const revisionId = digest(`${commentId}\0${updatedAt}\0${body}`);
+      const reactions = githubThumbsUpReactions(node, bot);
+      const updatedAt = [commentUpdatedAt, ...reactions.map((reaction) => reaction.createdAt)].sort().at(-1)!;
+      const revisionId = digest(`${commentId}\0${commentUpdatedAt}\0${body}\0${JSON.stringify(reactions)}`);
       const eventUrl = textField(node.url, "review thread comment URL");
       if (!sameGitHubBinding(eventUrl, `${review.url}#discussion_r${commentId}`)) throw new Error("Invalid GitHub review thread comment URL binding");
       if (!LOGIN_RE.test(authorLogin)) throw new Error("Invalid GitHub review thread comment author login");
       return { provider: "github" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber,
-        kind: updatedAt === createdAt ? "thread-comment" as const : "comment-edit" as const,
-        eventId: `review-comment:${commentId}`, revisionId, ...(updatedAt === createdAt ? {} : { editedRevisionId: revisionId }),
+        kind: commentUpdatedAt === createdAt ? "thread-comment" as const : "comment-edit" as const,
+        eventId: `review-comment:${commentId}`, revisionId, ...(commentUpdatedAt === createdAt ? {} : { editedRevisionId: revisionId }),
         orderKey: orderKey(updatedAt, "review-comment", commentId, revisionId), authorLogin, authorIsBot: authorLogin === bot,
-        createdAt, updatedAt, body, url: eventUrl, commentId,
+        createdAt, updatedAt, body, url: eventUrl, commentId, ...(reactions.length === 0 ? {} : { reactions }),
         threadId: found!.threadId, ...(index === 0 ? {} : { parentCommentId: providerId(object(node.replyTo ?? {}, "review thread reply").databaseId ?? found!.rootCommentId, "review thread parent id") }), placement: found!.placement } as ReviewActivityEvent;
     }).sort((a, b) => a.orderKey.localeCompare(b.orderKey));
     const { nodes: _nodes, comments: _comments, ...summary } = found;

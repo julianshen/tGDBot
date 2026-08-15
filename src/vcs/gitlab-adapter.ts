@@ -36,6 +36,7 @@ import {
   type ReviewDiscoveryCursor,
   type ReviewEventCursor,
   type ReviewActivityEvent,
+  type ReviewReaction,
   type ReviewEventPage,
   type ReviewEventPageToken,
   type ReviewThreadPage,
@@ -825,6 +826,7 @@ interface ConversationNote {
   readonly system: boolean;
   readonly resolved?: boolean;
   readonly outdated?: boolean;
+  readonly reactions: readonly Omit<ReviewReaction, "authorIsBot">[];
   readonly position?: {
     readonly file: string;
     readonly line?: number;
@@ -864,6 +866,12 @@ function parseConversationNote(value: unknown): ConversationNote {
   const type = row.type === undefined || row.type === null ? null : conversationText(row.type, "note type");
   const position = parseConversationPosition(row.position);
   const outdatedFlag = conversationOutdatedFlag(row);
+  const awards = row.award_emoji === undefined || row.award_emoji === null
+    ? []
+    : Array.isArray(row.award_emoji)
+      ? row.award_emoji
+      : (() => { throw new GlabOutputError("Invalid glab note award emoji"); })();
+  const reactions = parseConversationReactions(awards);
   return {
     id: conversationProviderId(row.id, "note id"),
     body: typeof row.body === "string" ? row.body : (() => { throw new GlabOutputError("Invalid glab note body"); })(),
@@ -872,10 +880,25 @@ function parseConversationNote(value: unknown): ConversationNote {
     updatedAt: conversationTimestamp(row.updated_at, "note updated timestamp"),
     type,
     system: row.system === true,
+    reactions,
     ...(typeof row.resolved === "boolean" ? { resolved: row.resolved } : {}),
     ...(outdatedFlag === undefined ? {} : { outdated: outdatedFlag }),
     ...(position ? { position } : {}),
   };
+}
+
+function parseConversationReactions(values: readonly unknown[]): readonly Omit<ReviewReaction, "authorIsBot">[] {
+  return values.flatMap((value): Array<Omit<ReviewReaction, "authorIsBot">> => {
+    const award = conversationRecord(value, "note award emoji");
+    if (award.name !== "thumbsup" && award.name !== "+1") return [];
+    const user = conversationRecord(award.user, "note award emoji user");
+    return [{
+      id: conversationProviderId(award.id, "note award emoji id"),
+      content: "thumbs-up",
+      authorLogin: conversationUsername(user.username, "note award emoji username"),
+      createdAt: conversationTimestamp(award.created_at, "note award emoji timestamp"),
+    }];
+  });
 }
 
 function parseConversationPosition(value: unknown): ConversationNote["position"] | undefined {
@@ -1593,7 +1616,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     const placement = this.discussionPlacement(root, mr.headSha, discussion.outdated);
     const resolvedFlag = root.resolved === true;
     const outdated = placement?.outdated === true;
-    const updatedAt = discussion.notes.map((note) => note.updatedAt).sort().at(-1)!;
+    const updatedAt = discussion.notes.flatMap((note) => [note.updatedAt, ...note.reactions.map((reaction) => reaction.createdAt)]).sort().at(-1)!;
     const resolutionObservedAt = mr.updatedAt;
     const summary: ReviewThreadSummary = {
       ...binding,
@@ -1608,21 +1631,27 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     };
     const events = discussion.notes.filter((note) => !note.system).map((note, index): ReviewActivityEvent => {
       const edited = note.updatedAt !== note.createdAt;
-      const revisionId = conversationDigest(`${note.id}\0${note.updatedAt}\0${note.body}`);
+      const reactions = note.reactions.map((reaction): ReviewReaction => ({
+        ...reaction,
+        authorIsBot: reaction.authorLogin === bot,
+      }));
+      const activityUpdatedAt = [note.updatedAt, ...reactions.map((reaction) => reaction.createdAt)].sort().at(-1)!;
+      const revisionId = conversationDigest(`${note.id}\0${note.updatedAt}\0${note.body}\0${JSON.stringify(reactions)}`);
       return {
         ...binding,
         kind: edited ? "comment-edit" : "thread-comment",
         eventId: `discussion-note:${note.id}`,
         revisionId,
         ...(edited ? { editedRevisionId: revisionId } : {}),
-        orderKey: conversationOrderKey(note.updatedAt, "thread-comment", note.id, revisionId),
+        orderKey: conversationOrderKey(activityUpdatedAt, "thread-comment", note.id, revisionId),
         authorLogin: note.author,
         authorIsBot: note.author === bot,
         createdAt: note.createdAt,
-        updatedAt: note.updatedAt,
+        updatedAt: activityUpdatedAt,
         body: note.body,
         url: `${review.url}#note_${note.id}`,
         commentId: note.id,
+        ...(reactions.length === 0 ? {} : { reactions }),
         threadId: discussion.id,
         ...(index === 0 ? {} : { parentCommentId: root.id }),
         ...(placement ? { placement } : {}),
@@ -1694,11 +1723,33 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
 
   async getReviewThread(review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
     const mr = await this.fetchConversationMergeRequest(review);
-    const discussion = await this.fetchDiscussion(review, threadId);
     const bot = (await this.getAuthenticatedBotIdentity()).login;
+    const fetched = await this.fetchDiscussion(review, threadId);
+    const discussion: ConversationDiscussion = {
+      ...fetched,
+      notes: await Promise.all(fetched.notes.map(async (note) =>
+        note.system || note.author !== bot
+          ? note
+          : { ...note, reactions: await this.fetchNoteThumbsUpReactions(review, note.id) })),
+    };
     const normalized = this.normalizeDiscussion(review, discussion, mr, bot);
     if (!normalized) throw new Error("GitLab review thread not found in target review");
     return { ...normalized.summary, events: [...normalized.events].sort((left, right) => left.orderKey.localeCompare(right.orderKey)) };
+  }
+
+  private async fetchNoteThumbsUpReactions(
+    review: ReviewIdentity,
+    noteId: string,
+  ): Promise<readonly Omit<ReviewReaction, "authorIsBot">[]> {
+    const repo = this.repositoryForReview(review);
+    const rows = await this.paginateNdjson(
+      repo,
+      `merge_requests/${review.reviewNumber}/notes/${encodeURIComponent(conversationProviderId(noteId, "note id"))}/award_emoji`,
+      100,
+      "note award emoji",
+    );
+    if (rows.length > 100) throw new GlabOutputError("GitLab review comment exceeds the 100-reaction feedback limit");
+    return parseConversationReactions(rows);
   }
 
   private validateReplyInput(review: ReviewIdentity, input: GeneralReplyInput): void {

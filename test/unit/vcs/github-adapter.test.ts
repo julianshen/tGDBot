@@ -1447,6 +1447,35 @@ describe("GitHub conversation activity", () => {
     expect(snapshot.events[0]).toMatchObject({ kind: "thread-comment", threadId: "T1", commentId: "8" });
   });
 
+  it("normalizes human thumbs-up reactions on review comments", async () => {
+    const fixture = JSON.parse(readFixture("gh-review-threads.json")) as {
+      data: { repository: { pullRequest: { reviewThreads: { nodes: Array<{ comments: { nodes: Array<Record<string, unknown>> } }> } } } };
+    };
+    fixture.data.repository.pullRequest.reviewThreads.nodes[0]!.comments.nodes[0]!.reactions = {
+      pageInfo: { hasNextPage: false, endCursor: null },
+      nodes: [{
+        id: "REACTION_77",
+        content: "THUMBS_UP",
+        createdAt: "2026-08-02T00:01:00Z",
+        user: { login: "alice" },
+      }],
+    };
+    const execGh = vi.fn(async (args: string[]) =>
+      args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : JSON.stringify(fixture));
+
+    const snapshot = await new GitHubAdapter(execGh, repo).getReviewThread(review, "T1");
+
+    expect(snapshot.events[0]?.reactions).toEqual([{
+      id: "REACTION_77",
+      content: "thumbs-up",
+      authorLogin: "alice",
+      authorIsBot: false,
+      createdAt: "2026-08-02T00:01:00.000Z",
+    }]);
+    expect(execGh.mock.calls.find(([args]) => (args as string[])[1] === "graphql")?.[0].join(" "))
+      .toContain("reactions(first:100,content:THUMBS_UP)");
+  });
+
   it("normalizes a nullable FILE review thread without a line", async () => {
     const fixture = JSON.parse(readFixture("gh-review-threads.json")) as { data: { repository: { pullRequest: { reviewThreads: { nodes: Array<Record<string, unknown>> } } } } };
     const node = fixture.data.repository.pullRequest.reviewThreads.nodes[0];

@@ -204,6 +204,9 @@ function renderThread(thread: ReviewThreadSnapshot): string {
   ].filter((line): line is string => line !== undefined);
 
   for (const event of commentEvents(thread)) {
+    const reactions = (event.reactions ?? [])
+      .filter((reaction) => reaction.content === "thumbs-up" && !reaction.authorIsBot)
+      .map((reaction) => `reaction: thumbs-up by ${stripControls(reaction.authorLogin)}`);
     lines.push(
       "",
       `comment ${stripControls(event.commentId ?? event.eventId)}`,
@@ -216,6 +219,7 @@ function renderThread(thread: ReviewThreadSnapshot): string {
       ].filter((line): line is string => line !== undefined),
       "",
       stripControls(event.body),
+      ...(reactions.length === 0 ? [] : ["", ...reactions]),
     );
   }
   return lines.join("\n");

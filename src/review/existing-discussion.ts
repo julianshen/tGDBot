@@ -59,20 +59,41 @@ export function summarizeExistingDiscussion(
 
     for (const event of thread.events ?? []) {
       if (discussionMemories.length >= MAX_DISCUSSION_MEMORIES) break;
-      if (event.kind === "thread-resolution" || event.authorIsBot) continue;
-      const summary = summarizeBody(event.body);
-      if (summary.length === 0) continue;
-      const memoryKey = JSON.stringify([thread.threadId, event.commentId ?? event.eventId, event.revisionId]);
-      if (seenMemories.has(memoryKey)) continue;
-      seenMemories.add(memoryKey);
-      discussionMemories.push({
-        threadId: thread.threadId,
-        ...(file === undefined ? {} : { file }),
-        ...(line === undefined ? {} : { line }),
-        author: event.authorLogin,
-        summary,
-        ...(thread.url === undefined ? {} : { url: thread.url }),
-      });
+      if (event.kind === "thread-resolution") continue;
+      if (!event.authorIsBot) {
+        const summary = summarizeBody(event.body);
+        if (summary.length === 0) continue;
+        const memoryKey = JSON.stringify([thread.threadId, event.commentId ?? event.eventId, event.revisionId]);
+        if (seenMemories.has(memoryKey)) continue;
+        seenMemories.add(memoryKey);
+        discussionMemories.push({
+          threadId: thread.threadId,
+          ...(file === undefined ? {} : { file }),
+          ...(line === undefined ? {} : { line }),
+          author: event.authorLogin,
+          summary,
+          ...(thread.url === undefined ? {} : { url: thread.url }),
+        });
+        continue;
+      }
+
+      const findingSummary = summarizeBody(event.body);
+      if (findingSummary.length === 0) continue;
+      for (const reaction of event.reactions ?? []) {
+        if (discussionMemories.length >= MAX_DISCUSSION_MEMORIES) break;
+        if (reaction.content !== "thumbs-up" || reaction.authorIsBot) continue;
+        const memoryKey = JSON.stringify([thread.threadId, event.commentId ?? event.eventId, reaction.id]);
+        if (seenMemories.has(memoryKey)) continue;
+        seenMemories.add(memoryKey);
+        discussionMemories.push({
+          threadId: thread.threadId,
+          ...(file === undefined ? {} : { file }),
+          ...(line === undefined ? {} : { line }),
+          author: reaction.authorLogin,
+          summary: summarizeBody(`👍 Endorsed tGDBot finding: ${findingSummary}`),
+          ...(thread.url === undefined ? {} : { url: thread.url }),
+        });
+      }
     }
   }
 

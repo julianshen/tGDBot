@@ -186,6 +186,14 @@ not echoed into this section. These summaries are review-scoped evidence; use
 `@bot remember <lesson>` when a conclusion should become durable
 repository-local memory for future reviews.
 
+A human 👍 on a tGDBot inline finding is positive review feedback. GitHub
+reactions and GitLab `thumbsup` award emoji are normalized into the next
+review's bounded discussion context, included in its fingerprint, and shown in
+**Local review memory** with the reacting user and source thread. Adding the
+reaction does not post an acknowledgement or start a review by itself; the next
+commit, scheduled review, or `@bot check latest` consumes it. Reactions from the
+authenticated bot are ignored, and other emoji are neutral.
+
 ### Local state
 
 Everything tGDBot remembers lives **outside the reviewed repository** and is
