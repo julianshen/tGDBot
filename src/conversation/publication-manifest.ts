@@ -611,9 +611,15 @@ export function buildReviewPublicationGraph(input: {
     readonly position?: PublicationInlinePosition;
   }[];
   readonly fallbacks: readonly { readonly replacesId: string; readonly body: string }[];
+  /**
+   * Publishes the narrative as a reply instead of the managed summary. A
+   * focused review needs the same inline and fallback graph as any other, but
+   * must not upsert the summary, so only the root child differs.
+   */
+  readonly root?: { readonly kind: "group-reply"; readonly threadId?: string };
 }): PublicationChild[] {
   const summaryId = `output_${createHash("sha256").update(`tgd:review-summary:v1\0${input.actionId}`, "utf8").digest("hex").slice(0, 32)}`;
-  const children: PublicationChild[] = [{
+  const children: PublicationChild[] = [input.root === undefined ? {
     id: summaryId,
     kind: "summary",
     status: "pending",
@@ -626,6 +632,16 @@ export function buildReviewPublicationGraph(input: {
       configHash: input.configHash,
       ...(input.terminalResult === undefined ? {} : { terminalResult: input.terminalResult }),
     },
+  } : {
+    id: summaryId,
+    kind: "group-reply",
+    status: "pending",
+    body: input.summaryBody,
+    bodyDigest: computeContentDigest(input.summaryBody),
+    marker: `<!-- tgd-review-reply:${input.actionId} -->`,
+    placement: input.root.threadId === undefined
+      ? { kind: "group-reply" }
+      : { kind: "group-reply", threadId: input.root.threadId },
   }];
   for (const inline of input.inlines) {
     children.push({

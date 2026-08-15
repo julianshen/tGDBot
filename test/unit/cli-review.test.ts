@@ -475,6 +475,67 @@ describe("review", () => {
     logSpy.mockRestore();
   });
 
+  // A focused run should anchor what it finds to the code, the same as a normal
+  // review — the difference is where the narrative goes, not whether findings
+  // are actionable in place.
+  it("a focused-command invocation anchors its findings as inline children", async () => {
+    const args = makeArgs({ stateDir: isolatedStateDir() });
+    const finding = {
+      ruleName: "rule-a",
+      severity: "warning" as const,
+      category: "correctness",
+      file: "x.ts",
+      line: 1,
+      message: "the error path drops the cause",
+    };
+    const h = makeHarness({
+      args,
+      dispatchResult: { findings: [finding], rulesRun: ["rule-a"], rulesFailed: [] },
+      orchestrationResult: {
+        commentBody: "- x.ts:1 — the error path drops the cause",
+        inlineComments: [{
+          // The orchestrator mints client IDs in this exact shape, and the
+          // inline child derivation validates it.
+          clientId: "finding-0",
+          path: "x.ts",
+          line: 1,
+          body: "the error path drops the cause",
+          position: {
+            oldPath: "x.ts",
+            newPath: "x.ts",
+            start: { type: "new" as const, newLine: 1 },
+            end: { type: "new" as const, newLine: 1 },
+            sameHunk: true as const,
+          },
+        }],
+        findingsCount: 1,
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, {
+      ...depsFrom(h),
+      invocation: {
+        kind: "focused-command",
+        actionId: `action_${"7".repeat(32)}`,
+        direction: "check the error handling",
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(h.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
+    const [, , comments] = h.vcsAdapter.createInlineReview.mock.calls[0] as [unknown, string, { path: string; line: number }[]];
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ path: "x.ts", line: 1 });
+    expect(h.vcsAdapter.postGeneralReply).toHaveBeenCalledTimes(1);
+    // Still supplemental.
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveStaleReviewThreads).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
   it("applies head/config dedup to an explicit GitLab merge request", async () => {
     const args = makeArgs({
       pr: "https://gitlab.example.com/group/project/-/merge_requests/42",

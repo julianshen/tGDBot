@@ -363,6 +363,87 @@ describe("publication crash-matrix recovery", () => {
     }
   });
 
+  // The matrix above stops at the inline children. A real multi-output review
+  // also freezes a fallback per inline, and those are the children most likely
+  // to be mid-flight when something dies: they are written last, after the
+  // inline they replace has already failed. Crash at every point in the write
+  // sequence, for both providers' strategies.
+  test.each(["github-atomic", "gitlab-selective"] as const)(
+    "recovers a full group/inline/fallback graph after a crash at any child (%s)",
+    async (strategy) => {
+      const children = graph();
+      const frozen = freezePublication(preparePublication(observePublication({
+        actionId: ACTION_ID,
+        identityDigest: IDENTITY,
+        reviewNumber: 42,
+        repository: BINDING,
+      })), children);
+
+      // Every inline fails, so every fallback is genuinely exercised.
+      // The crash comes from a hook, not the writer: a writer that throws is
+      // reported as a failed child, which is a different scenario entirely.
+      const writerFor = (written: string[]) => ({
+        async lookupChild() { return null; },
+        async writeChild(entry: PublicationChild): Promise<PublicationWriteResult> {
+          written.push(entry.id);
+          if (entry.kind === "inline") return { status: "failed" as const };
+          if (entry.kind === "fallback") return { status: "fallback-selected" as const };
+          return { status: "posted" as const, identity: postedIdentity(entry, entry.id.slice(0, 12)) };
+        },
+      });
+      const crashAt = (crashAfter: number) => {
+        let seen = 0;
+        return async () => {
+          seen += 1;
+          if (seen === crashAfter) throw new Error(`crash after child ${crashAfter}`);
+        };
+      };
+
+      // The strategies batch differently — one writes its inlines as a single
+      // atomic call — so the number of interruptible points is a property of
+      // the strategy, not of the graph. Measure it, then crash at each one.
+      let checkpoints = 0;
+      const baseline = await executePublication({
+        store: createStore(await stateRoot()),
+        action: frozen,
+        strategy,
+        writer: writerFor([]),
+        hooks: { afterChildWrite: async () => { checkpoints += 1; } },
+      });
+      expect(baseline.state).toBe("completed");
+      expect(checkpoints).toBeGreaterThan(1);
+
+      for (let crashAfter = 1; crashAfter <= checkpoints; crashAfter += 1) {
+        const store = createStore(await stateRoot());
+        await expect(executePublication({
+          store,
+          action: frozen,
+          strategy,
+          writer: writerFor([]),
+          hooks: { afterChildWrite: crashAt(crashAfter) },
+        })).rejects.toThrow(new RegExp(`crash after child ${crashAfter}`));
+
+        const modelOnRecovery = vi.fn();
+        const result = await executePublication({
+          store,
+          action: frozen,
+          strategy,
+          writer: writerFor([]),
+          hooks: { onModelWork: modelOnRecovery },
+        });
+
+        // Recovery replays the frozen graph exactly: no regeneration, every
+        // body byte-identical, and every child terminal so it can complete.
+        expect(modelOnRecovery).not.toHaveBeenCalled();
+        expect(result.state).toBe("completed");
+        expect(result.children.map((entry) => entry.id)).toEqual(children.map((entry) => entry.id));
+        expect(result.children.map((entry) => entry.body)).toEqual(children.map((entry) => entry.body));
+        expect(result.children.filter((entry) => entry.kind === "fallback")
+          .every((entry) => entry.status === "fallback-selected")).toBe(true);
+      }
+    },
+  );
+
   test("GitHub atomic-inline fallback selects every fallback without rewriting posted markers", async () => {
     const store = createStore(await stateRoot());
     const children = graph();

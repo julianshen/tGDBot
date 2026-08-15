@@ -17,13 +17,7 @@ import {
   type PublicationWriter,
 } from "../conversation/publication-manifest.js";
 import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "../conversation/markers.js";
-import {
-  childMarkerSuffix,
-  createConversationPublicationChild,
-  publicationBody,
-  renderFocusReply,
-  type RenderedConversationBody,
-} from "../conversation/render.js";
+import { publicationBody, renderFocusReply } from "../conversation/render.js";
 import type { ConversationStateStore } from "../conversation/state-store.js";
 import type { RepositoryBinding, ReviewIdentity } from "../conversation/types.js";
 import type { ConversationAdapter } from "../vcs/conversation-adapter.js";
@@ -82,6 +76,7 @@ export interface PrepareReviewFindingPublicationInput {
   readonly summaryBody: string;
   readonly terminalResult?: TerminalReviewResult;
   readonly inlineRecovery?: InlineRecoveryState;
+  readonly root?: { readonly kind: "group-reply"; readonly threadId?: string };
 }
 
 export function selectedFallbackIds(action: PublicationAction): Set<string> {
@@ -239,6 +234,7 @@ export function prepareReviewFindingPublication(
       summaryBody: input.summaryBody,
       headSha: input.headSha,
       configHash: input.configHash,
+      ...(input.root === undefined ? {} : { root: input.root }),
       ...(input.terminalResult === undefined ? {} : { terminalResult: input.terminalResult }),
       inlines,
       fallbacks: inlines.map((inline) => ({ replacesId: inline.childId, body: inline.body })),
@@ -365,33 +361,11 @@ export async function publishReviewFromManifest(options: {
     }
   }
 
-  function toInlineComment(child: PublicationChild) {
-    const markerSuffix = provider === "gitlab" ? `\n${child.marker}` : "";
-    return {
-      clientId: clientIdOf(child),
-      path: child.placement.kind === "inline" ? child.placement.file : "",
-      line: child.placement.kind === "inline" ? child.placement.line : 1,
-      ...(child.placement.kind === "inline" && child.placement.startLine !== undefined
-        ? { startLine: child.placement.startLine }
-        : {}),
-      position: child.placement.kind === "inline" && child.placement.position !== undefined
-        ? child.placement.position
-        : {
-            oldPath: child.placement.kind === "inline" ? child.placement.file : "",
-            newPath: child.placement.kind === "inline" ? child.placement.file : "",
-            start: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
-            end: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
-            sameHunk: true as const,
-          },
-      body: `${child.body}${markerSuffix}`,
-    };
-  }
-
   async function publishInlines(
     action: PublicationAction,
     children: readonly PublicationChild[],
   ): Promise<Map<string, PublicationWriteResult>> {
-    const comments = children.map(toInlineComment);
+    const comments = children.map((entry) => toInlineComment(entry, provider));
     const results = new Map<string, PublicationWriteResult>();
     try {
       const outcomes = await vcsAdapter.createInlineReview(
@@ -829,6 +803,28 @@ export async function publishConfirmedClarificationFinding(options: {
  * The reply is a single frozen child, so a crash after an accepted-but-
  * unconfirmed write is reconciled by its marker instead of posting twice.
  */
+function toInlineComment(child: PublicationChild, provider: "github" | "gitlab") {
+  const markerSuffix = provider === "gitlab" ? `\n${child.marker}` : "";
+  return {
+    clientId: clientIdOf(child),
+    path: child.placement.kind === "inline" ? child.placement.file : "",
+    line: child.placement.kind === "inline" ? child.placement.line : 1,
+    ...(child.placement.kind === "inline" && child.placement.startLine !== undefined
+      ? { startLine: child.placement.startLine }
+      : {}),
+    position: child.placement.kind === "inline" && child.placement.position !== undefined
+      ? child.placement.position
+      : {
+          oldPath: child.placement.kind === "inline" ? child.placement.file : "",
+          newPath: child.placement.kind === "inline" ? child.placement.file : "",
+          start: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
+          end: { type: "new" as const, newLine: child.placement.kind === "inline" ? child.placement.line : 1 },
+          sameHunk: true as const,
+        },
+    body: `${child.body}${markerSuffix}`,
+  };
+}
+
 export async function publishFocusedReview(options: {
   readonly store: ConversationStateStore;
   readonly context: ReviewPublicationContext;
@@ -838,51 +834,43 @@ export async function publishFocusedReview(options: {
   readonly publicationIdentity: { readonly actionId: string; readonly identityDigest: string };
   readonly direction: string;
   readonly summary: string;
+  readonly orchestration: OrchestrationResult;
+  readonly rules: readonly Pick<RuleDefinition, "name" | "body">[];
+  readonly reviewOptions: FindingReviewOptions;
+  readonly baseSha: string;
+  readonly configHash: string;
   readonly threadId?: string;
   readonly now: () => string;
   readonly hooks?: PublicationExecutorHooks;
 }): Promise<number> {
   const adapter = options.context.vcsAdapter as unknown as ConversationAdapter;
-  const publicDigest = computeRepositoryDigest(
-    options.context.provider,
-    options.context.repository.canonicalUrl,
-  );
-  const childHex = createHash("sha256")
-    .update(`tgd:focused-review:v1\0${options.publicationIdentity.actionId}`, "utf8")
-    .digest("hex")
-    .slice(0, 32);
-  // Ledger IDs and marker IDs use different prefixes for the same identity:
-  // `action_`/`output_` in state, `act_`/`out_` in the public marker grammar.
-  const childId = `output_${childHex}`;
-  const parentId = `act_${options.publicationIdentity.actionId.slice("action_".length)}`;
-  const markerFor = (contentDigest: string): string => formatChildMarker({
-    kind: "action",
-    parentId,
-    childId: `out_${childHex}`,
-    repositoryDigest: publicDigest,
+  const { vcsAdapter, locator, provider } = options.context;
+  const publicDigest = computeRepositoryDigest(provider, options.context.repository.canonicalUrl);
+  const timestamp = options.now();
+
+  // The narrative becomes a reply rather than the managed summary; everything
+  // below it — inline children, their fallbacks, the finding ledger — is the
+  // ordinary review graph, so a focused finding is as actionable as any other.
+  const prepared = prepareReviewFindingPublication({
+    publicationIdentity: options.publicationIdentity,
+    orchestration: options.orchestration,
+    storeBinding: options.repository,
     reviewNumber: Number(options.pr.id),
-    contentDigest,
+    reviewId: options.identity.reviewId,
+    baseSha: options.baseSha,
+    headSha: options.pr.headSha,
+    rules: options.rules,
+    reviewOptions: options.reviewOptions,
+    now: timestamp,
+    publicRepositoryDigest: publicDigest,
+    configHash: options.configHash,
+    summaryBody: publicationBody(renderFocusReply(
+      { direction: options.direction, summary: options.summary },
+      focusedReplyMarker(options.publicationIdentity.actionId, publicDigest, Number(options.pr.id), options.summary),
+    )),
+    root: { kind: "group-reply", ...(options.threadId === undefined ? {} : { threadId: options.threadId }) },
   });
-  const render = (marker: string): RenderedConversationBody =>
-    renderFocusReply({ direction: options.direction, summary: options.summary }, marker);
-
-  // Two passes so the marker commits to the digest of the body it is attached
-  // to, exactly as conversation replies do: render once to measure, then embed.
-  const provisional = markerFor("0".repeat(64));
-  const first = publicationBody(render(provisional));
-  const suffix = childMarkerSuffix(provisional);
-  const visible = first.endsWith(suffix) ? first.slice(0, -suffix.length) : first;
-  const marker = markerFor(computeContentDigest(visible));
-
-  const child = createConversationPublicationChild({
-    id: childId,
-    kind: "group-reply",
-    placement: options.threadId === undefined
-      ? { kind: "group-reply" }
-      : { kind: "group-reply", threadId: options.threadId },
-    body: render(marker),
-    marker: `<!-- tgd-focused-review:${options.publicationIdentity.actionId}:${childId} -->`,
-  });
+  await persistPreparedFindings(options.store, prepared.preparedFindings);
 
   const action: PublicationAction = {
     actionId: options.publicationIdentity.actionId,
@@ -891,8 +879,9 @@ export async function publishFocusedReview(options: {
     repository: options.repository,
     state: "prepared",
     successorActionId: null,
-    children: [child],
+    children: prepared.children,
   };
+
   const writer: PublicationWriter = {
     async lookupChild(pending) {
       const parsed = parseChildMarker((pending.body.split(/\r?\n/u).at(-1) ?? "").trim());
@@ -907,7 +896,24 @@ export async function publishFocusedReview(options: {
         contentDigest: parsed.contentDigest,
       });
     },
-    async writeChild(pending): Promise<PublicationWriteResult> {
+    async writeChild(pending, current): Promise<PublicationWriteResult> {
+      if (pending.kind === "inline") {
+        const siblings = current.children.filter((entry) => entry.kind === "inline");
+        const outcomes = await vcsAdapter.createInlineReview(
+          locator,
+          options.pr.headSha,
+          siblings.map((entry) => toInlineComment(entry, provider)),
+        );
+        const mine = outcomes.find((outcome) => outcome.clientId === clientIdOf(pending));
+        if (mine === undefined || mine.status !== "posted") return { status: "failed" };
+        return { status: "posted", identity: mine.identity };
+      }
+      if (pending.kind === "fallback") {
+        // A focused run already restates its findings in the reply, so a
+        // fallback needs no separate write — it exists so the manifest can
+        // reach a terminal state when an inline could not be anchored.
+        return { status: "fallback-selected" };
+      }
       const input = {
         provider: options.identity.provider,
         repositoryDigest: options.identity.repositoryDigest,
@@ -939,4 +945,26 @@ export async function publishFocusedReview(options: {
     ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
   });
   return published.state === "completed" ? 0 : 2;
+}
+
+/** Marker for the focused reply, bound to the digest of the body it carries. */
+function focusedReplyMarker(
+  actionId: string,
+  publicDigest: string,
+  reviewNumber: number,
+  summary: string,
+): string {
+  const childHex = createHash("sha256")
+    .update(`tgd:focused-review:v1\0${actionId}`, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  return formatChildMarker({
+    kind: "action",
+    // Ledger IDs and marker IDs use different prefixes for one identity.
+    parentId: `act_${actionId.slice("action_".length)}`,
+    childId: `out_${childHex}`,
+    repositoryDigest: publicDigest,
+    reviewNumber,
+    contentDigest: computeContentDigest(summary),
+  });
 }
