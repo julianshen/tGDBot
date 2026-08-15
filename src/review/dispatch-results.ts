@@ -33,6 +33,28 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 const VALID_SEVERITIES = new Set(["blocking", "warning", "suggestion"]);
+const MAX_STATE_SUGGESTION_CHARS = 20_000;
+
+/**
+ * Suggestions are optional executable enrichment and are later persisted in
+ * the conversation ledger. Keep only values that satisfy that ledger's text
+ * contract without rewriting a byte of the proposed replacement. Rewriting
+ * whitespace or Unicode would make the stored/replayed fix differ from what
+ * the reviewer authored, so an unsafe suggestion is dropped while its finding
+ * remains usable.
+ */
+function stateSafeSuggestion(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_STATE_SUGGESTION_CHARS ||
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value) ||
+    value !== value.normalize("NFC").trim()
+  ) {
+    return undefined;
+  }
+  return value;
+}
 
 // Validates a single Finding's required fields/types. `line` is optional/
 // nullable (per the JSON contract, `number | null`) so it's checked only
@@ -86,7 +108,7 @@ function normalizeFinding(finding: Finding): Finding {
   return {
     ...finding,
     title: typeof raw.title === "string" ? raw.title : undefined,
-    suggestion: typeof raw.suggestion === "string" ? raw.suggestion : undefined,
+    suggestion: stateSafeSuggestion(raw.suggestion),
     endLine: Number.isInteger(raw.endLine) ? (raw.endLine as number) : undefined,
   };
 }
@@ -214,7 +236,7 @@ export function parseFindingsFromFinalOutput(text: string, ruleName: string): Fi
       // whose findings had to be recovered from its raw output must not silently
       // lose its titles and suggestions.
       title: typeof c.title === "string" ? c.title : undefined,
-      suggestion: typeof c.suggestion === "string" ? c.suggestion : undefined,
+      suggestion: stateSafeSuggestion(c.suggestion),
       endLine: typeof c.endLine === "number" ? c.endLine : undefined,
     };
   });

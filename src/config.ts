@@ -15,6 +15,11 @@ export interface ResolvedConfig extends CliArgs {
   readonly vcsAdapter: VcsAdapter;
 }
 
+type GitHubRepositoryEnvironment = Partial<Pick<
+  NodeJS.ProcessEnv,
+  "GH_REPO" | "GITHUB_REPOSITORY"
+>>;
+
 function repositoriesMatch(
   left: RepositoryRef,
   right: RepositoryRef,
@@ -27,13 +32,20 @@ function repositoriesMatch(
     : left.canonicalUrl === right.canonicalUrl;
 }
 
-export function resolveReviewLocator(args: CliArgs): ReviewLocator {
+export function resolveReviewLocator(
+  args: CliArgs,
+  environment: GitHubRepositoryEnvironment = process.env,
+): ReviewLocator {
   if (/^\d+$/.test(args.pr)) {
     const number = Number(args.pr);
-    if (args.repo !== undefined) {
+    const environmentRepo = args.vcs === "github"
+      ? environment.GH_REPO ?? environment.GITHUB_REPOSITORY
+      : undefined;
+    const repository = args.repo ?? environmentRepo;
+    if (repository !== undefined) {
       return {
         kind: "repository",
-        repo: parseRepositoryRef(args.repo, args.vcs),
+        repo: parseRepositoryRef(repository, args.vcs),
         number,
       };
     }

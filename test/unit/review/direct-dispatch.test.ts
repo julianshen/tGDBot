@@ -374,6 +374,20 @@ describe("dispatchRulesDirect", () => {
     expect(prompts["rule-b"]).toContain("the-diff");
   });
 
+  it.each([
+    ["non-NFC", "const caf\u0065\u0301 = true;"],
+    ["surrounding whitespace", "  const value = true;\n"],
+  ])("drops a state-unsafe %s suggestion without losing its finding", async (_label, suggestion) => {
+    const unsafeFinding = { ...finding("a.ts", "real bug"), suggestion };
+    const { factory } = makeFactory({ "rule-a": JSON.stringify([unsafeFinding]) });
+
+    const result = await dispatchRulesDirect([makeRule()], "diff", false, { createSession: factory });
+
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({ message: "real bug", ruleName: "rule-a" });
+    expect(result.findings[0]?.suggestion).toBeUndefined();
+  });
+
   it("an empty array is a SUCCESS (the rule ran and found nothing)", async () => {
     const { factory } = makeFactory({ "rule-a": "[]" });
 
