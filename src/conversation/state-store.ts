@@ -981,7 +981,19 @@ class FileConversationStateStore implements ConversationStateStore {
           throw error;
         }
         await this.removeIfOwned(candidatePath, candidateIdentity);
-        if (await this.tryReclaimStaleLock(parentIdentity, currentProcess)) continue;
+        // A reclaim retries immediately, without backoff, because the lock was
+        // just freed and the winner should be decided now. It must still honour
+        // the deadline: tryReclaimStaleLock also reports success when the lock
+        // simply vanished between our failed link and our read, which under
+        // contention can repeat indefinitely. Retrying past the deadline turns
+        // a timeout into a hang with no CPU use and no diagnostic.
+        if (await this.tryReclaimStaleLock(parentIdentity, currentProcess)) {
+          if (!first && this.monotonicNow() >= deadline) {
+            throw new Error("Timed out acquiring conversation repository lock");
+          }
+          first = false;
+          continue;
+        }
         if (!first && this.monotonicNow() >= deadline) throw new Error("Timed out acquiring conversation repository lock");
         first = false;
         const remaining = deadline - this.monotonicNow();
