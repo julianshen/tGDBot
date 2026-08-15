@@ -112,6 +112,25 @@ describe("resolveReviewLocator", () => {
     });
   });
 
+  it("resolves numeric GitHub targets against GH_REPO instead of the checkout remote", () => {
+    expect(resolveReviewLocator(makeArgs(), { GH_REPO: "hmchangw/newchat" })).toMatchObject({
+      kind: "repository",
+      repo: { provider: "github", owner: "hmchangw", repo: "newchat" },
+      number: 42,
+    });
+  });
+
+  it("uses an explicit --repo in preference to GH_REPO", () => {
+    expect(resolveReviewLocator(
+      makeArgs({ repo: "octo-org/octo-repo" }),
+      { GH_REPO: "hmchangw/newchat" },
+    )).toMatchObject({
+      kind: "repository",
+      repo: { provider: "github", owner: "octo-org", repo: "octo-repo" },
+      number: 42,
+    });
+  });
+
   it.each([
     ["https://github.com/octo-org/octo-repo/pull/42", "github"],
     ["https://gitlab.example.com/group/project/-/merge_requests/42", "gitlab"],

@@ -27,6 +27,11 @@ const hoisted = vi.hoisted(() => {
     name: `${provider}/${modelId}`,
   }));
   const hasConfiguredAuthMock = vi.fn(() => true);
+  const modelRuntimeCreate = vi.fn(async () => ({
+    getModel: findModelMock,
+    hasConfiguredAuth: hasConfiguredAuthMock,
+    getAvailableSnapshot: vi.fn((): { provider: string; id: string }[] => []),
+  }));
   return {
     resourceLoaderInstances,
     FakeResourceLoader,
@@ -34,6 +39,7 @@ const hoisted = vi.hoisted(() => {
     createReadOnlyToolsMock,
     findModelMock,
     hasConfiguredAuthMock,
+    modelRuntimeCreate,
     sessionManagerInMemory: vi.fn(() => "fake-session-manager"),
     getAgentDirMock: vi.fn(() => "/fake/agent/dir"),
     authStorageCreate: vi.fn(() => "fake-auth-storage"),
@@ -53,6 +59,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
   getAgentDir: hoisted.getAgentDirMock,
   AuthStorage: { create: hoisted.authStorageCreate },
   ModelRegistry: { create: hoisted.modelRegistryCreate },
+  ModelRuntime: { create: hoisted.modelRuntimeCreate },
 }));
 
 import {

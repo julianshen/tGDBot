@@ -41,6 +41,28 @@ export const FINDING_DECISIONS = [
   "needs-clarification",
 ] as const satisfies readonly FindingDecision[];
 export const MAX_FINDING_QUESTION_CHARS = 500;
+const MAX_STATE_SUGGESTION_CHARS = 20_000;
+
+/**
+ * Suggestions are optional executable enrichment and are later persisted in
+ * the conversation ledger. Keep only values that satisfy that ledger's text
+ * contract without rewriting a byte of the proposed replacement. Rewriting
+ * whitespace or Unicode would make the stored/replayed fix differ from what
+ * the reviewer authored, so an unsafe suggestion is dropped while its finding
+ * remains usable.
+ */
+function stateSafeSuggestion(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_STATE_SUGGESTION_CHARS ||
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value) ||
+    value !== value.normalize("NFC").trim()
+  ) {
+    return undefined;
+  }
+  return value;
+}
 
 const FINDING_DECISION_SET = new Set<string>(FINDING_DECISIONS);
 
@@ -110,7 +132,8 @@ export function normalizeUnknownFinding(value: unknown, ruleName?: string): Find
     decision: contract.decision,
   };
   if (typeof candidate.title === "string") finding.title = candidate.title;
-  if (typeof candidate.suggestion === "string") finding.suggestion = candidate.suggestion;
+  const suggestion = stateSafeSuggestion(candidate.suggestion);
+  if (suggestion !== undefined) finding.suggestion = suggestion;
   if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;
   if (contract.question !== undefined) finding.question = contract.question;
   return finding;
