@@ -1756,6 +1756,31 @@ describe("GitLab conversation activity", () => {
       .toBe(true);
   });
 
+  it("bounds concurrent reaction requests for bot-authored discussion notes", async () => {
+    const discussions = JSON.parse(JSON.stringify(activityDiscussions())) as Array<Record<string, unknown>>;
+    const discussion = discussions[0]!;
+    const template = (discussion.notes as Array<Record<string, unknown>>)[0]!;
+    discussion.notes = Array.from({ length: 9 }, (_, index) => ({ ...template, id: 800 + index }));
+    const fallback = activityExec(activityNotes(), discussions);
+    let active = 0;
+    let peak = 0;
+    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/award_emoji")) {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return "";
+      }
+      return fallback(args, stdin);
+    });
+
+    await new GitLabAdapter(execGlab, repo).getReviewThread(review, "T1");
+
+    expect(peak).toBeLessThanOrEqual(4);
+  });
+
   it("keeps a still-applicable thread current when only the review head moved", async () => {
     const execGlab = activityExec();
     const page = await new GitLabAdapter(execGlab, repo).listReviewThreads(review);

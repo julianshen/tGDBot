@@ -70,10 +70,13 @@ describe("main command dispatch", () => {
 
     await main(["poll", "--repo", "owner/repo"], { runPoll });
 
-    expect(runPoll).toHaveBeenCalledWith(expect.objectContaining({
-      command: "poll",
-      repo: "owner/repo",
-    }));
+    expect(runPoll).toHaveBeenCalledWith(
+      expect.objectContaining({
+        command: "poll",
+        repo: "owner/repo",
+      }),
+      expect.objectContaining({ runReview: expect.any(Function) }),
+    );
     expect(exit).toHaveBeenCalledWith(0);
     exit.mockRestore();
   });
@@ -424,6 +427,53 @@ describe("review", () => {
     logSpy.mockRestore();
   });
 
+  it("gives a forced command its own publication after a completed normal review", async () => {
+    const args = makeArgs({ stateDir: isolatedStateDir() });
+    const h = makeHarness({ args });
+    const deps = depsFrom(h);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, deps)).resolves.toBe(0);
+    h.dispatchRules.mockClear();
+    h.vcsAdapter.upsertComment.mockClear();
+
+    await expect(review(h.args, {
+      ...deps,
+      invocation: { kind: "forced-command", actionId: `action_${"8".repeat(32)}` },
+    })).resolves.toBe(0);
+
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    logSpy.mockRestore();
+  });
+
+  it("runs a focused command even when the normal summary already covers the head", async () => {
+    const args = makeArgs({ stateDir: isolatedStateDir() });
+    const cfg = computeReviewConfigHash(args);
+    const h = makeHarness({
+      args,
+      botComment: {
+        id: "999",
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
+        lastReviewedSha: "cafef00d",
+        reviewedConfig: cfg,
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, {
+      ...depsFrom(h),
+      invocation: {
+        kind: "focused-command",
+        actionId: `action_${"9".repeat(32)}`,
+        direction: "check the error handling",
+      },
+    })).resolves.toBe(0);
+
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    expect(h.vcsAdapter.postGeneralReply).toHaveBeenCalledTimes(1);
+    logSpy.mockRestore();
+  });
+
   // A focused run is supplemental. It answers the person who asked, and must
   // leave the managed summary and the previous head's threads exactly as they
   // were — otherwise asking a narrow question silently rewrites the review.
@@ -488,11 +538,16 @@ describe("review", () => {
       line: 1,
       message: "the error path drops the cause",
     };
+    const secondFinding = {
+      ...finding,
+      line: 2,
+      message: "the retry path drops the cause",
+    };
     const h = makeHarness({
       args,
-      dispatchResult: { findings: [finding], rulesRun: ["rule-a"], rulesFailed: [] },
+      dispatchResult: { findings: [finding, secondFinding], rulesRun: ["rule-a"], rulesFailed: [] },
       orchestrationResult: {
-        commentBody: "- x.ts:1 — the error path drops the cause",
+        commentBody: "- x.ts:1 — the error path drops the cause\n- x.ts:2 — the retry path drops the cause",
         inlineComments: [{
           // The orchestrator mints client IDs in this exact shape, and the
           // inline child derivation validates it.
@@ -507,8 +562,20 @@ describe("review", () => {
             end: { type: "new" as const, newLine: 1 },
             sameHunk: true as const,
           },
+        }, {
+          clientId: "finding-1",
+          path: "x.ts",
+          line: 2,
+          body: "the retry path drops the cause",
+          position: {
+            oldPath: "x.ts",
+            newPath: "x.ts",
+            start: { type: "new" as const, newLine: 2 },
+            end: { type: "new" as const, newLine: 2 },
+            sameHunk: true as const,
+          },
         }],
-        findingsCount: 1,
+        findingsCount: 2,
         rulesRun: ["rule-a"],
         rulesFailed: [],
       },
@@ -527,8 +594,9 @@ describe("review", () => {
     expect(exitCode).toBe(0);
     expect(h.vcsAdapter.createInlineReview).toHaveBeenCalledTimes(1);
     const [, , comments] = h.vcsAdapter.createInlineReview.mock.calls[0] as [unknown, string, { path: string; line: number }[]];
-    expect(comments).toHaveLength(1);
+    expect(comments).toHaveLength(2);
     expect(comments[0]).toMatchObject({ path: "x.ts", line: 1 });
+    expect(comments[1]).toMatchObject({ path: "x.ts", line: 2 });
     expect(h.vcsAdapter.postGeneralReply).toHaveBeenCalledTimes(1);
     // Still supplemental.
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
@@ -2689,7 +2757,10 @@ function installConversationReads(
   const binding = conversationBinding();
   const all = options.extraUnrelated === undefined ? threads : [...threads, options.extraUnrelated];
   h.vcsAdapter.listReviewThreads = vi.fn().mockResolvedValue({
-    threads: all.map(({ events: _events, ...summary }) => summary),
+    threads: all.map(({ events, ...summary }) => {
+      void events;
+      return summary;
+    }),
   });
   h.vcsAdapter.getReviewThread = vi.fn().mockImplementation((_review, threadId: string) => {
     const match = all.find((thread) => thread.threadId === threadId);
@@ -2997,21 +3068,28 @@ describe("conversation-aware review", () => {
 
   it("renders a visible notice when optional discussion context cannot load", async () => {
     const h = conversationHarness();
+    h.args = makeArgs({ dryRun: true, dispatch: "direct" });
+    h.config = { ...h.config, dryRun: true };
+    h.resolveConfig.mockReturnValue(h.config);
     h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(new Error("GitHub authentication failed (HTTP 401)"));
     h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
     h.vcsAdapter.getReviewThread = vi.fn();
     h.orchestrate.mockImplementation(buildPresentation);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
 
     await review(h.args, depsFrom(h));
 
     expect(h.dispatchRules).toHaveBeenCalledOnce();
     expect(h.dispatchRules.mock.calls[0]?.[0].conversationContext).toBeUndefined();
     expect(h.orchestrate.mock.calls[0]?.[2]?.contextUnavailable).toEqual(expect.arrayContaining(["discussion"]));
-    expect(String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1])).toMatch(/discussion context was unavailable/i);
+    expect(log.mock.calls.flat().join("\n")).toMatch(/discussion context was unavailable/i);
   });
 
   it("discards partial thread pagination instead of dispatching a truncated snapshot", async () => {
     const h = conversationHarness();
+    h.args = makeArgs({ dryRun: true, dispatch: "direct" });
+    h.config = { ...h.config, dryRun: true };
+    h.resolveConfig.mockReturnValue(h.config);
     const binding = conversationBinding();
     const token = {
       scope: "review-thread-page" as const,
@@ -3021,7 +3099,13 @@ describe("conversation-aware review", () => {
       opaque: "page-2",
     };
     h.vcsAdapter.listReviewThreads = vi.fn()
-      .mockResolvedValueOnce({ threads: [relevant].map(({ events: _events, ...summary }) => summary), nextPageToken: token })
+      .mockResolvedValueOnce({
+        threads: [relevant].map(({ events, ...summary }) => {
+          void events;
+          return summary;
+        }),
+        nextPageToken: token,
+      })
       .mockRejectedValueOnce(new Error("GitHub lookup exceeded its bounded resource limit"));
     h.vcsAdapter.getReviewThread = vi.fn().mockResolvedValue(relevant);
     h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
@@ -3357,16 +3441,35 @@ describe("conversation context integrity fail-closed", () => {
     ["network", Object.assign(new Error("getaddrinfo ENOTFOUND api.github.com"), { code: "ENOTFOUND" })],
     ["rate-limit", "HTTP 429 rate limit exceeded"],
     ["timeout", Object.assign(new Error("request timed out"), { code: "ETIMEDOUT" })],
-  ])("continues a normal review when optional discussion is unavailable because of %s", async (_name, error) => {
+  ])("refuses to publish when duplicate-suppression discussion is unavailable because of %s", async (_name, error) => {
     const h = conversationHarness();
     h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(typeof error === "string" ? new Error(error) : error);
     h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
     h.vcsAdapter.getReviewThread = vi.fn();
     h.orchestrate.mockImplementation(buildPresentation);
-    await review(h.args, depsFrom(h));
-    expect(h.dispatchRules).toHaveBeenCalledOnce();
-    expect(h.vcsAdapter.upsertComment).toHaveBeenCalled();
-    expect(String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1])).toMatch(/discussion context was unavailable/i);
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/duplicate|discussion context/i);
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
+  });
+
+  it("refuses to publish when one thread snapshot fails after other summaries load", async () => {
+    const h = conversationHarness();
+    h.vcsAdapter.listReviewThreads = vi.fn().mockResolvedValue({
+      threads: [
+        { threadId: "known", updatedAt: "2026-08-14T00:00:00.000Z", orderKey: "known" },
+        { threadId: "broken", updatedAt: "2026-08-14T00:00:01.000Z", orderKey: "broken" },
+      ],
+    });
+    h.vcsAdapter.getReviewThread = vi.fn().mockImplementation(async (_identity, threadId: string) => {
+      if (threadId === "broken") throw new Error("reaction lookup failed");
+      return conversationThread({ threadId: "known" });
+    });
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/duplicate|discussion context/i);
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
   });
 
   it("does not treat an integrity failure as optional unavailability when both occur", async () => {
@@ -3587,4 +3690,3 @@ describe("clarification question publication", () => {
     expect(snapshot.pending.clarifications).toHaveLength(1);
   });
 });
-

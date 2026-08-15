@@ -525,6 +525,18 @@ describe("conversation action identities and thread scope", () => {
       event: reply, thread, findings: [ledger], repository: ledger.repository, markerRepositoryDigest: publicDigest,
     })).toEqual({ status: "marked", ledger, root });
 
+    const recoveredRoot = {
+      ...root,
+      body: `${root.body}\n<!-- tgd-inline-child:v=3;recovery=opaque -->`,
+    };
+    expect(resolveMarkedFindingThread({
+      event: reply,
+      thread: { ...thread, events: [recoveredRoot, reply] },
+      findings: [ledger],
+      repository: ledger.repository,
+      markerRepositoryDigest: publicDigest,
+    })).toEqual({ status: "marked", ledger, root: recoveredRoot });
+
     expect(resolveMarkedFindingThread({
       event: { ...reply, kind: "general-comment", threadId: undefined },
       thread: undefined,

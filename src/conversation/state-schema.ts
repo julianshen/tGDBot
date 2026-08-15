@@ -1,4 +1,4 @@
-import type { BotIdentity, ConversationItemIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
+import type { ConversationItemIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
 import { computeContentDigest, parseChildMarker } from "./markers.js";
 
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
@@ -493,15 +493,6 @@ function sameBinding(actual: RepositoryBinding, expected: RepositoryBinding): vo
   if (actual.provider !== expected.provider || actual.repositoryDigest !== expected.repositoryDigest) {
     throw new Error("State repository binding does not match the requested repository");
   }
-}
-
-function identity(value: unknown, name: string): BotIdentity {
-  const object = exact(value, name, ["provider", "login", "mention"]);
-  if (object.provider !== "github" && object.provider !== "gitlab") throw new Error(`${name}.provider is invalid`);
-  const login = text(object.login, `${name}.login`, 255);
-  const mention = text(object.mention, `${name}.mention`, 256);
-  if (mention !== `@${login}`) throw new Error(`${name}.mention does not match login`);
-  return { provider: object.provider, login, mention };
 }
 
 function placement(value: unknown, name: string): ConversationPlacement | null {

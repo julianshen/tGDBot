@@ -169,7 +169,8 @@ picks it up and re-runs (the direction changes the review's fingerprint).
 Pushing a new commit retires it.
 
 `check latest` is the one command that overrules the normal "nothing changed,
-nothing to do" skip.
+nothing to do" skip. Each command is tracked by its provider action ID, so a
+retry is idempotent while a later command on the same commit still runs.
 
 ### Existing review issues
 
@@ -193,6 +194,11 @@ review's bounded discussion context, included in its fingerprint, and shown in
 reaction does not post an acknowledgement or start a review by itself; the next
 commit, scheduled review, or `@bot check latest` consumes it. Reactions from the
 authenticated bot are ignored, and other emoji are neutral.
+
+Before a live review publishes anything, tGDBot must load the complete current
+discussion. If that context is unavailable, the review fails without posting so
+duplicate suppression remains reliable. `--dry-run` still completes and reports
+the missing context because it cannot create duplicate provider comments.
 
 ### Local state
 

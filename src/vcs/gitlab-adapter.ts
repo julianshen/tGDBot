@@ -48,6 +48,7 @@ import {
 
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const RULE_FILE_FETCH_CONCURRENCY = 4;
+const REACTION_FETCH_CONCURRENCY = 4;
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const HTTP_DIAGNOSTIC_RE =
   /(?:^|\r?\n)(?:HTTP ([1-5]\d{2})|glab: [^\r\n]* \(HTTP ([1-5]\d{2})\))\r?(?=\n|$)/;
@@ -1725,12 +1726,25 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     const mr = await this.fetchConversationMergeRequest(review);
     const bot = (await this.getAuthenticatedBotIdentity()).login;
     const fetched = await this.fetchDiscussion(review, threadId);
+    const notes = new Array<ConversationNote>(fetched.notes.length);
+    let nextNote = 0;
+    const normalizeNext = async (): Promise<void> => {
+      while (nextNote < fetched.notes.length) {
+        const index = nextNote;
+        nextNote += 1;
+        const note = fetched.notes[index]!;
+        notes[index] = note.system || note.author !== bot
+          ? note
+          : { ...note, reactions: await this.fetchNoteThumbsUpReactions(review, note.id) };
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(REACTION_FETCH_CONCURRENCY, fetched.notes.length) },
+      normalizeNext,
+    ));
     const discussion: ConversationDiscussion = {
       ...fetched,
-      notes: await Promise.all(fetched.notes.map(async (note) =>
-        note.system || note.author !== bot
-          ? note
-          : { ...note, reactions: await this.fetchNoteThumbsUpReactions(review, note.id) })),
+      notes,
     };
     const normalized = this.normalizeDiscussion(review, discussion, mr, bot);
     if (!normalized) throw new Error("GitLab review thread not found in target review");

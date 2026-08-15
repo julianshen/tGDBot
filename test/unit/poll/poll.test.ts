@@ -42,7 +42,7 @@ import {
   createPreparedClarification,
   transitionClarification,
 } from "../../../src/conversation/clarification.js";
-import { poll } from "../../../src/poll/poll.js";
+import { extractFileHunk, poll } from "../../../src/poll/poll.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
@@ -430,6 +430,27 @@ const commentableAuthDiff = [
   "   return user;",
   " }",
 ].join("\n");
+
+it("extracts only the addressed file section for focused model context", () => {
+  const diff = [
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -1 +1 @@",
+    "-old auth",
+    "+new auth",
+    "diff --git a/src/other.ts b/src/other.ts",
+    "--- a/src/other.ts",
+    "+++ b/src/other.ts",
+    "@@ -1 +1 @@",
+    "-old other",
+    "+new other",
+  ].join("\n");
+
+  expect(extractFileHunk(diff, "src/auth.ts")).toContain("+new auth");
+  expect(extractFileHunk(diff, "src/auth.ts")).not.toContain("src/other.ts");
+  expect(extractFileHunk(diff, "missing.ts")).toBe(diff);
+});
 
 function postedInlineIdentity(commentId: string) {
   return validateConversationItemIdentity({
@@ -1737,4 +1758,3 @@ describe("clarification answer lifecycle", () => {
     expect(snapshot.pending.clarifications[0]?.state).toBe("terminal");
   });
 });
-

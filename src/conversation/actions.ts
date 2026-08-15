@@ -367,11 +367,15 @@ export type ThreadFindingResolution =
   | { readonly status: "scope-error" }
   | { readonly status: "unsupported-history" };
 
-function lastNonEmptyLine(body: string): string {
+function terminalFindingMarker(body: string): string {
   const lines = body.split(/\r?\n/u);
   for (let index = lines.length - 1; index >= 0; index -= 1) {
     const line = lines[index]!.trim();
-    if (line.length > 0) return line;
+    if (line.length === 0) continue;
+    const marker = parseChildMarker(line);
+    if (marker?.kind === "finding") return line;
+    if (/^<!--\s*tgd-[^>]*-->$/u.test(line)) continue;
+    break;
   }
   return "";
 }
@@ -391,10 +395,11 @@ export function resolveMarkedFindingThread(input: {
     entry.commentId === input.thread!.rootCommentId)
     ?? input.thread.events.find((entry) => entry.kind === "thread-comment" || entry.kind === "comment-edit");
   if (root === undefined || root.authorIsBot !== true) return { status: "scope-error" };
-  const marker = parseChildMarker(lastNonEmptyLine(root.body));
+  const markerLine = terminalFindingMarker(root.body);
+  const marker = parseChildMarker(markerLine);
   if (marker === null || marker.kind !== "finding") return { status: "scope-error" };
   try {
-    const ledger = requireFindingLedgerRecord(lastNonEmptyLine(root.body), input.findings, {
+    const ledger = requireFindingLedgerRecord(markerLine, input.findings, {
       repository: input.repository,
       reviewNumber: input.event.reviewNumber,
       markerRepositoryDigest: input.markerRepositoryDigest,

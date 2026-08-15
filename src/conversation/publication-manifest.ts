@@ -82,24 +82,6 @@ function cloneAction(action: PublicationAction): PublicationAction {
   };
 }
 
-function frozenGraph(children: readonly PublicationChild[]): string {
-  return JSON.stringify(children.map((child) => ({
-    id: child.id,
-    kind: child.kind,
-    placement: child.placement,
-    body: child.body,
-    bodyDigest: child.bodyDigest,
-    marker: child.marker,
-    ...(child.replacesId === undefined ? {} : { replacesId: child.replacesId }),
-  })));
-}
-
-function assertSameFrozenGraph(previous: PublicationAction, next: PublicationAction): void {
-  if (frozenGraph(previous.children) !== frozenGraph(next.children)) {
-    throw new Error("Immutable publication manifest changed: body cannot change after freeze");
-  }
-}
-
 function assertTransition(from: ActionState, to: ActionState, empty = false): void {
   if (to === "superseded") {
     if (from === "completed" || from === "superseded") {
@@ -301,10 +283,12 @@ export function reviewPublicationIdentity(input: {
   readonly reviewNumber: number;
   readonly headSha: string;
   readonly configHash: string;
+  readonly commandActionId?: string;
 }): { readonly actionId: string; readonly identityDigest: string } {
   const material = [
     input.repository.provider, input.repository.repositoryDigest, String(input.reviewNumber),
     input.headSha.toLowerCase(), input.configHash,
+    ...(input.commandActionId === undefined ? [] : [input.commandActionId]),
   ].join("\0");
   const identityDigest = createHash("sha256").update(`tgd:review-publication:v1\0${material}`, "utf8").digest("hex");
   return { actionId: `action_${identityDigest.slice(0, 32)}`, identityDigest };
@@ -907,4 +891,3 @@ export async function publishClarificationQuestion(options: {
   }
   return { action: published, pending: current };
 }
-

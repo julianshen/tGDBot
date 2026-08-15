@@ -25,6 +25,7 @@ import {
   AmbiguousInlinePublishError,
   validateInlinePublishOutcomes,
   type BotComment,
+  type InlinePublishOutcome,
   type PullRequestInfo,
   type ReviewLocator,
   type VcsAdapter,
@@ -154,7 +155,8 @@ export function toFindingSnapshot(finding: Finding): FindingSnapshot {
 }
 
 export function actionableClarificationFinding(finding: Finding): Finding {
-  const { question: _question, ...rest } = finding;
+  const rest = { ...finding };
+  delete rest.question;
   if (rest.decision === "new" || rest.decision === "still-valid") return rest;
   return { ...rest, decision: "still-valid" };
 }
@@ -882,6 +884,8 @@ export async function publishFocusedReview(options: {
     children: prepared.children,
   };
 
+  let inlineOutcomes: readonly InlinePublishOutcome[] | undefined;
+
   const writer: PublicationWriter = {
     async lookupChild(pending) {
       const parsed = parseChildMarker((pending.body.split(/\r?\n/u).at(-1) ?? "").trim());
@@ -898,13 +902,15 @@ export async function publishFocusedReview(options: {
     },
     async writeChild(pending, current): Promise<PublicationWriteResult> {
       if (pending.kind === "inline") {
-        const siblings = current.children.filter((entry) => entry.kind === "inline");
-        const outcomes = await vcsAdapter.createInlineReview(
-          locator,
-          options.pr.headSha,
-          siblings.map((entry) => toInlineComment(entry, provider)),
-        );
-        const mine = outcomes.find((outcome) => outcome.clientId === clientIdOf(pending));
+        if (inlineOutcomes === undefined) {
+          const siblings = current.children.filter((entry) => entry.kind === "inline");
+          inlineOutcomes = await vcsAdapter.createInlineReview(
+            locator,
+            options.pr.headSha,
+            siblings.map((entry) => toInlineComment(entry, provider)),
+          );
+        }
+        const mine = inlineOutcomes.find((outcome) => outcome.clientId === clientIdOf(pending));
         if (mine === undefined || mine.status !== "posted") return { status: "failed" };
         return { status: "posted", identity: mine.identity };
       }

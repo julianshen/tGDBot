@@ -10,11 +10,11 @@ import {
   loadPublicationAction,
   observePublication,
   preparePublication,
+  reviewPublicationIdentity,
   startPublication,
   supersedePublication,
   supersedeWithSuccessor,
   updatePublicationChild,
-  type PublicationAction,
   type PublicationChild,
   type PublicationWriter,
 } from "../../../src/conversation/publication-manifest.js";
@@ -36,6 +36,23 @@ const testProcessInspector = {
   current: async () => ({ pid: 100, hostname: "unit-test-host", startIdentity: "unit-test-start" }),
   inspect: async () => ({ status: "unknown" as const }),
 };
+
+test("review publication identities are stable per command and distinct from normal reviews", () => {
+  const common = {
+    repository: BINDING,
+    reviewNumber: 42,
+    headSha: "c".repeat(40),
+    configHash: "d".repeat(12),
+  };
+  const normal = reviewPublicationIdentity(common);
+  const first = reviewPublicationIdentity({ ...common, commandActionId: `action_${"2".repeat(32)}` });
+  const retry = reviewPublicationIdentity({ ...common, commandActionId: `action_${"2".repeat(32)}` });
+  const second = reviewPublicationIdentity({ ...common, commandActionId: `action_${"3".repeat(32)}` });
+
+  expect(first).toEqual(retry);
+  expect(first).not.toEqual(normal);
+  expect(second).not.toEqual(first);
+});
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -87,18 +104,6 @@ function graph(): PublicationChild[] {
       placement: { kind: "fallback" },
     })),
   ];
-}
-
-function action(state: PublicationAction["state"], children: readonly PublicationChild[] = []): PublicationAction {
-  return {
-    actionId: ACTION_ID,
-    identityDigest: IDENTITY,
-    reviewNumber: 42,
-    repository: BINDING,
-    state,
-    successorActionId: null,
-    children,
-  };
 }
 
 describe("publication manifest state machine", () => {

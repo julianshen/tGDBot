@@ -15,7 +15,6 @@ import {
 import {
   childIsTerminal,
   clarificationQuestionWriter,
-  executePublication,
   loadPublicationAction,
   publishClarificationQuestion,
   reviewPublicationIdentity,
@@ -44,7 +43,7 @@ import {
   createConversationStateStore,
   type ConversationStateStore,
 } from "./conversation/state-store.js";
-import { poll } from "./poll/poll.js";
+import { poll, type PollDependencies } from "./poll/poll.js";
 import {
   computeReviewConfigHash,
   conversationDedupFingerprint,
@@ -57,7 +56,6 @@ import {
   formatPendingMarker,
   replacePendingMarker,
 } from "./review/comment-marker.js";
-import type { TerminalReviewResult } from "./review/comment-marker.js";
 import type { InlineRecoveryState } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
@@ -72,7 +70,7 @@ import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
 import type { RepositoryRef } from "./target/types.js";
-import type { BotComment, PullRequestInfo, VcsAdapter } from "./vcs/adapter.js";
+import type { PullRequestInfo } from "./vcs/adapter.js";
 
 
 export type { CommandArgs, PollArgs, ReviewArgs, SharedReviewOptions } from "./cli-args.js";
@@ -833,6 +831,11 @@ export async function review(
     identity: resolvedIdentity.identity,
     identityUnavailable: resolvedIdentity.unavailable,
   });
+  if (!config.dryRun && loadedContext.unavailable.includes("discussion")) {
+    throw new Error(
+      "Discussion context is unavailable; refusing to publish because duplicate finding suppression cannot be guaranteed",
+    );
+  }
   const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);
   const storeBinding = storeBindingOf(stateStore, repository);
   const publicationIdentity = reviewPublicationIdentity({
@@ -840,6 +843,7 @@ export async function review(
     reviewNumber: Number(pr.id),
     headSha: pr.headSha,
     configHash,
+    ...(invocation.kind === "normal" ? {} : { commandActionId: invocation.actionId }),
   });
   if (stateStore !== undefined) {
     const existing = loadPublicationAction(
@@ -927,10 +931,10 @@ export async function review(
   }
 
   // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
-  // A forced command is the one exception: it was issued against this exact
-  // head on purpose. Focused runs do not bypass it — they publish supplemental
-  // output rather than redoing the normal review.
-  if (invocation.kind !== "forced-command" &&
+  // Command-triggered reviews intentionally bypass the normal-summary check:
+  // forced commands redo this head, while focused commands publish supplemental
+  // output under their command-scoped publication identity.
+  if (invocation.kind === "normal" &&
     decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
     logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
     return EXIT_OK;
@@ -1252,7 +1256,7 @@ export async function review(
  * errors are logged and exit 1.
  */
 export interface MainDependencies {
-  runPoll?: (args: PollArgs) => Promise<number>;
+  runPoll?: (args: PollArgs, deps: Pick<PollDependencies, "runReview">) => Promise<number>;
 }
 
 export async function main(
@@ -1263,7 +1267,7 @@ export async function main(
     const args = parseCommandArgs(argv);
     const exitCode = args.command === "review"
       ? await review(args)
-      : await (dependencies.runPoll ?? poll)(args);
+      : await (dependencies.runPoll ?? poll)(args, { runReview: review });
     process.exit(exitCode);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
