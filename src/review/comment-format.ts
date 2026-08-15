@@ -8,6 +8,7 @@
 //
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
+import type { DiscussionMemory } from "./existing-discussion.js";
 import {
   isValidRelatedWorkProjectPath,
   validateResolvedRelatedWork,
@@ -236,6 +237,7 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
     // this is what lets resolveStaleReviewThreads recognize the tool's own
     // threads without touching a same-account human's comments.
     INLINE_COMMENT_MARKER,
+    ...(options.findingMarker ? [options.findingMarker] : []),
   );
 
   return parts.join("\n");
@@ -252,6 +254,8 @@ export interface RenderOptions {
    * want a one-click commit path from LLM-authored text.
    */
   suggestions?: boolean;
+  /** Versioned finding marker storing IDs and digests only. */
+  findingMarker?: string;
 }
 
 /**
@@ -313,6 +317,14 @@ function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
 
+export interface ClarificationPresentation {
+  readonly id: string;
+  readonly question: string;
+  readonly finding: Finding;
+  readonly publishedUrl?: string;
+  readonly publicationPending?: boolean;
+}
+
 export interface SummaryInput {
   /** Every deduped finding (inline + unanchored) — used for the severity counts. */
   allFindings: Finding[];
@@ -325,12 +337,22 @@ export interface SummaryInput {
   rulesFailed: string[];
   ruleFailureReasons?: Record<string, string>;
   relatedWork?: readonly RelatedWorkItem[];
+  /** Bounded summaries of human-authored active review discussion. */
+  discussionMemories?: readonly DiscussionMemory[];
   /**
    * True when inline posting was unavailable (e.g. the reviews API call failed).
    * The summary then carries EVERY finding, so a finding is never lost — it is
    * only ever relocated.
    */
   inlineUnavailable?: boolean;
+  /** The single active clarification question, if any. Not a defect. */
+  clarification?: ClarificationPresentation;
+  /** Other clarification candidates held back for later. */
+  deferredClarificationCount?: number;
+  /** Non-actionable discussion status. */
+  disputed?: readonly Finding[];
+  /** Optional labels such as "discussion" or "memory". */
+  contextUnavailable?: readonly string[];
 }
 
 function canonicalRelatedWorkReference(value: unknown): RelatedWorkReference | undefined {
@@ -446,6 +468,106 @@ function renderRelatedWorkSection(input: SummaryInput): string | undefined {
     : undefined;
 }
 
+function safeDiscussionUrl(url: string | undefined): string | undefined {
+  if (url === undefined) return undefined;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && parsed.username === "" && parsed.password === "" && !/[\s)]/u.test(url)
+      ? url
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function renderDiscussionMemorySection(input: SummaryInput): string | undefined {
+  const memories = input.discussionMemories ?? [];
+  if (memories.length === 0) return undefined;
+  const items = memories.map((memory) => {
+    const location = memory.file === undefined
+      ? "`general discussion`"
+      : `\`${sanitizeInline(memory.file)}${memory.line === undefined ? "" : `:${memory.line}`}\``;
+    const author = `@${sanitizeInline(memory.author)}`;
+    const summary = sanitizeInline(memory.summary);
+    const url = safeDiscussionUrl(memory.url);
+    const source = url === undefined ? "" : ` ([thread](${url}))`;
+    return `- ${location} — ${author}: ${summary}${source}`;
+  });
+  return [
+    "### Local review memory",
+    "",
+    "_Existing unresolved review discussion is retained here and is not reposted as new findings._",
+    "",
+    ...items,
+  ].join("\n");
+}
+
+function renderContextUnavailable(input: SummaryInput): string | undefined {
+  const labels = input.contextUnavailable ?? [];
+  const notes = [
+    labels.includes("discussion")
+      ? "> Discussion context was unavailable for this run. The review used the diff and trusted rules only."
+      : undefined,
+    labels.includes("memory")
+      ? "> Memory context was unavailable for this run."
+      : undefined,
+  ].filter((note): note is string => note !== undefined);
+  if (notes.length === 0) return undefined;
+  return `> [!NOTE]\n${notes.join("\n")}`;
+}
+
+function safeClarificationUrl(url: string | undefined): string | undefined {
+  if (url === undefined) return undefined;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "https:" || parsed.username !== "" || parsed.password !== "") return undefined;
+    if (/[\s)]/u.test(url)) return undefined;
+    return url;
+  } catch {
+    return undefined;
+  }
+}
+
+function renderClarificationSection(input: SummaryInput): string | undefined {
+  if (input.clarification === undefined) return undefined;
+  const question = sanitizeText(input.clarification.question);
+  const id = sanitizeInline(input.clarification.id);
+  const deferred = input.deferredClarificationCount ?? 0;
+  const deferredLine =
+    deferred === 1
+      ? "_1 additional clarification deferred._"
+      : deferred > 1
+        ? `_${deferred} additional clarifications deferred._`
+        : undefined;
+  const publishedUrl = safeClarificationUrl(input.clarification.publishedUrl);
+  const publicationLine = publishedUrl !== undefined
+    ? `[Open the question](${publishedUrl})`
+    : input.clarification.publicationPending === true
+      ? "_Publication is pending._"
+      : undefined;
+  return [
+    "### Needs clarification",
+    "",
+    question,
+    "",
+    `\`answer ${id}: <your answer>\``,
+    ...(publicationLine === undefined ? [] : ["", publicationLine]),
+    ...(deferredLine === undefined ? [] : ["", deferredLine]),
+  ].join("\n");
+}
+
+function renderDisputedSection(input: SummaryInput): string | undefined {
+  const disputed = input.disputed ?? [];
+  if (disputed.length === 0) return undefined;
+  const items = disputed.map((finding) => {
+    const file = sanitizeInline(finding.file);
+    const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
+    const message = sanitizeText(finding.message);
+    return `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`;
+  });
+  return `### Disputed\n\n${items.join("\n")}`;
+}
+
 export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
@@ -474,6 +596,9 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   const notice =
     "> [!WARNING]\n" +
     "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+  const contextUnavailable = renderContextUnavailable(input);
+  const clarification = renderClarificationSection(input);
+  const disputed = renderDisputedSection(input);
   const failedRules = input.rulesFailed.length > 0
     ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
         .map((name) => {
@@ -489,6 +614,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // bounded/sanitized representation in compact summaries and charge it
   // against the same provider-size budget as failed rules and finding labels.
   const relatedWork = renderRelatedWorkSection(input);
+  const discussionMemory = renderDiscussionMemorySection(input);
   const findings = input.unanchored.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
@@ -496,7 +622,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const message = sanitizeInline(finding.message);
     return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
   });
-  const fixed = [header, notice, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -507,6 +633,10 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   const body = [
     header,
     notice,
+    contextUnavailable,
+    clarification,
+    disputed,
+    discussionMemory,
     failedRules,
     relatedWork,
     ...findings.map(
@@ -582,6 +712,9 @@ function renderSummaryCommentWithIncludedSuggestions(
     );
   }
 
+  const contextUnavailable = renderContextUnavailable(input);
+  if (contextUnavailable) parts.push(contextUnavailable);
+
   // Findings that have no home on the diff still have to be SEEN. This is the
   // section that guarantees the inline path can never silently drop a finding.
   if (input.unanchored.length > 0) {
@@ -603,6 +736,11 @@ function renderSummaryCommentWithIncludedSuggestions(
     );
   }
 
+  const clarification = renderClarificationSection(input);
+  if (clarification) parts.push(clarification);
+  const disputed = renderDisputedSection(input);
+  if (disputed) parts.push(disputed);
+
   if (input.rulesFailed.length > 0) {
     const items = input.rulesFailed.map((name) => {
       const reason = input.ruleFailureReasons?.[name];
@@ -615,6 +753,9 @@ function renderSummaryCommentWithIncludedSuggestions(
 
   const relatedWork = renderRelatedWorkSection(input);
   if (relatedWork) parts.push(relatedWork);
+
+  const discussionMemory = renderDiscussionMemorySection(input);
+  if (discussionMemory) parts.push(discussionMemory);
 
   const collapsed: string[] = [];
   if (input.filesReviewed.length > 0) {

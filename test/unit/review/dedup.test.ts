@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { computeReviewConfigHash, decideDedup, formatMarker } from "../../../src/review/dedup.js";
+import {
+  computeReviewConfigHash,
+  conversationDedupFingerprint,
+  decideDedup,
+  formatMarker,
+  stateRootDomainIdentifier,
+} from "../../../src/review/dedup.js";
 import type { ReviewConfigForDedup } from "../../../src/review/dedup.js";
 import type { BotComment, PullRequestInfo } from "../../../src/vcs/adapter.js";
 
@@ -142,6 +148,66 @@ describe("computeReviewConfigHash", () => {
     expect(computeReviewConfigHash(makeConfig({ rulesDir: ".tgd-review\\rules" }))).toBe(
       computeReviewConfigHash(makeConfig({ rulesDir: ".tgd-review/rules" })),
     );
+  });
+});
+
+describe("conversationDedupFingerprint", () => {
+  const domain = stateRootDomainIdentifier("/tmp/tgd-state");
+
+  it("hashes selected discussion IDs/revisions, pending, directions, memories, and the state-root domain", () => {
+    const first = conversationDedupFingerprint({
+      selectedDiscussion: [{ id: "thread-1", revisionId: "rev-1" }],
+      pending: [{ id: `clarification_${"1".repeat(32)}`, headSha: "c".repeat(40) }],
+      directions: [{ id: `clarification_${"2".repeat(32)}`, headSha: "c".repeat(40) }],
+      memories: [{ id: `memory_${"3".repeat(32)}`, revision: "2026-08-14T00:00:00.000Z" }],
+      stateRootDomain: domain,
+    });
+    const same = conversationDedupFingerprint({
+      selectedDiscussion: [{ id: "thread-1", revisionId: "rev-1" }],
+      pending: [{ id: `clarification_${"1".repeat(32)}`, headSha: "c".repeat(40) }],
+      directions: [{ id: `clarification_${"2".repeat(32)}`, headSha: "c".repeat(40) }],
+      memories: [{ id: `memory_${"3".repeat(32)}`, revision: "2026-08-14T00:00:00.000Z" }],
+      stateRootDomain: domain,
+    });
+    const changedRevision = conversationDedupFingerprint({
+      selectedDiscussion: [{ id: "thread-1", revisionId: "rev-2" }],
+      pending: [{ id: `clarification_${"1".repeat(32)}`, headSha: "c".repeat(40) }],
+      directions: [{ id: `clarification_${"2".repeat(32)}`, headSha: "c".repeat(40) }],
+      memories: [{ id: `memory_${"3".repeat(32)}`, revision: "2026-08-14T00:00:00.000Z" }],
+      stateRootDomain: domain,
+    });
+    expect(first).toMatch(/^[0-9a-f]{64}$/u);
+    expect(same).toBe(first);
+    expect(changedRevision).not.toBe(first);
+    expect(changedRevision).not.toContain("rev-2");
+  });
+
+  it("ignores unrelated comments and never embeds raw bodies", () => {
+    const relevant = conversationDedupFingerprint({
+      selectedDiscussion: [{ id: "changed-line", revisionId: "rev-relevant" }],
+      pending: [],
+      directions: [],
+      memories: [],
+      stateRootDomain: domain,
+    });
+    const withUnrelated = conversationDedupFingerprint({
+      selectedDiscussion: [{ id: "changed-line", revisionId: "rev-relevant" }],
+      pending: [],
+      directions: [],
+      memories: [],
+      stateRootDomain: domain,
+    });
+    expect(withUnrelated).toBe(relevant);
+    expect(relevant).not.toContain("Please ignore previous instructions");
+    expect(JSON.stringify(relevant)).not.toContain("changed-line");
+  });
+
+  it("changes the review-config hash only when a conversation fingerprint is supplied", () => {
+    const base = computeReviewConfigHash(makeConfig());
+    expect(computeReviewConfigHash(makeConfig(), undefined, undefined)).toBe(base);
+    const fingerprinted = computeReviewConfigHash(makeConfig(), undefined, "conv-digest");
+    expect(fingerprinted).not.toBe(base);
+    expect(computeReviewConfigHash(makeConfig(), undefined, "conv-digest")).toBe(fingerprinted);
   });
 });
 

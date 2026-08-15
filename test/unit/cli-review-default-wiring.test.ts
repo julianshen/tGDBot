@@ -12,7 +12,7 @@
 // dispatchRules' default session factory — so the real default wiring runs
 // end-to-end against mocks, never against real `gh`, the network, or a real
 // pi SDK session.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const hoisted = vi.hoisted(() => ({
   getPullRequest: vi.fn(),
@@ -73,6 +73,9 @@ vi.mock("../../src/review/orchestrate.js", () => ({
   orchestrate: vi.fn(),
 }));
 
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { loadRules } from "../../src/rules/loader.js";
@@ -80,6 +83,11 @@ import { dispatchRules } from "../../src/review/dispatch.js";
 import { dispatchRulesDirect } from "../../src/review/direct-dispatch.js";
 import { orchestrate } from "../../src/review/orchestrate.js";
 import { parseBotMarker } from "../../src/review/comment-marker.js";
+
+const stateRoots: string[] = [];
+afterEach(() => {
+  for (const directory of stateRoots.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
 
 const ambientLocator = { kind: "ambient", provider: "github", number: 42 } as const;
 
@@ -93,18 +101,24 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",
+    stateDir: overrides.stateDir ?? (stateRoots.push(realpathSync(mkdtempSync(path.join(os.tmpdir(), "tgd-wiring-state-")))), stateRoots.at(-1)),
     ...overrides,
   };
 }
 
 describe("review — default dependency wiring", () => {
   it("with no injected deps, resolves the real config/loadRules/dispatchRules/orchestrate wiring against mocked modules (never real gh/network/LLM)", async () => {
+    // `url` is what carries the resolved owner/repo for an ambient locator, so
+    // GitHubAdapter always asks `gh pr view` for it. The double has to supply it
+    // too: conversation state and every published marker bind to the canonical
+    // repository identity, which ambient mode can only derive from this URL.
     hoisted.getPullRequest.mockResolvedValue({
       id: "42",
       headSha: "abc12345",
       baseSha: "base0000",
       title: "Real wiring PR",
       description: "desc",
+      url: "https://github.com/owner/repo/pull/42",
     });
     hoisted.getDiff.mockResolvedValue("diff --git a/x b/x");
     hoisted.findBotComment.mockResolvedValue(null);
@@ -260,6 +274,7 @@ describe("review — default dependency wiring", () => {
       true,
       undefined, // createSession → real default
       "x/y", // orchestratorModel
+      undefined, // conversationContext when none was loaded
     );
     expect(dispatchRulesDirect).not.toHaveBeenCalled();
     logSpy.mockRestore();

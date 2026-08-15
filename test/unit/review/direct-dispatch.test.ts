@@ -9,6 +9,7 @@ import {
   dispatchRulesDirect as dispatchRulesDirectObject,
   parseAdvisorDropList,
 } from "../../../src/review/direct-dispatch.js";
+import { MAX_FINDING_QUESTION_CHARS } from "../../../src/review/dispatch-results.js";
 import type {
   DirectDispatchDeps,
   DirectSessionFactory,
@@ -680,6 +681,28 @@ describe("dispatchRulesDirect", () => {
   });
 });
 
+describe("dispatchRulesDirect conversation context", () => {
+  it("embeds ReviewDispatchInput.conversationContext in each rule prompt", async () => {
+    const { factory, prompts } = makeFactory({ "rule-a": "[]" });
+    const conversationContext = {
+      text: "ADVISORY_LOCAL_MEMORY unique-direct-xyz",
+      digest: "b".repeat(64),
+    };
+
+    await dispatchRulesDirectObject(
+      {
+        rules: [makeRule()],
+        diff: "diff",
+        useAdvisor: false,
+        conversationContext,
+      },
+      { createSession: factory },
+    );
+
+    expect(prompts["rule-a"]).toContain(conversationContext.text);
+  });
+});
+
 describe("parseAdvisorDropList", () => {
   it("parses a clean drop object", () => {
     expect(parseAdvisorDropList('{"drop": [0, 2]}')).toEqual([0, 2]);
@@ -693,5 +716,64 @@ describe("parseAdvisorDropList", () => {
     expect(parseAdvisorDropList(undefined)).toBeUndefined();
     expect(parseAdvisorDropList("all good")).toBeUndefined();
     expect(parseAdvisorDropList('{"drop": ["a"]}')).toBeUndefined();
+  });
+});
+
+describe("finding decision contract", () => {
+  const core = {
+    file: "a.ts",
+    line: 1,
+    severity: "warning" as const,
+    category: "correctness",
+    message: "real bug",
+  };
+
+  it("defaults omitted decisions to new and shares the parser bound with the legacy engine", async () => {
+    const { factory } = makeFactory({ "rule-a": JSON.stringify([core]) });
+    const result = await dispatchRulesDirect([makeRule()], "diff", false, { createSession: factory });
+
+    expect(result.findings[0]).toMatchObject({ ...core, ruleName: "rule-a", decision: "new" });
+    expect(result.findings[0]?.question).toBeUndefined();
+    expect(MAX_FINDING_QUESTION_CHARS).toBeGreaterThan(0);
+  });
+
+  it("rejects malformed states and inconsistent questions instead of keeping the finding", async () => {
+    const cases = [
+      { ...core, decision: "waived" },
+      { ...core, decision: "new", question: "why?" },
+      { ...core, decision: "needs-clarification" },
+      { ...core, decision: "needs-clarification", question: "x".repeat(MAX_FINDING_QUESTION_CHARS + 1) },
+    ];
+
+    for (const raw of cases) {
+      const { factory } = makeFactory({ "rule-a": JSON.stringify([raw]) });
+      const result = await dispatchRulesDirect([makeRule()], "diff", false, { createSession: factory });
+      expect(result.findings, JSON.stringify(raw.decision)).toEqual([]);
+      expect(result.rulesFailed).toEqual(["rule-a"]);
+    }
+  });
+
+  it("preserves decision state when the advisor drops another finding by index", async () => {
+    const findings = [
+      { ...core, message: "keep me", decision: "still-valid" },
+      { ...core, message: "drop me", decision: "new" },
+    ];
+    const { factory } = makeFactory({ "rule-a": JSON.stringify(findings) });
+
+    const result = await dispatchRulesDirect([makeRule()], "diff", true, {
+      createSession: factory,
+      createAdvisorSession: async () => ({
+        async prompt() {},
+        getLastAssistantText: () => '{"drop": [1]}',
+      }),
+    });
+
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0]).toMatchObject({
+      message: "keep me",
+      decision: "still-valid",
+      ruleName: "rule-a",
+    });
+    expect(result.rulesRun).toEqual(["rule-a"]);
   });
 });

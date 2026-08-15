@@ -1,5 +1,70 @@
-import { describe, expect, it } from "vitest";
-import { parseArgs } from "../../src/cli.js";
+import { describe, expect, it, vi } from "vitest";
+import { main, parseArgs } from "../../src/cli.js";
+import { parseCommandArgs } from "../../src/cli-args.js";
+
+describe("parseCommandArgs", () => {
+  it("preserves the legacy review invocation without an explicit subcommand", () => {
+    expect(parseCommandArgs(["--pr", "42"])).toMatchObject({ command: "review", pr: "42" });
+  });
+  it("parses review with shared state directory", () => {
+    expect(parseCommandArgs(["review", "--pr", "42", "--state-dir", "/tmp/tgd-state"])).toMatchObject({
+      command: "review",
+      stateDir: "/tmp/tgd-state",
+    });
+  });
+
+  it("parses poll with its required repository and shared flags", () => {
+    expect(parseCommandArgs([
+      "poll", "--repo", "owner/repo", "--model", "openai/gpt-5",
+      "--dispatch", "direct", "--advisor", "off", "--state-dir", "/tmp/tgd-state",
+    ])).toMatchObject({
+      command: "poll",
+      repo: "owner/repo",
+      model: "openai/gpt-5",
+      dispatch: "direct",
+      advisor: "off",
+      stateDir: "/tmp/tgd-state",
+    });
+  });
+
+  it("preserves every review default", () => {
+    expect(parseCommandArgs(["review", "--pr", "42"])).toEqual({
+      command: "review",
+      pr: "42",
+      vcs: "github",
+      repo: undefined,
+      model: undefined,
+      rulesDir: ".review/rules",
+      disableBuiltinRule: false,
+      advisor: "on",
+      suggestions: "on",
+      dryRun: false,
+      trustLocalRules: false,
+      dispatch: "direct",
+      maxDiffChars: undefined,
+      stateDir: undefined,
+    });
+  });
+
+  it("requires --pr for review", () => {
+    expect(() => parseCommandArgs(["review"])).toThrow(/--pr/);
+  });
+
+  it("requires --repo for poll", () => {
+    expect(() => parseCommandArgs(["poll"])).toThrow(/--repo/);
+  });
+
+  it.each([
+    ["unknown command", ["inspect", "--pr", "42"]],
+    ["review preceded by options", ["--pr", "42", "review"]],
+    ["poll preceded by options", ["--repo", "owner/repo", "poll"]],
+    ["extra review positional", ["review", "extra", "--pr", "42"]],
+    ["extra poll positional", ["poll", "extra", "--repo", "owner/repo"]],
+    ["review-only --pr on poll", ["poll", "--repo", "owner/repo", "--pr", "42"]],
+  ])("rejects incompatible or unknown positionals: %s", (_label, argv) => {
+    expect(() => parseCommandArgs(argv)).toThrow();
+  });
+});
 
 describe("parseArgs", () => {
   // AC-1.1: Given the CLI is invoked with `review --pr 42`, When argument
@@ -178,5 +243,44 @@ describe("parseArgs", () => {
 
   it("rejects a nonnumeric --pr that is not a complete PR or MR URL", () => {
     expect(() => parseArgs(["review", "--pr", "group/project!42"])).toThrow(/--pr/);
+  });
+});
+
+describe("main poll exit codes", () => {
+  it("exits 0 for clean, bootstrap, and more-remains poll results", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    try {
+      await main(["poll", "--repo", "owner/repo"], { runPoll: async () => 0 });
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      exit.mockRestore();
+    }
+  });
+
+  it("exits 1 for a pre-write fatal or transient poll failure", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      await main(["poll", "--repo", "owner/repo"], {
+        runPoll: async () => {
+          throw new Error("discovery page 2 failed");
+        },
+      });
+      expect(error).toHaveBeenCalledWith(expect.stringContaining("discovery page 2 failed"));
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      error.mockRestore();
+      exit.mockRestore();
+    }
+  });
+
+  it("exits 2 only after a provider write occurred with a partial result", async () => {
+    const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+    try {
+      await main(["poll", "--repo", "owner/repo"], { runPoll: async () => 2 });
+      expect(exit).toHaveBeenCalledWith(2);
+    } finally {
+      exit.mockRestore();
+    }
   });
 });

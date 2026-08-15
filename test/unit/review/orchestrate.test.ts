@@ -26,6 +26,46 @@ function makeDispatchResult(overrides: Partial<DispatchResult> = {}): DispatchRe
 }
 
 describe("orchestrate", () => {
+  it("does not post a finding on an issue already covered by an unresolved review thread", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -9,1 +9,2 @@
+ context
++added
+`;
+    const duplicate = makeFinding({ file: "src/foo.ts", line: 10, message: "Missing null check" });
+    const fresh = makeFinding({ file: "src/foo.ts", line: 9, message: "Different issue" });
+
+    const result = orchestrate(makeDispatchResult({ findings: [duplicate, fresh] }), diff, {
+      existingIssues: [{ threadId: "thread-1", file: "src/foo.ts", line: 10 }],
+    });
+
+    expect(result.findingsCount).toBe(1);
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]?.line).toBe(9);
+    expect(result.commentBody).not.toContain("Missing null check");
+  });
+
+  it("keeps bounded summaries of other reviewers' comments in the managed comment", () => {
+    const result = orchestrate(makeDispatchResult(), "", {
+      discussionMemories: [{
+        threadId: "thread-1",
+        file: "src/foo.ts",
+        line: 10,
+        author: "alice",
+        summary: "The nil case is already being handled in the caller.",
+        url: "https://github.com/acme/app/pull/7#discussion_r1",
+      }],
+    });
+
+    expect(result.commentBody).toContain("### Local review memory");
+    expect(result.commentBody).toContain("`src/foo.ts:10`");
+    expect(result.commentBody).toContain("@alice");
+    expect(result.commentBody).toContain("The nil case is already being handled in the caller.");
+    expect(result.commentBody).toContain("https://github.com/acme/app/pull/7#discussion_r1");
+  });
+
   it("preserves related work exactly once and unchanged through every inline fallback mode", () => {
     const diff = `diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -9,1 +9,2 @@\n context\n+added\n`;
     const relatedWork = [{ provider: "github" as const, host: "github.com", projectPath: "acme/app", number: 42, kindHint: "issue" as const, sourceText: "#42", identifier: "#42", fallbackUrl: "https://github.com/acme/app/issues/42", kind: "issue" as const, title: "Fix login", state: "open" as const, url: "https://github.com/acme/app/issues/42" }];
@@ -720,5 +760,118 @@ describe("ADR-007: review fixes", () => {
     expect(body).not.toContain("Committable suggestion");
     expect(body).toContain("Proposed fix (not committable)");
     expect(body).toContain("const x = 1;"); // the fix is STILL SHOWN
+  });
+});
+
+describe("finding decisions", () => {
+  const DIFF = `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -9,1 +9,2 @@
+ context
++added
+`;
+
+  it("counts only new and still-valid findings as actionable", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({ message: "fresh", decision: "new", line: 10 }),
+          makeFinding({ message: "still there", decision: "still-valid", line: 9 }),
+          makeFinding({ message: "fixed", decision: "addressed", line: 10 }),
+          makeFinding({ message: "argued", decision: "disputed", line: 9 }),
+          makeFinding({
+            message: "unclear",
+            decision: "needs-clarification",
+            question: "Is the timeout intentional?",
+            line: 10,
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.findingsCount).toBe(2);
+    expect(result.inlineComments.map((comment) => comment.body)).toEqual([
+      expect.stringContaining("fresh"),
+      expect.stringContaining("still there"),
+    ]);
+    expect(result.commentBody).toContain("**Actionable comments posted: 2**");
+    expect(result.commentBody).not.toContain("fixed");
+    expect(result.commentBody).not.toMatch(/Actionable comments posted: [345]/);
+  });
+
+  it("suppresses a repeated finding once any copy is addressed", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({ message: "Missing null check", decision: "addressed", ruleName: "rule-a" }),
+          makeFinding({ message: "missing   null check", decision: "new", ruleName: "rule-b" }),
+          makeFinding({ message: "Missing null check", decision: "still-valid", ruleName: "rule-c" }),
+        ],
+      }),
+    );
+
+    expect(result.findingsCount).toBe(0);
+    expect(result.commentBody).toMatch(/no actionable comments/i);
+    expect(result.commentBody).not.toContain("Missing null check");
+  });
+
+  it("keeps disputed findings as non-actionable status, not defects", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [makeFinding({ message: "Maybe a race", decision: "disputed", line: 10 })],
+      }),
+      DIFF,
+    );
+
+    expect(result.findingsCount).toBe(0);
+    expect(result.inlineComments).toEqual([]);
+    expect(result.commentBody).toMatch(/no actionable comments/i);
+    expect(result.commentBody).toMatch(/### Disputed/i);
+    expect(result.commentBody).toContain("Maybe a race");
+    expect(result.commentBody).not.toContain("**Actionable comments posted:");
+  });
+
+  it("selects the first deterministic clarification and renders the deferred count separately", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            ruleName: "later-rule",
+            message: "later candidate",
+            decision: "needs-clarification",
+            question: "Should later-rule win?",
+            line: 10,
+          }),
+          makeFinding({
+            ruleName: "earlier-rule",
+            message: "earlier candidate",
+            decision: "needs-clarification",
+            question: "Is the earlier case intended?",
+            line: 9,
+          }),
+          makeFinding({
+            ruleName: "earlier-rule",
+            message: "second earlier",
+            decision: "needs-clarification",
+            question: "And this later earlier-rule question?",
+            line: 10,
+          }),
+        ],
+      }),
+      DIFF,
+      { ruleOrder: ["earlier-rule", "later-rule"] },
+    );
+
+    expect(result.findingsCount).toBe(0);
+    expect(result.inlineComments).toEqual([]);
+    expect(result.commentBody).toContain("### Needs clarification");
+    expect(result.commentBody).toContain("Is the earlier case intended?");
+    expect(result.commentBody).not.toContain("Should later-rule win?");
+    expect(result.commentBody).not.toContain("And this later earlier-rule question?");
+    expect(result.commentBody).toMatch(/2 additional (?:questions|clarifications) deferred/i);
+    expect(result.commentBody).not.toContain("**Actionable comments posted:");
+    expect(result.commentBody).not.toMatch(/🔴|🟠|🔵/);
   });
 });

@@ -252,7 +252,7 @@ export async function dispatchRulesDirect(
   input: ReviewDispatchInput,
   deps: DirectDispatchDeps = {},
 ): Promise<DispatchResult> {
-  const { rules, diff, useAdvisor, contextPacks, orchestratorModel } = input;
+  const { rules, diff, useAdvisor, contextPacks, orchestratorModel, conversationContext } = input;
   const createSession = deps.createSession ?? createRealDirectSession;
   const ruleTimeoutMs = deps.ruleTimeoutMs ?? RULE_PROMPT_TIMEOUT_MS;
   const advisorTimeoutMs = deps.advisorTimeoutMs ?? ADVISOR_PROMPT_TIMEOUT_MS;
@@ -312,7 +312,7 @@ export async function dispatchRulesDirect(
         );
         await withTimeout(
           session.prompt(
-            buildTaskText(rule, diff, validatedContext.packsByRule?.get(rule.name)),
+            buildTaskText(rule, diff, validatedContext.packsByRule?.get(rule.name), conversationContext),
           ),
           ruleTimeoutMs,
           `rule "${rule.name}" timed out after ${ruleTimeoutMs}ms`,

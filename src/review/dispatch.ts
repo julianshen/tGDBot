@@ -45,7 +45,7 @@ import {
   describeAuthContext,
   PI_AUTH_ERROR_RE,
 } from "./session-hermetics.js";
-import type { DispatchResult } from "./types.js";
+import type { DispatchResult, ReviewConversationContext } from "./types.js";
 
 // Re-exported public surface (unchanged by the design-review #8 split).
 export type { DispatchResult, Finding } from "./types.js";
@@ -210,6 +210,7 @@ export async function dispatchRules(
    * EVERY candidate must have configured credentials on this machine.
    */
   orchestratorModel?: string,
+  conversationContext?: ReviewConversationContext,
 ): Promise<DispatchResult> {
   // SINGLE-FLIGHT GUARD (design-review item #5). runDispatch mutates a
   // process-global — process.env.PI_CODING_AGENT_DIR — for the duration of a
@@ -224,7 +225,7 @@ export async function dispatchRules(
   // defensive catch below keeps one hypothetical rejection from wedging every
   // later call), so this cannot deadlock or leak an error across calls.
   const run = dispatchChain.then(() =>
-    runDispatch(rules, diff, useAdvisor, createSession, orchestratorModel),
+    runDispatch(rules, diff, useAdvisor, createSession, orchestratorModel, conversationContext),
   );
   dispatchChain = run.catch(() => undefined);
   return run;
@@ -239,6 +240,7 @@ async function runDispatch(
   useAdvisor: boolean,
   createSession: DispatchSessionFactory,
   orchestratorModel?: string,
+  conversationContext?: ReviewConversationContext,
 ): Promise<DispatchResult> {
   // Hermetic agent dir + PI_CODING_AGENT_DIR override (intercom-bridge fix,
   // see createIsolatedAgentDir) are set up ONLY for the real session factory.
@@ -333,7 +335,7 @@ async function runDispatch(
     };
 
     const session = await createSession(useAdvisor, sessionCwd, modelRequest);
-    const prompt = buildDispatchPrompt(effective, diff, useAdvisor);
+    const prompt = buildDispatchPrompt(effective, diff, useAdvisor, conversationContext);
 
     // Capture the subagent tool's structured per-task results (details.results)
     // so we can deterministically reconcile the orchestrator's self-reported

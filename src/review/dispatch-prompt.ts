@@ -7,6 +7,7 @@
 import { createHash } from "node:crypto";
 import type { ContextPackResult } from "../context/context-pack.js";
 import type { EffectiveRule } from "../rules/types.js";
+import type { ReviewConversationContext } from "./types.js";
 
 // Appended to every rule's task automatically — rule authors never write
 // this themselves (TASKS.md Task 5 technical design).
@@ -20,7 +21,9 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
   "category": string,
   "title": string,
   "message": string,
-  "suggestion": string | null
+  "suggestion": string | null,
+  "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification",
+  "question": string | null
 }]
 
 - "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
@@ -41,6 +44,12 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
       a contiguous line range (design changes, "add a test elsewhere", etc.).
 - "endLine": the last line the suggestion replaces (inclusive). Omit/null when
   the suggestion replaces only "line", or when there is no suggestion.
+- "decision": optional. Omit it (or use "new") for a fresh finding. Use
+  "still-valid" when prior discussion still applies, "addressed" when the
+  concern is fixed, "disputed" when discussion exists but the violation remains,
+  and "needs-clarification" when correctness depends on one short question.
+- "question": required only for "needs-clarification" — one short, answerable
+  question. Must be null/omitted for every other decision.
 
 If you find nothing, respond with [] exactly.
 `.trim();
@@ -117,18 +126,22 @@ function taskBoundaryToken(
   rule: EffectiveRule,
   diff: string,
   contextPack: ContextPackResult | undefined,
+  conversationContext?: ReviewConversationContext,
 ): string {
   const contextText = contextPack?.text ?? "";
-  const enclosed = [rule.body, contextText, FINDING_JSON_CONTRACT, diff];
+  const conversationText = conversationContext?.text ?? "";
+  const enclosed = [rule.body, contextText, FINDING_JSON_CONTRACT, diff, conversationText];
 
   for (let counter = 0; ; counter += 1) {
     const hash = createHash("sha256");
     for (const value of [
       rule.name,
       contextPack?.manifestHash ?? "context-free",
+      conversationContext?.digest ?? "conversation-free",
       rule.body,
       contextText,
       diff,
+      conversationText,
       String(counter),
     ]) {
       updateLengthPrefixed(hash, value);
@@ -146,8 +159,9 @@ export function buildTaskText(
   rule: EffectiveRule,
   diff: string,
   contextPack?: ContextPackResult,
+  conversationContext?: ReviewConversationContext,
 ): string {
-  const token = taskBoundaryToken(rule, diff, contextPack);
+  const token = taskBoundaryToken(rule, diff, contextPack, conversationContext);
   const parts = [
     `${TRUST_BOUNDARY_INSTRUCTION}\n${READ_ONLY_INSTRUCTION}`,
     section("TRUSTED_RULE", token, rule.body),
@@ -159,6 +173,9 @@ export function buildTaskText(
     section("FINDING_CONTRACT", token, FINDING_JSON_CONTRACT),
     section("UNTRUSTED_DIFF", token, diff),
   );
+  if (conversationContext !== undefined && conversationContext.text.length > 0) {
+    parts.push(conversationContext.text);
+  }
   return parts.join("\n\n");
 }
 
@@ -171,6 +188,7 @@ export function buildDispatchPrompt(
   rules: EffectiveRule[],
   diff: string,
   useAdvisor: boolean,
+  conversationContext?: ReviewConversationContext,
 ): string {
   warnIfDiffCostRisk(rules, diff);
 
@@ -184,7 +202,7 @@ export function buildDispatchPrompt(
         `  agent: "reviewer"`,
         `  model: "${modelRef}"`,
         `  task: """`,
-        buildTaskText(rule, diff),
+        buildTaskText(rule, diff, undefined, conversationContext),
         `  """`,
       ].join("\n");
     })
@@ -226,7 +244,7 @@ export function buildDispatchPrompt(
 
   parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
-    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
+    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
     // ADR-007/ADR-008: the orchestrator MERGES the subagents' findings and re-emits
     // them, so every field it is not told to keep is silently dropped at this last
     // hop. That is exactly what happened on the first live run: the reviewers were
@@ -235,7 +253,7 @@ export function buildDispatchPrompt(
     // Copy them through VERBATIM; never rewrite a suggestion (it is literal code
     // destined for the file, and a paraphrase would commit something the reviewer
     // never proposed).
-    `Copy each finding's "title", "message", "suggestion" and "endLine" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
+    `Copy each finding's "title", "message", "suggestion", "endLine", "decision" and "question" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
     // Attribution fix (see order-mapping note above): the old wording defined
     // rulesFailed as tasks that "produced no usable output", which the
     // orchestrator wrongly applied to a task that RAN and returned an empty or

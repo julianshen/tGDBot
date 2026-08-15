@@ -3,11 +3,14 @@ import { createHash } from "node:crypto";
 import { parseBotMarker } from "../review/comment-marker.js";
 import { INLINE_COMMENT_MARKER } from "../review/comment-format.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
-import type { GitLabRepositoryRef } from "../target/types.js";
+import type { GitLabRepositoryRef, RepositoryRef } from "../target/types.js";
+import { computeContentDigest, computeRepositoryDigest, parseChildMarker, verifyChildMarkerBinding } from "../conversation/markers.js";
+import type { BotIdentity, ConversationItemIdentity, ReviewIdentity } from "../conversation/types.js";
 import { resolveGitLabRelatedWork } from "./gitlab-related-work.js";
 import {
   validateInlinePublishInputs,
   validateInlinePublishOutcomes,
+  validateConversationItemIdentity,
 } from "./adapter.js";
 import type {
   BotComment,
@@ -18,9 +21,34 @@ import type {
   RuleFileContent,
   VcsAdapter,
 } from "./adapter.js";
+import {
+  validateConversationAnchor,
+  validateOpenReviewPageToken,
+  validateReviewDiscoveryCursor,
+  validateReviewEventCursor,
+  validateReviewEventPageToken,
+  validateReviewThreadPageToken,
+  type ChildMarkerLookup,
+  type ConversationAdapter,
+  type GeneralReplyInput,
+  type OpenReviewPage,
+  type OpenReviewPageToken,
+  type ReviewDiscoveryCursor,
+  type ReviewEventCursor,
+  type ReviewActivityEvent,
+  type ReviewReaction,
+  type ReviewEventPage,
+  type ReviewEventPageToken,
+  type ReviewThreadPage,
+  type ReviewThreadPageToken,
+  type ReviewThreadSnapshot,
+  type ReviewThreadSummary,
+  type ThreadReplyInput,
+} from "./conversation-adapter.js";
 
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 const RULE_FILE_FETCH_CONCURRENCY = 4;
+const REACTION_FETCH_CONCURRENCY = 4;
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const HTTP_DIAGNOSTIC_RE =
   /(?:^|\r?\n)(?:HTTP ([1-5]\d{2})|glab: [^\r\n]* \(HTTP ([1-5]\d{2})\))\r?(?=\n|$)/;
@@ -60,6 +88,13 @@ export class GlabOutputError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = "GlabOutputError";
+  }
+}
+
+export class ConcurrentGitLabMutationError extends Error {
+  constructor(message = "GitLab changed during a stable snapshot scan") {
+    super(message);
+    this.name = "ConcurrentGitLabMutationError";
   }
 }
 
@@ -468,7 +503,10 @@ function parseNewestMergeRequestVersion(stdout: string): GlabMergeRequestVersion
   };
 }
 
-function validateWrittenDiscussion(stdout: string, expectedBody: string): void {
+function validateWrittenDiscussion(
+  stdout: string,
+  expectedBody: string,
+): { readonly discussionId: string; readonly noteId: string } {
   let value: unknown;
   try {
     value = JSON.parse(stdout);
@@ -494,6 +532,10 @@ function validateWrittenDiscussion(stdout: string, expectedBody: string): void {
   ) {
     throw new GlabOutputError("Invalid glab discussion response");
   }
+  const matchingNote = value.notes.find(
+    (note) => isRecord(note) && note.body === expectedBody,
+  ) as { id: number; body: string };
+  return { discussionId: value.id, noteId: String(matchingNote.id) };
 }
 
 function validatedNoteId(id: string): number {
@@ -591,8 +633,329 @@ function downgradeGitLabRangeSuggestion(body: string): string {
     .replace(/^(`{3,})suggestion\s*$/m, (_match, fence: string) => `${fence}text`);
 }
 
-export class GitLabAdapter implements VcsAdapter {
-  constructor(private readonly execGlab: ExecGlab = realExecGlab) {}
+const CONVERSATION_SHA_RE = /^[0-9a-f]{40,64}$/iu;
+const USERNAME_RE = /^[A-Za-z0-9._][A-Za-z0-9._-]{0,254}$/u;
+const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u;
+const TIMESTAMP_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/u;
+const MAX_STABLE_SCAN_ATTEMPTS = 3;
+const MAX_TARGET_PAGES = 10_000;
+const MAX_THREAD_SNAPSHOT_NOTES = 10_000;
+
+function conversationRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new GlabOutputError(`Invalid glab ${label} response`);
+  return value;
+}
+
+function conversationText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || /[\u0000-\u001f\u007f]/u.test(value)) {
+    throw new GlabOutputError(`Invalid glab ${label}`);
+  }
+  return value;
+}
+
+function conversationProviderId(value: unknown, label: string): string {
+  const id = typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? String(value) : value;
+  if (typeof id !== "string" || !PROVIDER_ID_RE.test(id)) throw new GlabOutputError(`Invalid glab ${label}`);
+  return id;
+}
+
+function conversationTimestamp(value: unknown, label: string): string {
+  const result = conversationText(value, label);
+  if (!TIMESTAMP_RE.test(result)) throw new GlabOutputError(`Invalid glab ${label}`);
+  const epoch = Date.parse(result);
+  if (!Number.isFinite(epoch)) throw new GlabOutputError(`Invalid glab ${label}`);
+  return new Date(epoch).toISOString();
+}
+
+function conversationDigest(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function conversationOrderKey(at: string, type: string, id: string, revision = ""): string {
+  return `${at}|${type}|${id.padStart(32, "0")}|${revision}`;
+}
+
+function eventBoundaryToken(event: ReviewActivityEvent): string {
+  return event.kind === "thread-resolution"
+    ? `r:${event.threadId}:${event.resolved ? "1" : "0"}:${event.outdated ? "1" : "0"}`
+    : event.revisionId;
+}
+
+function parseNdjsonPage(stdout: string, label: string): Record<string, unknown>[] {
+  return decodeNdjsonRecords<unknown>(stdout).flatMap((entry) => {
+    const rows = Array.isArray(entry) ? entry : [entry];
+    return rows.map((row) => conversationRecord(row, label));
+  });
+}
+
+interface InclusiveHighWater { readonly at: string; readonly seen: readonly string[]; readonly cutoff?: string }
+interface StableScanResult<T> {
+  readonly witness: string;
+  readonly count: number;
+  readonly candidates: readonly T[];
+  readonly cutoffRank?: number;
+}
+interface TieContinuation {
+  readonly v: 1;
+  readonly cursor: string | null;
+  readonly cutoff: string;
+  readonly witness: string;
+  readonly count: number;
+  readonly emittedRank: number;
+  readonly checksum: string;
+}
+
+function decodeHighWater(opaque: string): InclusiveHighWater {
+  try {
+    const value = conversationRecord(JSON.parse(opaque), "cursor high-water");
+    const at = conversationTimestamp(value.at, "cursor high-water timestamp");
+    if (!Array.isArray(value.seen) || value.seen.some((id) => typeof id !== "string" || id.length === 0)) {
+      throw new Error("Invalid GitLab cursor seen set");
+    }
+    if (value.cutoff !== undefined && (typeof value.cutoff !== "string" || value.cutoff.length === 0)) {
+      throw new Error("Invalid GitLab cursor cutoff");
+    }
+    return { at, seen: value.seen as string[], ...(typeof value.cutoff === "string" ? { cutoff: value.cutoff } : {}) };
+  } catch (cause) {
+    throw new Error("Invalid GitLab cursor high-water state", { cause });
+  }
+}
+
+function encodeHighWater(at: string, seen: readonly string[], cutoff?: string): string {
+  const unique = cutoff ? [] : [...new Set(seen)].sort();
+  let encoded = JSON.stringify({ at, seen: unique, ...(cutoff ? { cutoff } : {}) });
+  if (Buffer.byteLength(encoded, "utf8") > 3_900) {
+    encoded = JSON.stringify({ at: new Date(Date.parse(at) - 1).toISOString(), seen: [] });
+  }
+  return encoded;
+}
+
+type TieContinuationPayload = Omit<TieContinuation, "checksum">;
+
+function tieContinuationChecksum(value: TieContinuationPayload): string {
+  return conversationDigest(JSON.stringify(value));
+}
+
+function encodeTieContinuation(value: TieContinuationPayload): string {
+  const encoded = JSON.stringify({ ...value, checksum: tieContinuationChecksum(value) });
+  if (Buffer.byteLength(encoded, "utf8") > 3_900) throw new Error("GitLab continuation token exceeds safe bound");
+  return encoded;
+}
+
+function decodeTieContinuation(opaque: string): TieContinuation {
+  try {
+    const value = conversationRecord(JSON.parse(opaque), "tie continuation");
+    const keys = Object.keys(value).sort();
+    if (keys.join("\0") !== ["checksum", "count", "cursor", "cutoff", "emittedRank", "v", "witness"].sort().join("\0")) {
+      throw new Error("Invalid GitLab continuation properties");
+    }
+    if (
+      value.v !== 1 ||
+      (value.cursor !== null && typeof value.cursor !== "string") ||
+      typeof value.cutoff !== "string" ||
+      value.cutoff.length === 0 ||
+      typeof value.witness !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(value.witness) ||
+      !Number.isSafeInteger(value.count) ||
+      (value.count as number) < 0 ||
+      !Number.isSafeInteger(value.emittedRank) ||
+      (value.emittedRank as number) <= 0 ||
+      (value.emittedRank as number) > (value.count as number) ||
+      typeof value.checksum !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(value.checksum)
+    ) {
+      throw new Error("Invalid GitLab tie continuation");
+    }
+    if (value.cursor !== null) decodeHighWater(value.cursor);
+    const parsed = value as unknown as TieContinuation;
+    const { checksum, ...payload } = parsed;
+    if (checksum !== tieContinuationChecksum(payload)) throw new Error("Invalid GitLab continuation checksum");
+    return parsed;
+  } catch (cause) {
+    throw new Error(
+      cause instanceof Error && /checksum/iu.test(cause.message)
+        ? "Invalid GitLab tie continuation checksum"
+        : "Invalid GitLab tie continuation state",
+      { cause },
+    );
+  }
+}
+
+function addWitnessEntry(hash: ReturnType<typeof createHash>, parts: readonly string[]): void {
+  for (const part of parts) hash.update(`${Buffer.byteLength(part, "utf8")}:`).update(part);
+  hash.update("\n");
+}
+
+function canonicalInlineBody(body: string): string {
+  return body.replace(/\r\n?/gu, "\n");
+}
+
+function conversationUsername(value: unknown, label: string): string {
+  const username = conversationText(value, label);
+  if (!USERNAME_RE.test(username)) throw new GlabOutputError(`Invalid glab ${label}`);
+  return username.toLowerCase();
+}
+
+function conversationSha(value: unknown, label: string): string {
+  const sha = conversationText(value, label).toLowerCase();
+  if (!CONVERSATION_SHA_RE.test(sha)) throw new GlabOutputError(`Invalid glab ${label}`);
+  return sha;
+}
+
+function conversationDiscussionId(value: unknown): string {
+  const id = conversationProviderId(value, "discussion id");
+  if (!OPAQUE_DISCUSSION_ID_RE.test(id) || id.includes("..")) throw new GlabOutputError("Invalid glab discussion id");
+  return id;
+}
+
+interface ConversationMergeRequest {
+  readonly id: string;
+  readonly iid: number;
+  readonly title: string;
+  readonly webUrl: string;
+  readonly updatedAt: string;
+  readonly headSha: string;
+}
+
+interface ConversationNote {
+  readonly id: string;
+  readonly body: string;
+  readonly author: string;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+  readonly type: string | null;
+  readonly system: boolean;
+  readonly resolved?: boolean;
+  readonly outdated?: boolean;
+  readonly reactions: readonly Omit<ReviewReaction, "authorIsBot">[];
+  readonly position?: {
+    readonly file: string;
+    readonly line?: number;
+    readonly side?: "old" | "new";
+    readonly headSha?: string;
+    readonly positionType: string;
+  };
+}
+
+interface ConversationDiscussion {
+  readonly id: string;
+  readonly individualNote: boolean;
+  readonly outdated?: boolean;
+  readonly notes: readonly ConversationNote[];
+}
+
+function parseConversationMergeRequest(stdout: string): ConversationMergeRequest {
+  const value = conversationRecord((() => {
+    try { return JSON.parse(stdout); } catch (cause) { throw new GlabOutputError("Invalid glab MR response: malformed JSON", { cause }); }
+  })(), "merge request");
+  const diffRefs = isRecord(value.diff_refs) ? value.diff_refs : undefined;
+  const headSha = value.sha ?? diffRefs?.head_sha;
+  if (!Number.isSafeInteger(value.iid) || (value.iid as number) <= 0) throw new GlabOutputError("Invalid glab MR response: malformed iid");
+  return {
+    id: conversationProviderId(value.id, "merge request id"),
+    iid: value.iid as number,
+    title: conversationText(value.title, "merge request title"),
+    webUrl: conversationText(value.web_url, "merge request URL"),
+    updatedAt: conversationTimestamp(value.updated_at, "merge request updated timestamp"),
+    headSha: conversationSha(headSha, "merge request head SHA"),
+  };
+}
+
+function parseConversationNote(value: unknown): ConversationNote {
+  const row = conversationRecord(value, "note");
+  const author = conversationRecord(row.author, "note author");
+  const type = row.type === undefined || row.type === null ? null : conversationText(row.type, "note type");
+  const position = parseConversationPosition(row.position);
+  const outdatedFlag = conversationOutdatedFlag(row);
+  const awards = row.award_emoji === undefined || row.award_emoji === null
+    ? []
+    : Array.isArray(row.award_emoji)
+      ? row.award_emoji
+      : (() => { throw new GlabOutputError("Invalid glab note award emoji"); })();
+  const reactions = parseConversationReactions(awards);
+  return {
+    id: conversationProviderId(row.id, "note id"),
+    body: typeof row.body === "string" ? row.body : (() => { throw new GlabOutputError("Invalid glab note body"); })(),
+    author: conversationUsername(author.username, "note author username"),
+    createdAt: conversationTimestamp(row.created_at, "note created timestamp"),
+    updatedAt: conversationTimestamp(row.updated_at, "note updated timestamp"),
+    type,
+    system: row.system === true,
+    reactions,
+    ...(typeof row.resolved === "boolean" ? { resolved: row.resolved } : {}),
+    ...(outdatedFlag === undefined ? {} : { outdated: outdatedFlag }),
+    ...(position ? { position } : {}),
+  };
+}
+
+function parseConversationReactions(values: readonly unknown[]): readonly Omit<ReviewReaction, "authorIsBot">[] {
+  return values.flatMap((value): Array<Omit<ReviewReaction, "authorIsBot">> => {
+    const award = conversationRecord(value, "note award emoji");
+    if (award.name !== "thumbsup" && award.name !== "+1") return [];
+    const user = conversationRecord(award.user, "note award emoji user");
+    return [{
+      id: conversationProviderId(award.id, "note award emoji id"),
+      content: "thumbs-up",
+      authorLogin: conversationUsername(user.username, "note award emoji username"),
+      createdAt: conversationTimestamp(award.created_at, "note award emoji timestamp"),
+    }];
+  });
+}
+
+function parseConversationPosition(value: unknown): ConversationNote["position"] | undefined {
+  if (value === undefined || value === null) return undefined;
+  const position = conversationRecord(value, "note position");
+  const chosenPath = typeof position.new_path === "string" && position.new_path.length > 0
+    ? position.new_path
+    : position.old_path;
+  const file = conversationText(chosenPath, "note path");
+  const positionType = typeof position.position_type === "string" ? position.position_type : "text";
+  const rawLine = position.new_line ?? position.old_line;
+  const line = rawLine == null ? undefined : Number(rawLine);
+  if (positionType !== "file" && line !== undefined && (!Number.isSafeInteger(line) || line <= 0)) {
+    throw new GlabOutputError("Invalid glab note line");
+  }
+  if (positionType === "file" && line !== undefined) throw new GlabOutputError("Invalid glab file-level note line");
+  const side = positionType === "file"
+    ? (typeof position.new_path === "string" && position.new_path.length > 0 ? "new" as const : "old" as const)
+    : position.new_line != null ? "new" as const : position.old_line != null ? "old" as const : undefined;
+  return {
+    file,
+    ...(positionType === "file" || line === undefined ? {} : { line }),
+    ...(side ? { side } : {}),
+    ...(position.head_sha === undefined || position.head_sha === null ? {} : { headSha: conversationSha(position.head_sha, "note head SHA") }),
+    positionType,
+  };
+}
+
+function parseConversationDiscussion(value: unknown): ConversationDiscussion {
+  const row = conversationRecord(value, "discussion");
+  if (!Array.isArray(row.notes) || row.notes.length === 0) throw new GlabOutputError("Invalid glab discussion response");
+  const outdatedFlag = conversationOutdatedFlag(row);
+  return {
+    id: conversationDiscussionId(row.id),
+    individualNote: row.individual_note === true,
+    ...(outdatedFlag === undefined ? {} : { outdated: outdatedFlag }),
+    notes: row.notes.map(parseConversationNote),
+  };
+}
+
+function conversationOutdatedFlag(row: Record<string, unknown>): boolean | undefined {
+  if (typeof row.outdated === "boolean") return row.outdated;
+  if (typeof row.stale === "boolean") return row.stale;
+  if (typeof row.active === "boolean") return row.active === false;
+  return undefined;
+}
+
+function isGeneralNote(note: ConversationNote): boolean {
+  return !note.system && note.type === null;
+}
+
+export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
+  constructor(
+    private readonly execGlab: ExecGlab = realExecGlab,
+    private readonly repository?: GitLabRepositoryRef,
+  ) {}
 
   resolveRelatedWork(
     references: readonly RelatedWorkReference[],
@@ -778,8 +1141,17 @@ export class GitLabAdapter implements VcsAdapter {
           "--input",
           "-",
         ], JSON.stringify(payload));
-        validateWrittenDiscussion(stdout, payload.body);
-        outcomes.push({ clientId: comment.clientId, status: "posted" });
+        const written = validateWrittenDiscussion(stdout, payload.body);
+        outcomes.push({
+          clientId: comment.clientId,
+          status: "posted",
+          identity: validateConversationItemIdentity({
+            provider: "gitlab",
+            commentId: written.noteId,
+            threadId: written.discussionId,
+            url: `${repo.canonicalUrl}/-/merge_requests/${iid}#note_${written.noteId}`,
+          }, { repo, reviewNumber: Number(iid) }),
+        });
       } catch (error) {
         if (error instanceof GlabOutputError) {
           const reason = "GitLab returned an invalid inline discussion response";
@@ -808,7 +1180,7 @@ export class GitLabAdapter implements VcsAdapter {
         }
       }
     }
-    return validateInlinePublishOutcomes(comments, outcomes);
+    return validateInlinePublishOutcomes(comments, outcomes, { repo, reviewNumber: Number(iid) });
   }
 
   async resolveStaleReviewThreads(locator: ReviewLocator): Promise<number> {
@@ -925,5 +1297,628 @@ export class GitLabAdapter implements VcsAdapter {
       ),
     );
     return files;
+  }
+
+  async getAuthenticatedBotIdentity(): Promise<BotIdentity> {
+    if (!this.repository) throw new Error("GitLab conversation identity requires an explicit canonical repository");
+    const login = conversationUsername(await this.getUsername(this.repository), "authenticated username");
+    return { provider: "gitlab", login, mention: `@${login}` };
+  }
+
+  private requireRepository(binding: { provider: string; repositoryDigest: string }): GitLabRepositoryRef {
+    if (binding.provider !== "gitlab") throw new Error("GitLab repository provider binding mismatch");
+    if (!this.repository) throw new Error("GitLab repository activity requires an explicit canonical repository");
+    if (binding.repositoryDigest !== computeRepositoryDigest("gitlab", this.repository.canonicalUrl)) {
+      throw new Error("GitLab repository digest binding mismatch");
+    }
+    return this.repository;
+  }
+
+  private repositoryForReview(review: ReviewIdentity): GitLabRepositoryRef {
+    if (review.provider !== "gitlab" || !Number.isSafeInteger(review.reviewNumber) || review.reviewNumber <= 0) {
+      throw new Error("Invalid GitLab review binding");
+    }
+    const repo = this.requireRepository(review);
+    if (review.url !== `${repo.canonicalUrl}/-/merge_requests/${review.reviewNumber}`) {
+      throw new Error("Invalid GitLab review URL binding");
+    }
+    conversationProviderId(review.reviewId, "review id");
+    return repo;
+  }
+
+  private async scanStablePages<T>(scan: () => Promise<StableScanResult<T>>): Promise<StableScanResult<T>> {
+    for (let attempt = 0; attempt < MAX_STABLE_SCAN_ATTEMPTS; attempt += 1) {
+      const first = await scan();
+      const second = await scan();
+      if (first.count === second.count && first.witness === second.witness) return second;
+    }
+    throw new ConcurrentGitLabMutationError();
+  }
+
+  async resolveReviewIdentity(repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
+    if (repository.provider !== "gitlab") throw new Error("GitLab review identity requires a GitLab repository");
+    if (!Number.isSafeInteger(reviewNumber) || reviewNumber <= 0) throw new Error("Invalid GitLab review binding");
+    if (this.repository && this.repository.canonicalUrl !== repository.canonicalUrl) {
+      throw new Error("GitLab configured repository binding mismatch");
+    }
+    const repo = repository;
+    const mr = parseConversationMergeRequest(await this.execGlab([
+      "api", "--method", "GET", "--hostname", repo.host,
+      projectEndpoint(repo, `merge_requests/${reviewNumber}`),
+    ]));
+    const url = `${repo.canonicalUrl}/-/merge_requests/${reviewNumber}`;
+    if (mr.iid !== reviewNumber || mr.webUrl !== url) {
+      throw new GlabOutputError("GitLab merge request identity binding mismatch");
+    }
+    return {
+      provider: "gitlab",
+      repositoryDigest: computeRepositoryDigest("gitlab", repo.canonicalUrl),
+      reviewNumber,
+      reviewId: mr.id,
+      url,
+    };
+  }
+
+  private async fetchConversationMergeRequest(review: ReviewIdentity): Promise<ConversationMergeRequest> {
+    const repo = this.repositoryForReview(review);
+    const mr = parseConversationMergeRequest(await this.execGlab([
+      "api", "--method", "GET", "--hostname", repo.host,
+      projectEndpoint(repo, `merge_requests/${review.reviewNumber}`),
+    ]));
+    if (mr.id !== review.reviewId || mr.iid !== review.reviewNumber || mr.webUrl !== review.url) {
+      throw new GlabOutputError("GitLab merge request identity binding mismatch");
+    }
+    return mr;
+  }
+
+  private async fetchDiscussion(review: ReviewIdentity, threadId: string): Promise<ConversationDiscussion> {
+    const repo = this.repositoryForReview(review);
+    const id = conversationDiscussionId(threadId);
+    const raw = await this.execGlab([
+      "api", "--method", "GET", "--hostname", repo.host,
+      projectEndpoint(repo, `merge_requests/${review.reviewNumber}/discussions/${encodeURIComponent(id)}`),
+    ]);
+    let value: unknown;
+    try { value = JSON.parse(raw); } catch (cause) { throw new GlabOutputError("Invalid glab discussion response: malformed JSON", { cause }); }
+    const discussion = parseConversationDiscussion(value);
+    if (discussion.id !== id) throw new GlabOutputError("GitLab discussion identity binding mismatch");
+    return discussion;
+  }
+
+  async listOpenReviews(
+    repositoryBinding: { provider: "github" | "gitlab"; repositoryDigest: string },
+    after?: ReviewDiscoveryCursor,
+    pageToken?: OpenReviewPageToken,
+  ): Promise<OpenReviewPage> {
+    const repo = this.requireRepository(repositoryBinding);
+    const binding = { provider: "gitlab" as const, repositoryDigest: repositoryBinding.repositoryDigest };
+    const cursor = after === undefined ? undefined : validateReviewDiscoveryCursor(after, binding);
+    const continuation = pageToken === undefined ? undefined : decodeTieContinuation(validateOpenReviewPageToken(pageToken, binding).opaque);
+    if (continuation && continuation.cursor !== (cursor?.opaque ?? null)) throw new Error("GitLab open review continuation cursor binding mismatch");
+    const boundary = continuation?.cursor === null ? undefined : continuation ? decodeHighWater(continuation.cursor) : cursor ? decodeHighWater(cursor.opaque) : undefined;
+    const cutoff = continuation?.cutoff;
+    const snapshot = await this.scanStablePages(async () => {
+      const candidates: OpenReviewPage["reviews"][number][] = [];
+      const hash = createHash("sha256");
+      let count = 0;
+      let cutoffRank = 0;
+      let previousStable = -1;
+      for (let page = 1; page <= MAX_TARGET_PAGES; page += 1) {
+        const rows = parseNdjsonPage(await this.execGlab([
+          "api", "--method", "GET", "--output", "ndjson",
+          "--hostname", repo.host,
+          projectEndpoint(repo, "merge_requests"),
+          "--field", "state=all",
+          "--field", "order_by=created_at",
+          "--field", "sort=asc",
+          "--field", "per_page=100",
+          "--field", `page=${page}`,
+        ]), "merge requests");
+        if (rows.length > 100) throw new GlabOutputError("GitLab merge request page exceeds requested bound");
+        for (const row of rows) {
+          const databaseId = conversationProviderId(row.id, "merge request database id");
+          const stable = Number(databaseId);
+          if (!Number.isSafeInteger(stable) || stable <= previousStable) throw new GlabOutputError("GitLab merge request stable ordering is nonmonotonic or duplicated");
+          previousStable = stable;
+          const number = Number(row.iid);
+          const state = row.state;
+          if (!Number.isSafeInteger(number) || number <= 0 || (state !== "opened" && state !== "closed" && state !== "merged" && state !== "locked")) {
+            throw new GlabOutputError("Invalid GitLab merge request binding");
+          }
+          const url = conversationText(row.web_url, "merge request URL");
+          if (url !== `${repo.canonicalUrl}/-/merge_requests/${number}`) throw new GlabOutputError("Invalid GitLab merge request URL binding");
+          const headSha = conversationSha(row.sha ?? (isRecord(row.diff_refs) ? row.diff_refs.head_sha : undefined), "merge request head SHA");
+          const updatedAt = conversationTimestamp(row.updated_at, "merge request updated timestamp");
+          const title = conversationText(row.title, "merge request title");
+          addWitnessEntry(hash, [databaseId, databaseId, String(number), String(state), url, headSha, updatedAt, title]);
+          count += 1;
+          const item = {
+            identity: { ...binding, reviewNumber: number, reviewId: databaseId, url },
+            title, headSha, updatedAt,
+            orderKey: `${updatedAt}|${number.toString().padStart(16, "0")}|${databaseId.padStart(32, "0")}`,
+          };
+          const afterBoundary = !boundary || updatedAt > boundary.at || (updatedAt === boundary.at && (!boundary.cutoff || item.orderKey > boundary.cutoff));
+          if (state === "opened" && afterBoundary && cutoff && item.orderKey <= cutoff) cutoffRank += 1;
+          if (state === "opened" && afterBoundary && (!cutoff || item.orderKey > cutoff)) {
+            candidates.push(item);
+            candidates.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+            if (candidates.length > 101) candidates.pop();
+          }
+        }
+        if (rows.length < 100) break;
+        if (page === MAX_TARGET_PAGES) throw new GlabOutputError("GitLab merge request scan exceeded safe page bound");
+      }
+      return { witness: hash.digest("hex"), count, candidates, cutoffRank };
+    });
+    if (continuation && (continuation.witness !== snapshot.witness || continuation.count !== snapshot.count)) {
+      throw new ConcurrentGitLabMutationError("GitLab changed during an open review continuation");
+    }
+    if (continuation && snapshot.cutoffRank !== continuation.emittedRank) throw new Error("GitLab open review continuation cutoff rank mismatch");
+    const reviews = snapshot.candidates.slice(0, 100);
+    if (new Set(reviews.map((item) => item.identity.reviewId)).size !== reviews.length || new Set(reviews.map((item) => item.identity.reviewNumber)).size !== reviews.length) {
+      throw new GlabOutputError("Duplicate GitLab merge request identity");
+    }
+    const priorAt = boundary?.at ?? new Date(0).toISOString();
+    const highAt = reviews.at(-1)?.updatedAt ?? priorAt;
+    const highSeen = reviews.filter((item) => item.updatedAt === highAt).map((item) => item.identity.reviewId);
+    const hasMore = snapshot.candidates.length > 100;
+    const stableCursor = hasMore
+      ? { scope: "open-review-discovery" as const, ...binding, opaque: cursor?.opaque ?? encodeHighWater(new Date(0).toISOString(), []), orderKey: cursor?.orderKey ?? new Date(0).toISOString() }
+      : reviews.length === 0 && cursor
+        ? cursor
+        : { scope: "open-review-discovery" as const, ...binding, opaque: encodeHighWater(highAt, highSeen, reviews.at(-1)?.orderKey), orderKey: highAt };
+    return {
+      reviews,
+      nextCursor: stableCursor,
+      ...(hasMore ? { nextPageToken: { scope: "open-review-page" as const, ...binding,
+        opaque: encodeTieContinuation({ v: 1, cursor: cursor?.opaque ?? null, cutoff: reviews.at(-1)!.orderKey, witness: snapshot.witness, count: snapshot.count,
+          emittedRank: (continuation?.emittedRank ?? 0) + reviews.length }) } } : {}),
+    };
+  }
+
+  async listReviewEvents(review: ReviewIdentity, after?: ReviewEventCursor, pageToken?: ReviewEventPageToken): Promise<ReviewEventPage> {
+    const binding = { provider: "gitlab" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const cursor = after === undefined ? undefined : validateReviewEventCursor(after, binding);
+    const continuation = pageToken === undefined ? undefined : decodeTieContinuation(validateReviewEventPageToken(pageToken, binding).opaque);
+    if (continuation && continuation.cursor !== (cursor?.opaque ?? null)) throw new Error("GitLab review event continuation cursor binding mismatch");
+    const boundary = continuation?.cursor === null ? undefined : continuation ? decodeHighWater(continuation.cursor) : cursor ? decodeHighWater(cursor.opaque) : undefined;
+    const bot = (await this.getAuthenticatedBotIdentity()).login;
+    const snapshot = await this.scanStablePages(() => this.scanReviewEventsOnce(review, boundary, continuation?.cutoff, bot));
+    if (continuation && (continuation.witness !== snapshot.witness || continuation.count !== snapshot.count)) {
+      throw new ConcurrentGitLabMutationError("GitLab changed during a review event continuation");
+    }
+    if (continuation && snapshot.cutoffRank !== continuation.emittedRank) throw new Error("GitLab review event continuation cutoff rank mismatch");
+    const events = snapshot.candidates.slice(0, 100);
+    const highAt = events.at(-1)?.updatedAt ?? boundary?.at ?? new Date(0).toISOString();
+    const highSeen = events.filter((event) => event.updatedAt === highAt).map(eventBoundaryToken);
+    const hasMore = snapshot.candidates.length > 100;
+    const stableCursor = hasMore
+      ? { scope: "review-events" as const, ...binding, opaque: cursor?.opaque ?? encodeHighWater(new Date(0).toISOString(), []), orderKey: cursor?.orderKey ?? new Date(0).toISOString() }
+      : events.length === 0 && cursor
+        ? cursor
+        : { scope: "review-events" as const, ...binding, opaque: encodeHighWater(highAt, highSeen, events.at(-1)?.orderKey), orderKey: highAt };
+    return {
+      events,
+      nextCursor: stableCursor,
+      ...(hasMore ? { nextPageToken: { scope: "review-event-page" as const, ...binding,
+        opaque: encodeTieContinuation({ v: 1, cursor: cursor?.opaque ?? null, cutoff: events.at(-1)!.orderKey, witness: snapshot.witness, count: snapshot.count,
+          emittedRank: (continuation?.emittedRank ?? 0) + events.length }) } } : {}),
+    };
+  }
+
+  private async paginateNdjson(
+    repo: GitLabRepositoryRef,
+    suffix: string,
+    perPage: number,
+    label: string,
+    maxRows?: number,
+  ): Promise<Record<string, unknown>[]> {
+    const rows: Record<string, unknown>[] = [];
+    for (let page = 1; page <= MAX_TARGET_PAGES; page += 1) {
+      const query = suffix.endsWith("/notes")
+        ? [
+          "--field", "sort=asc",
+          "--field", "order_by=created_at",
+          "--field", `per_page=${perPage}`,
+          "--field", `page=${page}`,
+        ]
+        : [
+          "--field", `per_page=${perPage}`,
+          "--field", `page=${page}`,
+        ];
+      const batch = parseNdjsonPage(await this.execGlab([
+        "api", "--method", "GET", "--output", "ndjson",
+        "--hostname", repo.host,
+        projectEndpoint(repo, suffix),
+        ...query,
+      ]), label);
+      if (batch.length > perPage) throw new GlabOutputError(`GitLab ${label} page exceeds requested bound`);
+      rows.push(...batch);
+      if (maxRows !== undefined && rows.length >= maxRows) return rows.slice(0, maxRows);
+      if (batch.length < perPage) break;
+      if (page === MAX_TARGET_PAGES) throw new GlabOutputError(`GitLab ${label} scan exceeded safe page bound`);
+    }
+    return rows;
+  }
+
+  private async scanReviewEventsOnce(
+    review: ReviewIdentity,
+    boundary: InclusiveHighWater | undefined,
+    cutoff: string | undefined,
+    bot: string,
+  ): Promise<StableScanResult<ReviewActivityEvent>> {
+    const repo = this.repositoryForReview(review);
+    const binding = { provider: "gitlab" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const mr = await this.fetchConversationMergeRequest(review);
+    const hash = createHash("sha256");
+    let count = 0;
+    let cutoffRank = 0;
+    const events: ReviewActivityEvent[] = [];
+    const keep = (event: ReviewActivityEvent): void => {
+      const afterBoundary = !boundary || event.updatedAt > boundary.at ||
+        (event.updatedAt === boundary.at && (boundary.cutoff ? event.orderKey > boundary.cutoff : !boundary.seen.includes(eventBoundaryToken(event))));
+      if (afterBoundary && cutoff && event.orderKey <= cutoff) { cutoffRank += 1; return; }
+      if (afterBoundary && (!cutoff || event.orderKey > cutoff)) {
+        events.push(event);
+        events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+        if (events.length > 101) events.pop();
+      }
+    };
+    const seenNoteIds = new Set<string>();
+    for (const row of await this.paginateNdjson(repo, `merge_requests/${review.reviewNumber}/notes`, 50, "notes")) {
+      const note = parseConversationNote(row);
+      if (seenNoteIds.has(note.id)) throw new GlabOutputError("GitLab note stable ordering is nonmonotonic or duplicated");
+      seenNoteIds.add(note.id);
+      const revisionId = conversationDigest(`${note.id}\0${note.updatedAt}\0${note.body}`);
+      addWitnessEntry(hash, ["note", note.id, revisionId, conversationDigest(JSON.stringify(row))]);
+      count += 1;
+      if (!isGeneralNote(note)) continue;
+      const edited = note.updatedAt !== note.createdAt;
+      keep({
+        ...binding,
+        kind: edited ? "comment-edit" : "general-comment",
+        eventId: `mr-note:${note.id}`,
+        revisionId,
+        ...(edited ? { editedRevisionId: revisionId } : {}),
+        orderKey: conversationOrderKey(note.updatedAt, "general-comment", note.id, revisionId),
+        authorLogin: note.author,
+        authorIsBot: note.author === bot,
+        createdAt: note.createdAt,
+        updatedAt: note.updatedAt,
+        body: note.body,
+        url: `${review.url}#note_${note.id}`,
+        commentId: note.id,
+      } as ReviewActivityEvent);
+    }
+    const seenDiscussionIds = new Set<string>();
+    for (const row of await this.paginateNdjson(repo, `merge_requests/${review.reviewNumber}/discussions`, 100, "discussions")) {
+      const discussion = parseConversationDiscussion(row);
+      if (seenDiscussionIds.has(discussion.id)) throw new GlabOutputError("Duplicate GitLab discussion identity");
+      seenDiscussionIds.add(discussion.id);
+      const thread = this.normalizeDiscussion(review, discussion, mr, bot);
+      addWitnessEntry(hash, ["thread", discussion.id, conversationDigest(JSON.stringify(row)), thread?.resolutionObservedAt ?? "", mr.headSha]);
+      count += 1 + discussion.notes.filter((note) => !note.system).length;
+      if (!thread) continue;
+      for (const event of thread.events) keep(event);
+      keep(thread.resolution);
+    }
+    events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    return { candidates: events, witness: hash.digest("hex"), count, cutoffRank };
+  }
+
+  private normalizeDiscussion(
+    review: ReviewIdentity,
+    discussion: ConversationDiscussion,
+    mr: ConversationMergeRequest,
+    bot = "",
+  ): { readonly events: readonly ReviewActivityEvent[]; readonly resolution: ReviewActivityEvent; readonly summary: ReviewThreadSummary; readonly resolutionObservedAt: string } | undefined {
+    if (discussion.individualNote) return undefined;
+    const binding = { provider: "gitlab" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const root = discussion.notes[0]!;
+    if (discussion.notes.length > MAX_THREAD_SNAPSHOT_NOTES) throw new GlabOutputError("GitLab review thread exceeds the 10,000-note atomic snapshot limit");
+    const placement = this.discussionPlacement(root, mr.headSha, discussion.outdated);
+    const resolvedFlag = root.resolved === true;
+    const outdated = placement?.outdated === true;
+    const updatedAt = discussion.notes.flatMap((note) => [note.updatedAt, ...note.reactions.map((reaction) => reaction.createdAt)]).sort().at(-1)!;
+    const resolutionObservedAt = mr.updatedAt;
+    const summary: ReviewThreadSummary = {
+      ...binding,
+      threadId: discussion.id,
+      rootCommentId: root.id,
+      url: `${review.url}#note_${root.id}`,
+      resolved: resolvedFlag,
+      outdated,
+      updatedAt,
+      orderKey: conversationOrderKey(updatedAt, "thread", discussion.id),
+      ...(placement ? { placement } : {}),
+    };
+    const events = discussion.notes.filter((note) => !note.system).map((note, index): ReviewActivityEvent => {
+      const edited = note.updatedAt !== note.createdAt;
+      const reactions = note.reactions.map((reaction): ReviewReaction => ({
+        ...reaction,
+        authorIsBot: reaction.authorLogin === bot,
+      }));
+      const activityUpdatedAt = [note.updatedAt, ...reactions.map((reaction) => reaction.createdAt)].sort().at(-1)!;
+      const revisionId = conversationDigest(`${note.id}\0${note.updatedAt}\0${note.body}\0${JSON.stringify(reactions)}`);
+      return {
+        ...binding,
+        kind: edited ? "comment-edit" : "thread-comment",
+        eventId: `discussion-note:${note.id}`,
+        revisionId,
+        ...(edited ? { editedRevisionId: revisionId } : {}),
+        orderKey: conversationOrderKey(activityUpdatedAt, "thread-comment", note.id, revisionId),
+        authorLogin: note.author,
+        authorIsBot: note.author === bot,
+        createdAt: note.createdAt,
+        updatedAt: activityUpdatedAt,
+        body: note.body,
+        url: `${review.url}#note_${note.id}`,
+        commentId: note.id,
+        ...(reactions.length === 0 ? {} : { reactions }),
+        threadId: discussion.id,
+        ...(index === 0 ? {} : { parentCommentId: root.id }),
+        ...(placement ? { placement } : {}),
+      } as ReviewActivityEvent;
+    });
+    const revisionId = conversationDigest(`${discussion.id}\0resolved=${String(resolvedFlag)}\0outdated=${String(outdated)}`);
+    const resolution: ReviewActivityEvent = {
+      ...binding,
+      kind: "thread-resolution",
+      eventId: `thread-resolution:${discussion.id}`,
+      revisionId,
+      orderKey: conversationOrderKey(resolutionObservedAt, "thread-resolution", discussion.id, revisionId),
+      createdAt: root.createdAt,
+      updatedAt: resolutionObservedAt,
+      body: "",
+      url: summary.url,
+      threadId: discussion.id,
+      resolved: resolvedFlag,
+      outdated,
+      ...(placement ? { placement } : {}),
+    };
+    return { events, resolution, summary, resolutionObservedAt };
+  }
+
+  private discussionPlacement(
+    root: ConversationNote,
+    currentHeadSha: string,
+    discussionOutdated?: boolean,
+  ): ReviewThreadSummary["placement"] | undefined {
+    if (!root.position) return undefined;
+    const originalHeadSha = root.position.headSha;
+    // Outdated means the provider marked the anchor stale, not that HEAD moved.
+    const outdated = root.outdated === true || discussionOutdated === true;
+    return validateConversationAnchor({
+      file: root.position.file,
+      ...(root.position.line === undefined ? {} : { line: root.position.line }),
+      ...(root.position.side === undefined ? {} : { side: root.position.side }),
+      ...(originalHeadSha === undefined ? {} : { originalHeadSha, currentHeadSha }),
+      outdated,
+    });
+  }
+
+  async listReviewThreads(review: ReviewIdentity, pageToken?: ReviewThreadPageToken): Promise<ReviewThreadPage> {
+    const repo = this.repositoryForReview(review);
+    const binding = { provider: "gitlab" as const, repositoryDigest: review.repositoryDigest, reviewNumber: review.reviewNumber };
+    const opaque = pageToken === undefined ? "1" : validateReviewThreadPageToken(pageToken, binding).opaque;
+    if (!/^[1-9]\d*$/u.test(opaque)) throw new Error("Invalid GitLab thread page token");
+    const page = Number(opaque);
+    if (!Number.isSafeInteger(page)) throw new Error("Invalid GitLab thread page token");
+    const mr = await this.fetchConversationMergeRequest(review);
+    const rows = parseNdjsonPage(await this.execGlab([
+      "api", "--method", "GET", "--output", "ndjson",
+      "--hostname", repo.host,
+      projectEndpoint(repo, `merge_requests/${review.reviewNumber}/discussions`),
+      "--field", "per_page=100",
+      "--field", `page=${page}`,
+    ]), "discussions");
+    if (rows.length > 100) throw new GlabOutputError("GitLab discussion page exceeds requested bound");
+    const threads = rows
+      .map(parseConversationDiscussion)
+      .map((discussion) => this.normalizeDiscussion(review, discussion, mr)?.summary)
+      .filter((summary): summary is ReviewThreadSummary => summary !== undefined)
+      .sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    return {
+      threads,
+      ...(rows.length === 100 ? { nextPageToken: { scope: "review-thread-page" as const, ...binding, opaque: String(page + 1) } } : {}),
+    };
+  }
+
+  async getReviewThread(review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
+    const mr = await this.fetchConversationMergeRequest(review);
+    const bot = (await this.getAuthenticatedBotIdentity()).login;
+    const fetched = await this.fetchDiscussion(review, threadId);
+    const notes = new Array<ConversationNote>(fetched.notes.length);
+    let nextNote = 0;
+    const normalizeNext = async (): Promise<void> => {
+      while (nextNote < fetched.notes.length) {
+        const index = nextNote;
+        nextNote += 1;
+        const note = fetched.notes[index]!;
+        notes[index] = note.system || note.author !== bot
+          ? note
+          : { ...note, reactions: await this.fetchNoteThumbsUpReactions(review, note.id) };
+      }
+    };
+    await Promise.all(Array.from(
+      { length: Math.min(REACTION_FETCH_CONCURRENCY, fetched.notes.length) },
+      normalizeNext,
+    ));
+    const discussion: ConversationDiscussion = {
+      ...fetched,
+      notes,
+    };
+    const normalized = this.normalizeDiscussion(review, discussion, mr, bot);
+    if (!normalized) throw new Error("GitLab review thread not found in target review");
+    return { ...normalized.summary, events: [...normalized.events].sort((left, right) => left.orderKey.localeCompare(right.orderKey)) };
+  }
+
+  private async fetchNoteThumbsUpReactions(
+    review: ReviewIdentity,
+    noteId: string,
+  ): Promise<readonly Omit<ReviewReaction, "authorIsBot">[]> {
+    const repo = this.repositoryForReview(review);
+    const rows = await this.paginateNdjson(
+      repo,
+      `merge_requests/${review.reviewNumber}/notes/${encodeURIComponent(conversationProviderId(noteId, "note id"))}/award_emoji`,
+      100,
+      "note award emoji",
+      100,
+    );
+    return parseConversationReactions(rows);
+  }
+
+  private validateReplyInput(review: ReviewIdentity, input: GeneralReplyInput): void {
+    if (input.provider !== review.provider || input.repositoryDigest !== review.repositoryDigest || input.reviewNumber !== review.reviewNumber) {
+      throw new Error("GitLab reply input binding mismatch");
+    }
+    if (typeof input.body !== "string" || input.body.length === 0) throw new Error("GitLab reply body must not be empty");
+  }
+
+  private async writeConversationNote(
+    review: ReviewIdentity,
+    body: string,
+    suffix: string,
+    threadId?: string,
+  ): Promise<ConversationItemIdentity> {
+    const repo = this.repositoryForReview(review);
+    const bot = (await this.getAuthenticatedBotIdentity()).login;
+    let value: unknown;
+    try {
+      value = JSON.parse(await this.execGlab([
+        "api", "--method", "POST", "--hostname", repo.host,
+        projectEndpoint(repo, suffix),
+        "--input", "-",
+      ], JSON.stringify({ body })));
+    } catch (cause) {
+      throw new Error("Invalid GitLab reply write response", { cause });
+    }
+    const row = conversationRecord(value, "reply write");
+    const id = conversationProviderId(row.id, "reply id");
+    if (row.body !== body || conversationUsername(conversationRecord(row.author, "reply author").username, "reply author username") !== bot) {
+      throw new Error("GitLab reply response body/author mismatch");
+    }
+    return validateConversationItemIdentity({
+      provider: "gitlab",
+      commentId: id,
+      ...(threadId ? { threadId } : {}),
+      url: `${review.url}#note_${id}`,
+    }, { repo, reviewNumber: review.reviewNumber });
+  }
+
+  async postGeneralReply(review: ReviewIdentity, input: GeneralReplyInput): Promise<ConversationItemIdentity> {
+    this.validateReplyInput(review, input);
+    this.repositoryForReview(review);
+    return this.writeConversationNote(review, input.body, `merge_requests/${review.reviewNumber}/notes`);
+  }
+
+  async postThreadReply(review: ReviewIdentity, input: ThreadReplyInput): Promise<ConversationItemIdentity> {
+    this.validateReplyInput(review, input);
+    conversationDiscussionId(input.threadId);
+    if (!input.parentCommentId) throw new Error("GitLab thread replies require parentCommentId");
+    const parent = conversationProviderId(input.parentCommentId, "reply parent comment id");
+    let discussion: ConversationDiscussion;
+    try {
+      discussion = await this.fetchDiscussion(review, input.threadId);
+    } catch (cause) {
+      throw new Error("GitLab reply parent does not belong to addressed thread", { cause });
+    }
+    if (discussion.individualNote || !discussion.notes.some((note) => note.id === parent)) {
+      throw new Error("GitLab reply parent does not belong to addressed thread");
+    }
+    return this.writeConversationNote(
+      review,
+      input.body,
+      `merge_requests/${review.reviewNumber}/discussions/${encodeURIComponent(input.threadId)}/notes`,
+      input.threadId,
+    );
+  }
+
+  async findBotChildMarker(review: ReviewIdentity, marker: ChildMarkerLookup): Promise<ConversationItemIdentity | null> {
+    if (marker.provider !== review.provider || marker.repositoryDigest !== review.repositoryDigest || marker.reviewNumber !== review.reviewNumber) {
+      throw new Error("GitLab child marker lookup binding mismatch");
+    }
+    const repo = this.repositoryForReview(review);
+    const bot = (await this.getAuthenticatedBotIdentity()).login;
+    const matches: ConversationItemIdentity[] = [];
+    const expected = {
+      kind: marker.kind,
+      parentId: marker.parentId,
+      childId: marker.childId,
+      repositoryDigest: marker.repositoryDigest,
+      reviewNumber: marker.reviewNumber,
+      contentDigest: marker.contentDigest,
+    };
+    for (const row of await this.paginateNdjson(repo, `merge_requests/${review.reviewNumber}/discussions`, 100, "discussions")) {
+      const discussion = parseConversationDiscussion(row);
+      for (const note of discussion.notes) {
+        if (note.author !== bot) continue;
+        const candidate = note.body.split(/\r?\n/u).at(-1) ?? "";
+        if (!verifyChildMarkerBinding(candidate, expected)) continue;
+        const canonicalBody = canonicalInlineBody(note.body);
+        const suffix = `\n${candidate}`;
+        if (!canonicalBody.endsWith(suffix)) throw new Error("Authenticated GitLab child marker is not a separable terminal suffix");
+        let visibleBody = canonicalBody.slice(0, -suffix.length);
+        const inlineSuffix = `\n${INLINE_COMMENT_MARKER}`;
+        if (visibleBody.endsWith(inlineSuffix)) visibleBody = visibleBody.slice(0, -inlineSuffix.length);
+        if (computeContentDigest(visibleBody) !== marker.contentDigest) throw new Error("Authenticated GitLab child marker visible body digest mismatch");
+        matches.push(validateConversationItemIdentity({
+          provider: "gitlab",
+          commentId: note.id,
+          ...(discussion.individualNote ? {} : { threadId: discussion.id }),
+          url: `${review.url}#note_${note.id}`,
+        }, { repo, reviewNumber: review.reviewNumber }));
+        if (matches.length > 1) throw new Error("Multiple authenticated GitLab child marker matches");
+      }
+    }
+    return matches[0] ?? null;
+  }
+
+  async findPublishedMarker(locator: ReviewLocator, marker: string): Promise<ConversationItemIdentity | null> {
+    if (typeof marker !== "string" || marker.length === 0 || marker.length > 2_048) {
+      throw new Error("Invalid publication marker");
+    }
+    const { repo, iid } = resolveMergeRequestLocator(locator);
+    const parsed = parseChildMarker(marker);
+    if (parsed !== null && this.repository !== undefined) {
+      const mr = parseConversationMergeRequest(await this.execGlab([
+        "api", "--method", "GET", "--hostname", repo.host,
+        projectEndpoint(repo, `merge_requests/${iid}`),
+      ]));
+      return this.findBotChildMarker({
+        provider: "gitlab",
+        repositoryDigest: computeRepositoryDigest("gitlab", repo.canonicalUrl),
+        reviewNumber: Number(iid),
+        reviewId: mr.id,
+        url: mr.webUrl,
+      }, {
+        provider: "gitlab",
+        repositoryDigest: parsed.repositoryDigest,
+        reviewNumber: parsed.reviewNumber,
+        kind: parsed.kind,
+        parentId: parsed.parentId,
+        childId: parsed.childId,
+        contentDigest: parsed.contentDigest,
+      });
+    }
+    const username = await this.getUsername(repo);
+    const matches: ConversationItemIdentity[] = [];
+    const binding = { repo, reviewNumber: Number(iid) };
+    for (const row of await this.paginateNdjson(repo, `merge_requests/${iid}/discussions`, 100, "discussions")) {
+      const discussion = parseConversationDiscussion(row);
+      for (const note of discussion.notes) {
+        if (note.author !== username) continue;
+        const lastLine = note.body.split(/\r?\n/u).at(-1) ?? "";
+        if (lastLine !== marker && !note.body.includes(marker)) continue;
+        matches.push(validateConversationItemIdentity({
+          provider: "gitlab",
+          commentId: note.id,
+          ...(discussion.individualNote ? {} : { threadId: discussion.id }),
+          url: `${repo.canonicalUrl}/-/merge_requests/${iid}#note_${note.id}`,
+        }, binding));
+        if (matches.length > 1) throw new Error("Multiple authenticated GitLab publication marker matches");
+      }
+    }
+    return matches[0] ?? null;
   }
 }

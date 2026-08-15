@@ -5,6 +5,7 @@ import { Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
+  ConcurrentGitLabMutationError,
   decodeNdjsonRecords,
   GitLabAdapter,
   GlabCommandError,
@@ -13,8 +14,17 @@ import {
   realExecGlab,
   type ExecGlab,
 } from "../../../src/vcs/gitlab-adapter.js";
+import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 import type { InlineReviewComment } from "../../../src/vcs/adapter.js";
+import { parseRepositoryRef } from "../../../src/target/review-target.js";
+import {
+  computeContentDigest,
+  computeRepositoryDigest,
+  formatChildMarker,
+} from "../../../src/conversation/markers.js";
+import type { ReviewActivityEvent } from "../../../src/vcs/conversation-adapter.js";
+import type { ReviewIdentity } from "../../../src/conversation/types.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 
@@ -52,6 +62,12 @@ const notesFixturePath = fileURLToPath(new URL("../../fixtures/glab-notes.jsonl"
 const notesFixture = await readFile(notesFixturePath, "utf8");
 const discussionsFixturePath = fileURLToPath(new URL("../../fixtures/glab-discussions.jsonl", import.meta.url));
 const discussionsFixture = await readFile(discussionsFixturePath, "utf8");
+const openMrsFixturePath = fileURLToPath(new URL("../../fixtures/glab-open-mrs.jsonl", import.meta.url));
+const openMrsFixture = await readFile(openMrsFixturePath, "utf8");
+const activityFixturePath = fileURLToPath(new URL("../../fixtures/glab-review-activity.jsonl", import.meta.url));
+const activityFixture = await readFile(activityFixturePath, "utf8");
+const githubActivityPath = fileURLToPath(new URL("../../fixtures/gh-review-activity.json", import.meta.url));
+const githubThreadsPath = fileURLToPath(new URL("../../fixtures/gh-review-threads.json", import.meta.url));
 const writtenDiscussionFixture = (body: string) => JSON.stringify({
   id: "discussion-1",
   individual_note: false,
@@ -698,7 +714,15 @@ describe("GitLabAdapter inline discussions", () => {
         "projects/group%2Fproject/merge_requests/42/discussions", "--input", "-",
       ],
     ]);
-    expect(result).toEqual([{ clientId: "finding-0", status: "posted" }]);
+    expect(result).toMatchObject([{ clientId: "finding-0", status: "posted" }]);
+    expect(result[0]).toMatchObject({
+      identity: {
+        provider: "gitlab",
+        commentId: "701",
+        threadId: "discussion-1",
+        url: "https://gitlab.example.com:8443/group/project/-/merge_requests/42#note_701",
+      },
+    });
   });
 
   it.each([
@@ -761,7 +785,7 @@ describe("GitLabAdapter inline discussions", () => {
 
     await expect(
       new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, [added]),
-    ).resolves.toEqual([{ clientId: "finding-0", status: "posted" }]);
+    ).resolves.toMatchObject([{ clientId: "finding-0", status: "posted" }]);
     expect(JSON.parse(calls[2]!.stdin!)).toMatchObject({
       position: {
         base_sha: BASE_SHA,
@@ -862,7 +886,7 @@ describe("GitLabAdapter inline discussions", () => {
     };
     const pathHash = createHash("sha1").update("src/new-name.ts").digest("hex");
     expect(payload.body).toBe("```text\nreplacement\n```");
-    expect(outcomes).toEqual([{ clientId: "finding-range", status: "posted" }]);
+    expect(outcomes).toMatchObject([{ clientId: "finding-range", status: "posted" }]);
     expect(payload.position.line_range).toEqual({
       start: {
         line_code: `${pathHash}_${start.oldLine ?? ""}_${start.newLine}`,
@@ -926,7 +950,7 @@ describe("GitLabAdapter inline discussions", () => {
 
     const outcomes = await new GitLabAdapter(execGlab)
       .createInlineReview(locator(), HEAD_SHA, comments);
-    expect(outcomes).toEqual([
+    expect(outcomes).toMatchObject([
       { clientId: "finding-0", status: "posted" },
       { clientId: "finding-1", status: "failed", reason: expect.any(String) },
       { clientId: "finding-2", status: "posted" },
@@ -965,7 +989,7 @@ describe("GitLabAdapter inline discussions", () => {
     const outcomes = await new GitLabAdapter(execGlab)
       .createInlineReview(locator(), HEAD_SHA, comments);
     expect(posts).toBe(behavior === "continue" ? 2 : 1);
-    expect(outcomes).toEqual([
+    expect(outcomes).toMatchObject([
       { clientId: "finding-0", status: "failed", reason: expect.any(String) },
       behavior === "continue"
         ? { clientId: "finding-1", status: "posted" }
@@ -1082,7 +1106,7 @@ describe("GitLabAdapter inline discussions", () => {
 
     await expect(
       new GitLabAdapter(execGlab).createInlineReview(locator(), HEAD_SHA, [added]),
-    ).resolves.toEqual([{ clientId: added.clientId, status: "posted" }]);
+    ).resolves.toMatchObject([{ clientId: added.clientId, status: "posted" }]);
   });
 });
 
@@ -1305,5 +1329,728 @@ describe("realExecGlab", () => {
       expect(error).toMatchObject({ httpStatus: sample.status, stderr: sample.stderr });
       expect((error as Error).message).not.toContain(sample.stderr.trim());
     }
+  });
+});
+
+describe("GitLab conversation activity", () => {
+  const repo = gitlabComRepo;
+  const repositoryDigest = computeRepositoryDigest("gitlab", repo.canonicalUrl);
+  const review: ReviewIdentity = {
+    provider: "gitlab",
+    repositoryDigest,
+    reviewNumber: 42,
+    reviewId: "4200",
+    url: `${repo.canonicalUrl}/-/merge_requests/42`,
+  };
+  const HEAD_B = "b".repeat(40);
+  const HEAD_A = "a".repeat(40);
+
+  const toNdjson = (rows: readonly unknown[]): string =>
+    `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`;
+
+  const activityRecords = (): Array<Record<string, unknown>> =>
+    decodeNdjsonRecords<Record<string, unknown>>(activityFixture);
+
+  const activityNotes = (): Array<Record<string, unknown>> =>
+    activityRecords().filter((row) => typeof row.id === "number");
+
+  const activityDiscussions = (): Array<Record<string, unknown>> =>
+    activityRecords().filter((row) => typeof row.id === "string");
+
+  const conversationMr = (overrides: Record<string, unknown> = {}): string =>
+    JSON.stringify({
+      ...JSON.parse(fixture),
+      id: 4200,
+      iid: 42,
+      web_url: review.url,
+      updated_at: "2026-08-01T00:00:00Z",
+      sha: HEAD_B,
+      diff_refs: {
+        base_sha: "c".repeat(40),
+        head_sha: HEAD_B,
+        start_sha: "0".repeat(40),
+      },
+      ...overrides,
+    });
+
+  const field = (args: readonly string[], name: string): string | undefined => {
+    const index = args.findIndex((arg, i) => arg === "--field" && args[i + 1]?.startsWith(`${name}=`));
+    return index >= 0 ? args[index + 1]!.slice(name.length + 1) : undefined;
+  };
+
+  const activityExec = (
+    notes = activityNotes(),
+    discussions = activityDiscussions(),
+    mr = conversationMr(),
+  ): ExecGlab =>
+    vi.fn(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "Octo-Bot" });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/merge_requests")) {
+        return openMrsFixture;
+      }
+      if (endpoint?.match(/merge_requests\/\d+$/u)) return mr;
+      if (endpoint?.endsWith("/award_emoji")) return "";
+      const perPage = Number(field(args, "per_page") ?? "100");
+      const page = Number(field(args, "page") ?? "1");
+      if (endpoint?.includes("/notes") && !endpoint.includes("/discussions")) {
+        return toNdjson(notes.slice((page - 1) * perPage, page * perPage));
+      }
+      if (endpoint?.includes("/discussions/")) {
+        const id = decodeURIComponent(endpoint.slice(endpoint.lastIndexOf("/") + 1));
+        const match = discussions.find((row) => row.id === id);
+        return JSON.stringify(match ?? {});
+      }
+      if (endpoint?.includes("/discussions")) {
+        return toNdjson(discussions.slice((page - 1) * perPage, page * perPage));
+      }
+      throw new Error(`unexpected glab invocation: ${args.join(" ")}`);
+    });
+
+  it("evicts a failed authenticated identity lookup and normalizes the retry", async () => {
+    const execGlab = vi.fn()
+      .mockRejectedValueOnce(new Error("expired token"))
+      .mockResolvedValueOnce(JSON.stringify({ username: "Octo-Bot" }));
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.getAuthenticatedBotIdentity()).rejects.toThrow(/expired token/);
+    await expect(adapter.getAuthenticatedBotIdentity()).resolves.toEqual({
+      provider: "gitlab", login: "octo-bot", mention: "@octo-bot",
+    });
+    expect(execGlab).toHaveBeenCalledTimes(2);
+    expect(execGlab).toHaveBeenLastCalledWith(["api", "user", "--hostname", "gitlab.com"]);
+  });
+
+  it("lists a stable explicit page of open MRs and emits bound cursors", async () => {
+    const execGlab = activityExec();
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const page = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest });
+    expect(page.reviews.map((item) => item.identity.reviewId)).toEqual(["3", "12"]);
+    expect(page.nextCursor).toMatchObject({ scope: "open-review-discovery", provider: "gitlab", repositoryDigest });
+    expect(execGlab).toHaveBeenCalledWith([
+      "api", "--method", "GET", "--output", "ndjson",
+      "--hostname", "gitlab.com",
+      "projects/group%2Fsubgroup%2Fproject/merge_requests",
+      "--field", "state=all",
+      "--field", "order_by=created_at",
+      "--field", "sort=asc",
+      "--field", "per_page=100",
+      "--field", "page=1",
+    ]);
+  });
+
+  it("bounds open review discovery memory while scanning immutable provider pages", async () => {
+    const template = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture)[0]!;
+    const rows = Array.from({ length: 100 }, (_, index) => ({
+      ...template, id: index + 1, iid: index + 1,
+      web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
+    }));
+    const execGlab = vi.fn(async (args) => field(args, "page") === "1" ? toNdjson(rows) : "");
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const first = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest });
+    expect(first.reviews).toHaveLength(100);
+    expect(execGlab).toHaveBeenLastCalledWith(expect.arrayContaining(["--field", "page=2"]));
+    expect(execGlab.mock.calls.flatMap(([args]) => [...args])).not.toContain("--paginate");
+  });
+
+  it("discovers an old MR updated after the cursor and includes unseen equal-time identities", async () => {
+    const rows = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture);
+    rows[0]!.updated_at = "2026-08-13T10:00:00Z";
+    rows[1]!.updated_at = "2026-08-12T10:00:00Z";
+    const adapter = new GitLabAdapter(vi.fn().mockResolvedValue(toNdjson(rows)), repo);
+    const page = await adapter.listOpenReviews(
+      { provider: "gitlab", repositoryDigest },
+      { scope: "open-review-discovery", provider: "gitlab", repositoryDigest, opaque: JSON.stringify({ at: "2026-08-12T10:00:00Z", seen: [] }), orderKey: "2026-08-12T10:00:00Z" },
+    );
+    expect(page.reviews.map((item) => item.identity.reviewId)).toEqual(["12", "3"]);
+    expect(JSON.parse(page.nextCursor!.opaque)).toMatchObject({ at: "2026-08-13T10:00:00.000Z", seen: [], cutoff: expect.any(String) });
+  });
+
+  it("replays the same MR at the inclusive updated-time boundary even when its ID was seen", async () => {
+    const rows = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture);
+    rows[0]!.updated_at = "2026-08-12T10:00:00Z";
+    const adapter = new GitLabAdapter(vi.fn().mockResolvedValue(toNdjson([rows[0]])), repo);
+    const page = await adapter.listOpenReviews(
+      { provider: "gitlab", repositoryDigest },
+      { scope: "open-review-discovery", provider: "gitlab", repositoryDigest,
+        opaque: JSON.stringify({ at: "2026-08-12T10:00:00Z", seen: ["3"] }), orderKey: "2026-08-12T10:00:00Z" },
+    );
+    expect(page.reviews.map((item) => item.identity.reviewId)).toEqual(["3"]);
+  });
+
+  it("retries a torn open-review snapshot and filters closed rows only after verification", async () => {
+    const template = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture)[0]!;
+    const open = { ...template, id: 1, iid: 1, web_url: `${repo.canonicalUrl}/-/merge_requests/1` };
+    const closed = { ...template, id: 2, iid: 2, state: "closed", web_url: `${repo.canonicalUrl}/-/merge_requests/2` };
+    let completeScans = 0;
+    const execGlab = vi.fn(async () => {
+      completeScans += 1;
+      if (completeScans === 1) return toNdjson([open]);
+      return toNdjson([open, closed]);
+    });
+    const page = await new GitLabAdapter(execGlab, repo).listOpenReviews({ provider: "gitlab", repositoryDigest });
+    expect(page.reviews.map((entry) => entry.identity.reviewId)).toEqual(["1"]);
+    expect(execGlab).toHaveBeenCalledTimes(4);
+    expect(execGlab.mock.calls[0]![0]).toEqual(expect.arrayContaining(["--field", "state=all"]));
+  });
+
+  it("fails closed when every verified open-review snapshot pair changes", async () => {
+    const template = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture)[0]!;
+    let sequence = 0;
+    const execGlab = vi.fn(async () => {
+      sequence += 1;
+      return toNdjson([{ ...template, id: sequence, iid: sequence, web_url: `${repo.canonicalUrl}/-/merge_requests/${sequence}` }]);
+    });
+    await expect(new GitLabAdapter(execGlab, repo).listOpenReviews({ provider: "gitlab", repositoryDigest })).rejects.toBeInstanceOf(ConcurrentGitLabMutationError);
+    expect(execGlab).toHaveBeenCalledTimes(6);
+  });
+
+  it("continues 250 equal-time open reviews with a compact snapshot-bound token", async () => {
+    const template = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture)[0]!;
+    const rows = Array.from({ length: 250 }, (_, index) => ({
+      ...template, id: index + 1, iid: index + 1,
+      updated_at: "2026-08-12T10:00:00Z",
+      web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
+    }));
+    const execGlab = vi.fn(async (args) => {
+      const page = Number(field(args, "page") ?? "1");
+      return toNdjson(rows.slice((page - 1) * 100, page * 100));
+    });
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const found: string[] = [];
+    let token: import("../../../src/vcs/conversation-adapter.js").OpenReviewPageToken | undefined;
+    do {
+      const page = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest }, undefined, token);
+      found.push(...page.reviews.map((entry) => entry.identity.reviewId));
+      token = page.nextPageToken;
+      if (token) expect(Buffer.byteLength(token.opaque)).toBeLessThan(4_000);
+    } while (token);
+    expect(found).toEqual(rows.map((row) => String(row.id)));
+  });
+
+  it("rejects a continuation whose cutoff was altered without its checksum", async () => {
+    const template = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture)[0]!;
+    const rows = Array.from({ length: 101 }, (_, index) => ({
+      ...template, id: index + 1, iid: index + 1,
+      updated_at: "2026-08-12T10:00:00Z",
+      web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
+    }));
+    const execGlab = vi.fn(async (args) => toNdjson(field(args, "page") === "1" ? rows.slice(0, 100) : rows.slice(100)));
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const first = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest });
+    const token = JSON.parse(first.nextPageToken!.opaque) as Record<string, unknown>;
+    token.cutoff = `${String(token.cutoff)}-tampered`;
+    await expect(adapter.listOpenReviews({ provider: "gitlab", repositoryDigest }, undefined, { ...first.nextPageToken!, opaque: JSON.stringify(token) })).rejects.toThrow(/checksum/i);
+  });
+
+  it("records a compact terminal cutoff so a completed equal-time tie does not replay forever", async () => {
+    const template = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture)[0]!;
+    const rows = Array.from({ length: 101 }, (_, index) => ({
+      ...template, id: index + 1, iid: index + 1,
+      updated_at: "2026-08-12T10:00:00Z",
+      web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
+    }));
+    const execGlab = vi.fn(async (args) => toNdjson(field(args, "page") === "1" ? rows.slice(0, 100) : rows.slice(100)));
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const first = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest });
+    const last = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest }, undefined, first.nextPageToken);
+    expect(JSON.parse(last.nextCursor!.opaque)).toMatchObject({ at: "2026-08-12T10:00:00.000Z", cutoff: expect.any(String) });
+    await expect(adapter.listOpenReviews({ provider: "gitlab", repositoryDigest }, last.nextCursor)).resolves.toMatchObject({ reviews: [] });
+  });
+
+  it("normalizes notes and discussions in total updated-time order, including edits", async () => {
+    const execGlab = activityExec();
+    const events = await new GitLabAdapter(execGlab, repo).listReviewEvents(review);
+    expect(events.events.map((event) => [event.kind, event.commentId, event.authorIsBot])).toEqual([
+      ["thread-resolution", undefined, undefined], ["comment-edit", "7", false], ["thread-comment", "8", true],
+    ]);
+    expect(events.events[2]).toMatchObject({
+      threadId: "T1",
+      placement: { file: "src/a.ts", line: 4, side: "new", outdated: false, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B },
+    });
+    expect(events.nextCursor).toMatchObject({ scope: "review-events", reviewNumber: 42 });
+    expect(execGlab.mock.calls.filter(([args]) => args.includes("per_page=50"))).toHaveLength(2);
+    expect(execGlab.mock.calls.flatMap(([args]) => [...args])).not.toContain("--paginate");
+  });
+
+  it("keeps an unseen changed revision at the same cursor timestamp regardless of digest order", async () => {
+    const notes = activityNotes();
+    notes[0]!.body = "changed again";
+    const execGlab = activityExec(notes);
+    const cursor = {
+      scope: "review-events" as const, provider: "gitlab" as const, repositoryDigest, reviewNumber: 42,
+      opaque: JSON.stringify({ at: "2026-08-02T00:00:00Z", seen: ["deadbeef"] }), orderKey: "2026-08-02T00:00:00Z",
+    };
+    const page = await new GitLabAdapter(execGlab, repo).listReviewEvents(review, cursor);
+    expect(page.events).toHaveLength(2);
+    expect(page.events[0]!.updatedAt).toBe("2026-08-02T00:00:00.000Z");
+  });
+
+  it("never regresses an event high-water when a traversal observes only older rows", async () => {
+    const execGlab = activityExec();
+    const boundary = { at: "2027-01-01T00:00:00.000Z", seen: [] as string[] };
+    const cursor = { scope: "review-events" as const, provider: "gitlab" as const, repositoryDigest, reviewNumber: 42, opaque: JSON.stringify(boundary), orderKey: boundary.at };
+    let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
+    let last = cursor;
+    do {
+      const page = await new GitLabAdapter(execGlab, repo).listReviewEvents(review, cursor, token);
+      expect(page.events).toHaveLength(0);
+      expect(page.nextCursor.orderKey).toBe(boundary.at);
+      last = page.nextCursor;
+      token = page.nextPageToken;
+    } while (token);
+    expect(JSON.parse(last.opaque)).toEqual(boundary);
+  });
+
+  it("emits resolved and reopened thread snapshot revisions without a new comment", async () => {
+    const discussions = activityDiscussions();
+    let mrUpdated = "2026-08-03T00:00:00Z";
+    const execGlab = vi.fn(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr({ updated_at: mrUpdated });
+      if (endpoint?.includes("/notes") && !endpoint.includes("/discussions")) return toNdjson(activityNotes());
+      if (endpoint?.includes("/discussions")) return toNdjson(discussions);
+      throw new Error(`unexpected glab invocation: ${args.join(" ")}`);
+    });
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const first = await adapter.listReviewEvents(review);
+    const firstNote = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    firstNote.resolved = true;
+    mrUpdated = "2026-08-04T00:00:00Z";
+    const resolved = await adapter.listReviewEvents(review, first.nextCursor);
+    expect(resolved.events).toMatchObject([{ kind: "thread-resolution", threadId: "T1", resolved: true, updatedAt: "2026-08-04T00:00:00.000Z" }]);
+    firstNote.resolved = false;
+    mrUpdated = "2026-08-05T00:00:00Z";
+    const reopened = await adapter.listReviewEvents(review, resolved.nextCursor);
+    expect(reopened.events).toMatchObject([{ kind: "thread-resolution", threadId: "T1", resolved: false, updatedAt: "2026-08-05T00:00:00.000Z" }]);
+  });
+
+  it("pages an interleaved notes-and-discussions activity traversal with bounded exact continuation state", async () => {
+    const at = (index: number) => new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString();
+    const noteRows = Array.from({ length: 120 }, (_, index) => ({
+      id: 1000 + index, body: `note-${index}`, author: { username: "alice" },
+      created_at: at(index), updated_at: at(index), type: null, system: false,
+    }));
+    const discussions = Array.from({ length: 120 }, (_, index) => ({
+      id: `T${index}`, individual_note: false,
+      notes: [{
+        id: 2000 + index, body: `inline-${index}`, author: { username: "bob" },
+        created_at: at(index), updated_at: at(index), type: "DiffNote", system: false,
+        resolvable: true, resolved: index % 2 === 0,
+        position: {
+          position_type: "text", new_path: `src/${index}.ts`, old_path: `src/${index}.ts`,
+          new_line: 1, old_line: 1, head_sha: HEAD_A,
+        },
+      }],
+    }));
+    const execGlab = vi.fn(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr({ updated_at: "2026-09-01T00:00:00Z" });
+      const page = Number(field(args, "page") ?? "1");
+      if (endpoint?.includes("/notes") && !endpoint.includes("/discussions")) {
+        return toNdjson(noteRows.slice((page - 1) * 50, page * 50));
+      }
+      return toNdjson(discussions.slice((page - 1) * 100, page * 100));
+    });
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const found = new Set<string>();
+    let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
+    do {
+      const page = await adapter.listReviewEvents(review, undefined, token);
+      expect(page.events.length).toBeLessThanOrEqual(100);
+      for (const event of page.events) {
+        const key = `${event.eventId}:${event.revisionId}`;
+        expect(found.has(key)).toBe(false);
+        found.add(key);
+      }
+      token = page.nextPageToken;
+    } while (token);
+    expect(found.size).toBe(360);
+    expect(execGlab.mock.calls.flatMap(([args]) => [...args])).not.toContain("--paginate");
+  });
+
+  it("continues 300 equal-time activity revisions and terminally advances without starvation", async () => {
+    const at = "2026-08-12T10:00:00Z";
+    const rows = Array.from({ length: 300 }, (_, index) => ({
+      id: index + 1, body: `note-${index}`, author: { username: "alice" },
+      created_at: at, updated_at: at, type: null, system: false,
+    }));
+    const execGlab = vi.fn(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr({ updated_at: at });
+      if (endpoint?.includes("/discussions")) return "";
+      const page = Number(field(args, "page") ?? "1");
+      return toNdjson(rows.slice((page - 1) * 50, page * 50));
+    });
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const found: string[] = [];
+    let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
+    let terminal: import("../../../src/vcs/conversation-adapter.js").ReviewEventCursor | undefined;
+    do {
+      const page = await adapter.listReviewEvents(review, undefined, token);
+      found.push(...page.events.map((event) => `${event.eventId}:${event.revisionId}`));
+      token = page.nextPageToken;
+      terminal = page.nextCursor;
+      if (token) expect(Buffer.byteLength(token.opaque)).toBeLessThan(4_000);
+    } while (token);
+    expect(found).toHaveLength(300);
+    expect(new Set(found)).toHaveLength(300);
+    await expect(adapter.listReviewEvents(review, terminal)).resolves.toMatchObject({ events: [] });
+  });
+
+  it("resolves the merge request database id as reviewId", async () => {
+    const execGlab = vi.fn().mockResolvedValue(conversationMr());
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.resolveReviewIdentity(repo, 42)).resolves.toEqual({
+      provider: "gitlab",
+      repositoryDigest,
+      reviewNumber: 42,
+      reviewId: "4200",
+      url: review.url,
+    });
+    expect("4200").not.toBe("42");
+    expect(repositoryDigest).toBe(computeRepositoryDigest("gitlab", repo.canonicalUrl));
+  });
+
+  it("pages discussion thread summaries and can fetch a complete addressed thread", async () => {
+    const execGlab = activityExec();
+    const adapter = new GitLabAdapter(execGlab, repo);
+    const page = await adapter.listReviewThreads(review);
+    expect(page.threads[0]).toMatchObject({
+      threadId: "T1", rootCommentId: "8", outdated: false, resolved: false,
+      placement: { file: "src/a.ts", line: 4, side: "new", outdated: false, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B },
+    });
+    const snapshot = await adapter.getReviewThread(review, "T1");
+    expect(snapshot.events).toHaveLength(1);
+    expect(snapshot.events[0]).toMatchObject({ kind: "thread-comment", threadId: "T1", commentId: "8" });
+  });
+
+  it("normalizes human thumbs-up award emoji on discussion notes", async () => {
+    const fallback = activityExec();
+    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/merge_requests/42/notes/8/award_emoji")) {
+        return toNdjson([{
+          id: 77,
+          name: "thumbsup",
+          user: { username: "alice" },
+          created_at: "2026-08-01T00:01:00Z",
+        }]);
+      }
+      return fallback(args, stdin);
+    });
+    const snapshot = await new GitLabAdapter(execGlab, repo)
+      .getReviewThread(review, "T1");
+
+    expect(snapshot.events[0]?.reactions).toEqual([{
+      id: "77",
+      content: "thumbs-up",
+      authorLogin: "alice",
+      authorIsBot: false,
+      createdAt: "2026-08-01T00:01:00.000Z",
+    }]);
+    expect(execGlab.mock.calls.some(([args]) =>
+      (args as string[]).some((arg) => arg.endsWith("/merge_requests/42/notes/8/award_emoji"))))
+      .toBe(true);
+  });
+
+  it("retains a bounded reaction subset when a discussion note has more than 100 thumbs-up awards", async () => {
+    const fallback = activityExec();
+    const awards = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      name: "thumbsup",
+      user: { username: `user-${index}` },
+      created_at: new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString(),
+    }));
+    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/merge_requests/42/notes/8/award_emoji")) {
+        const page = Number(field(args, "page") ?? "1");
+        return toNdjson(awards.slice((page - 1) * 100, page * 100));
+      }
+      return fallback(args, stdin);
+    });
+
+    const snapshot = await new GitLabAdapter(execGlab, repo).getReviewThread(review, "T1");
+
+    expect(snapshot.events[0]?.reactions).toHaveLength(100);
+    expect(snapshot.events[0]?.reactions?.[0]?.id).toBe("1");
+    expect(execGlab.mock.calls.filter(([args]) =>
+      (args as string[]).some((arg) => arg.endsWith("/merge_requests/42/notes/8/award_emoji"))))
+      .toHaveLength(1);
+  });
+
+  it("bounds concurrent reaction requests for bot-authored discussion notes", async () => {
+    const discussions = JSON.parse(JSON.stringify(activityDiscussions())) as Array<Record<string, unknown>>;
+    const discussion = discussions[0]!;
+    const template = (discussion.notes as Array<Record<string, unknown>>)[0]!;
+    discussion.notes = Array.from({ length: 9 }, (_, index) => ({ ...template, id: 800 + index }));
+    const fallback = activityExec(activityNotes(), discussions);
+    let active = 0;
+    let peak = 0;
+    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/award_emoji")) {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        active -= 1;
+        return "";
+      }
+      return fallback(args, stdin);
+    });
+
+    await new GitLabAdapter(execGlab, repo).getReviewThread(review, "T1");
+
+    expect(peak).toBeLessThanOrEqual(4);
+  });
+
+  it("keeps a still-applicable thread current when only the review head moved", async () => {
+    const execGlab = activityExec();
+    const page = await new GitLabAdapter(execGlab, repo).listReviewThreads(review);
+    expect(page.threads[0]!.outdated).toBe(false);
+    expect(page.threads[0]!.placement).toMatchObject({
+      file: "src/a.ts", line: 4, side: "new", outdated: false, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B,
+    });
+    expect(HEAD_A).not.toBe(HEAD_B);
+  });
+
+  it("honors an explicit GitLab outdated flag independently of head SHAs", async () => {
+    const discussions = activityDiscussions();
+    const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    note.outdated = true;
+    const execGlab = activityExec(activityNotes(), discussions);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).resolves.toMatchObject({
+      threads: [{ outdated: true, placement: { outdated: true, originalHeadSha: HEAD_A, currentHeadSha: HEAD_B } }],
+    });
+  });
+
+  it("fails closed when a discussion position new_path contains a control character", async () => {
+    const discussions = activityDiscussions();
+    const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    const position = { ...(note.position as Record<string, unknown>), new_path: "src/a.ts\u0000evil" };
+    note.position = position;
+    const execGlab = activityExec(activityNotes(), discussions);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).rejects.toBeInstanceOf(GlabOutputError);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).rejects.toThrow(/note path/i);
+  });
+
+  it.each([
+    ["missing original head", (position: Record<string, unknown>) => { delete position.head_sha; }, /originalHeadSha/i],
+    ["heads equal to the current MR SHA", (position: Record<string, unknown>) => { position.head_sha = HEAD_B; }, /heads must differ/i],
+  ])("fails closed when a provider-outdated placement has %s", async (_name, mutate, expected) => {
+    const discussions = activityDiscussions();
+    const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    note.outdated = true;
+    const position = { ...(note.position as Record<string, unknown>) };
+    mutate(position);
+    note.position = position;
+    const execGlab = activityExec(activityNotes(), discussions);
+    await expect(new GitLabAdapter(execGlab, repo).listReviewThreads(review)).rejects.toThrow(expected);
+  });
+
+  it("rejects a non-decimal GitLab thread page token", async () => {
+    const adapter = new GitLabAdapter(activityExec(), repo);
+    const token = {
+      scope: "review-thread-page" as const,
+      provider: "gitlab" as const,
+      repositoryDigest,
+      reviewNumber: 42,
+      opaque: "01",
+    };
+    await expect(adapter.listReviewThreads(review, token)).rejects.toThrow(/page token/i);
+  });
+
+  it("normalizes a nullable FILE discussion without a line", async () => {
+    const discussions = activityDiscussions();
+    const note = (discussions[0]!.notes as Array<Record<string, unknown>>)[0]!;
+    note.position = {
+      position_type: "file", new_path: "src/a.ts", old_path: "src/a.ts",
+      new_line: null, old_line: null, head_sha: HEAD_A,
+    };
+    const execGlab = activityExec(activityNotes(), discussions);
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.listReviewThreads(review)).resolves.toMatchObject({
+      threads: [{ placement: { file: "src/a.ts", side: "new", outdated: false } }],
+    });
+    expect((await adapter.getReviewThread(review, "T1")).placement).not.toHaveProperty("line");
+  });
+
+  it("posts replies with stdin JSON and validates the returned binding", async () => {
+    const execGlab = vi.fn(async (args, stdin) => {
+      if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (args.includes("POST")) {
+        const body = JSON.parse(stdin ?? "{}") as { body?: string };
+        const threadReply = endpoint?.includes("/discussions/");
+        return JSON.stringify({
+          id: threadReply ? 10 : 9,
+          body: body.body,
+          author: { username: "octo-bot" },
+        });
+      }
+      if (endpoint?.includes("/discussions/")) return JSON.stringify(activityDiscussions()[0]);
+      if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr();
+      throw new Error(`unexpected glab invocation: ${args.join(" ")}`);
+    });
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.postGeneralReply(review, { provider: "gitlab", repositoryDigest, reviewNumber: 42, body: "hello" })).resolves.toMatchObject({
+      commentId: "9",
+      url: `${review.url}#note_9`,
+    });
+    await expect(adapter.postThreadReply(review, { provider: "gitlab", repositoryDigest, reviewNumber: 42, threadId: "T1", parentCommentId: "8", body: "reply" })).resolves.toMatchObject({
+      commentId: "10",
+      threadId: "T1",
+      url: `${review.url}#note_10`,
+    });
+    expect(execGlab).toHaveBeenCalledWith([
+      "api", "--method", "POST", "--hostname", "gitlab.com",
+      "projects/group%2Fsubgroup%2Fproject/merge_requests/42/notes", "--input", "-",
+    ], JSON.stringify({ body: "hello" }));
+    expect(execGlab).toHaveBeenCalledWith([
+      "api", "--method", "POST", "--hostname", "gitlab.com",
+      "projects/group%2Fsubgroup%2Fproject/merge_requests/42/discussions/T1/notes", "--input", "-",
+    ], JSON.stringify({ body: "reply" }));
+  });
+
+  it("rejects a thread reply when the parent is outside the addressed discussion", async () => {
+    const execGlab = activityExec();
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.postThreadReply(review, { provider: "gitlab", repositoryDigest, reviewNumber: 42, threadId: "T1", parentCommentId: "999", body: "reply" })).rejects.toThrow(/parent.*thread/i);
+    expect(execGlab.mock.calls.some(([args]) => args.includes("POST"))).toBe(false);
+  });
+
+  it("posts a reply addressed to a nested comment through the discussion endpoint", async () => {
+    const discussion = structuredClone(activityDiscussions()[0]!) as {
+      notes: Array<Record<string, unknown>>;
+    };
+    discussion.notes.push({
+      id: 9, body: "nested", author: { username: "alice" },
+      created_at: "2026-08-01T00:00:01Z", updated_at: "2026-08-01T00:00:01Z",
+      type: "DiffNote", system: false, resolvable: true, resolved: false,
+    });
+    const execGlab = vi.fn(async (args, stdin) => {
+      if (args.includes("POST")) {
+        return JSON.stringify({ id: 10, body: JSON.parse(stdin!).body, author: { username: "octo-bot" } });
+      }
+      if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.includes("/discussions/")) return JSON.stringify(discussion);
+      if (endpoint?.includes("/discussions")) return toNdjson([discussion]);
+      if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr();
+      return "";
+    });
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.postThreadReply(review, { provider: "gitlab", repositoryDigest, reviewNumber: 42, threadId: "T1", parentCommentId: "9", body: "reply" })).resolves.toMatchObject({ commentId: "10", threadId: "T1" });
+    expect(execGlab).toHaveBeenCalledWith([
+      "api", "--method", "POST", "--hostname", "gitlab.com",
+      "projects/group%2Fsubgroup%2Fproject/merge_requests/42/discussions/T1/notes", "--input", "-",
+    ], JSON.stringify({ body: "reply" }));
+  });
+
+  it("ignores spoofed markers and rejects multiple authenticated matches", async () => {
+    const visibleBody = "trusted finding";
+    const contentDigest = computeContentDigest(visibleBody);
+    const marker = formatChildMarker({
+      kind: "finding", parentId: `act_${"a".repeat(32)}`, childId: `finding_${"b".repeat(32)}`,
+      repositoryDigest, reviewNumber: 42, contentDigest,
+    });
+    const discussions = [
+      { id: "N1", individual_note: true, notes: [{ id: 1, body: `${visibleBody}\n${marker}`, author: { username: "mallory" }, created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z", type: null, system: false, resolved: false }] },
+      { id: "N2", individual_note: true, notes: [{ id: 2, body: `${visibleBody}\n${marker}`, author: { username: "octo-bot" }, created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z", type: null, system: false, resolved: false }] },
+      { id: "N3", individual_note: true, notes: [{ id: 3, body: `${visibleBody}\n${marker}`, author: { username: "octo-bot" }, created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z", type: null, system: false, resolved: false }] },
+    ];
+    const execGlab = activityExec([], discussions);
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.findBotChildMarker(review, {
+      provider: "gitlab", repositoryDigest, reviewNumber: 42, kind: "finding",
+      parentId: `act_${"a".repeat(32)}`, childId: `finding_${"b".repeat(32)}`, contentDigest,
+    })).rejects.toThrow(/multiple.*marker/i);
+  });
+
+  it("rejects an authenticated child marker copied onto edited visible content", async () => {
+    const contentDigest = computeContentDigest("trusted");
+    const expected = {
+      provider: "gitlab" as const, repositoryDigest, reviewNumber: 42, kind: "finding" as const,
+      parentId: `act_${"a".repeat(32)}`, childId: `finding_${"b".repeat(32)}`, contentDigest,
+    };
+    const marker = formatChildMarker(expected);
+    const discussions = [{
+      id: "N2", individual_note: true,
+      notes: [{ id: 2, body: `edited\n${marker}`, author: { username: "octo-bot" }, created_at: "2026-08-01T00:00:00Z", updated_at: "2026-08-01T00:00:00Z", type: null, system: false, resolved: false }],
+    }];
+    await expect(new GitLabAdapter(activityExec([], discussions), repo).findBotChildMarker(review, expected)).rejects.toThrow(/body digest/i);
+  });
+
+  it("findPublishedMarker recovers a child marker through findBotChildMarker", async () => {
+    const visibleBody = "trusted finding";
+    const contentDigest = computeContentDigest(visibleBody);
+    const marker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"a".repeat(32)}`,
+      childId: `finding_${"b".repeat(32)}`,
+      repositoryDigest,
+      reviewNumber: 42,
+      contentDigest,
+    });
+    const discussions = [{
+      id: "N2",
+      individual_note: true,
+      notes: [{
+        id: 2,
+        body: `${visibleBody}\n${marker}`,
+        author: { username: "octo-bot" },
+        created_at: "2026-08-01T00:00:00Z",
+        updated_at: "2026-08-01T00:00:00Z",
+        type: null,
+        system: false,
+        resolved: false,
+      }],
+    }];
+    await expect(new GitLabAdapter(activityExec([], discussions), repo).findPublishedMarker({
+      kind: "repository",
+      repo,
+      number: 42,
+    }, marker)).resolves.toMatchObject({ commentId: "2" });
+  });
+
+  it("normalizes equivalent GitHub and GitLab fixtures into core records that differ only by provider identity", async () => {
+    const githubRepo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const githubDigest = computeRepositoryDigest("github", githubRepo.canonicalUrl);
+    const githubReview: ReviewIdentity = {
+      provider: "github", repositoryDigest: githubDigest, reviewNumber: 42,
+      reviewId: "PR_kwDO42", url: "https://github.com/octo-org/octo-repo/pull/42",
+    };
+    const githubActivity = JSON.parse(await readFile(githubActivityPath, "utf8")) as { issueComments: unknown[]; reviewComments: unknown[] };
+    const githubExec = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") return await readFile(githubThreadsPath, "utf8");
+      return JSON.stringify(args.some((arg) => arg.includes("issues/42/comments")) ? githubActivity.issueComments : githubActivity.reviewComments);
+    });
+    const githubPage = await new GitHubAdapter(githubExec, githubRepo).listReviewEvents(githubReview);
+    const gitlabPage = await new GitLabAdapter(activityExec(), repo).listReviewEvents(review);
+    const core = (event: ReviewActivityEvent) => ({
+      kind: event.kind,
+      createdAt: event.createdAt,
+      updatedAt: event.updatedAt,
+      body: event.body,
+      authorIsBot: event.authorIsBot,
+      resolved: event.resolved,
+      outdated: event.outdated,
+      placement: event.placement === undefined ? undefined : {
+        file: event.placement.file,
+        line: event.placement.line,
+        side: event.placement.side,
+        originalHeadSha: event.placement.originalHeadSha,
+        currentHeadSha: event.placement.currentHeadSha,
+        outdated: event.placement.outdated,
+      },
+    });
+    expect(gitlabPage.events.map(core)).toEqual(githubPage.events.map(core));
+    expect(new Set(gitlabPage.events.map((event) => event.provider))).toEqual(new Set(["gitlab"]));
+    expect(new Set(githubPage.events.map((event) => event.provider))).toEqual(new Set(["github"]));
+    expect(gitlabPage.events.map((event) => event.url)).not.toEqual(githubPage.events.map((event) => event.url));
   });
 });

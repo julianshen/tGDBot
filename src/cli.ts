@@ -1,94 +1,85 @@
 #!/usr/bin/env node
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { parseArgs as nodeParseArgs } from "node:util";
+import { parseCommandArgs } from "./cli-args.js";
+import type { PollArgs, ReviewArgs } from "./cli-args.js";
 import { resolveConfig as resolveConfigReal } from "./config.js";
 import type { ResolvedConfig } from "./config.js";
-import { computeReviewConfigHash, decideDedup, formatMarker } from "./review/dedup.js";
+import {
+  clarificationLifecycleState,
+  createPreparedClarification,
+  selectClarification,
+} from "./conversation/clarification.js";
+import {
+  childIsTerminal,
+  clarificationQuestionWriter,
+  loadPublicationAction,
+  publishClarificationQuestion,
+  reviewPublicationIdentity,
+  type PublicationExecutorHooks,
+} from "./conversation/publication-manifest.js";
+import {
+  persistPreparedFindings,
+  prepareReviewFindingPublication,
+  publishFocusedReview,
+  publishReviewFromManifest,
+  type ReviewPublicationContext,
+} from "./review/review-publication.js";
+import type { ClarificationPresentation } from "./review/comment-format.js";
+import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
+import { computeRepositoryDigest } from "./conversation/markers.js";
+import { redactedMessage } from "./conversation/redact.js";
+import {
+  buildConversationContext,
+  MAX_REVIEW_CONTEXT_PAGES,
+  rethrowIfIntegrityFailure,
+} from "./conversation/context.js";
+import type { ReviewIdentity } from "./conversation/types.js";
+import type { ConversationAdapter, ReviewThreadSnapshot } from "./vcs/conversation-adapter.js";
+import { canonicalStateRepositoryIdentity, selectConversationStateRoot } from "./conversation/state-paths.js";
+import {
+  createConversationStateStore,
+  type ConversationStateStore,
+} from "./conversation/state-store.js";
+import { poll, type PollDependencies } from "./poll/poll.js";
+import {
+  computeReviewConfigHash,
+  conversationDedupFingerprint,
+  decideDedup,
+  formatMarker,
+  stateRootDomainIdentifier,
+} from "./review/dedup.js";
+import { changedFiles, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
 import {
   formatPendingMarker,
   replacePendingMarker,
 } from "./review/comment-marker.js";
-import type { TerminalReviewResult } from "./review/comment-marker.js";
+import type { InlineRecoveryState } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
+import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
+import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
+import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
+import type { RepositoryRef } from "./target/types.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
-import { validateInlinePublishOutcomes } from "./vcs/adapter.js";
-import { parseReviewTarget } from "./target/review-target.js";
+
+
+export type { CommandArgs, PollArgs, ReviewArgs, SharedReviewOptions } from "./cli-args.js";
+export { parseCommandArgs } from "./cli-args.js";
 
 /**
  * Parsed configuration for the `review` command, per SPEC.md's API Contract.
  */
-export interface CliArgs {
-  pr: string;
-  vcs: "github" | "gitlab";
-  /** Internal parse provenance used to distinguish the default from an explicit --vcs. */
-  vcsExplicit?: boolean;
-  repo?: string;
-  /**
-   * "<provider>/<model>" — the DEFAULT model (design-review #6). Runs the
-   * ORCHESTRATING session and every rule that doesn't pin its own
-   * provider/model. Optional. Resolution order for each consumer is --model ->
-   * pi's settings default -> (orchestrator only: each pinned rule's model) ->
-   * pi's auth-aware default, and every candidate must have configured
-   * credentials on this machine (see resolveOrchestratorModel /
-   * resolveEffectiveRules).
-   */
-  model?: string;
-  rulesDir: string;
-  disableBuiltinRule: boolean;
-  advisor: "on" | "off";
-  /**
-   * ADR-007: whether to render committable ```suggestion blocks (one-click
-   * "Commit suggestion"). Default on. `off` downgrades them to plain,
-   * non-committable code blocks — for repos that do not want a one-click commit
-   * path from text an automated reviewer derived from an untrusted diff.
-   */
-  suggestions: "on" | "off";
-  dryRun: boolean;
-  trustLocalRules: boolean;
-  /**
-   * Design-review P0: which dispatch engine runs the rules.
-   *  - "direct" (default): one AgentSession per rule via the pi SDK's public
-   *    API, merged deterministically in TypeScript — no orchestrating LLM on
-   *    the data path. See src/review/direct-dispatch.ts.
-   *  - "legacy": the previous LLM-orchestrated pi-subagents fan-out
-   *    (src/review/dispatch.ts). Kept for one release as the escape hatch
-   *    while the direct engine gets live mileage.
-   */
-  dispatch: "direct" | "legacy";
-  /**
-   * Design-review item #13: a HARD cost ceiling on diff size. The dispatch
-   * prompt embeds the diff once per rule (O(rules × diff) tokens — see
-   * dispatch.ts's warnIfDiffCostRisk, which only WARNS). When set and the
-   * diff exceeds it, the run skips with a visible notice (exit 0, nothing
-   * posted) instead of silently spending. Absent = unlimited (the
-   * pre-existing behavior). Deliberately NOT part of the dedup config hash:
-   * a size-skip writes no marker, so a later run with a higher ceiling is
-   * never wrongly deduped, and for runs under the ceiling the output is
-   * ceiling-independent.
-   */
-  maxDiffChars?: number;
-}
-
-const DEFAULTS = {
-  vcs: "github" as const,
-  rulesDir: ".review/rules",
-  disableBuiltinRule: false,
-  advisor: "on" as const,
-  suggestions: "on" as const,
-  dryRun: false,
-  trustLocalRules: false,
-  dispatch: "direct" as const,
-};
+export type CliArgs = Omit<ReviewArgs, "command">;
 
 /**
  * Parses CLI argv into a CliArgs object for the `review` command.
@@ -121,115 +112,15 @@ const DEFAULTS = {
  * enforces the trust boundary in the first place.
  */
 export function parseArgs(argv: string[]): CliArgs {
-  const { values } = nodeParseArgs({
-    args: argv,
-    // Allow (and ignore) the leading positional `review` command token.
-    allowPositionals: true,
-    options: {
-      pr: { type: "string" },
-      repo: { type: "string" },
-      vcs: { type: "string" },
-      "rules-dir": { type: "string" },
-      "disable-builtin-rule": { type: "boolean" },
-      advisor: { type: "string" },
-      suggestions: { type: "string" },
-      model: { type: "string" },
-      "dry-run": { type: "boolean" },
-      "trust-local-rules": { type: "boolean" },
-      "max-diff-chars": { type: "string" },
-      dispatch: { type: "string" },
-    },
-  });
-
-  if (!values.pr) {
-    throw new Error(
-      "Missing required argument: --pr <number> (usage: tgd-review-agent review --pr <number>)",
-    );
+  const parsed = parseCommandArgs(argv[0] === "review" ? argv : ["review", ...argv]);
+  if (parsed.command !== "review") {
+    throw new Error("parseArgs only supports the review command");
   }
-
-  // Defense-in-depth (DEBT.md security item, Low): --pr is interpolated
-  // into `gh api repos/{owner}/{repo}/issues/${id}/comments`-style paths in
-  // github-adapter.ts. Not currently exploitable — execFile is invoked with
-  // array args (no shell), and in practice callers pass a genuine integer PR
-  // number — but a plain positive-integer check costs nothing and closes off
-  // any future path/query-string interpolation from accepting non-numeric
-  // input.
-  if (!/^\d+$/.test(values.pr as string)) {
-    try {
-      parseReviewTarget(values.pr as string);
-    } catch {
-      throw new Error(
-        `Invalid --pr value: "${values.pr as string}" (expected a positive integer or complete GitHub/GitLab review URL)`,
-      );
-    }
-  }
-
-  const vcs = (values.vcs as string | undefined) ?? DEFAULTS.vcs;
-  if (vcs !== "github" && vcs !== "gitlab") {
-    throw new Error(`Invalid --vcs value: "${vcs}" (expected "github" or "gitlab")`);
-  }
-
-  const advisor = (values.advisor as string | undefined) ?? DEFAULTS.advisor;
-  if (advisor !== "on" && advisor !== "off") {
-    throw new Error(`Invalid --advisor value: "${advisor}" (expected "on" or "off")`);
-  }
-
-  const suggestions = (values.suggestions as string | undefined) ?? DEFAULTS.suggestions;
-  if (suggestions !== "on" && suggestions !== "off") {
-    throw new Error(`Invalid --suggestions value: "${suggestions}" (expected "on" or "off")`);
-  }
-
-  const dispatch = (values.dispatch as string | undefined) ?? DEFAULTS.dispatch;
-  if (dispatch !== "direct" && dispatch !== "legacy") {
-    throw new Error(`Invalid --dispatch value: "${dispatch}" (expected "direct" or "legacy")`);
-  }
-
-  // Issue #1 (round 2), review fix: validate --model HERE, like --vcs/--advisor.
-  // `??` is nullish-only, so an EMPTY string would otherwise sail past the
-  // rule-derived default and land back on pi's ambient default — silently
-  // restoring the exact coupling this flag exists to remove (realistic trigger:
-  // a workflow passing `--model "${{ inputs.model }}"` with the input unset).
-  const model = values.model as string | undefined;
-  if (model !== undefined) {
-    const slash = model.indexOf("/");
-    if (slash <= 0 || slash === model.length - 1) {
-      throw new Error(
-        `Invalid --model value: "${model}" (expected "<provider>/<model>", e.g. "openai-codex/gpt-5.6-terra")`,
-      );
-    }
-  }
-
-  // Same validation posture as --pr: `parseArgs` is the one place bad input
-  // dies with a naming, actionable message instead of surfacing later as NaN
-  // comparisons. Zero is rejected too — a ceiling every diff exceeds is
-  // certainly a mistyped value, not a real configuration.
-  const maxDiffCharsRaw = values["max-diff-chars"] as string | undefined;
-  let maxDiffChars: number | undefined;
-  if (maxDiffCharsRaw !== undefined) {
-    if (!/^\d+$/.test(maxDiffCharsRaw) || Number(maxDiffCharsRaw) === 0) {
-      throw new Error(
-        `Invalid --max-diff-chars value: "${maxDiffCharsRaw}" (expected a positive integer, e.g. --max-diff-chars 500000)`,
-      );
-    }
-    maxDiffChars = Number(maxDiffCharsRaw);
-  }
-
-  const result: CliArgs = {
-    pr: values.pr as string,
-    repo: values.repo as string | undefined,
-    vcs,
-    model,
-    maxDiffChars,
-    dispatch,
-    rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
-    disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
-    advisor,
-    suggestions,
-    dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
-    trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,
-  };
+  const { command, stateDir, ...reviewArgs } = parsed;
+  void command;
+  const result: CliArgs = stateDir === undefined ? reviewArgs : { ...reviewArgs, stateDir };
   Object.defineProperty(result, "vcsExplicit", {
-    value: values.vcs !== undefined,
+    value: parsed.vcsExplicit,
     enumerable: false,
   });
   return result;
@@ -242,15 +133,395 @@ export function parseArgs(argv: string[]): CliArgs {
  * never has to shell out to `gh`, hit the network, or construct a real pi
  * SDK session.
  */
+/**
+ * Why this run is happening, rather than a bare `force` boolean. Only an
+ * explicit command may overrule dedup, and a focused run needs to carry its
+ * direction and the action that requested it, so the reason has to be a value
+ * the review flow can branch on — not a flag whose meaning is lost at the call
+ * site.
+ */
+export type ReviewInvocation =
+  | { readonly kind: "normal" }
+  | { readonly kind: "forced-command"; readonly actionId: string }
+  | {
+      readonly kind: "focused-command";
+      readonly actionId: string;
+      readonly direction: string;
+      /** Thread the command was posted in, so the reply lands beneath it. */
+      readonly threadId?: string;
+    };
+
 export interface ReviewDependencies {
+  invocation: ReviewInvocation;
   resolveConfig: (args: CliArgs) => ResolvedConfig;
   loadRules: (rulesDir: string, includeBuiltin: boolean) => Promise<LoadResult>;
   dispatchRules: (input: ReviewDispatchInput) => Promise<DispatchResult>;
   orchestrate: (
     dispatchResult: DispatchResult,
     diff?: string,
-    options?: { inline?: boolean; suggestions?: boolean; relatedWork?: readonly RelatedWorkItem[] },
+    options?: {
+      inline?: boolean;
+      suggestions?: boolean;
+      relatedWork?: readonly RelatedWorkItem[];
+      contextUnavailable?: readonly string[];
+      reviewBinding?: { repositoryDigest: string; reviewNumber: number; headSha: string };
+      clarification?: ClarificationPresentation;
+      deferredClarificationCount?: number;
+      excludeClarificationIds?: readonly string[];
+    },
   ) => OrchestrationResult;
+  createStateStore?: typeof createConversationStateStore;
+  publicationHooks?: PublicationExecutorHooks;
+  now?: () => string;
+}
+
+function resolveRepositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): RepositoryRef {
+  if (config.locator.kind === "repository") return config.locator.repo;
+  if (typeof config.repo === "string" && config.repo.length > 0) {
+    return parseRepositoryRef(config.repo, config.vcs);
+  }
+  if (typeof pr.url === "string" && pr.url.length > 0) {
+    try {
+      return parseReviewTarget(pr.url).repo;
+    } catch (error) {
+      throw new Error("Cannot resolve a canonical repository identity for this review", { cause: error });
+    }
+  }
+  throw new Error("Cannot resolve a canonical repository identity for this review");
+}
+
+function repositoryForReview(config: ResolvedConfig, pr: PullRequestInfo): RepositoryRef {
+  return canonicalStateRepositoryIdentity(resolveRepositoryForReview(config, pr));
+}
+
+function storeBindingOf(store: ConversationStateStore | undefined, repository: RepositoryRef) {
+  if (store !== undefined) return store.repositoryBinding;
+  return {
+    provider: repository.provider,
+    repositoryDigest: repositoryDigestOf(repository),
+  };
+}
+
+function reviewUrlFor(repository: RepositoryRef, reviewNumber: number): string {
+  return `${repository.canonicalUrl}${repository.provider === "gitlab" ? "/-/merge_requests/" : "/pull/"}${reviewNumber}`;
+}
+
+function canonicalizeReviewIdentity(repository: RepositoryRef, identity: ReviewIdentity): ReviewIdentity {
+  return {
+    provider: repository.provider,
+    repositoryDigest: computeRepositoryDigest(repository.provider, repository.canonicalUrl),
+    reviewNumber: identity.reviewNumber,
+    reviewId: identity.reviewId,
+    url: reviewUrlFor(repository, identity.reviewNumber),
+  };
+}
+
+function repositoryDigestOf(repository: RepositoryRef): string {
+  return createHash("sha256").update(repository.canonicalUrl, "utf8").digest("hex");
+}
+
+function reviewIdentityFor(repository: RepositoryRef, pr: PullRequestInfo): ReviewIdentity {
+  const provider = repository.provider;
+  return {
+    provider,
+    repositoryDigest: computeRepositoryDigest(provider, repository.canonicalUrl),
+    reviewNumber: Number(pr.id),
+    reviewId: pr.reviewId ?? String(pr.id),
+    url: reviewUrlFor(repository, Number(pr.id)),
+  };
+}
+
+async function resolveConversationIdentity(
+  adapter: Partial<ConversationAdapter>,
+  repository: RepositoryRef,
+  pr: PullRequestInfo,
+): Promise<{ identity?: ReviewIdentity; unavailable?: "discussion" }> {
+  if (typeof adapter.resolveReviewIdentity === "function") {
+    try {
+      return {
+        identity: canonicalizeReviewIdentity(repository, await adapter.resolveReviewIdentity(repository, Number(pr.id))),
+      };
+    } catch (error) {
+      rethrowIfIntegrityFailure(error);
+      return { unavailable: "discussion" };
+    }
+  }
+  return { identity: reviewIdentityFor(repository, pr) };
+}
+
+function reviewOptionsSnapshot(config: ResolvedConfig): FindingReviewOptions {
+  return {
+    advisor: config.advisor,
+    suggestions: config.suggestions,
+    disableBuiltinRule: config.disableBuiltinRule,
+    trustLocalRules: config.trustLocalRules,
+    rulesDir: config.rulesDir,
+    dispatch: config.dispatch,
+    ...(config.model === undefined ? {} : { model: config.model }),
+  };
+}
+
+function openConversationStore(
+  createStore: typeof createConversationStateStore,
+  config: ResolvedConfig,
+  repository: RepositoryRef,
+): ConversationStateStore | undefined {
+  try {
+    return createStore({
+      root: selectConversationStateRoot({ explicitStateDir: config.stateDir }),
+      repository,
+    });
+  } catch (error) {
+    rethrowIfIntegrityFailure(error);
+    return undefined;
+  }
+}
+
+async function fetchReviewDiscussion(
+  adapter: Partial<ConversationAdapter>,
+  identity: ReviewIdentity,
+): Promise<{ threads: readonly ReviewThreadSnapshot[]; unavailable?: "discussion" }> {
+  if (typeof adapter.listReviewThreads !== "function" || typeof adapter.getReviewThread !== "function") {
+    return { threads: [] };
+  }
+  try {
+    const summaries = [];
+    let pageToken = undefined;
+    let pages = 0;
+    do {
+      pages += 1;
+      if (pages > MAX_REVIEW_CONTEXT_PAGES) {
+        return { threads: [], unavailable: "discussion" };
+      }
+      const page = await adapter.listReviewThreads(identity, pageToken);
+      summaries.push(...page.threads);
+      pageToken = page.nextPageToken;
+    } while (pageToken !== undefined);
+
+    if (typeof adapter.listReviewEvents === "function") {
+      let eventToken = undefined;
+      let eventPages = 0;
+      do {
+        eventPages += 1;
+        if (eventPages > MAX_REVIEW_CONTEXT_PAGES) {
+          return { threads: [], unavailable: "discussion" };
+        }
+        const page = await adapter.listReviewEvents(identity, undefined, eventToken);
+        eventToken = page.nextPageToken;
+      } while (eventToken !== undefined);
+    }
+
+    const threads: ReviewThreadSnapshot[] = [];
+    for (const summary of summaries) {
+      threads.push(await adapter.getReviewThread(identity, summary.threadId));
+    }
+    return { threads };
+  } catch (error) {
+    rethrowIfIntegrityFailure(error);
+    return { threads: [], unavailable: "discussion" };
+  }
+}
+
+async function loadOptionalReviewContext(options: {
+  readonly adapter: Partial<ConversationAdapter>;
+  readonly store: ConversationStateStore | undefined;
+  readonly missingStore: boolean;
+  readonly repository: RepositoryRef;
+  readonly pr: PullRequestInfo;
+  readonly diff: string;
+  readonly stateRoot?: string;
+  readonly identity?: ReviewIdentity;
+  readonly identityUnavailable?: "discussion";
+}): Promise<{
+  conversationContext?: { text: string; digest: string };
+  fingerprint?: string;
+  existingIssues: readonly ExistingReviewIssue[];
+  discussionMemories: readonly DiscussionMemory[];
+  unavailable: string[];
+}> {
+  const unavailable: string[] = [];
+  const resolved = options.identity !== undefined || options.identityUnavailable !== undefined
+    ? { identity: options.identity, unavailable: options.identityUnavailable }
+    : await resolveConversationIdentity(options.adapter, options.repository, options.pr);
+  if (resolved.unavailable !== undefined) unavailable.push("discussion");
+  const discussion = resolved.identity === undefined
+    ? { threads: [] as const, unavailable: "discussion" as const }
+    : await fetchReviewDiscussion(options.adapter, resolved.identity);
+  if (discussion.unavailable !== undefined && !unavailable.includes("discussion")) unavailable.push("discussion");
+
+  let memories: readonly import("./conversation/state-schema.js").MemoryCreateEntry[] = [];
+  let pending: readonly import("./conversation/state-schema.js").PendingClarification[] = [];
+  let directions: readonly import("./conversation/state-schema.js").PendingDirection[] = [];
+  if (options.missingStore || options.store === undefined) {
+    unavailable.push("memory");
+  } else {
+    try {
+      const snapshot = await options.store.readContextSnapshot();
+      memories = snapshot.memories;
+      pending = snapshot.pending.clarifications.filter((item) => item.reviewNumber === Number(options.pr.id));
+      directions = snapshot.pending.directions.filter((item) => item.reviewNumber === Number(options.pr.id));
+    } catch (error) {
+      rethrowIfIntegrityFailure(error);
+      unavailable.push("memory");
+    }
+  }
+
+  const changedLines = changedFiles(options.diff).map((file) => ({ file }));
+  const built = buildConversationContext({
+    currentHeadSha: options.pr.headSha,
+    changedLines,
+    threads: discussion.threads,
+    directions,
+    pending,
+    memories,
+  });
+  const existingDiscussion = summarizeExistingDiscussion(discussion.threads);
+  const fingerprintItems = {
+    selectedDiscussion: built.selectedIds.flatMap((id) => {
+      const thread = discussion.threads.find((item) => item.threadId === id);
+      if (thread === undefined) return [];
+      return (thread.events ?? [])
+        .filter((event) => event.kind !== "thread-resolution")
+        .map((event) => ({ id: thread.threadId, revisionId: event.revisionId }));
+    }),
+    pending: pending.map((item) => ({ id: item.id, headSha: item.headSha })),
+    directions: directions.map((item) => ({ id: item.id, headSha: item.headSha })),
+    memories: memories.map((item) => ({ id: item.id, revision: item.at })),
+    stateRootDomain: options.stateRoot === undefined ? "" : stateRootDomainIdentifier(options.stateRoot),
+  };
+  const hasFingerprint = fingerprintItems.selectedDiscussion.length > 0 ||
+    fingerprintItems.pending.length > 0 || fingerprintItems.directions.length > 0 ||
+    fingerprintItems.memories.length > 0;
+  return {
+    ...(built.text.length > 0 ? { conversationContext: { text: built.text, digest: built.digest } } : {}),
+    ...(hasFingerprint && options.stateRoot !== undefined
+      ? { fingerprint: conversationDedupFingerprint(fingerprintItems) }
+      : {}),
+    existingIssues: existingDiscussion.existingIssues,
+    discussionMemories: existingDiscussion.discussionMemories,
+    unavailable,
+  };
+}
+
+async function persistAndPublishReviewClarification(options: {
+  readonly store: ConversationStateStore;
+  readonly dispatchResult: DispatchResult;
+  readonly reviewBinding: { readonly repositoryDigest: string; readonly reviewNumber: number; readonly headSha: string };
+  readonly publicDigest: string;
+  readonly reviewIdentity: ReviewIdentity;
+  readonly adapter: Partial<ConversationAdapter>;
+  readonly locator: import("./vcs/adapter.js").ReviewLocator;
+  readonly diff: string;
+  readonly now: () => string;
+  readonly hooks?: PublicationExecutorHooks;
+}): Promise<ClarificationPresentation | undefined> {
+  if (!options.dispatchResult.findings.some((finding) => finding.decision === "needs-clarification")) {
+    return undefined;
+  }
+  const snapshot = await options.store.readContextSnapshot();
+  const existing = snapshot.pending.clarifications.filter((item) =>
+    item.reviewNumber === options.reviewBinding.reviewNumber);
+  const active = existing.find((item) =>
+    item.headSha.toLowerCase() === options.reviewBinding.headSha.toLowerCase() &&
+    clarificationLifecycleState(item) !== "terminal");
+  const selected = active === undefined
+    ? selectClarification({
+        repositoryDigest: options.reviewBinding.repositoryDigest,
+        reviewNumber: options.reviewBinding.reviewNumber,
+        headSha: options.reviewBinding.headSha,
+        findings: options.dispatchResult.findings,
+        ruleOrder: options.dispatchResult.rulesRun,
+        excludeIds: existing.filter((item) => clarificationLifecycleState(item) === "terminal").map((item) => item.id),
+      })
+    : {
+        selected: {
+          id: active.id,
+          question: active.question,
+          finding: active.finding ?? {
+            file: "unknown",
+            severity: "warning" as const,
+            category: "correctness",
+            message: active.question,
+            ruleName: active.ruleName ?? "clarification",
+            decision: "needs-clarification" as const,
+            question: active.question,
+          },
+        },
+        deferredCount: 0,
+      };
+  if (selected.selected === undefined) return undefined;
+
+  const prepared: PendingClarification = active ?? createPreparedClarification({
+    id: selected.selected.id,
+    reviewNumber: options.reviewBinding.reviewNumber,
+    headSha: options.reviewBinding.headSha,
+    question: selected.selected.question,
+    createdAt: options.now(),
+    finding: selected.selected.finding,
+    ruleName: selected.selected.finding.ruleName,
+  });
+  const conversation = options.adapter;
+  if (typeof conversation.postGeneralReply !== "function" || typeof conversation.findBotChildMarker !== "function") {
+    return {
+      id: prepared.id,
+      question: prepared.question,
+      finding: selected.selected.finding,
+      publicationPending: true,
+    };
+  }
+  const finding = selected.selected.finding;
+  const anchors = options.diff === "" ? undefined : commentableLines(parseDiffPositions(options.diff));
+  const inline = finding.line !== undefined && anchors !== undefined &&
+    isCommentable(anchors, finding.file, finding.line);
+  const published = await publishClarificationQuestion({
+    store: options.store,
+    pending: prepared,
+    repository: options.store.repositoryBinding,
+    publicRepositoryDigest: options.publicDigest,
+    writer: clarificationQuestionWriter({
+      adapter: conversation as Pick<ConversationAdapter, "postGeneralReply" | "findBotChildMarker">,
+      reviewIdentity: options.reviewIdentity,
+      writeInline: async (child) => {
+        const adapter = options.adapter as Partial<import("./vcs/adapter.js").VcsAdapter>;
+        if (typeof adapter.createInlineReview !== "function" || child.placement.kind !== "general-question" ||
+          child.placement.file === undefined || child.placement.line === undefined) {
+          return null;
+        }
+        try {
+          const outcomes = await adapter.createInlineReview(
+            options.locator,
+            options.reviewBinding.headSha,
+            [{
+              clientId: child.id,
+              path: child.placement.file,
+              line: child.placement.line,
+              position: {
+                oldPath: child.placement.file,
+                newPath: child.placement.file,
+                start: { type: "new", newLine: child.placement.line },
+                end: { type: "new", newLine: child.placement.line },
+                sameHunk: true,
+              },
+              body: child.body,
+            }],
+          );
+          const posted = outcomes.find((outcome) => outcome.clientId === child.id && outcome.status === "posted");
+          return posted?.status === "posted" ? { status: "posted", identity: posted.identity } : null;
+        } catch {
+          return null;
+        }
+      },
+    }),
+    hooks: options.hooks,
+    now: options.now,
+    ...(inline ? { file: finding.file, line: finding.line } : {}),
+  });
+  return {
+    id: published.pending.id,
+    question: published.pending.question,
+    finding: selected.selected.finding,
+    ...(published.pending.identity?.url === undefined ? { publicationPending: true } : { publishedUrl: published.pending.identity.url }),
+  };
 }
 
 // Named exit codes (Task 8 review fix #3; refined by review fix #1) — see
@@ -267,8 +538,11 @@ const EXIT_PARTIAL = 2;
 interface StatusLog {
   status: "skipped" | "posted" | "partial";
   findingsCount: number;
-  rulesRun: string[];
-  rulesFailed: string[];
+  // Readonly because these are forwarded straight from a recovered
+  // TerminalReviewResult, whose arrays are readonly; this shape is only ever
+  // serialized, never mutated.
+  rulesRun: readonly string[];
+  rulesFailed: readonly string[];
   // Design-review #13: distinguishes WHY a run was skipped. Only present for
   // the --max-diff-chars ceiling skip ("diff-too-large"); the original dedup
   // skip keeps its exact pre-existing shape (no reason field) so anyone
@@ -279,7 +553,7 @@ interface StatusLog {
   // from `rulesFailed`, which is dispatch-time-only. Omitted entirely
   // (via JSON.stringify dropping `undefined` values) when there were no
   // load errors, so the "skipped"/all-succeeded log shape is unchanged.
-  loadErrors?: string[];
+  loadErrors?: readonly string[];
 }
 
 // Task 8 review fix #2: the final structured status line is always the
@@ -298,21 +572,17 @@ function logStatus(log: StatusLog): void {
   console.log(`${STATUS_LOG_PREFIX}${JSON.stringify(log)}`);
 }
 
-function sameTerminalResult(
-  actual: TerminalReviewResult | undefined,
-  expected: TerminalReviewResult,
-): boolean {
-  return actual?.status === expected.status &&
-    actual.findingsCount === expected.findingsCount &&
-    actual.exitCode === expected.exitCode &&
-    actual.rulesRun.length === expected.rulesRun.length &&
-    actual.rulesRun.every((rule, index) => rule === expected.rulesRun[index]) &&
-    actual.rulesFailed.length === expected.rulesFailed.length &&
-    actual.rulesFailed.every((rule, index) => rule === expected.rulesFailed[index]) &&
-    (actual.loadErrors?.length ?? 0) === (expected.loadErrors?.length ?? 0) &&
-    (actual.loadErrors ?? []).every(
-      (error, index) => error === expected.loadErrors?.[index],
-    );
+function publicationContext(
+  config: ResolvedConfig,
+  pr: PullRequestInfo,
+  provider: "github" | "gitlab",
+): ReviewPublicationContext {
+  return {
+    vcsAdapter: config.vcsAdapter,
+    locator: config.locator,
+    provider,
+    repository: repositoryForReview(config, pr),
+  };
 }
 
 // Task 8 review fix #1: renders a visible section naming every rule file
@@ -424,7 +694,7 @@ async function loadRulesForReview(
     // dispatch.ts's existing "warn, don't throw" cleanup pattern.
     await rm(tempRulesDir, { recursive: true, force: true }).catch((err: unknown) => {
       console.warn(
-        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${(err as Error).message})`,
+        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${redactedMessage(err)})`,
       );
     });
   }
@@ -442,6 +712,7 @@ export async function review(
   args: CliArgs,
   deps: Partial<ReviewDependencies> = {},
 ): Promise<number> {
+  const invocation: ReviewInvocation = deps.invocation ?? { kind: "normal" };
   const resolveConfigFn = deps.resolveConfig ?? resolveConfigReal;
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
   // Task 3: both engines share one object-shaped CLI seam. The legacy adapter
@@ -456,9 +727,13 @@ export async function review(
             input.useAdvisor,
             undefined,
             input.orchestratorModel,
+            input.conversationContext,
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
+  const createStore = deps.createStateStore ?? createConversationStateStore;
+  const publicationHooks = deps.publicationHooks;
+  const now = deps.now ?? (() => new Date().toISOString());
 
   const config = resolveConfigFn(args);
   const pr = await config.vcsAdapter.getPullRequest(config.locator);
@@ -486,16 +761,113 @@ export async function review(
 
   const botComment = await config.vcsAdapter.findBotComment(config.locator);
 
-  // Config-aware dedup: a run is skipped only when this exact head SHA was
-  // already reviewed WITH THE SAME review configuration. Computed from CLI flags
-  // alone (no rule fetch), so the skip decision stays as cheap as before — see
-  // computeReviewConfigHash for what is and isn't captured.
-  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted));
-
   if (botComment?.invalidPendingState === true) {
     throw new Error(
       "Invalid pending review recovery metadata; refusing to dispatch or write",
     );
+  }
+
+  const repository = repositoryForReview(config, pr);
+  let missingStore = false;
+  let stateRoot: string | undefined;
+  try {
+    stateRoot = selectConversationStateRoot({ explicitStateDir: config.stateDir });
+  } catch (error) {
+    rethrowIfIntegrityFailure(error);
+    missingStore = true;
+  }
+  const stateStore = missingStore ? undefined : openConversationStore(createStore, config, repository);
+  if (stateStore === undefined) missingStore = true;
+
+  let diff: string;
+  try {
+    diff = await config.vcsAdapter.getDiff(config.locator);
+  } catch (err) {
+    if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
+    console.warn(
+      `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +
+        `(${redactedMessage(err)}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
+        `this as over the ceiling and skipping the review (nothing was posted).`,
+    );
+    logStatus({
+      status: "skipped",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "diff-too-large",
+    });
+    return EXIT_OK;
+  }
+  if (config.maxDiffChars !== undefined && diff.length > config.maxDiffChars) {
+    console.warn(
+      `tgd-review-agent: diff is ${diff.length} chars, over the --max-diff-chars ceiling of ` +
+        `${config.maxDiffChars}; skipping the review (nothing was posted). Raise or drop the ` +
+        `flag to review this PR.`,
+    );
+    logStatus({
+      status: "skipped",
+      findingsCount: 0,
+      rulesRun: [],
+      rulesFailed: [],
+      reason: "diff-too-large",
+    });
+    return EXIT_OK;
+  }
+
+  const resolvedIdentity = await resolveConversationIdentity(
+    config.vcsAdapter as Partial<ConversationAdapter>,
+    repository,
+    pr,
+  );
+  const reviewIdentity = resolvedIdentity.identity ?? reviewIdentityFor(repository, pr);
+  const loadedContext = await loadOptionalReviewContext({
+    adapter: config.vcsAdapter as Partial<ConversationAdapter>,
+    store: stateStore,
+    missingStore,
+    repository,
+    pr,
+    diff,
+    stateRoot,
+    identity: resolvedIdentity.identity,
+    identityUnavailable: resolvedIdentity.unavailable,
+  });
+  if (!config.dryRun && loadedContext.unavailable.includes("discussion")) {
+    throw new Error(
+      "Discussion context is unavailable; refusing to publish because duplicate finding suppression cannot be guaranteed",
+    );
+  }
+  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);
+  const storeBinding = storeBindingOf(stateStore, repository);
+  const publicationIdentity = reviewPublicationIdentity({
+    repository: storeBinding,
+    reviewNumber: Number(pr.id),
+    headSha: pr.headSha,
+    configHash,
+    ...(invocation.kind === "normal" ? {} : { commandActionId: invocation.actionId }),
+  });
+  if (stateStore !== undefined) {
+    const existing = loadPublicationAction(
+      (await stateStore.readContextSnapshot()).events,
+      publicationIdentity,
+    );
+    if (
+      existing !== undefined &&
+      existing.children.length > 0 &&
+      existing.children.every((child) => childIsTerminal(child, existing.children))
+    ) {
+      return publishReviewFromManifest({
+        action: existing,
+        store: stateStore,
+        context: publicationContext(config, pr, provider),
+        pr,
+        configHash,
+        botComment,
+        hooks: publicationHooks,
+        now,
+        identity: reviewIdentity,
+        logStatus,
+      });
+    }
   }
 
   // A ready checkpoint means a previous process already made the conservative
@@ -503,17 +875,40 @@ export async function review(
   // process died during the final marker update, finalize the exact same note
   // without dispatching again or risking duplicate inline POSTs.
   const recovery = botComment?.pendingState;
-  // Only a ready checkpoint for this exact SHA/config can represent an
-  // interrupted current run. Once those two fields match, every remaining
-  // binding is mandatory and a mismatch is corruption, not permission to
-  // republish inline comments. A stale SHA/config intentionally falls through
-  // to the normal re-review path for the new revision/configuration.
   if (
     botComment !== null &&
+    (recovery?.phase === "ambiguous" || (recovery?.phase === "ready" && recovery.inlineRecovery !== undefined)) &&
+    recovery.headSha === pr.headSha && recovery.configHash === configHash
+  ) {
+    if (recovery.noteId !== botComment.id || recovery.terminalResult === undefined || recovery.inlineRecovery === undefined || config.vcsAdapter.recoverInlineReview === undefined) {
+      throw new Error("Invalid current inline recovery binding; refusing to dispatch or write");
+    }
+    if (config.dryRun) return EXIT_PARTIAL;
+    const status = await config.vcsAdapter.recoverInlineReview(config.locator, recovery.inlineRecovery);
+    if (status !== "complete") {
+      // A durable ready/ambiguous checkpoint is written before the atomic POST.
+      // An empty marker lookup after that point is not proof of rejection:
+      // GitHub's REST/GraphQL views may lag an accepted write. Keep the full
+      // fallback visible and permanently suppress reposting this action until
+      // exact authenticated markers reconcile it.
+      logStatus({ status: "partial", findingsCount: recovery.terminalResult.findingsCount, rulesRun: recovery.terminalResult.rulesRun, rulesFailed: recovery.terminalResult.rulesFailed, reason: status === "none" ? "inline-publication-awaiting-consistency" : "inline-publication-still-ambiguous" });
+      return EXIT_PARTIAL;
+    }
+    const finalizedBody = `${recovery.inlineRecovery.noFallbackBody.trimEnd()}\n\n${formatMarker(pr.headSha, configHash)}`;
+    const finalized = await config.vcsAdapter.upsertComment(config.locator, finalizedBody, botComment);
+    if (finalized.id !== botComment.id || finalized.lastReviewedSha !== pr.headSha || finalized.reviewedConfig !== configHash) throw new Error("Could not finalize ambiguous inline recovery checkpoint");
+    logStatus({ status: recovery.terminalResult.status, findingsCount: recovery.terminalResult.findingsCount, rulesRun: recovery.terminalResult.rulesRun, rulesFailed: recovery.terminalResult.rulesFailed, reason: "recovered-ambiguous-inline-review" });
+    return recovery.terminalResult.exitCode;
+  }
+  // A ready checkpoint for this exact SHA/config is an interrupted current run.
+  // Binding mismatches are corruption. Dry-run reproduces the stored result
+  // without writing. Crash recovery consults the frozen manifest below instead
+  // of finalizing the conservative pending summary here.
+  const readyCurrent = botComment !== null &&
     recovery?.phase === "ready" &&
     recovery.headSha === pr.headSha &&
-    recovery.configHash === configHash
-  ) {
+    recovery.configHash === configHash;
+  if (readyCurrent) {
     if (
       recovery.noteId !== botComment.id ||
       recovery.terminalResult === undefined
@@ -533,6 +928,40 @@ export async function review(
       });
       return recovery.terminalResult.exitCode;
     }
+  }
+
+  // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
+  // Command-triggered reviews intentionally bypass the normal-summary check:
+  // forced commands redo this head, while focused commands publish supplemental
+  // output under their command-scoped publication identity.
+  if (invocation.kind === "normal" &&
+    decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
+    logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
+    return EXIT_OK;
+  }
+
+  if (stateStore !== undefined) {
+    const existing = loadPublicationAction(
+      (await stateStore.readContextSnapshot()).events,
+      publicationIdentity,
+    );
+    if (existing !== undefined && (existing.state === "manifest-ready" || existing.state === "published" || existing.state === "completed")) {
+      return publishReviewFromManifest({
+        action: existing,
+        store: stateStore,
+        context: publicationContext(config, pr, provider),
+        pr,
+        configHash,
+        botComment,
+        hooks: publicationHooks,
+        now,
+        identity: reviewIdentity,
+        logStatus,
+      });
+    }
+  }
+
+  if (readyCurrent && botComment !== null && recovery?.terminalResult !== undefined) {
     const finalizedBody = replacePendingMarker(
       botComment.body,
       formatMarker(pr.headSha, configHash),
@@ -562,62 +991,6 @@ export async function review(
     return recovery.terminalResult.exitCode;
   }
 
-  // AC-8.1: sha + config match -> skip, exit 0, upsertComment is never called.
-  if (decideDedup(pr, botComment, configHash) === "skip-no-new-commits") {
-    logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [] });
-    return EXIT_OK;
-  }
-
-  // Codex review fix (PR #5): a diff can be too large to even FETCH — the
-  // GitHub adapter's execFile buffer is capped (10 MiB), and a bigger diff
-  // makes getDiff() reject with a maxBuffer error BEFORE the length check
-  // below could ever run. With --max-diff-chars set, that rejection is proof
-  // positive the diff is over any expressible ceiling, so it gets the same
-  // graceful skip the flag promises — hitting exactly the largest PRs the
-  // ceiling exists to guard. Without the flag, the rejection stays fatal
-  // (the pre-existing behavior: the user asked for no ceiling).
-  let diff: string;
-  try {
-    diff = await config.vcsAdapter.getDiff(config.locator);
-  } catch (err) {
-    if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
-    console.warn(
-      `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +
-        `(${(err as Error).message}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
-        `this as over the ceiling and skipping the review (nothing was posted).`,
-    );
-    logStatus({
-      status: "skipped",
-      findingsCount: 0,
-      rulesRun: [],
-      rulesFailed: [],
-      reason: "diff-too-large",
-    });
-    return EXIT_OK;
-  }
-
-  // Design-review #13: hard cost ceiling. The dispatch prompt embeds the diff
-  // once per rule (O(rules × diff) tokens); warnIfDiffCostRisk in dispatch.ts
-  // only WARNS. When the user set a ceiling and this diff is over it, skip
-  // loudly BEFORE fetching rules or spending a single model token — nothing is
-  // posted (so no marker is written: a later run with a higher ceiling reviews
-  // normally), and the status line says why.
-  if (config.maxDiffChars !== undefined && diff.length > config.maxDiffChars) {
-    console.warn(
-      `tgd-review-agent: diff is ${diff.length} chars, over the --max-diff-chars ceiling of ` +
-        `${config.maxDiffChars}; skipping the review (nothing was posted). Raise or drop the ` +
-        `flag to review this PR.`,
-    );
-    logStatus({
-      status: "skipped",
-      findingsCount: 0,
-      rulesRun: [],
-      rulesFailed: [],
-      reason: "diff-too-large",
-    });
-    return EXIT_OK;
-  }
-
   const { rules, errors: loadErrors } = await loadRulesForReview(config, pr, loadRulesFn);
 
   // Task 8 review fix #1: surface load errors via console.error whenever
@@ -642,6 +1015,9 @@ export async function review(
     diff,
     useAdvisor: config.advisor === "on",
     orchestratorModel: config.model,
+    ...(loadedContext.conversationContext === undefined
+      ? {}
+      : { conversationContext: loadedContext.conversationContext }),
   });
 
   if (extracted.omittedCount > 0) {
@@ -666,7 +1042,36 @@ export async function review(
   // Only an explicit "off" disables them — an absent value means the documented
   // default (on), never a silent downgrade.
   const renderOpts = { suggestions: config.suggestions !== "off" };
-  const orchestration = orchestrateFn(dispatchResult, diff, { inline: true, ...renderOpts, relatedWork });
+  const publicDigest = computeRepositoryDigest(repository.provider, repository.canonicalUrl);
+  const reviewBinding = {
+    repositoryDigest: publicDigest,
+    reviewNumber: Number(pr.id),
+    headSha: pr.headSha,
+  };
+  const clarificationPresentation = stateStore === undefined || config.dryRun
+    ? undefined
+    : await persistAndPublishReviewClarification({
+        store: stateStore,
+        dispatchResult,
+        reviewBinding,
+        publicDigest,
+        reviewIdentity,
+        adapter: config.vcsAdapter as Partial<ConversationAdapter>,
+        locator: config.locator,
+        diff,
+        now,
+        hooks: publicationHooks,
+      });
+  const orchestration = orchestrateFn(dispatchResult, diff, {
+    inline: true,
+    ...renderOpts,
+    relatedWork,
+    existingIssues: loadedContext.existingIssues,
+    discussionMemories: loadedContext.discussionMemories,
+    reviewBinding,
+    ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
+    ...(loadedContext.unavailable.length === 0 ? {} : { contextUnavailable: loadedContext.unavailable }),
+  });
   const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
   const terminalResult = {
     status: hasFailure ? "partial" as const : "posted" as const,
@@ -714,209 +1119,111 @@ export async function review(
     }
     if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
     console.log(buildBody(orchestration, noFallbackIds, undefined, false));
+  } else if (invocation.kind === "focused-command") {
+    // Supplemental: reply to the person who asked, and leave the managed
+    // summary and the previous head's threads exactly as they were. All trusted
+    // rules still ran — the direction is additive context, never a rule — so
+    // this publishes what that run found without restating the whole review.
+    if (stateStore === undefined) throw new Error("Review publication requires a conversation state store");
+    return publishFocusedReview({
+      store: stateStore,
+      context: publicationContext(config, pr, provider),
+      pr,
+      identity: reviewIdentity,
+      repository: storeBinding,
+      publicationIdentity: {
+        actionId: publicationIdentity.actionId,
+        identityDigest: publicationIdentity.identityDigest,
+      },
+      direction: invocation.direction,
+      summary: buildBody(orchestration, noFallbackIds, undefined, false),
+      orchestration,
+      rules,
+      reviewOptions: reviewOptionsSnapshot(config),
+      baseSha: pr.baseSha,
+      configHash,
+      ...(invocation.threadId === undefined ? {} : { threadId: invocation.threadId }),
+      now,
+      ...(publicationHooks === undefined ? {} : { hooks: publicationHooks }),
+    });
   } else {
-    // ORDER MATTERS. The summary is durable and updatable; inline comments are
-    // append-only.
-    //
-    // Write an explicit PENDING marker first. It makes the durable summary
-    // rediscoverable without claiming this SHA/config is complete. Only after
-    // inline outcomes and selective fallback are settled do we replace it with
-    // the complete dedup marker, targeting the exact returned identity.
-    let allInlineIds: Set<string> | undefined;
+    if (stateStore === undefined) throw new Error("Review publication requires a conversation state store");
+    let inlineRecovery: InlineRecoveryState | undefined;
+    const allInlineIds = new Set(orchestration.inlineComments.map((comment) => comment.clientId));
     if (orchestration.inlineComments.length > 0) {
-      allInlineIds = new Set(
-        orchestration.inlineComments.map((comment) => comment.clientId),
-      );
+      if (config.vcsAdapter.prepareInlineReviewRecovery !== undefined) {
+        const actionIdentity = createHash("sha256").update(JSON.stringify({ configHash, headSha: pr.headSha,
+          children: orchestration.inlineComments.map((comment) => ({ clientId: comment.clientId, path: comment.path, line: comment.line, startLine: comment.startLine ?? null, body: comment.body })) }), "utf8").digest("hex");
+        const prepared = await config.vcsAdapter.prepareInlineReviewRecovery(config.locator, pr.headSha, orchestration.inlineComments, `${configHash}:${actionIdentity}`);
+        inlineRecovery = { ...prepared, noFallbackBody: buildBody(orchestration, noFallbackIds, "") };
+      }
       // The provider assigns the real note identity on the first write, but
       // every already-known recovery field must be representable before that
       // write. A safe placeholder exercises the exact same bounded encoder.
-      formatPendingMarker({
+      if (provider === "github") {
+        if (orchestration.inlineComments.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
+        const payloadChars = orchestration.inlineComments.reduce((total, comment, index) => total + comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 256, 0);
+        if (payloadChars > 1_000_000 || orchestration.inlineComments.some((comment, index) => comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 128 > 65_536)) {
+          throw new Error("GitHub inline review exceeds the safe atomic payload size");
+        }
+      }
+      const readyPreflight = formatPendingMarker({
         phase: "ready",
         headSha: pr.headSha,
         configHash,
         noteId: "preflight",
         terminalResult,
+        inlineRecovery,
       });
+      buildBody(orchestration, allInlineIds, readyPreflight);
+      if (inlineRecovery !== undefined) {
+        buildBody(orchestration, allInlineIds, formatPendingMarker({ phase: "ambiguous", headSha: pr.headSha, configHash, noteId: "preflight", terminalResult, inlineRecovery }));
+      }
     }
 
-    const writtenSummary = await config.vcsAdapter.upsertComment(
-      config.locator,
-      buildBody(
-        orchestration,
-        noFallbackIds,
-        formatPendingMarker({
-          phase: "publishing",
-          headSha: pr.headSha,
-          configHash,
-        }),
-      ),
+    const prepared = prepareReviewFindingPublication({
+      publicationIdentity,
+      orchestration,
+      storeBinding,
+      reviewNumber: Number(pr.id),
+      reviewId: reviewIdentity.reviewId,
+      baseSha: pr.baseSha,
+      headSha: pr.headSha,
+      rules,
+      reviewOptions: reviewOptionsSnapshot(config),
+      now: now(),
+      publicRepositoryDigest: computeRepositoryDigest(repository.provider, repository.canonicalUrl),
+      configHash,
+      summaryBody: buildBody(orchestration, noFallbackIds, ""),
+      terminalResult,
+      inlineRecovery,
+    });
+    await persistPreparedFindings(stateStore, prepared.preparedFindings);
+    return publishReviewFromManifest({
+      action: {
+        ...publicationIdentity,
+        reviewNumber: Number(pr.id),
+        repository: storeBinding,
+        state: "manifest-ready",
+        successorActionId: null,
+        children: prepared.children,
+      },
+      store: stateStore,
+      context: publicationContext(config, pr, provider),
+      pr,
+      configHash,
       botComment,
-    );
-    if (
-      !writtenSummary ||
-      typeof writtenSummary.id !== "string" ||
-      writtenSummary.id.length === 0 ||
-      writtenSummary.lastReviewedSha !== "" ||
-      writtenSummary.reviewedConfig !== "" ||
-      writtenSummary.pendingState?.phase !== "publishing" ||
-      writtenSummary.pendingState.headSha !== pr.headSha ||
-      writtenSummary.pendingState.configHash !== configHash
-    ) {
-      throw new Error(
-        "The VCS adapter did not return the exact identity of the pending summary note",
-      );
-    }
-
-    let summaryIdentity = writtenSummary;
-    if (orchestration.inlineComments.length > 0) {
-      const checkpoint = await config.vcsAdapter.upsertComment(
-        config.locator,
-        buildBody(
-          orchestration,
-          allInlineIds!,
-          formatPendingMarker({
-            phase: "ready",
-            headSha: pr.headSha,
-            configHash,
-            noteId: writtenSummary.id,
-            terminalResult,
-          }),
-        ),
-        writtenSummary,
-      );
-      if (
-        checkpoint.id !== writtenSummary.id ||
-        checkpoint.lastReviewedSha !== "" ||
-        checkpoint.reviewedConfig !== "" ||
-        checkpoint.pendingState?.phase !== "ready" ||
-        checkpoint.pendingState.headSha !== pr.headSha ||
-        checkpoint.pendingState.configHash !== configHash ||
-        checkpoint.pendingState.noteId !== writtenSummary.id ||
-        !sameTerminalResult(checkpoint.pendingState.terminalResult, terminalResult)
-      ) {
-        throw new Error(
-          "The VCS adapter could not confirm the exact ready recovery checkpoint",
-        );
-      }
-      summaryIdentity = checkpoint;
-    }
-
-    // Design-review #10: collapse the PREVIOUS runs' inline threads before
-    // posting this run's. Inline review comments are append-only, so without
-    // this every past head SHA's comments accumulate uncollapsed forever.
-    // Resolved threads stay visible as history — nothing is deleted, and only
-    // threads the bot itself started are touched. Runs AFTER the pending write
-    // (idempotency must never depend on cosmetic cleanup) and BEFORE the new
-    // inline post (so this run's comments are the only unresolved ones left).
-    // Strictly best-effort: a failure here must not abort or degrade the
-    // review — warn and carry on.
-    try {
-      const resolved = await config.vcsAdapter.resolveStaleReviewThreads(config.locator);
-      if (resolved > 0) {
-        console.log(`tgd-review-agent: resolved ${resolved} stale inline comment thread(s) from previous runs`);
-      }
-    } catch (err) {
-      console.warn(
-        `tgd-review-agent: could not resolve stale inline comment threads (${(err as Error).message}); ` +
-          `continuing — old threads stay expanded but this run is unaffected`,
-      );
-    }
-
-    let finalFallbackIds = noFallbackIds;
-    if (orchestration.inlineComments.length > 0) {
-      let fallbackIds: Set<string> | undefined;
-      try {
-        const outcomes = await config.vcsAdapter.createInlineReview(
-          config.locator,
-          pr.headSha,
-          orchestration.inlineComments,
-        );
-        try {
-          const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
-            if (typeof outcome !== "object" || outcome === null) return false;
-            const candidate = outcome as Record<string, unknown>;
-            return typeof candidate.clientId === "string" &&
-              (candidate.status === "posted" || candidate.status === "failed") &&
-              (candidate.reason === undefined || typeof candidate.reason === "string");
-          });
-          if (!shapesValid) throw new Error("malformed inline publish outcome");
-          const validated = validateInlinePublishOutcomes(
-            orchestration.inlineComments,
-            outcomes,
-          );
-          fallbackIds = new Set(
-            validated
-              .filter((outcome) => outcome.status === "failed")
-              .map((outcome) => outcome.clientId),
-          );
-        } catch (err) {
-          console.warn(
-            `tgd-review-agent: inline review returned invalid outcomes (${(err as Error).message}); ` +
-              `rewriting the summary comment to carry every inline finding instead`,
-          );
-          fallbackIds = allInlineIds;
-        }
-      } catch (err) {
-        console.warn(
-          `tgd-review-agent: could not post inline review comments (${(err as Error).message}); ` +
-            `rewriting the summary comment to carry every finding instead`,
-        );
-        fallbackIds = allInlineIds;
-      }
-
-      if (fallbackIds && fallbackIds.size > 0) {
-        finalFallbackIds = fallbackIds;
-      }
-
-      const selectiveCheckpoint = await config.vcsAdapter.upsertComment(
-        config.locator,
-        buildBody(
-          orchestration,
-          finalFallbackIds,
-          formatPendingMarker({
-            phase: "ready",
-            headSha: pr.headSha,
-            configHash,
-            noteId: summaryIdentity.id,
-            terminalResult,
-          }),
-        ),
-        summaryIdentity,
-      );
-      if (
-        selectiveCheckpoint.id !== summaryIdentity.id ||
-        selectiveCheckpoint.lastReviewedSha !== "" ||
-        selectiveCheckpoint.reviewedConfig !== "" ||
-        selectiveCheckpoint.pendingState?.phase !== "ready" ||
-        selectiveCheckpoint.pendingState.headSha !== pr.headSha ||
-        selectiveCheckpoint.pendingState.configHash !== configHash ||
-        selectiveCheckpoint.pendingState.noteId !== summaryIdentity.id ||
-        !sameTerminalResult(
-          selectiveCheckpoint.pendingState.terminalResult,
-          terminalResult,
-        )
-      ) {
-        throw new Error(
-          "The VCS adapter could not confirm the exact selective recovery checkpoint",
-        );
-      }
-      summaryIdentity = selectiveCheckpoint;
-    }
-    const finalizedSummary = await config.vcsAdapter.upsertComment(
-      config.locator,
-      buildBody(orchestration, finalFallbackIds),
-      summaryIdentity,
-    );
-    if (
-      !finalizedSummary ||
-      finalizedSummary.id !== summaryIdentity.id ||
-      finalizedSummary.lastReviewedSha !== pr.headSha ||
-      finalizedSummary.reviewedConfig !== configHash
-    ) {
-      throw new Error(
-        "The VCS adapter could not confirm finalization of the exact completed summary note",
-      );
-    }
+      hooks: publicationHooks,
+      now,
+      orchestration,
+      loadErrors,
+      buildBody,
+      terminalResult,
+      inlineRecovery,
+      preparedFindings: prepared.preparedFindings,
+      identity: reviewIdentity,
+      logStatus,
+    });
   }
 
   logStatus({
@@ -943,14 +1250,24 @@ export async function review(
 }
 
 /**
- * Entry point. Parses argv, runs the `review` command, and exits with its
- * returned code. Parse errors and any error `review()` doesn't itself
- * recover from are logged and exit 1.
+ * Entry point. Parses argv, dispatches `review` or `poll`, and exits with the
+ * command's returned code. `poll` defaults to the classification-only runtime
+ * and remains injectable for tests. Parse errors and unrecovered command
+ * errors are logged and exit 1.
  */
-export async function main(argv: string[] = process.argv.slice(2)): Promise<void> {
+export interface MainDependencies {
+  runPoll?: (args: PollArgs, deps: Pick<PollDependencies, "runReview">) => Promise<number>;
+}
+
+export async function main(
+  argv: string[] = process.argv.slice(2),
+  dependencies: MainDependencies = {},
+): Promise<void> {
   try {
-    const args = parseArgs(argv);
-    const exitCode = await review(args);
+    const args = parseCommandArgs(argv);
+    const exitCode = args.command === "review"
+      ? await review(args)
+      : await (dependencies.runPoll ?? poll)(args, { runReview: review });
     process.exit(exitCode);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

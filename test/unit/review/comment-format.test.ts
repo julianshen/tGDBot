@@ -7,6 +7,7 @@ import {
   renderInlineComment,
   renderSummaryComment,
 } from "../../../src/review/comment-format.js";
+import { formatChildMarker } from "../../../src/conversation/markers.js";
 import type { Finding } from "../../../src/review/types.js";
 import type { RelatedWorkItem } from "../../../src/review/related-work.js";
 
@@ -113,6 +114,24 @@ describe("renderInlineComment — injection hardening", () => {
     expect(renderInlineComment(makeFinding({})).trimEnd().endsWith(INLINE_COMMENT_MARKER)).toBe(
       true,
     );
+  });
+
+  it("keeps the generic bot marker and appends a structured finding marker", () => {
+    const findingMarker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"1".repeat(32)}`,
+      childId: `finding_${"2".repeat(32)}`,
+      repositoryDigest: "a".repeat(64),
+      reviewNumber: 42,
+      contentDigest: "b".repeat(64),
+    });
+    const body = renderInlineComment(makeFinding(), { findingMarker });
+    expect(body).toContain(INLINE_COMMENT_MARKER);
+    expect(body).toContain(findingMarker);
+    expect(body.indexOf(INLINE_COMMENT_MARKER)).toBeLessThan(body.indexOf(findingMarker));
+    expect(body).not.toContain(makeFinding().message + findingMarker);
+    expect(findingMarker).not.toContain("Something is wrong.");
+    expect(findingMarker).not.toContain("src/a.ts");
   });
 
   it("cannot escape the <details> container or inject HTML", () => {
@@ -475,6 +494,100 @@ describe("renderSummaryComment", () => {
     const relatedWork = [hostile] as unknown as RelatedWorkItem[];
     expect(() => renderSummaryComment({ ...base, relatedWork })).not.toThrow();
     expect(renderSummaryComment({ ...base, relatedWork })).not.toContain("Related work");
+  });
+
+  it("keeps the actionable count unchanged and renders singular clarification plus status", () => {
+    const actionable = makeFinding({ message: "A real defect." });
+    const disputed = makeFinding({ message: "Still argued.", decision: "disputed" });
+    const body = renderSummaryComment({
+      ...base,
+      allFindings: [actionable],
+      inlineCount: 1,
+      disputed: [disputed],
+      clarification: {
+        id: `clar_${"a".repeat(32)}`,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({
+          decision: "needs-clarification",
+          question: "Is the fallback path intentional?",
+        }),
+      },
+      deferredClarificationCount: 2,
+      contextUnavailable: ["discussion", "memory"],
+    });
+
+    expect(body).toContain("**Actionable comments posted: 1**");
+    expect(body).toContain("### Needs clarification");
+    expect(body).not.toMatch(/Needs clarifications/i);
+    expect(body).toContain("Is the fallback path intentional?");
+    expect(body).toContain(`clar_${"a".repeat(32)}`);
+    expect(body).toMatch(/2 additional (?:questions|clarifications) deferred/i);
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("Still argued.");
+    expect(body).toMatch(/discussion context was unavailable/i);
+    expect(body).toMatch(/memory context was unavailable/i);
+    expect(body).not.toMatch(/Needs clarification[\s\S]*🔴|Needs clarification[\s\S]*Blocking/i);
+  });
+
+  it("does not treat a pending question as a defect when nothing is actionable", () => {
+    const body = renderSummaryComment({
+      ...base,
+      clarification: {
+        id: `clar_${"b".repeat(32)}`,
+        question: "Should this stay?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Should this stay?" }),
+      },
+    });
+
+    expect(body).toContain("**No actionable comments.** ✅");
+    expect(body).toContain("### Needs clarification");
+    expect(body).toContain("Should this stay?");
+    expect(body).not.toContain("**Actionable comments posted:");
+    expect(body).not.toContain("Additional comments");
+  });
+
+  it("shows the exact answer syntax and withholds a link while publication is pending", () => {
+    const id = `clar_${"c".repeat(26)}`;
+    const body = renderSummaryComment({
+      ...base,
+      clarification: {
+        id,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Is the fallback path intentional?" }),
+        publicationPending: true,
+      },
+    });
+
+    expect(body).toContain(`answer ${id}: <your answer>`);
+    expect(body).toMatch(/publication is pending/i);
+    expect(body).not.toContain("](https://");
+  });
+
+  it("links only a validated published identity", () => {
+    const id = `clar_${"d".repeat(26)}`;
+    const linked = renderSummaryComment({
+      ...base,
+      clarification: {
+        id,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Is the fallback path intentional?" }),
+        publishedUrl: "https://github.com/acme/app/pull/42#discussion_r99",
+      },
+    });
+    const rejected = renderSummaryComment({
+      ...base,
+      clarification: {
+        id,
+        question: "Is the fallback path intentional?",
+        finding: makeFinding({ decision: "needs-clarification", question: "Is the fallback path intentional?" }),
+        publishedUrl: "javascript:alert(1)",
+      },
+    });
+
+    expect(linked).toContain("[Open the question](https://github.com/acme/app/pull/42#discussion_r99)");
+    expect(linked).not.toMatch(/publication is pending/i);
+    expect(rejected).not.toContain("javascript:");
+    expect(rejected).not.toContain("](javascript:alert(1))");
   });
 });
 
