@@ -1099,6 +1099,37 @@ describe("event-to-action poll", () => {
     expect(snapshot.events.some((entry) => entry.state === "completed" && entry.manifest.length > 0)).toBe(false);
   });
 
+  // Provider CLIs quote the request they attempted when it fails, so the error
+  // can carry the token used to make it. These diagnostics get pasted into
+  // issues, so the credential must not survive the trip to the console.
+  it("keeps a credential out of the diagnostic when a provider call fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const secret = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    adapter.replaceEvents([commentEvent("focus", "@tgdbot review focus: the error handling")]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let logged = "";
+    try {
+      await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+        ...executionDeps(adapter),
+        runReview: async () => 0,
+        getReviewMetadata: async () => {
+          throw new Error(`HTTP 401 on GET /repos/o/r using Authorization: Bearer ${secret}`);
+        },
+      })).resolves.toBe(1);
+      // Read before restoring: mockRestore also clears the recorded calls.
+      logged = warn.mock.calls.flat().join("\n");
+    } finally {
+      warn.mockRestore();
+    }
+
+    expect(logged).not.toContain(secret);
+    expect(logged).toContain("[redacted]");
+    // The reason for the failure still has to survive redaction.
+    expect(logged).toContain("401");
+    expect(adapter.postedBodies).toEqual([]);
+  });
+
   it("produces one response per recognized event", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });

@@ -21,6 +21,7 @@ import {
   transitionClarification,
 } from "../conversation/clarification.js";
 import { parseConversationCommand } from "../conversation/command-parser.js";
+import { redactedMessage } from "../conversation/redact.js";
 import {
   encodeMemoryPublicId,
   listMemories,
@@ -664,7 +665,7 @@ async function executeReviewCommand(input: {
   try {
     exitCode = await runReview(reviewArgsFor(options.config, item.event.reviewNumber), { invocation });
   } catch (error) {
-    console.warn(`tgd-review-agent: review command failed (${(error as Error).message})`);
+    console.warn(`tgd-review-agent: review command failed (${redactedMessage(error)})`);
     return "transient";
   }
   if (exitCode !== 0 && exitCode !== 2) return "transient";
@@ -787,7 +788,7 @@ async function planConversationReply(input: {
     try {
       thread = await options.adapter.getReviewThread(reviewIdentity, item.event.threadId);
     } catch (error) {
-      console.warn(`tgd-review-agent: could not load addressed thread (${(error as Error).message})`);
+      console.warn(`tgd-review-agent: could not load addressed thread (${redactedMessage(error)})`);
       return { status: "transient" };
     }
   }
@@ -1036,7 +1037,7 @@ async function publishReplyPlan(input: {
       if (stale.staleHead === true && stale.successor !== undefined) {
         return "stale";
       }
-      console.warn(`tgd-review-agent: conversation reply failed (${(error as Error).message})`);
+      console.warn(`tgd-review-agent: conversation reply failed (${redactedMessage(error)})`);
       return "transient";
     }
   }
@@ -1064,7 +1065,7 @@ async function publishPreparedReply(input: {
     });
     return published.state === "completed" ? "completed" : "transient";
   } catch (error) {
-    console.warn(`tgd-review-agent: conversation reply recovery failed (${(error as Error).message})`);
+    console.warn(`tgd-review-agent: conversation reply recovery failed (${redactedMessage(error)})`);
     return "transient";
   }
 }
@@ -1190,7 +1191,7 @@ async function loadReviewMetadata(
     const diff = await options.config.vcsAdapter.getDiff(locator);
     return { headSha: pr.headSha, baseSha: pr.baseSha, diff };
   } catch (error) {
-    console.warn(`tgd-review-agent: could not load review metadata (${(error as Error).message})`);
+    console.warn(`tgd-review-agent: could not load review metadata (${redactedMessage(error)})`);
     return undefined;
   }
 }
@@ -1241,7 +1242,7 @@ async function loadTrustedBaseRules(
   } finally {
     await rm(tempRulesDir, { recursive: true, force: true }).catch((err: unknown) => {
       console.warn(
-        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${(err as Error).message})`,
+        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${redactedMessage(err)})`,
       );
     });
   }
@@ -1340,7 +1341,7 @@ async function maybeExecuteClarification(input: {
       thread = await input.options.adapter.getReviewThread(input.reviewIdentity, input.item.event.threadId);
     } catch (error) {
       if (answerCommand || mayBeClarificationAnswer({ event: input.item.event, pending })) {
-        console.warn(`tgd-review-agent: could not load clarification thread (${(error as Error).message})`);
+        console.warn(`tgd-review-agent: could not load clarification thread (${redactedMessage(error)})`);
         return "transient";
       }
     }
@@ -1403,7 +1404,7 @@ async function completeEmptyPrepared(input: {
     });
     return published.state === "completed" ? "completed" : "transient";
   } catch (error) {
-    console.warn(`tgd-review-agent: could not close ignored clarification event (${(error as Error).message})`);
+    console.warn(`tgd-review-agent: could not close ignored clarification event (${redactedMessage(error)})`);
     return "transient";
   }
 }
@@ -1563,7 +1564,7 @@ async function executeClarificationAnswer(input: {
           });
           if (publishedFinding !== 0) return "transient";
         } catch (error) {
-          console.warn(`tgd-review-agent: could not publish clarified finding (${(error as Error).message})`);
+          console.warn(`tgd-review-agent: could not publish clarified finding (${redactedMessage(error)})`);
           return "transient";
         }
       }

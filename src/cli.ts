@@ -31,6 +31,7 @@ import {
 import type { ClarificationPresentation } from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
+import { redactedMessage } from "./conversation/redact.js";
 import {
   buildConversationContext,
   MAX_REVIEW_CONTEXT_PAGES,
@@ -688,7 +689,7 @@ async function loadRulesForReview(
     // dispatch.ts's existing "warn, don't throw" cleanup pattern.
     await rm(tempRulesDir, { recursive: true, force: true }).catch((err: unknown) => {
       console.warn(
-        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${(err as Error).message})`,
+        `tgd-review-agent: failed to remove temp rules directory ${tempRulesDir} (${redactedMessage(err)})`,
       );
     });
   }
@@ -780,7 +781,7 @@ export async function review(
     if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
     console.warn(
       `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +
-        `(${(err as Error).message}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
+        `(${redactedMessage(err)}); with --max-diff-chars ${config.maxDiffChars} set, treating ` +
         `this as over the ceiling and skipping the review (nothing was posted).`,
     );
     logStatus({

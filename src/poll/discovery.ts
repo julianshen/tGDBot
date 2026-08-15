@@ -12,7 +12,6 @@ import type {
   ReviewEventPageToken,
 } from "../vcs/conversation-adapter.js";
 
-export const MAX_POLL_EVENTS = 200;
 
 export interface StoredReviewProgress {
   readonly reviewId: string;
