@@ -8,6 +8,7 @@
 //
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
+import type { DiscussionMemory } from "./existing-discussion.js";
 import {
   isValidRelatedWorkProjectPath,
   validateResolvedRelatedWork,
@@ -336,6 +337,8 @@ export interface SummaryInput {
   rulesFailed: string[];
   ruleFailureReasons?: Record<string, string>;
   relatedWork?: readonly RelatedWorkItem[];
+  /** Bounded summaries of human-authored active review discussion. */
+  discussionMemories?: readonly DiscussionMemory[];
   /**
    * True when inline posting was unavailable (e.g. the reviews API call failed).
    * The summary then carries EVERY finding, so a finding is never lost — it is
@@ -465,6 +468,40 @@ function renderRelatedWorkSection(input: SummaryInput): string | undefined {
     : undefined;
 }
 
+function safeDiscussionUrl(url: string | undefined): string | undefined {
+  if (url === undefined) return undefined;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "https:" && parsed.username === "" && parsed.password === "" && !/[\s)]/u.test(url)
+      ? url
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function renderDiscussionMemorySection(input: SummaryInput): string | undefined {
+  const memories = input.discussionMemories ?? [];
+  if (memories.length === 0) return undefined;
+  const items = memories.map((memory) => {
+    const location = memory.file === undefined
+      ? "`general discussion`"
+      : `\`${sanitizeInline(memory.file)}${memory.line === undefined ? "" : `:${memory.line}`}\``;
+    const author = `@${sanitizeInline(memory.author)}`;
+    const summary = sanitizeInline(memory.summary);
+    const url = safeDiscussionUrl(memory.url);
+    const source = url === undefined ? "" : ` ([thread](${url}))`;
+    return `- ${location} — ${author}: ${summary}${source}`;
+  });
+  return [
+    "### Local review memory",
+    "",
+    "_Existing unresolved review discussion is retained here and is not reposted as new findings._",
+    "",
+    ...items,
+  ].join("\n");
+}
+
 function renderContextUnavailable(input: SummaryInput): string | undefined {
   const labels = input.contextUnavailable ?? [];
   const notes = [
@@ -577,6 +614,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // bounded/sanitized representation in compact summaries and charge it
   // against the same provider-size budget as failed rules and finding labels.
   const relatedWork = renderRelatedWorkSection(input);
+  const discussionMemory = renderDiscussionMemorySection(input);
   const findings = input.unanchored.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
@@ -584,7 +622,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const message = sanitizeInline(finding.message);
     return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
   });
-  const fixed = [header, notice, contextUnavailable, clarification, disputed, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -598,6 +636,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     contextUnavailable,
     clarification,
     disputed,
+    discussionMemory,
     failedRules,
     relatedWork,
     ...findings.map(
@@ -714,6 +753,9 @@ function renderSummaryCommentWithIncludedSuggestions(
 
   const relatedWork = renderRelatedWorkSection(input);
   if (relatedWork) parts.push(relatedWork);
+
+  const discussionMemory = renderDiscussionMemorySection(input);
+  if (discussionMemory) parts.push(discussionMemory);
 
   const collapsed: string[] = [];
   if (input.filesReviewed.length > 0) {

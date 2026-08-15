@@ -171,6 +171,21 @@ Pushing a new commit retires it.
 `check latest` is the one command that overrules the normal "nothing changed,
 nothing to do" skip.
 
+### Existing review issues
+
+tGDBot does not add another finding on a file and line that already has an
+unresolved, current review thread. This applies whether that thread was opened
+by tGDBot or another reviewer. Resolved and outdated threads no longer reserve
+the anchor, so a genuinely recurring issue can be reported again.
+
+Human comments from those active threads remain visible in the managed summary
+under **Local review memory**. The section keeps at most ten deterministic,
+single-line summaries of 240 characters each, with the author and source thread,
+so readers can see why a candidate finding was not repeated. Bot comments are
+not echoed into this section. These summaries are review-scoped evidence; use
+`@bot remember <lesson>` when a conclusion should become durable
+repository-local memory for future reviews.
+
 ### Local state
 
 Everything tGDBot remembers lives **outside the reviewed repository** and is

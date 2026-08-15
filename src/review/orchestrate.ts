@@ -19,6 +19,7 @@ import {
 } from "./diff-anchors.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
+import type { DiscussionMemory, ExistingReviewIssue } from "./existing-discussion.js";
 
 export type { InlineComment } from "./comment-format.js";
 
@@ -62,6 +63,8 @@ export type OrchestrateOptions = {
   clarification?: ClarificationPresentation;
   excludeClarificationIds?: readonly string[];
   deferredClarificationCount?: number;
+  existingIssues?: readonly ExistingReviewIssue[];
+  discussionMemories?: readonly DiscussionMemory[];
 } & RenderOptions;
 
 function decisionOf(finding: Finding): FindingDecision {
@@ -105,6 +108,10 @@ function dedupeFindings(findings: Finding[]): Finding[] {
   }
 
   return [...bestByKey.values()];
+}
+
+function issueAnchorKey(file: string, line: number): string {
+  return JSON.stringify([file, line]);
 }
 
 
@@ -195,7 +202,13 @@ export function orchestrate(
   // scanning the inline comments. dedupeFindings preserves insertion order, so
   // sort explicitly. (The old severity-grouped renderer got this for free; the
   // regression it would otherwise have introduced was caught by AC-7.2.)
-  const dedupedFindings = dedupeFindings(actionable).sort(
+  const existingIssueAnchors = new Set(
+    (options.existingIssues ?? []).map((issue) => issueAnchorKey(issue.file, issue.line)),
+  );
+  const dedupedFindings = dedupeFindings(actionable).filter(
+    (finding) => finding.line === undefined || finding.line === null ||
+      !existingIssueAnchors.has(issueAnchorKey(finding.file, finding.line)),
+  ).sort(
     (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
   );
   const inlineEnabled = options.inline !== false && diff !== "";
@@ -302,6 +315,7 @@ export function orchestrate(
     rulesFailed: dispatchResult.rulesFailed,
     ruleFailureReasons: dispatchResult.ruleFailureReasons,
     relatedWork: options.relatedWork,
+    discussionMemories: options.discussionMemories,
     inlineUnavailable: !inlineEnabled && dedupedFindings.length > 0,
     ...(clarification.selected === undefined ? {} : { clarification: clarification.selected }),
     ...(clarification.deferredCount > 0 ? { deferredClarificationCount: clarification.deferredCount } : {}),

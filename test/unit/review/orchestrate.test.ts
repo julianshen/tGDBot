@@ -26,6 +26,46 @@ function makeDispatchResult(overrides: Partial<DispatchResult> = {}): DispatchRe
 }
 
 describe("orchestrate", () => {
+  it("does not post a finding on an issue already covered by an unresolved review thread", () => {
+    const diff = `diff --git a/src/foo.ts b/src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -9,1 +9,2 @@
+ context
++added
+`;
+    const duplicate = makeFinding({ file: "src/foo.ts", line: 10, message: "Missing null check" });
+    const fresh = makeFinding({ file: "src/foo.ts", line: 9, message: "Different issue" });
+
+    const result = orchestrate(makeDispatchResult({ findings: [duplicate, fresh] }), diff, {
+      existingIssues: [{ threadId: "thread-1", file: "src/foo.ts", line: 10 }],
+    });
+
+    expect(result.findingsCount).toBe(1);
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]?.line).toBe(9);
+    expect(result.commentBody).not.toContain("Missing null check");
+  });
+
+  it("keeps bounded summaries of other reviewers' comments in the managed comment", () => {
+    const result = orchestrate(makeDispatchResult(), "", {
+      discussionMemories: [{
+        threadId: "thread-1",
+        file: "src/foo.ts",
+        line: 10,
+        author: "alice",
+        summary: "The nil case is already being handled in the caller.",
+        url: "https://github.com/acme/app/pull/7#discussion_r1",
+      }],
+    });
+
+    expect(result.commentBody).toContain("### Local review memory");
+    expect(result.commentBody).toContain("`src/foo.ts:10`");
+    expect(result.commentBody).toContain("@alice");
+    expect(result.commentBody).toContain("The nil case is already being handled in the caller.");
+    expect(result.commentBody).toContain("https://github.com/acme/app/pull/7#discussion_r1");
+  });
+
   it("preserves related work exactly once and unchanged through every inline fallback mode", () => {
     const diff = `diff --git a/src/foo.ts b/src/foo.ts\n--- a/src/foo.ts\n+++ b/src/foo.ts\n@@ -9,1 +9,2 @@\n context\n+added\n`;
     const relatedWork = [{ provider: "github" as const, host: "github.com", projectPath: "acme/app", number: 42, kindHint: "issue" as const, sourceText: "#42", identifier: "#42", fallbackUrl: "https://github.com/acme/app/issues/42", kind: "issue" as const, title: "Fix login", state: "open" as const, url: "https://github.com/acme/app/issues/42" }];

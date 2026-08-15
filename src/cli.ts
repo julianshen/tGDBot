@@ -64,6 +64,8 @@ import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
+import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
+import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
@@ -335,6 +337,8 @@ async function loadOptionalReviewContext(options: {
 }): Promise<{
   conversationContext?: { text: string; digest: string };
   fingerprint?: string;
+  existingIssues: readonly ExistingReviewIssue[];
+  discussionMemories: readonly DiscussionMemory[];
   unavailable: string[];
 }> {
   const unavailable: string[] = [];
@@ -373,6 +377,7 @@ async function loadOptionalReviewContext(options: {
     pending,
     memories,
   });
+  const existingDiscussion = summarizeExistingDiscussion(discussion.threads);
   const fingerprintItems = {
     selectedDiscussion: built.selectedIds.flatMap((id) => {
       const thread = discussion.threads.find((item) => item.threadId === id);
@@ -394,6 +399,8 @@ async function loadOptionalReviewContext(options: {
     ...(hasFingerprint && options.stateRoot !== undefined
       ? { fingerprint: conversationDedupFingerprint(fingerprintItems) }
       : {}),
+    existingIssues: existingDiscussion.existingIssues,
+    discussionMemories: existingDiscussion.discussionMemories,
     unavailable,
   };
 }
@@ -1055,6 +1062,8 @@ export async function review(
     inline: true,
     ...renderOpts,
     relatedWork,
+    existingIssues: loadedContext.existingIssues,
+    discussionMemories: loadedContext.discussionMemories,
     reviewBinding,
     ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
     ...(loadedContext.unavailable.length === 0 ? {} : { contextUnavailable: loadedContext.unavailable }),

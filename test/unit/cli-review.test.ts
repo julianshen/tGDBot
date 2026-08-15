@@ -2815,6 +2815,32 @@ describe("conversation-aware review", () => {
     })],
   });
 
+  it("passes active review anchors and human comment memories into orchestration", async () => {
+    const human = conversationThread({
+      threadId: "human-existing-issue",
+      events: [conversationComment(
+        "human-existing-issue",
+        "human-c1",
+        "This nil case is already handled by the caller.",
+        { authorLogin: "alice", authorIsBot: false },
+      )],
+    });
+    const h = conversationHarness({ threads: [human] });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.orchestrate.mock.calls[0]?.[2]).toMatchObject({
+      existingIssues: [{ threadId: "human-existing-issue", file: "src/changed.ts", line: 10 }],
+      discussionMemories: [{
+        threadId: "human-existing-issue",
+        file: "src/changed.ts",
+        line: 10,
+        author: "alice",
+        summary: "This nil case is already handled by the caller.",
+      }],
+    });
+  });
+
   it("fetches current discussion even when no poll state exists and passes it to both dispatch modes", async () => {
     for (const dispatch of ["direct", "legacy"] as const) {
       const h = conversationHarness({ dispatch, threads: [relevant] });
@@ -3561,5 +3587,4 @@ describe("clarification question publication", () => {
     expect(snapshot.pending.clarifications).toHaveLength(1);
   });
 });
-
 
