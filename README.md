@@ -157,10 +157,15 @@ so quoting someone else's command does not re-run it.
 Replace `@bot` with the authenticated bot's own mention. A clarification posted
 in a thread is answered by simply replying in that thread — no mention needed.
 
-`review focus:` currently records its direction only. It **does not yet post**
-a supplemental review of its own; the direction is picked up by the next
-`review` of that same head, which re-runs because the direction changed the
-review's fingerprint. Pushing a new commit retires the direction.
+`review focus:` runs a review with your direction as extra context and replies
+beneath your comment with what it found. It is **supplemental**: the managed
+summary is left exactly as it was, and previous findings are not resolved. All
+the trusted rules still run — a direction is additional context, never a rule,
+and it cannot switch one off.
+
+The direction is also recorded, so the next ordinary `review` of that same head
+picks it up and re-runs (the direction changes the review's fingerprint).
+Pushing a new commit retires it.
 
 `check latest` is the one command that overrules the normal "nothing changed,
 nothing to do" skip.

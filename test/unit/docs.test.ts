@@ -145,10 +145,12 @@ describe("conversational review and local memory documentation", () => {
     }
     expect(pollSection).toMatch(/one command per comment/i);
     expect(pollSection).toMatch(/quoted|fenced/i);
-    // review focus records a direction but does not yet publish a supplemental
-    // review, and the README must not imply otherwise.
+    // A focused run is supplemental: readers have to know it will not rewrite
+    // the summary or resolve what the previous review found.
     expect(pollSection).toMatch(/review focus/i);
-    expect(pollSection).toMatch(/does not yet (?:post|publish)/i);
+    expect(pollSection).toMatch(/supplemental/i);
+    expect(pollSection).toMatch(/summary is left|not resolved/i);
+    expect(pollSection).toMatch(/never a rule/i);
   });
 
   it("documents local state: precedence, isolation, bootstrap, and loss", () => {
