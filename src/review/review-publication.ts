@@ -17,6 +17,13 @@ import {
   type PublicationWriter,
 } from "../conversation/publication-manifest.js";
 import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "../conversation/markers.js";
+import {
+  childMarkerSuffix,
+  createConversationPublicationChild,
+  publicationBody,
+  renderFocusReply,
+  type RenderedConversationBody,
+} from "../conversation/render.js";
 import type { ConversationStateStore } from "../conversation/state-store.js";
 import type { RepositoryBinding, ReviewIdentity } from "../conversation/types.js";
 import type { ConversationAdapter } from "../vcs/conversation-adapter.js";
@@ -808,4 +815,128 @@ export async function publishConfirmedClarificationFinding(options: {
     identity: options.reviewIdentity,
     cleanStale: false,
   });
+}
+
+/**
+ * Publishes a focused review as a reply of its own.
+ *
+ * A focused run answers the person who asked a narrow question. It must not
+ * touch the managed summary or resolve the previous head's threads — doing
+ * either would let a narrow question silently rewrite the whole review — so
+ * this deliberately does NOT go through publishReviewFromManifest, which is
+ * built around upserting that summary and requires one to exist.
+ *
+ * The reply is a single frozen child, so a crash after an accepted-but-
+ * unconfirmed write is reconciled by its marker instead of posting twice.
+ */
+export async function publishFocusedReview(options: {
+  readonly store: ConversationStateStore;
+  readonly context: ReviewPublicationContext;
+  readonly pr: PullRequestInfo;
+  readonly identity: ReviewIdentity;
+  readonly repository: RepositoryBinding;
+  readonly publicationIdentity: { readonly actionId: string; readonly identityDigest: string };
+  readonly direction: string;
+  readonly summary: string;
+  readonly threadId?: string;
+  readonly now: () => string;
+  readonly hooks?: PublicationExecutorHooks;
+}): Promise<number> {
+  const adapter = options.context.vcsAdapter as unknown as ConversationAdapter;
+  const publicDigest = computeRepositoryDigest(
+    options.context.provider,
+    options.context.repository.canonicalUrl,
+  );
+  const childHex = createHash("sha256")
+    .update(`tgd:focused-review:v1\0${options.publicationIdentity.actionId}`, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  // Ledger IDs and marker IDs use different prefixes for the same identity:
+  // `action_`/`output_` in state, `act_`/`out_` in the public marker grammar.
+  const childId = `output_${childHex}`;
+  const parentId = `act_${options.publicationIdentity.actionId.slice("action_".length)}`;
+  const markerFor = (contentDigest: string): string => formatChildMarker({
+    kind: "action",
+    parentId,
+    childId: `out_${childHex}`,
+    repositoryDigest: publicDigest,
+    reviewNumber: Number(options.pr.id),
+    contentDigest,
+  });
+  const render = (marker: string): RenderedConversationBody =>
+    renderFocusReply({ direction: options.direction, summary: options.summary }, marker);
+
+  // Two passes so the marker commits to the digest of the body it is attached
+  // to, exactly as conversation replies do: render once to measure, then embed.
+  const provisional = markerFor("0".repeat(64));
+  const first = publicationBody(render(provisional));
+  const suffix = childMarkerSuffix(provisional);
+  const visible = first.endsWith(suffix) ? first.slice(0, -suffix.length) : first;
+  const marker = markerFor(computeContentDigest(visible));
+
+  const child = createConversationPublicationChild({
+    id: childId,
+    kind: "group-reply",
+    placement: options.threadId === undefined
+      ? { kind: "group-reply" }
+      : { kind: "group-reply", threadId: options.threadId },
+    body: render(marker),
+    marker: `<!-- tgd-focused-review:${options.publicationIdentity.actionId}:${childId} -->`,
+  });
+
+  const action: PublicationAction = {
+    actionId: options.publicationIdentity.actionId,
+    identityDigest: options.publicationIdentity.identityDigest,
+    reviewNumber: Number(options.pr.id),
+    repository: options.repository,
+    state: "prepared",
+    successorActionId: null,
+    children: [child],
+  };
+  const writer: PublicationWriter = {
+    async lookupChild(pending) {
+      const parsed = parseChildMarker((pending.body.split(/\r?\n/u).at(-1) ?? "").trim());
+      if (parsed === null) return null;
+      return adapter.findBotChildMarker(options.identity, {
+        provider: options.identity.provider,
+        repositoryDigest: parsed.repositoryDigest,
+        reviewNumber: parsed.reviewNumber,
+        kind: parsed.kind,
+        parentId: parsed.parentId,
+        childId: parsed.childId,
+        contentDigest: parsed.contentDigest,
+      });
+    },
+    async writeChild(pending): Promise<PublicationWriteResult> {
+      const input = {
+        provider: options.identity.provider,
+        repositoryDigest: options.identity.repositoryDigest,
+        reviewNumber: options.identity.reviewNumber,
+        body: pending.body,
+      };
+      const written = pending.placement.kind === "group-reply" && pending.placement.threadId !== undefined
+        ? await adapter.postThreadReply(options.identity, { ...input, threadId: pending.placement.threadId })
+        : await adapter.postGeneralReply(options.identity, input);
+      // Take only the identity fields. Whatever else an adapter returns is its
+      // own business and must not reach the stored manifest.
+      return {
+        status: "posted",
+        identity: {
+          provider: written.provider,
+          commentId: written.commentId,
+          ...(written.threadId === undefined ? {} : { threadId: written.threadId }),
+          url: written.url,
+        },
+      };
+    },
+  };
+
+  const published = await executePublication({
+    store: options.store,
+    action,
+    writer,
+    now: options.now,
+    ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
+  });
+  return published.state === "completed" ? 0 : 2;
 }

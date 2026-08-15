@@ -424,6 +424,57 @@ describe("review", () => {
     logSpy.mockRestore();
   });
 
+  // A focused run is supplemental. It answers the person who asked, and must
+  // leave the managed summary and the previous head's threads exactly as they
+  // were — otherwise asking a narrow question silently rewrites the review.
+  it("a focused-command invocation replies beneath the command without touching the summary", async () => {
+    const args = makeArgs({ stateDir: isolatedStateDir() });
+    const findings = {
+      findings: [{
+        ruleName: "rule-a",
+        severity: "warning" as const,
+        category: "correctness",
+        file: "x.ts",
+        line: 1,
+        message: "the error path drops the cause",
+      }],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    };
+    const h = makeHarness({
+      args,
+      dispatchResult: findings,
+      orchestrationResult: {
+        commentBody: "- x.ts:1 — the error path drops the cause",
+        inlineComments: [],
+        findingsCount: 1,
+        rulesRun: findings.rulesRun,
+        rulesFailed: findings.rulesFailed,
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, {
+      ...depsFrom(h),
+      invocation: {
+        kind: "focused-command",
+        actionId: `action_${"6".repeat(32)}`,
+        direction: "check the error handling",
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    // The findings went to a reply of their own...
+    expect(h.vcsAdapter.postGeneralReply).toHaveBeenCalledTimes(1);
+    const [, replyInput] = h.vcsAdapter.postGeneralReply.mock.calls[0] as [unknown, { body: string }];
+    expect(replyInput.body).toContain("the error path drops the cause");
+    expect(replyInput.body).toContain("check the error handling");
+    // ...and nothing else moved.
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.resolveStaleReviewThreads).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
   it("applies head/config dedup to an explicit GitLab merge request", async () => {
     const args = makeArgs({
       pr: "https://gitlab.example.com/group/project/-/merge_requests/42",

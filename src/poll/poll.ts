@@ -639,7 +639,12 @@ async function executeReviewCommand(input: {
   }
   const invocation: ReviewInvocation = command.kind === "check-latest"
     ? { kind: "forced-command", actionId: item.identity.actionId }
-    : { kind: "focused-command", actionId: item.identity.actionId, direction: command.direction };
+    : {
+        kind: "focused-command",
+        actionId: item.identity.actionId,
+        direction: command.direction,
+        ...(item.event.threadId === undefined ? {} : { threadId: item.event.threadId }),
+      };
 
   // The direction is durable BEFORE the supplemental run. If the review fails
   // transiently, the retry still knows what was asked; and a later normal
@@ -653,14 +658,6 @@ async function executeReviewCommand(input: {
       options,
     });
     if (stored === "transient") return "transient";
-    // The supplemental publication path — results replying beneath the command,
-    // leaving the managed summary and prior threads untouched — is not built
-    // yet. Running an ordinary review here would do the opposite: overwrite the
-    // summary and resolve the previous head's threads. So the direction is
-    // recorded and steers the next review of this head, and nothing is
-    // published until the supplemental path exists.
-    await completeReviewCommandAction(item, options);
-    return "completed";
   }
 
   let exitCode: number;

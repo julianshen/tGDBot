@@ -872,7 +872,7 @@ describe("event-to-action poll", () => {
   // The direction has to be durable BEFORE the supplemental run: if the review
   // fails transiently, the retry must still know what was asked, and a later
   // normal review on the same head has to be able to pick it up as context.
-  it("review focus records the direction bound to the review head and publishes nothing yet", async () => {
+  it("review focus stores the direction bound to the head before running the focused review", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);
     let directionsAtRunTime: readonly { text: string; headSha: string }[] = [];
@@ -890,14 +890,17 @@ describe("event-to-action poll", () => {
       ...executionDeps(adapter), runReview,
     })).resolves.toBe(0);
 
-    // The supplemental publication path does not exist yet, and running an
-    // ordinary review would overwrite the managed summary and resolve the prior
-    // head's threads — the opposite of what a focused run must do. So nothing
-    // is reviewed or published; the direction is recorded to steer the next
-    // review of this head.
-    expect(runReview).not.toHaveBeenCalled();
-    expect(directionsAtRunTime).toEqual([]);
-    expect(adapter.postedBodies).toEqual([]);
+    expect(runReview).toHaveBeenCalledTimes(1);
+    const [, reviewDeps] = runReview.mock.calls[0] as [unknown, Record<string, unknown>];
+    expect(reviewDeps.invocation).toMatchObject({
+      kind: "focused-command",
+      direction: "check the error handling",
+    });
+    // Durable BEFORE the supplemental run, not after it: a transient failure
+    // must leave the direction recorded for the retry.
+    expect(directionsAtRunTime).toEqual([
+      { text: "check the error handling", headSha: adapter.headSha.toLowerCase() },
+    ]);
     const stored = (await store.readContextSnapshot()).pending.directions;
     expect(stored).toHaveLength(1);
     expect(stored[0]).toMatchObject({
@@ -905,6 +908,36 @@ describe("event-to-action poll", () => {
       author: "alice",
       text: "check the error handling",
     });
+  });
+
+  // The provider keeps returning a comment forever; what stops a second review
+  // is that the review's cursor advanced past it. Verified here for a focus
+  // command specifically, since it both dispatches a review AND writes a
+  // direction — running twice would steer the next review twice over.
+  //
+  // Note this exercises cursor advancement, not the completed-action guard:
+  // the second pass never sees the event at all. Re-delivery of an already
+  // completed action is a separate path and is not covered here.
+  it("does not re-run a focus command once its review has advanced the cursor", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const runReview = vi.fn(async () => 0);
+    const focus = commentEvent("focus", "@tgdbot review focus: check the error handling");
+    adapter.replaceEvents([focus]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter), runReview,
+    })).resolves.toBe(0);
+
+    // The provider still reports the same comment on the next pass.
+    adapter.replaceEvents([focus]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter), runReview,
+    })).resolves.toBe(0);
+
+    expect(runReview).toHaveBeenCalledTimes(1);
+    const directions = (await createConversationStateStore({ root: stateDir, repository: repo })
+      .readContextSnapshot()).pending.directions;
+    expect(directions).toHaveLength(1);
   });
 
   it("executes explain and reconsider only in a marked bot-started finding thread", async () => {

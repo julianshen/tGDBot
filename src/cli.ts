@@ -24,6 +24,7 @@ import {
 import {
   persistPreparedFindings,
   prepareReviewFindingPublication,
+  publishFocusedReview,
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
@@ -141,7 +142,13 @@ export function parseArgs(argv: string[]): CliArgs {
 export type ReviewInvocation =
   | { readonly kind: "normal" }
   | { readonly kind: "forced-command"; readonly actionId: string }
-  | { readonly kind: "focused-command"; readonly actionId: string; readonly direction: string };
+  | {
+      readonly kind: "focused-command";
+      readonly actionId: string;
+      readonly direction: string;
+      /** Thread the command was posted in, so the reply lands beneath it. */
+      readonly threadId?: string;
+    };
 
 export interface ReviewDependencies {
   invocation: ReviewInvocation;
@@ -1098,6 +1105,28 @@ export async function review(
     }
     if (orchestration.inlineComments.length > 0) console.log("\n----- summary comment -----");
     console.log(buildBody(orchestration, noFallbackIds, undefined, false));
+  } else if (invocation.kind === "focused-command") {
+    // Supplemental: reply to the person who asked, and leave the managed
+    // summary and the previous head's threads exactly as they were. All trusted
+    // rules still ran — the direction is additive context, never a rule — so
+    // this publishes what that run found without restating the whole review.
+    if (stateStore === undefined) throw new Error("Review publication requires a conversation state store");
+    return publishFocusedReview({
+      store: stateStore,
+      context: publicationContext(config, pr, provider),
+      pr,
+      identity: reviewIdentity,
+      repository: storeBinding,
+      publicationIdentity: {
+        actionId: publicationIdentity.actionId,
+        identityDigest: publicationIdentity.identityDigest,
+      },
+      direction: invocation.direction,
+      summary: buildBody(orchestration, noFallbackIds, undefined, false),
+      ...(invocation.threadId === undefined ? {} : { threadId: invocation.threadId }),
+      now,
+      ...(publicationHooks === undefined ? {} : { hooks: publicationHooks }),
+    });
   } else {
     if (stateStore === undefined) throw new Error("Review publication requires a conversation state store");
     let inlineRecovery: InlineRecoveryState | undefined;
