@@ -1756,6 +1756,32 @@ describe("GitLab conversation activity", () => {
       .toBe(true);
   });
 
+  it("retains a bounded reaction subset when a discussion note has more than 100 thumbs-up awards", async () => {
+    const fallback = activityExec();
+    const awards = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      name: "thumbsup",
+      user: { username: `user-${index}` },
+      created_at: new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString(),
+    }));
+    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+      const endpoint = args.find((arg) => arg.startsWith("projects/"));
+      if (endpoint?.endsWith("/merge_requests/42/notes/8/award_emoji")) {
+        const page = Number(field(args, "page") ?? "1");
+        return toNdjson(awards.slice((page - 1) * 100, page * 100));
+      }
+      return fallback(args, stdin);
+    });
+
+    const snapshot = await new GitLabAdapter(execGlab, repo).getReviewThread(review, "T1");
+
+    expect(snapshot.events[0]?.reactions).toHaveLength(100);
+    expect(snapshot.events[0]?.reactions?.[0]?.id).toBe("1");
+    expect(execGlab.mock.calls.filter(([args]) =>
+      (args as string[]).some((arg) => arg.endsWith("/merge_requests/42/notes/8/award_emoji"))))
+      .toHaveLength(1);
+  });
+
   it("bounds concurrent reaction requests for bot-authored discussion notes", async () => {
     const discussions = JSON.parse(JSON.stringify(activityDiscussions())) as Array<Record<string, unknown>>;
     const discussion = discussions[0]!;

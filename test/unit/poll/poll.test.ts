@@ -1635,6 +1635,22 @@ describe("clarification answer lifecycle", () => {
     expect(adapter.postedBodies.join("\n")).not.toMatch(/clar_|question|pending/i);
   });
 
+  it("answers an unknown explicit clarification ID instead of silently advancing", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    adapter.replaceEvents([commentEvent("unknown-answer", `answer clar_${"c".repeat(26)}: yes`)]);
+    const createSession = vi.fn(sessionFor("{}"));
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toContain("## Clarification unavailable");
+    expect(createSession).not.toHaveBeenCalled();
+  });
+
   it("acknowledges a stale-head answer without promoting a current finding", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);
@@ -1700,7 +1716,7 @@ describe("clarification answer lifecycle", () => {
     expect(adapter.postedBodies).toEqual([]);
   });
 
-  it("stays silent after a terminal result until a new mention", async () => {
+  it("stays silent for terminal thread chatter but answers an explicit terminal clarification ID", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);
     await seedPublishedQuestion(stateDir);
@@ -1730,7 +1746,8 @@ describe("clarification answer lifecycle", () => {
       ...executionDeps(adapter, { createSession }),
     })).resolves.toBe(0);
     expect(createSession).not.toHaveBeenCalled();
-    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies).toHaveLength(2);
+    expect(adapter.postedBodies[1]).toContain("## Clarification unavailable");
   });
 
   const confirmedFinding = {

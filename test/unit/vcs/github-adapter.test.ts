@@ -1476,6 +1476,27 @@ describe("GitHub conversation activity", () => {
       .toContain("reactions(first:100,content:THUMBS_UP)");
   });
 
+  it("retains the bounded first page when a review comment has more than 100 thumbs-up reactions", async () => {
+    const fixture = JSON.parse(readFixture("gh-review-threads.json")) as {
+      data: { repository: { pullRequest: { reviewThreads: { nodes: Array<{ comments: { nodes: Array<Record<string, unknown>> } }> } } } };
+    };
+    fixture.data.repository.pullRequest.reviewThreads.nodes[0]!.comments.nodes[0]!.reactions = {
+      pageInfo: { hasNextPage: true, endCursor: "REACTION_CURSOR" },
+      nodes: [{
+        id: "REACTION_1",
+        content: "THUMBS_UP",
+        createdAt: "2026-08-02T00:01:00Z",
+        user: { login: "alice" },
+      }],
+    };
+    const execGh = vi.fn(async (args: string[]) =>
+      args[1] === "user" ? JSON.stringify({ login: "octo-bot" }) : JSON.stringify(fixture));
+
+    const snapshot = await new GitHubAdapter(execGh, repo).getReviewThread(review, "T1");
+
+    expect(snapshot.events[0]?.reactions).toMatchObject([{ id: "REACTION_1", authorLogin: "alice" }]);
+  });
+
   it("normalizes a nullable FILE review thread without a line", async () => {
     const fixture = JSON.parse(readFixture("gh-review-threads.json")) as { data: { repository: { pullRequest: { reviewThreads: { nodes: Array<Record<string, unknown>> } } } } };
     const node = fixture.data.repository.pullRequest.reviewThreads.nodes[0];

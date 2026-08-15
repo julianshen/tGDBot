@@ -306,6 +306,12 @@ export function renderScopeErrorReply(marker: string): RenderedConversationBody 
   ], marker);
 }
 
+export function renderClarificationUnavailableReply(marker: string): RenderedConversationBody {
+  return renderSections("## Clarification unavailable", [
+    "That clarification ID is not active in this review. Check the ID and answer an open clarification from this review.",
+  ], marker);
+}
+
 export function renderUnsupportedHistoryReply(marker: string): RenderedConversationBody {
   return renderSections("## History unavailable", [
     "This thread's original finding is no longer in the local ledger, so tGDBot cannot explain or reconsider it.",

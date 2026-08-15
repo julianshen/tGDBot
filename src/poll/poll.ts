@@ -18,6 +18,7 @@ import {
   associateClarificationEvent,
   clarificationLifecycleState,
   mayBeClarificationAnswer,
+  parseAnswerSyntax,
   transitionClarification,
 } from "../conversation/clarification.js";
 import { parseConversationCommand } from "../conversation/command-parser.js";
@@ -56,6 +57,7 @@ import {
   createConversationPublicationChild,
   publicationBody,
   renderClarificationReply,
+  renderClarificationUnavailableReply,
   renderExplainReply,
   renderInactiveRuleReply,
   renderMemoryReply,
@@ -276,7 +278,8 @@ async function classifyOpenReviewEvents(options: {
             const pendingForReview = tx.snapshot.pending.clarifications.filter((entry) =>
               entry.reviewNumber === item.event.reviewNumber);
             const answerCommand = item.parsed.kind === "command" && item.parsed.command.kind === "answer";
-            if (item.parsed.kind === "command" || item.parsed.kind === "invalid" || answerCommand ||
+            const explicitAnswer = answerCommand || parseAnswerSyntax(item.event.body) !== undefined;
+            if (item.parsed.kind === "command" || item.parsed.kind === "invalid" || explicitAnswer ||
               mayBeClarificationAnswer({ event: item.event, pending: pendingForReview })) {
               appendPrepared(tx, item.identity, item.event.reviewNumber, options.now());
             } else {
@@ -292,7 +295,8 @@ async function classifyOpenReviewEvents(options: {
 
       const pendingForReview = (options.dryRun ? snapshot : await options.store.readContextSnapshot())
         .pending.clarifications.filter((entry) => entry.reviewNumber === item.event.reviewNumber);
-      const maybeAnswer = mayBeClarificationAnswer({ event: item.event, pending: pendingForReview });
+      const maybeAnswer = parseAnswerSyntax(item.event.body) !== undefined ||
+        mayBeClarificationAnswer({ event: item.event, pending: pendingForReview });
       if (knownActionIds.has(item.identity.actionId) || (item.parsed.kind === "irrelevant" && !maybeAnswer)) {
         if (item.parsed.kind === "irrelevant" && !maybeAnswer) knownActionIds.add(item.identity.actionId);
         continue;
@@ -518,6 +522,7 @@ async function resolveLatestAction(
 
 type ReplyPlan =
   | { readonly kind: "usage" }
+  | { readonly kind: "clarification-unavailable" }
   | {
       readonly kind: "memory";
       readonly reply: MemoryReply;
@@ -1152,6 +1157,7 @@ function buildReplyChild(input: {
   const parentId = `act_${input.actionId.slice("action_".length)}`;
   const render = (marker: string): RenderedConversationBody => {
     if (input.plan.kind === "usage") return renderUsageReply(marker);
+    if (input.plan.kind === "clarification-unavailable") return renderClarificationUnavailableReply(marker);
     if (input.plan.kind === "memory") return renderMemoryReply(input.plan.reply, marker);
     if (input.plan.kind === "scope") return renderScopeErrorReply(marker);
     if (input.plan.kind === "history") return renderUnsupportedHistoryReply(marker);
@@ -1396,21 +1402,22 @@ async function maybeExecuteClarification(input: {
   const snapshot = await input.options.store.readContextSnapshot();
   const pending = snapshot.pending.clarifications.filter((entry) => entry.reviewNumber === input.item.event.reviewNumber);
   const answerCommand = input.item.parsed.kind === "command" && input.item.parsed.command.kind === "answer";
-  if (pending.length === 0 && !answerCommand) return undefined;
+  const explicitAnswer = answerCommand || parseAnswerSyntax(input.item.event.body) !== undefined;
+  if (pending.length === 0 && !explicitAnswer) return undefined;
 
   let thread: ReviewThreadSnapshot | undefined;
   if (input.item.event.threadId !== undefined) {
     try {
       thread = await input.options.adapter.getReviewThread(input.reviewIdentity, input.item.event.threadId);
     } catch (error) {
-      if (answerCommand || mayBeClarificationAnswer({ event: input.item.event, pending })) {
+      if (explicitAnswer || mayBeClarificationAnswer({ event: input.item.event, pending })) {
         console.warn(`tgd-review-agent: could not load clarification thread (${redactedMessage(error)})`);
         return "transient";
       }
     }
   }
   const metadata = await loadReviewMetadata(input.item.event.reviewNumber, input.options);
-  const potentialAnswer = answerCommand || mayBeClarificationAnswer({ event: input.item.event, pending });
+  const potentialAnswer = explicitAnswer || mayBeClarificationAnswer({ event: input.item.event, pending });
   if (metadata === undefined) return potentialAnswer ? "transient" : undefined;
   const publicDigest = computeRepositoryDigest(
     input.options.config.repository.provider,
@@ -1426,6 +1433,19 @@ async function maybeExecuteClarification(input: {
     mentioned: input.item.parsed.kind === "command",
   });
   if (association.kind === "ignore") {
+    const boundExplicitAnswer = explicitAnswer &&
+      input.item.event.repositoryDigest === publicDigest &&
+      input.item.event.reviewNumber === input.reviewIdentity.reviewNumber;
+    if (boundExplicitAnswer) {
+      return publishReplyPlan({
+        event: input.item.event,
+        identity: input.item.identity,
+        plan: { kind: "clarification-unavailable" },
+        reviewIdentity: input.reviewIdentity,
+        options: input.options,
+      });
+    }
+    if (explicitAnswer && input.latest?.state === "prepared") return completeEmptyPrepared(input);
     const preparedAsAnswer = input.latest?.state === "prepared" && (
       answerCommand || mayBeClarificationAnswer({ event: input.item.event, pending })
     );

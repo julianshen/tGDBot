@@ -51,9 +51,7 @@ function githubThumbsUpReactions(node: Record<string, unknown>, bot: string): re
   if (node.reactions === undefined || node.reactions === null) return [];
   const connection = object(node.reactions, "review comment reactions");
   const pageInfo = object(connection.pageInfo, "review comment reaction page info");
-  if (pageInfo.hasNextPage !== false) {
-    throw new Error("GitHub review comment exceeds the 100-reaction feedback limit");
-  }
+  if (typeof pageInfo.hasNextPage !== "boolean") throw new Error("Invalid GitHub review comment reaction page info");
   if (!Array.isArray(connection.nodes)) throw new Error("Invalid GitHub review comment reactions");
   return connection.nodes.map((value): ReviewReaction => {
     const reaction = object(value, "review comment reaction");

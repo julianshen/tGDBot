@@ -1511,6 +1511,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     suffix: string,
     perPage: number,
     label: string,
+    maxRows?: number,
   ): Promise<Record<string, unknown>[]> {
     const rows: Record<string, unknown>[] = [];
     for (let page = 1; page <= MAX_TARGET_PAGES; page += 1) {
@@ -1533,6 +1534,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       ]), label);
       if (batch.length > perPage) throw new GlabOutputError(`GitLab ${label} page exceeds requested bound`);
       rows.push(...batch);
+      if (maxRows !== undefined && rows.length >= maxRows) return rows.slice(0, maxRows);
       if (batch.length < perPage) break;
       if (page === MAX_TARGET_PAGES) throw new GlabOutputError(`GitLab ${label} scan exceeded safe page bound`);
     }
@@ -1761,8 +1763,8 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       `merge_requests/${review.reviewNumber}/notes/${encodeURIComponent(conversationProviderId(noteId, "note id"))}/award_emoji`,
       100,
       "note award emoji",
+      100,
     );
-    if (rows.length > 100) throw new GlabOutputError("GitLab review comment exceeds the 100-reaction feedback limit");
     return parseConversationReactions(rows);
   }
 
