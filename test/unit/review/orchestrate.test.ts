@@ -429,7 +429,7 @@ describe("inline anchoring", () => {
     expect(result.inlineComments[0].body).toContain("🔴 Blocking");
     expect(result.inlineComments[0].body).toContain("Prompt for AI Agents");
     // Counted, not repeated, in the summary.
-    expect(result.commentBody).toContain("Actionable comments posted: 1");
+    expect(result.commentBody).toContain("1 finding · 1 inline comment posted");
     expect(result.commentBody).not.toContain("Bad thing here.");
   });
 
@@ -450,7 +450,7 @@ describe("inline anchoring", () => {
     expect(result.commentBody).toContain("No line at all.");
     expect(result.commentBody).toContain("Additional comments (3)");
     // Total = inline + summary, so nothing is double-counted.
-    expect(result.commentBody).toContain("Actionable comments posted: 4");
+    expect(result.commentBody).toContain("4 findings · 1 inline comment posted");
   });
 
   it("never duplicates: an anchored finding appears inline and NOT in the summary body", () => {
@@ -796,9 +796,9 @@ describe("finding decisions", () => {
       expect.stringContaining("fresh"),
       expect.stringContaining("still there"),
     ]);
-    expect(result.commentBody).toContain("**Actionable comments posted: 2**");
+    expect(result.commentBody).toContain("**2 findings · 2 inline comments posted**");
     expect(result.commentBody).not.toContain("fixed");
-    expect(result.commentBody).not.toMatch(/Actionable comments posted: [345]/);
+    expect(result.commentBody).not.toMatch(/^\*\*[345] findings ·/mu);
   });
 
   it("suppresses a repeated finding once any copy is addressed", () => {
@@ -830,7 +830,7 @@ describe("finding decisions", () => {
     expect(result.commentBody).toMatch(/no actionable comments/i);
     expect(result.commentBody).toMatch(/### Disputed/i);
     expect(result.commentBody).toContain("Maybe a race");
-    expect(result.commentBody).not.toContain("**Actionable comments posted:");
+    expect(result.commentBody).not.toMatch(/\*\*\d+ findings? ·/u);
   });
 
   it("selects the first deterministic clarification and renders the deferred count separately", () => {
@@ -871,7 +871,118 @@ describe("finding decisions", () => {
     expect(result.commentBody).not.toContain("Should later-rule win?");
     expect(result.commentBody).not.toContain("And this later earlier-rule question?");
     expect(result.commentBody).toMatch(/2 additional (?:questions|clarifications) deferred/i);
-    expect(result.commentBody).not.toContain("**Actionable comments posted:");
+    expect(result.commentBody).not.toMatch(/\*\*\d+ findings? ·/u);
     expect(result.commentBody).not.toMatch(/🔴|🟠|🔵/);
+  });
+});
+
+// PR #281: 14 findings, 9 distinct defects, 0 inline comments posted, and a
+// summary that blamed the diff for a provider rejection.
+describe("orchestrate — outcome groups and clustering", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return {
+      file: "a.go",
+      line: 11,
+      severity: "blocking",
+      category: "concurrency",
+      ruleName: "rule-a",
+      ...overrides,
+    };
+  }
+
+  it("collapses one defect reported by several rules into a single entry", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "mongodb", message: "Set followed by Get is not atomic." }),
+          f({ ruleName: "nats", message: "Set followed by Get is not atomic here." }),
+          f({ ruleName: "tgd-review", message: "Set followed by Get is not atomic at all." }),
+        ],
+        rulesRun: ["mongodb", "nats", "tgd-review"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.commentBody).toContain("3 findings · 1 unique issue");
+  });
+
+  it("keeps distinct defects apart", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "a", message: "Set followed by Get is not atomic." }),
+          f({ ruleName: "b", message: "Clock skew shortens the retention window." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(2);
+    expect(result.summaryInput.uniqueIssueCount).toBe(2);
+  });
+
+  it("attaches a diff excerpt to findings that fall back to the summary", () => {
+    const result = orchestrate(
+      { findings: [f({ line: 999, message: "Off the diff." })], rulesRun: ["a"], rulesFailed: [] } as never,
+      DIFF,
+      {},
+    );
+
+    // Line 999 is not in the diff, so there is no excerpt to show — but the
+    // finding must still be rendered rather than dropped.
+    expect(result.summaryInput.unanchored).toHaveLength(1);
+    expect(result.commentBody).toContain("a.go:999");
+  });
+
+  it("routes a publish failure to publishFailed, never to unanchored", () => {
+    const result = orchestrate(
+      { findings: [f({ message: "Anchored fine." })], rulesRun: ["a"], rulesFailed: [] } as never,
+      DIFF,
+      {},
+    );
+    expect(result.inlineComments).toHaveLength(1);
+
+    const body = renderSummary(
+      result,
+      new Set([result.inlineComments[0]!.clientId]),
+      undefined,
+      "GitHub rejected the atomic inline review (HTTP 422)",
+    );
+
+    expect(body).toContain("### 📌 Inline publication failed (1)");
+    expect(body).toContain("HTTP 422");
+    expect(body).not.toContain("### 💬 Additional comments");
+    expect(body).toContain("0 inline comments posted");
+  });
+
+  it("gives a rejected finding the diff excerpt it lost by not being inline", () => {
+    const result = orchestrate(
+      { findings: [f({ message: "Anchored fine." })], rulesRun: ["a"], rulesFailed: [] } as never,
+      DIFF,
+      {},
+    );
+
+    const body = renderSummary(result, new Set([result.inlineComments[0]!.clientId]), undefined, "rejected");
+
+    expect(body).toContain("```diff");
+    expect(body).toContain("+added");
   });
 });

@@ -7,16 +7,18 @@
 // module is a plain formatting/safety-net layer on top of its output.
 import { selectClarification } from "../conversation/clarification.js";
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
-import type { ClarificationPresentation, RenderOptions } from "./comment-format.js";
+import type { ClarificationPresentation, FindingContext, RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
 import {
   changedFiles,
   commentableLines,
+  hunkSnippet,
   diffPositionRange,
   isCommentable,
   parseDiffPositions,
   rangeIsCommentable,
 } from "./diff-anchors.js";
+import { clusterFindings } from "./finding-clusters.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./existing-discussion.js";
@@ -205,12 +207,22 @@ export function orchestrate(
   const existingIssueAnchors = new Set(
     (options.existingIssues ?? []).map((issue) => issueAnchorKey(issue.file, issue.line)),
   );
-  const dedupedFindings = dedupeFindings(actionable).filter(
+  const allFindings = dedupeFindings(actionable).filter(
     (finding) => finding.line === undefined || finding.line === null ||
       !existingIssueAnchors.has(issueAnchorKey(finding.file, finding.line)),
-  ).sort(
-    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
   );
+
+  // Several rules recognising ONE defect used to produce one entry each — five
+  // statements of the same race on PR #281, three of them anchored to the very
+  // same line. Cluster first, then present one entry per root cause with its
+  // contributing rules as metadata, so the reader meets each defect once.
+  const clusters = clusterFindings(allFindings);
+  const contributingRules = new Map<Finding, readonly string[]>(
+    clusters.map((cluster) => [cluster.representative, cluster.rules]),
+  );
+  const dedupedFindings = clusters
+    .map((cluster) => cluster.representative)
+    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   const inlineEnabled = options.inline !== false && diff !== "";
 
   const positions = inlineEnabled ? parseDiffPositions(diff) : undefined;
@@ -306,10 +318,32 @@ export function orchestrate(
     });
   }
 
+  // Built for EVERY finding, not just the currently-unanchored ones: an inline
+  // comment can still be rejected at publication time, and renderSummary must be
+  // able to give it its excerpt then without re-parsing the diff.
+  const context = new Map<Finding, FindingContext>(
+    dedupedFindings.map((finding) => [
+      finding,
+      {
+        ...(inlineEnabled
+          ? { snippet: hunkSnippet(diff, finding.file, finding.line, finding.endLine) }
+          : {}),
+        ...(() => {
+          const rules = contributingRules.get(finding);
+          return rules && rules.length > 1 ? { rules } : {};
+        })(),
+      },
+    ]),
+  );
+
   const summaryInput = {
     allFindings: dedupedFindings,
     inlineCount: inlineComments.length,
     unanchored,
+    publishFailed: [] as Finding[],
+    findingCount: allFindings.length,
+    uniqueIssueCount: clusters.length,
+    context,
     filesReviewed: changedFiles(diff),
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
@@ -335,10 +369,21 @@ export function orchestrate(
   };
 }
 
+/**
+ * Re-renders the summary once publication outcomes are known.
+ *
+ * `failedIds` are findings whose anchors were VALID — they were accepted by
+ * every check this tool makes and then refused by the provider. Merging them
+ * into `unanchored` (which is what this did) made the comment tell the reader
+ * their line numbers were not in the diff, sending them to audit anchors that
+ * were never wrong. They get their own group, and `reason` carries the
+ * provider's own words so the failure is diagnosable from the comment alone.
+ */
 export function renderSummary(
   presentation: OrchestrationResult,
   failedIds: ReadonlySet<string>,
   maxLength?: number,
+  reason?: string,
 ): string {
   const failed = [...failedIds].map((id) => {
     const finding = presentation.findingByClientId.get(id);
@@ -348,9 +393,11 @@ export function renderSummary(
   return renderSummaryComment({
     ...presentation.summaryInput,
     inlineCount: presentation.inlineComments.length - failed.length,
-    unanchored: [...presentation.summaryInput.unanchored, ...failed].sort(
-      (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
-    ),
+    publishFailed: [
+      ...(presentation.summaryInput.publishFailed ?? []),
+      ...failed,
+    ].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]),
+    ...(reason === undefined ? {} : { publishFailureReason: reason }),
     inlineUnavailable: presentation.summaryInput.inlineUnavailable,
   }, maxLength);
 }

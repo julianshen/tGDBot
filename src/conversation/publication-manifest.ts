@@ -48,6 +48,14 @@ export interface PublicationAction {
 export interface PublicationWriteResult {
   readonly status: "posted" | "failed" | "fallback-selected";
   readonly identity?: ConversationItemIdentity;
+  /**
+   * The provider's own words for WHY a write failed, carried through to the
+   * summary comment. Without it the summary can only say that a finding is not
+   * inline, leaving the reader to guess between a bad anchor, a permissions
+   * problem, and an outage — the exact ambiguity that made PR #281's summary
+   * blame the diff for a rejection.
+   */
+  readonly reason?: string;
 }
 
 export interface PublicationWriter {

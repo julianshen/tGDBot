@@ -11,6 +11,7 @@ import {
   diffPositionRange,
   parseDiffPositions,
   isCommentable,
+  hunkSnippet,
 } from "../../../src/review/diff-anchors.js";
 
 const SIMPLE = `diff --git a/src/a.go b/src/a.go
@@ -343,5 +344,63 @@ diff --git a/victim.ts b/victim.ts
 `;
     // `+new` is line 2 and must survive — the `\\` line consumes no line.
     expect([...(commentableLines(diff).get("n.ts") ?? [])].sort((a, b) => a - b)).toEqual([1, 2]);
+  });
+});
+
+// A finding that lands in the summary instead of on the diff loses GitHub's
+// native code context. hunkSnippet recovers it: the diff excerpt around the
+// finding's lines, so the summary entry is readable on its own.
+describe("hunkSnippet", () => {
+  it("returns the diff excerpt around a single line, marking the target", () => {
+    const snippet = hunkSnippet(SIMPLE, "src/a.go", 11);
+
+    expect(snippet).toEqual({
+      startLine: 11,
+      endLine: 11,
+      lines: [
+        { marker: " ", text: "ctx1", newLine: 10, target: false },
+        { marker: "-", text: "removed", newLine: undefined, target: false },
+        { marker: "+", text: "added1", newLine: 11, target: true },
+        { marker: "+", text: "added2", newLine: 12, target: false },
+        { marker: " ", text: "ctx2", newLine: 13, target: false },
+      ],
+    });
+  });
+
+  it("marks every line of a multi-line range as target", () => {
+    const snippet = hunkSnippet(SIMPLE, "src/a.go", 11, 12);
+
+    expect(snippet?.startLine).toBe(11);
+    expect(snippet?.endLine).toBe(12);
+    expect(snippet?.lines.filter((l) => l.target).map((l) => l.text)).toEqual([
+      "added1",
+      "added2",
+    ]);
+  });
+
+  it("bounds the excerpt to `context` lines either side of the range", () => {
+    const wide = [
+      "diff --git a/src/b.go b/src/b.go",
+      "--- a/src/b.go",
+      "+++ b/src/b.go",
+      "@@ -1,9 +1,9 @@",
+      ...["a", "b", "c", "d"].map((t) => ` ${t}`),
+      "+target",
+      ...["e", "f", "g", "h"].map((t) => ` ${t}`),
+      "",
+    ].join("\n");
+
+    const snippet = hunkSnippet(wide, "src/b.go", 5, 5, 2);
+
+    expect(snippet?.lines.map((l) => l.text)).toEqual(["c", "d", "target", "e", "f"]);
+  });
+
+  it("returns undefined for a line that is not in the diff", () => {
+    expect(hunkSnippet(SIMPLE, "src/a.go", 999)).toBeUndefined();
+    expect(hunkSnippet(SIMPLE, "src/missing.go", 11)).toBeUndefined();
+  });
+
+  it("returns undefined when the finding has no line at all", () => {
+    expect(hunkSnippet(SIMPLE, "src/a.go", undefined)).toBeUndefined();
   });
 });

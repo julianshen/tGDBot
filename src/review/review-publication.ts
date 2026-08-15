@@ -294,6 +294,7 @@ export async function publishReviewFromManifest(options: {
     failedIds: ReadonlySet<string>,
     marker?: string,
     providerLimit?: boolean,
+    publishFailureReason?: string,
   ) => string;
   readonly terminalResult?: TerminalReviewResult;
   readonly inlineRecovery?: InlineRecoveryState;
@@ -332,9 +333,18 @@ export async function publishReviewFromManifest(options: {
     options.logStatus?.(log);
   };
 
+  // Any one provider reason explains the batch: an atomic review fails for a
+  // single cause, and bisection reports each isolated comment with its own.
+  const firstFailureReason = (): string | undefined => {
+    for (const result of githubInlineResults.values()) {
+      if (result.status === "failed" && result.reason !== undefined) return result.reason;
+    }
+    return undefined;
+  };
+
   const bodyFor = (action: PublicationAction, failedIds: ReadonlySet<string>, marker: string): string => {
     if (orchestration !== undefined && buildBody !== undefined) {
-      return buildBody(orchestration, failedIds, marker);
+      return buildBody(orchestration, failedIds, marker, undefined, firstFailureReason());
     }
     return composeFrozenSummary(action, failedIds, marker);
   };
@@ -396,7 +406,7 @@ export async function publishReviewFromManifest(options: {
           const outcome = validated.find((entry) => entry.clientId === clientIdOf(child));
           results.set(child.id, outcome?.status === "posted"
             ? { status: "posted", identity: outcome.identity }
-            : { status: "failed" });
+            : { status: "failed", ...(outcome?.reason === undefined ? {} : { reason: outcome.reason }) });
         }
       } catch (err) {
         console.warn(

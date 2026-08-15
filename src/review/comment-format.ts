@@ -8,6 +8,7 @@
 //
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
+import type { HunkSnippet } from "./diff-anchors.js";
 import type { DiscussionMemory } from "./existing-discussion.js";
 import {
   isValidRelatedWorkProjectPath,
@@ -243,8 +244,14 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
   return parts.join("\n");
 }
 
-function metaLine(finding: Finding): string {
-  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | _\`${sanitizeInline(finding.ruleName)}\`_`;
+function metaLine(finding: Finding, contributingRules?: readonly string[]): string {
+  // When several rules independently found ONE defect, the interesting fact is
+  // that corroboration — not which rule happened to win the representative slot.
+  const rules =
+    contributingRules && contributingRules.length > 1
+      ? `${contributingRules.map((rule) => `\`${sanitizeInline(rule)}\``).join(", ")} (${contributingRules.length} rules)`
+      : `\`${sanitizeInline(finding.ruleName)}\``;
+  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | _${rules}_`;
 }
 
 export interface RenderOptions {
@@ -317,6 +324,14 @@ function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
 
+/** Presentation extras attached to one finding in a fallback section. */
+export interface FindingContext {
+  /** The diff excerpt around the finding, recovering the context inline gives free. */
+  readonly snippet?: HunkSnippet;
+  /** Every rule that reported this root cause, when clustering merged several. */
+  readonly rules?: readonly string[];
+}
+
 export interface ClarificationPresentation {
   readonly id: string;
   readonly question: string;
@@ -332,6 +347,29 @@ export interface SummaryInput {
   inlineCount: number;
   /** Findings that could NOT be anchored to the diff; rendered in full here. */
   unanchored: Finding[];
+  /**
+   * Findings whose anchors WERE valid but whose inline publication the provider
+   * rejected. Kept apart from `unanchored` because merging them (as this code
+   * used to) makes the summary blame the diff for a provider failure — the
+   * reader then goes looking for a bad line number that does not exist.
+   */
+  publishFailed?: Finding[];
+  /** The provider's own reason, so a rejection is diagnosable from the comment. */
+  publishFailureReason?: string;
+  /** Distinct root causes across `allFindings` (see finding-clusters). */
+  uniqueIssueCount?: number;
+  /**
+   * Findings BEFORE clustering. The rendered entries are one per root cause, so
+   * without this the headline could only report the post-clustering number and
+   * "14 findings · 9 unique issues" would be unsayable.
+   */
+  findingCount?: number;
+  /**
+   * Per-finding presentation extras, keyed by finding IDENTITY — the same object
+   * references that appear in `unanchored`/`publishFailed`. Identity keying
+   * avoids inventing a synthetic key that two findings on one line would share.
+   */
+  context?: ReadonlyMap<Finding, FindingContext>;
   filesReviewed: string[];
   rulesRun: string[];
   rulesFailed: string[];
@@ -420,13 +458,44 @@ export function normalizeRelatedWorkForRender(items: readonly unknown[]): string
   });
 }
 
-function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): string {
+// The diff excerpt is the whole point of the fallback rendering: an inline
+// comment gets the provider's own code context for free, and a finding pushed
+// into the summary otherwise becomes an assertion about code the reader has to
+// go and look up. Rendered as ```diff so +/- lines keep their colouring.
+//
+// The excerpt comes from the diff we already fetched, NOT from finding text, so
+// it needs no sanitizing for injection — but it is fenced with a run longer than
+// any inside it for the same reason renderSuggestionBlock is: a crafted source
+// line containing ``` must not be able to close the block early and let the rest
+// render as markdown.
+function renderDiffExcerpt(snippet: HunkSnippet): string {
+  const body = snippet.lines.map((line) => `${line.marker}${line.text}`).join("\n");
+  const longestRun = Math.max(2, ...[...body.matchAll(/`+/gu)].map((m) => m[0].length));
+  const fence = "`".repeat(longestRun + 1);
+  return `${fence}diff\n${body}\n${fence}`;
+}
+
+function renderUnanchoredFinding(
+  finding: Finding,
+  includeSuggestion = true,
+  context?: FindingContext,
+): string {
   const file = sanitizeInline(finding.file);
-  const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
+  const snippet = context?.snippet;
+  // A finding whose excerpt spans several lines names the range, so the heading
+  // matches what the reader is about to see rather than a single line inside it.
+  const lineLabel =
+    snippet && snippet.endLine > snippet.startLine
+      ? `${snippet.startLine}-${snippet.endLine}`
+      : typeof finding.line === "number"
+        ? String(finding.line)
+        : undefined;
+  const loc = lineLabel === undefined ? file : `${file}:${lineLabel}`;
   const full = sanitizeText(finding.message);
   const { headline, body } = resolveHeadline(finding, full);
 
-  const parts = [`**\`${loc}\`**`, "", metaLine(finding), ""];
+  const parts = [`**\`${loc}\`**`, "", metaLine(finding, context?.rules), ""];
+  if (snippet) parts.push(renderDiffExcerpt(snippet), "");
   if (headline) {
     parts.push(`**${headline}**`);
     if (body) parts.push("", body);
@@ -443,6 +512,32 @@ function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): st
     );
   }
   return parts.join("\n");
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * The headline, which has to survive being the ONLY line a busy reader reads.
+ *
+ * "Actionable comments posted: 14" counted findings, not comments, and PR #281
+ * printed it while zero review comments existed on the PR. Three separate
+ * numbers are reported instead, because they answer three different questions:
+ * how much was found, how much of it is actually distinct, and how much of it
+ * the reader will find sitting on the diff.
+ *
+ * The unique-issue count is omitted when clustering merged nothing — "8 findings
+ * · 8 unique issues" is a fact about the renderer, not about the review.
+ */
+function summaryHeadline(input: SummaryInput, total: number): string {
+  const findings = input.findingCount ?? total;
+  const segments = [plural(findings, "finding")];
+  if (input.uniqueIssueCount !== undefined && input.uniqueIssueCount < findings) {
+    segments.push(plural(input.uniqueIssueCount, "unique issue"));
+  }
+  segments.push(`${plural(input.inlineCount, "inline comment")} posted`);
+  return segments.join(" · ");
 }
 
 // The number that decides whether a reviewer reads this now or later.
@@ -590,8 +685,14 @@ export function renderSummaryComment(
 }
 
 function renderCompactSummary(input: SummaryInput, maxLength: number): string {
+  // Compact mode must carry the SAME finding set as the full renderer — it is a
+  // size fallback, not a scope fallback. Publication failures were previously
+  // absent from this list because they only ever reached it via `unanchored`;
+  // now that they are their own group they must be appended explicitly, or a
+  // long review would silently drop them.
+  const relocated = [...input.unanchored, ...(input.publishFailed ?? [])];
   const header =
-    `**Actionable comments posted: ${input.inlineCount + input.unanchored.length}**` +
+    `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
   const notice =
     "> [!WARNING]\n" +
@@ -615,7 +716,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // against the same provider-size budget as failed rules and finding labels.
   const relatedWork = renderRelatedWorkSection(input);
   const discussionMemory = renderDiscussionMemorySection(input);
-  const findings = input.unanchored.map((finding) => {
+  const findings = relocated.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const rule = truncate(sanitizeInline(finding.ruleName), 80);
@@ -651,7 +752,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     input.rulesFailed.length > 0
       ? `${input.rulesFailed.length} rule(s) failed to run.`
       : undefined,
-    `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+    `${relocated.length} finding(s) could not fit in the provider comment.`,
   ].filter((part): part is string => part !== undefined);
   const withRelatedWork = relatedWork
     ? [...compactStatus.slice(0, 2), relatedWork, ...compactStatus.slice(2)].join("\n\n")
@@ -690,7 +791,8 @@ function renderSummaryCommentWithIncludedSuggestions(
   input: SummaryInput,
   includedSuggestions: ReadonlySet<number>,
 ): string {
-  const total = input.inlineCount + input.unanchored.length;
+  const publishFailed = input.publishFailed ?? [];
+  const total = input.inlineCount + input.unanchored.length + publishFailed.length;
   const parts: string[] = [];
 
   if (total === 0) {
@@ -702,7 +804,7 @@ function renderSummaryCommentWithIncludedSuggestions(
         : "**No actionable comments.** ✅",
     );
   } else {
-    parts.push(`**Actionable comments posted: ${total}**${severityCounts(input)}`);
+    parts.push(`**${summaryHeadline(input, total)}**${severityCounts(input)}`);
   }
 
   if (input.inlineUnavailable && total > 0) {
@@ -714,6 +816,25 @@ function renderSummaryCommentWithIncludedSuggestions(
 
   const contextUnavailable = renderContextUnavailable(input);
   if (contextUnavailable) parts.push(contextUnavailable);
+
+  // Anchors were VALID; the provider refused the write. Named separately so the
+  // reader chases the right problem — and so nobody re-checks line numbers that
+  // were never wrong.
+  if (publishFailed.length > 0) {
+    const reason = input.publishFailureReason
+      ? ` Reason: ${sanitizeInline(input.publishFailureReason)}.`
+      : "";
+    parts.push(
+      [
+        `### 📌 Inline publication failed (${publishFailed.length})`,
+        `\n_These anchor to lines that ARE in the diff, but the provider rejected the inline comment.${reason}_\n`,
+        "",
+        publishFailed
+          .map((finding) => renderUnanchoredFinding(finding, true, input.context?.get(finding)))
+          .join("\n\n---\n\n"),
+      ].join("\n"),
+    );
+  }
 
   // Findings that have no home on the diff still have to be SEEN. This is the
   // section that guarantees the inline path can never silently drop a finding.
@@ -729,7 +850,7 @@ function renderSummaryCommentWithIncludedSuggestions(
         ? capSuggestion(finding.suggestion)
         : undefined;
       const includeSuggestion = suggestion === undefined || includedSuggestions.has(index);
-      return renderUnanchoredFinding(finding, includeSuggestion);
+      return renderUnanchoredFinding(finding, includeSuggestion, input.context?.get(finding));
     });
     parts.push(
       `${heading}${note}\n\n${findings.join("\n\n---\n\n")}`,
