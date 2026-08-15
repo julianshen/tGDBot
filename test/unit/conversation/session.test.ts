@@ -227,6 +227,26 @@ describe("runConversationSession isolation", () => {
     warnSpy.mockRestore();
   });
 
+  it("redacts credentials from session and abort diagnostics", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const sessionToken = `ghp_${"a".repeat(24)}`;
+    const abortToken = `glpat-${"b".repeat(24)}`;
+    await runConversationSession("prompt", {
+      model: MODEL,
+      createSession: async () => ({
+        prompt: vi.fn().mockRejectedValue(new Error(`request failed with Bearer ${sessionToken}`)),
+        getLastAssistantText: () => "unused",
+        abort: vi.fn().mockRejectedValue(new Error(`abort failed with token ${abortToken}`)),
+      }),
+    });
+
+    const diagnostics = warnSpy.mock.calls.flat().join("\n");
+    expect(diagnostics).toContain("[redacted]");
+    expect(diagnostics).not.toContain(sessionToken);
+    expect(diagnostics).not.toContain(abortToken);
+    warnSpy.mockRestore();
+  });
+
   it("cannot reach a target checkout through relative paths from the session CWD", async () => {
     const target = await tempDir("tgd-reviewed-repo-");
     writeFileSync(path.join(target, "payload.ts"), "ATTACK", "utf8");

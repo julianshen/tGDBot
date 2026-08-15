@@ -275,4 +275,12 @@ describe("conversation command parser", () => {
     expect(parse(`@tGDBot ${"x".repeat(MAX_COMMAND_BODY_SCALARS)}`))
       .toEqual({ kind: "invalid", reason: "oversized" });
   });
+
+  it.each([
+    `\`@tGDBot\` ${"x".repeat(MAX_COMMAND_BODY_SCALARS)}`,
+    `> @tGDBot\n> ${"x".repeat(MAX_COMMAND_BODY_SCALARS)}`,
+    `<!-- @tGDBot ${"x".repeat(MAX_COMMAND_BODY_SCALARS)} -->`,
+  ])("ignores an oversized comment whose only mention is masked", (body) => {
+    expect(parse(body)).toEqual({ kind: "irrelevant" });
+  });
 });

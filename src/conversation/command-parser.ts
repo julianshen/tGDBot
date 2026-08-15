@@ -256,17 +256,6 @@ function mentionsBot(body: string, botIdentity: BotIdentity): boolean {
 export function parseConversationCommand(input: CommandParseInput): CommandParseResult {
   if (input.authorIsBot) return { kind: "irrelevant" };
   if (typeof input.body !== "string") return { kind: "invalid", reason: "malformed" };
-  const bodyInspection = inspectBody(input.body);
-  if (bodyInspection.scalars > MAX_COMMAND_BODY_SCALARS) {
-    // Too large to parse, so it can never be a valid command. Whether that is
-    // worth a public reply depends on whether the author was talking to us: a
-    // long comment between humans must stay irrelevant, or tGDBot answers with
-    // usage help nobody asked for. A body this size cannot be a well-formed
-    // command anyway, so the mention only decides silence versus help.
-    return mentionsBot(input.body, input.botIdentity)
-      ? { kind: "invalid", reason: "oversized" }
-      : { kind: "irrelevant" };
-  }
   if (
     !/^[\x00-\x7f]+$/u.test(input.botIdentity.mention) ||
     !/^[\x00-\x7f]+$/u.test(input.botIdentity.login) ||
@@ -275,6 +264,17 @@ export function parseConversationCommand(input: CommandParseInput): CommandParse
 
   const lineNormalizedBody = input.body.replace(/\r\n?|\n/gu, "\n");
   const rawMasked = maskMarkdown(lineNormalizedBody);
+  const bodyInspection = inspectBody(input.body);
+  if (bodyInspection.scalars > MAX_COMMAND_BODY_SCALARS) {
+    // Too large to parse, so it can never be a valid command. Whether that is
+    // worth a public reply depends on whether the author was talking to us: a
+    // long comment between humans must stay irrelevant, or tGDBot answers with
+    // usage help nobody asked for. A body this size cannot be a well-formed
+    // command anyway, so the mention only decides silence versus help.
+    return mentionsBot(rawMasked, input.botIdentity)
+      ? { kind: "invalid", reason: "oversized" }
+      : { kind: "irrelevant" };
+  }
   const rawMention = input.botIdentity.mention;
   const rawMentions = scanMentionOccurrences(rawMasked, rawMention).positions;
   if (rawMentions.length === 1) {

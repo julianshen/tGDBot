@@ -14,6 +14,7 @@ import {
 import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
 import type { DispatchSession } from "../review/dispatch.js";
 import { resolveRuleSessionModel } from "../review/orchestrator-model.js";
+import { redactedMessage } from "./redact.js";
 
 export const CONVERSATION_READ_ONLY_TOOLS = ["read", "grep", "find", "ls"] as const;
 export const MAX_CONVERSATION_PROMPT_CHARS = 100_000;
@@ -156,11 +157,11 @@ export async function runConversationSession(
         await session.abort();
       } catch (abortError) {
         console.warn(
-          `runConversationSession: failed to abort session (${(abortError as Error).message})`,
+          `runConversationSession: failed to abort session (${redactedMessage(abortError)})`,
         );
       }
     }
-    console.warn(`runConversationSession: session failed (${(error as Error).message})`);
+    console.warn(`runConversationSession: session failed (${redactedMessage(error)})`);
     return transient("the conversation session did not complete");
   } finally {
     if (cwd !== undefined) {

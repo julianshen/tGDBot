@@ -230,6 +230,18 @@ function canonicalInlineBody(body: string): string {
   return body.replace(/\r\n?/gu, "\n");
 }
 
+function inlineRecoveryContentDigests(body: string): readonly string[] {
+  const canonical = canonicalInlineBody(body);
+  const lastLine = canonical.split("\n").at(-1) ?? "";
+  const marker = parseChildMarker(lastLine);
+  if (marker?.kind !== "finding") return [computeContentDigest(canonical)];
+  const withoutMarker = canonical.slice(0, -(lastLine.length + (canonical.length === lastLine.length ? 0 : 1)));
+  return [...new Set([
+    computeContentDigest(withoutMarker),
+    computeContentDigest(`${withoutMarker}\n`),
+  ])];
+}
+
 function orderKey(at: string, type: string, id: string, revision = ""): string {
   return `${at}|${type}|${id.padStart(32, "0")}|${revision}`;
 }
@@ -1392,7 +1404,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       const comment = comments[index]!;
       const placementDigest = digest(JSON.stringify({ path: comment.path, line: comment.line, startLine: comment.startLine ?? null, side: "RIGHT", startSide: comment.startLine === undefined ? null : "RIGHT" }));
       const exactMarker = formatInlineRecoveryMarker(child);
-      return child.clientId !== comment.clientId || child.headSha !== headSha || child.reviewNumber !== Number(resolved.id) || child.repositoryDigest !== computeRepositoryDigest("github", repo.canonicalUrl) || child.contentDigest !== computeContentDigest(canonicalInlineBody(comment.body)) || child.placementDigest !== placementDigest || child.marker !== exactMarker;
+      return child.clientId !== comment.clientId || child.headSha !== headSha || child.reviewNumber !== Number(resolved.id) || child.repositoryDigest !== computeRepositoryDigest("github", repo.canonicalUrl) || !inlineRecoveryContentDigests(comment.body).includes(child.contentDigest) || child.placementDigest !== placementDigest || child.marker !== exactMarker;
     })) {
       throw new Error("GitHub inline recovery manifest does not match publication inputs");
     }
@@ -1506,7 +1518,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       const child = validated.children.find((candidate) => candidate.marker === marker)!;
       const canonicalBody = canonicalInlineBody(row.body);
       const suffix = `\n${INLINE_COMMENT_MARKER}\n${marker}`;
-      if (!canonicalBody.endsWith(suffix) || computeContentDigest(canonicalBody.slice(0, -suffix.length)) !== child.contentDigest) return "ambiguous";
+      if (!canonicalBody.endsWith(suffix) || !inlineRecoveryContentDigests(canonicalBody.slice(0, -suffix.length)).includes(child.contentDigest)) return "ambiguous";
       const placementDigest = digest(JSON.stringify({ path: row.path, line: row.line, startLine: row.start_line ?? null, side: row.side, startSide: row.start_side ?? null }));
       if (placementDigest !== child.placementDigest || row.commit_id !== child.headSha) return "ambiguous";
       counts.set(marker, counts.get(marker)! + 1);

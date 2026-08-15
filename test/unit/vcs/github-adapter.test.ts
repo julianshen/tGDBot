@@ -1848,6 +1848,38 @@ describe("resolveStaleReviewThreads", () => {
 // ADR-007: a multi-line committable suggestion spans start_line..line. GitHub
 // requires start_side alongside start_line, and start_line < line.
 describe("createInlineReview: multi-line suggestion ranges", () => {
+  it("accepts recovery prepared before the public finding marker is appended", async () => {
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const post = vi.fn();
+    const adapter = new GitHubAdapter(async (args) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args.includes("POST")) {
+        post();
+        throw new Error("GitHub rejected request (HTTP 422)");
+      }
+      return "[]";
+    }, repo);
+    const locator = { kind: "repository" as const, repo, number: 42 };
+    const head = "d".repeat(40);
+    const original = [{ clientId: "finding-0", path: "a.ts", line: 13, body: "finding", position: {} as never }];
+    const recovery = await adapter.prepareInlineReviewRecovery(locator, head, original, "run-1");
+    const child = recovery.children[0]!;
+    const findingMarker = formatChildMarker({
+      kind: "finding",
+      parentId: child.parentId,
+      childId: child.childId,
+      repositoryDigest: "a".repeat(64),
+      reviewNumber: 42,
+      contentDigest: child.contentDigest,
+    });
+
+    await expect(adapter.createInlineReview(locator, head, [{
+      ...original[0]!,
+      body: `finding\n${findingMarker}`,
+    }], recovery)).resolves.toMatchObject([{ clientId: "finding-0", status: "failed" }]);
+    expect(post).toHaveBeenCalledOnce();
+  });
+
   it("posts one atomic review and recovers every identity after an incomplete direct response", async () => {
     const calls: { args: string[]; stdin?: string }[] = [];
     const execGh: ExecGh = async (args, stdin) => {
