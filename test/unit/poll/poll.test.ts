@@ -748,8 +748,12 @@ describe("event-to-action poll", () => {
     const { stateDir } = await bootstrapAndSeed(adapter);
     adapter.replaceEvents([
       commentEvent("bad", "@tgdbot frobnicate"),
-      commentEvent("big", `${"x".repeat(MAX_COMMAND_BODY_SCALARS + 1)}`, "2026-08-14T00:00:01.000Z"),
-      commentEvent("later", "thanks", "2026-08-14T00:00:02.000Z"),
+      // Addressed to tGDBot but too large to parse: worth usage help.
+      commentEvent("big", `@tgdbot ${"x".repeat(MAX_COMMAND_BODY_SCALARS)}`, "2026-08-14T00:00:01.000Z"),
+      // Equally oversized but never addressed to tGDBot — a long comment
+      // between humans, which must not draw an unprompted reply.
+      commentEvent("huge", "x".repeat(MAX_COMMAND_BODY_SCALARS + 1), "2026-08-14T00:00:02.000Z"),
+      commentEvent("later", "thanks", "2026-08-14T00:00:03.000Z"),
     ]);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
       .resolves.toBe(0);

@@ -111,6 +111,125 @@ or from whatever CI system you already use — anywhere `gh` is authenticated
 and the provider keys are present in the environment. If you do automate it on
 untrusted PRs, read "⚠️ Security Considerations" above first.
 
+## Conversational review and local memories
+
+`review` posts a review. `poll` reads the discussion on your open PRs/MRs and
+answers commands addressed to the bot. They are separate commands and share
+every review flag, so a command runs under exactly the configuration you gave
+`poll` — not some ambient default.
+
+```bash
+tgd-review-agent poll --repo owner/repo --state-dir /secure/tgdbot-state
+```
+
+**`poll` is not a daemon.** It processes the activity it can see, writes down
+where it got to, and exits. Nothing runs between invocations, and there is no
+CI requirement — run it by hand while you work, or have something invoke it
+repeatedly:
+
+```bash
+# every 10 minutes via cron
+*/10 * * * * cd /srv/tgdbot && node dist/cli.js poll --repo owner/repo --state-dir /secure/tgdbot-state
+```
+
+launchd and systemd timers work equally well. The cadence is entirely yours;
+tGDBot never schedules itself.
+
+### Commands
+
+Any human commenter may issue these. Comments tGDBot wrote never trigger
+commands, and exactly **one command per comment** is accepted — a comment
+holding two commands, or a command buried in prose, gets usage help instead.
+Commands inside quoted, fenced, or inline-code regions are ignored entirely,
+so quoting someone else's command does not re-run it.
+
+| Command | Where | What it does |
+| --- | --- | --- |
+| `@bot explain` | in a tGDBot finding's thread | Explains that finding against the rule that produced it |
+| `@bot reconsider <reason>` | in a tGDBot finding's thread | Re-assesses it against current code and the current rule |
+| `@bot answer <clar-id>: <text>` | anywhere on the review | Answers an unthreaded clarification question |
+| `@bot remember <lesson>` | anywhere on the review | Records a repository-local lesson |
+| `@bot forget <memory-id>` | anywhere on the review | Retires one memory by its `mem_…` ID |
+| `@bot memories` | anywhere on the review | Lists the active memories |
+| `@bot check latest` | anywhere on the review | Reviews the current head even if nothing changed |
+| `@bot review focus: <direction>` | anywhere on the review | Records a direction for the next review of this head |
+
+Replace `@bot` with the authenticated bot's own mention. A clarification posted
+in a thread is answered by simply replying in that thread — no mention needed.
+
+`review focus:` currently records its direction only. It **does not yet post**
+a supplemental review of its own; the direction is picked up by the next
+`review` of that same head, which re-runs because the direction changed the
+review's fingerprint. Pushing a new commit retires the direction.
+
+`check latest` is the one command that overrules the normal "nothing changed,
+nothing to do" skip.
+
+### Local state
+
+Everything tGDBot remembers lives **outside the reviewed repository** and is
+never committed to it. The root is chosen in this order:
+
+1. `--state-dir <absolute path>`
+2. `TGD_REVIEW_STATE_DIR`
+3. an absolute `XDG_STATE_HOME`, else a per-platform fallback
+
+Relative paths are rejected rather than guessed at.
+
+State is **repository-local**: memories, directions, and clarifications never
+cross from one repository to another, and an ID from one repository is simply
+not found in another. `review` and `poll` only share state when you give them
+the same root.
+
+The **first run against a repository bootstraps**: it records the current
+high-water mark for each open review and handles nothing that came before, so
+turning tGDBot on does not answer months of history. Reviews created later
+start from their own creation point and are processed normally.
+
+Back it up like any other operational data. Deleting it loses the memories and
+the record of which comments were already answered — the comments themselves
+remain in the provider as the human-readable record, and tGDBot's own reply
+markers stop it re-answering anything still visible there. It then bootstraps
+again from the current high-water mark.
+
+> **Do not point two state roots at one repository.** They cannot coordinate,
+> so both will answer the same comment and you will see duplicate replies. One
+> repository, one root.
+
+### Memories are advisory, never rules
+
+**Anyone who can comment can write a memory**, so treat memories as untrusted
+advice. A memory is shown to the reviewing model as advisory context and can
+explain intent or head off a false positive. It can never introduce a rule,
+disable one, change which model runs, or override a trusted rule from the base
+branch — the trust boundary described above still holds. Contradictory
+memories are kept and shown as-is rather than silently reconciled; use
+`forget` to resolve them.
+
+A repository holds at most **200** active memories, and each is capped at 2,000
+characters. At the limit, `remember` declines and tells you to free a slot.
+
+### Ceilings, dry-run, and exit codes
+
+Each invocation processes at most 200 event revisions and then exits reporting
+that more remains; the next invocation resumes where it stopped.
+
+A comment over 16,384 characters is too large to parse as a command. If it
+addressed tGDBot it gets usage help; otherwise it stays irrelevant, so long
+comments between humans are never answered. A single command argument is capped
+at 2,000 characters. At most 100 comments of a discussion are carried into a
+review's context, and anything dropped is reported in the summary rather than
+silently omitted. No single oversized item stalls the review it belongs to.
+
+`poll --dry-run` prints the target and what it would do, and writes nothing —
+no comments, no cursors, no memories, no locks.
+
+Exit codes match `review`: `0` success (including "bootstrapped" and "more
+remains"), `1` a failure before anything was written, `2` a write happened but
+the result was partial. Provider rate limits and auth failures are treated as
+transient: the command stays unanswered, nothing is posted, and the next
+invocation retries it.
+
 ### GitLab targets and authentication
 
 Install `glab` before reviewing GitLab merge requests. The ordinary interactive

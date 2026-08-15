@@ -244,12 +244,28 @@ function malformed(): CommandParseResult {
   return { kind: "invalid", reason: "malformed" };
 }
 
+/**
+ * Case-insensitive presence check for the authenticated mention, used only to
+ * decide whether an unparseable body was addressed to tGDBot. This is not the
+ * command grammar's mention match — that is exact and anchored.
+ */
+function mentionsBot(body: string, botIdentity: BotIdentity): boolean {
+  return body.toLowerCase().includes(botIdentity.mention.toLowerCase());
+}
+
 export function parseConversationCommand(input: CommandParseInput): CommandParseResult {
   if (input.authorIsBot) return { kind: "irrelevant" };
   if (typeof input.body !== "string") return { kind: "invalid", reason: "malformed" };
   const bodyInspection = inspectBody(input.body);
   if (bodyInspection.scalars > MAX_COMMAND_BODY_SCALARS) {
-    return { kind: "invalid", reason: "oversized" };
+    // Too large to parse, so it can never be a valid command. Whether that is
+    // worth a public reply depends on whether the author was talking to us: a
+    // long comment between humans must stay irrelevant, or tGDBot answers with
+    // usage help nobody asked for. A body this size cannot be a well-formed
+    // command anyway, so the mention only decides silence versus help.
+    return mentionsBot(input.body, input.botIdentity)
+      ? { kind: "invalid", reason: "oversized" }
+      : { kind: "irrelevant" };
   }
   if (
     !/^[\x00-\x7f]+$/u.test(input.botIdentity.mention) ||

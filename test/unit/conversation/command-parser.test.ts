@@ -260,6 +260,19 @@ describe("conversation command parser", () => {
   });
 
   it("bounds the raw body even when masked", () => {
-    expect(parse(`<!--${"x".repeat(MAX_COMMAND_BODY_SCALARS)}-->`)).toEqual({ kind: "invalid", reason: "oversized" });
+    expect(parse(`@tGDBot <!--${"x".repeat(MAX_COMMAND_BODY_SCALARS)}-->`)).toEqual({ kind: "invalid", reason: "oversized" });
+  });
+
+  // An oversized body is checked before the body is parsed at all, so without
+  // this a long comment that never addressed tGDBot is "invalid" rather than
+  // irrelevant — and invalid commands get usage help. That means replying,
+  // unprompted, to any sufficiently long comment on the review.
+  it("leaves an oversized comment that never mentions the bot irrelevant", () => {
+    expect(parse("x".repeat(MAX_COMMAND_BODY_SCALARS + 1))).toEqual({ kind: "irrelevant" });
+  });
+
+  it("still answers an oversized comment that does address the bot", () => {
+    expect(parse(`@tGDBot ${"x".repeat(MAX_COMMAND_BODY_SCALARS)}`))
+      .toEqual({ kind: "invalid", reason: "oversized" });
   });
 });

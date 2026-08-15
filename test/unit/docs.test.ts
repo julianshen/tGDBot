@@ -116,3 +116,58 @@ describe("GitLab review documentation", () => {
     expect(readme).toMatch(/not part of the default test suite/i);
   });
 });
+
+describe("conversational review and local memory documentation", () => {
+  const pollHeading = /^## Conversational review and local memories.*$/m;
+  const pollStart = readme.match(pollHeading);
+  const pollSection = (() => {
+    if (pollStart === null) return "";
+    const start = readme.indexOf(pollStart[0]);
+    const rest = readme.slice(start + pollStart[0].length);
+    const nextHeading = rest.match(/^## .*$/m);
+    return nextHeading === null ? rest : rest.slice(0, nextHeading.index);
+  })();
+
+  it("documents poll as a one-shot command the caller schedules", () => {
+    expect(pollStart).not.toBeNull();
+    expect(pollSection).toContain("tgd-review-agent poll --repo owner/repo");
+    // The single most misreadable thing about this command: it is not a daemon
+    // and does not require CI. Someone who assumes otherwise gets a bot that
+    // answers once and never again.
+    expect(pollSection).toMatch(/not a daemon/i);
+    expect(pollSection).toMatch(/exits/i);
+    expect(pollSection).toMatch(/cron|launchd|systemd timer/i);
+  });
+
+  it("documents the exact command grammar including which commands are unimplemented", () => {
+    for (const command of ["explain", "reconsider", "remember", "forget", "memories", "check latest", "answer"]) {
+      expect(pollSection).toContain(command);
+    }
+    expect(pollSection).toMatch(/one command per comment/i);
+    expect(pollSection).toMatch(/quoted|fenced/i);
+    // review focus records a direction but does not yet publish a supplemental
+    // review, and the README must not imply otherwise.
+    expect(pollSection).toMatch(/review focus/i);
+    expect(pollSection).toMatch(/does not yet (?:post|publish)/i);
+  });
+
+  it("documents local state: precedence, isolation, bootstrap, and loss", () => {
+    expect(pollSection).toContain("--state-dir");
+    expect(pollSection).toContain("TGD_REVIEW_STATE_DIR");
+    expect(pollSection).toMatch(/never committed|not committed|outside the repository/i);
+    expect(pollSection).toMatch(/first run|bootstrap/i);
+    expect(pollSection).toMatch(/never cross(?:es)? repositor|per repository|repository-local/i);
+    // Two state roots for one repository cannot coordinate, so replies duplicate.
+    expect(pollSection).toMatch(/duplicate/i);
+    expect(pollSection).toMatch(/back ?up|delete/i);
+  });
+
+  it("documents memory trust, ceilings, and exit codes", () => {
+    expect(pollSection).toMatch(/any(?:one|\s+commenter)/i);
+    expect(pollSection).toMatch(/advisory/i);
+    expect(pollSection).toMatch(/never.*(?:rule|override)/is);
+    expect(pollSection).toContain("200");
+    expect(pollSection).toMatch(/exit/i);
+    expect(pollSection).toContain("--dry-run");
+  });
+});
