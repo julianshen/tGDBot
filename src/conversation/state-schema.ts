@@ -6,6 +6,12 @@ const SHA_RE = /^[0-9a-f]{7,64}$/iu;
 const ID_RE = /^(?:action|output|finding|clarification|memory)_[0-9a-f]{32}$/u;
 const CLAR_PUBLIC_ID_RE = /^clar_[abcdefghijklmnopqrstuvwxyz234567]{12,32}$/u;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u;
+/**
+ * Ceiling on simultaneously active memories. Reaching it is a terminal refusal
+ * at the command layer, and an integrity failure if stored state ever exceeds
+ * it — so the limit lives with the validator that enforces it.
+ */
+export const MAX_ACTIVE_MEMORIES = 200;
 const MAX_COLLECTION = 10_000;
 const MAX_TEXT = 20_000;
 const MAX_STATE_FILE_BYTES = 10_000_000;
@@ -986,7 +992,9 @@ export function materializeMemories(entries: readonly MemoryEntry[]): readonly M
       if (seen.has(entry.id)) throw new Error("duplicate memory create");
       seen.add(entry.id);
       active.set(entry.id, entry);
-      if (active.size > 200) throw new Error("active memory capacity exceeds 200");
+      if (active.size > MAX_ACTIVE_MEMORIES) {
+        throw new Error(`active memory capacity exceeds ${MAX_ACTIVE_MEMORIES}`);
+      }
     } else {
       if (!active.delete(entry.id)) throw new Error("impossible or duplicate memory tombstone");
     }

@@ -11,6 +11,7 @@ import {
   parseChildMarker,
   verifyChildMarkerBinding,
 } from "../../../src/conversation/markers.js";
+import { encodeMemoryPublicId } from "../../../src/conversation/memories.js";
 import { resolvePollConfig } from "../../../src/poll/config.js";
 import type { VcsAdapter } from "../../../src/vcs/adapter.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
@@ -262,13 +263,13 @@ describe("classification-only poll", () => {
     adapter.replaceEvents([
       commentEvent("irr", "looks good"),
       commentEvent("self", "@tgdbot explain", "2026-08-14T00:00:00.000Z", { authorLogin: "tgdbot", authorIsBot: true }),
-      commentEvent("cmd", "@tgdbot memories"),
+      commentEvent("cmd", "@tgdbot check latest"),
     ]);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
       await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
       expect(adapter.writes).toEqual([]);
-      expect(log.mock.calls.flat().join("\n")).toMatch(/@tgdbot memories/i);
+      expect(log.mock.calls.flat().join("\n")).toMatch(/@tgdbot check latest/i);
       expect(log.mock.calls.flat().join("\n")).toMatch(/executor unavailable/i);
     } finally {
       log.mockRestore();
@@ -741,6 +742,55 @@ describe("event-to-action poll", () => {
     expect(createSession).not.toHaveBeenCalled();
     expect(adapter.postedBodies).toHaveLength(2);
     expect(adapter.postedBodies.every((body) => body.includes("## Out of scope"))).toBe(true);
+  });
+
+  it("records a remembered lesson locally and acknowledges it without a model", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([commentEvent("rem", "@tgdbot remember prefer explicit null checks")]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toHaveLength(1);
+    expect(adapter.postedBodies[0]).toContain("## Memory recorded");
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readContextSnapshot();
+    expect(snapshot.memories.map((memory) => memory.text)).toEqual([
+      "prefer explicit null checks",
+    ]);
+  });
+
+  it("lists an active memory and stops listing it once forgotten", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    adapter.replaceEvents([commentEvent("rem", "@tgdbot remember prefer explicit null checks")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const created = (await store.readContextSnapshot()).memories[0]!;
+    const publicId = encodeMemoryPublicId(created.id);
+
+    adapter.replaceEvents([
+      commentEvent("list", "@tgdbot memories", "2026-08-14T00:00:01.000Z"),
+      commentEvent("forget", `@tgdbot forget ${publicId}`, "2026-08-14T00:00:02.000Z"),
+      commentEvent("list2", "@tgdbot memories", "2026-08-14T00:00:03.000Z"),
+    ]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const [firstList, forgotten, secondList] = adapter.postedBodies.slice(-3);
+    expect(firstList).toContain(publicId);
+    expect(firstList).toContain("prefer explicit null checks");
+    expect(forgotten).toContain("## Memory forgotten");
+    expect(secondList).toContain("no active memories");
+    expect((await store.readContextSnapshot()).memories).toHaveLength(0);
   });
 
   it("executes explain and reconsider only in a marked bot-started finding thread", async () => {

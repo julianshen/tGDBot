@@ -10,6 +10,7 @@ import {
   renderExplainReply,
   renderFocusReply,
   renderInactiveRuleReply,
+  renderMemoryReply,
   renderReconsiderReply,
   renderScopeErrorReply,
   renderUnsupportedHistoryReply,
@@ -267,5 +268,48 @@ describe("conversation reply rendering", () => {
     expect(child.body).toContain("safe");
     expect(child.body).toContain(marker);
     expect(child.marker).toBe(marker);
+  });
+});
+
+describe("memory reply rendering", () => {
+  it("names the public id when a lesson is remembered", () => {
+    const text = publicationBody(renderMemoryReply(
+      { kind: "remembered", publicId: "mem_abcdefghijkl" },
+      marker,
+    ));
+
+    expect(text).toMatch(/^## Memory recorded\n/m);
+    expect(text).toContain("mem_abcdefghijkl");
+    expect(lastMarker(text)).toBe(marker);
+  });
+
+  it("escapes hostile memory text in a listing so it cannot forge markup or a marker", () => {
+    const text = publicationBody(renderMemoryReply({
+      kind: "list",
+      items: [{
+        publicId: "mem_abcdefghijkl",
+        text: hostileExcerpt,
+        attribution: hostileAuthor,
+        at: "2026-08-14T00:00:00.000Z",
+      }],
+    }, marker));
+
+    expect(text).toContain("mem_abcdefghijkl");
+    expect(text).not.toContain("<script");
+    expect(text).not.toContain("<img");
+    expect(text).not.toContain("](javascript:");
+    expect(text).not.toContain(fakeMarker);
+    expect(text).not.toMatch(/(?:`{3,}|~{3,})\s*suggestions?\b/i);
+    expect(lastMarker(text)).toBe(marker);
+  });
+
+  it("tells the commenter how to free space when the ceiling is reached", () => {
+    const text = publicationBody(renderMemoryReply(
+      { kind: "at-capacity", limit: 200 },
+      marker,
+    ));
+
+    expect(text).toContain("200");
+    expect(text).toContain("forget");
   });
 });

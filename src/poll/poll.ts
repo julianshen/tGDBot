@@ -21,6 +21,12 @@ import {
 } from "../conversation/clarification.js";
 import { parseConversationCommand } from "../conversation/command-parser.js";
 import {
+  encodeMemoryPublicId,
+  listMemories,
+  planForget,
+  planRemember,
+} from "../conversation/memories.js";
+import {
   computeContentDigest,
   computeRepositoryDigest,
   formatChildMarker,
@@ -50,10 +56,12 @@ import {
   renderClarificationReply,
   renderExplainReply,
   renderInactiveRuleReply,
+  renderMemoryReply,
   renderReconsiderReply,
   renderScopeErrorReply,
   renderUnsupportedHistoryReply,
   renderUsageReply,
+  type MemoryReply,
   type RenderedConversationBody,
 } from "../conversation/render.js";
 import type { ConversationSessionFactory } from "../conversation/session.js";
@@ -62,8 +70,17 @@ import {
   replacePendingClarification,
   type ConversationStateStore,
 } from "../conversation/state-store.js";
-import { prepareFindingLedgerEntry, type ConversationEventEntry } from "../conversation/state-schema.js";
-import type { BotIdentity, CommandParseResult, RepositoryBinding } from "../conversation/types.js";
+import {
+  prepareFindingLedgerEntry,
+  type ConversationEventEntry,
+  type MemoryEntry,
+} from "../conversation/state-schema.js";
+import type {
+  BotIdentity,
+  CommandParseResult,
+  ConversationCommand,
+  RepositoryBinding,
+} from "../conversation/types.js";
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
 import type {
@@ -268,6 +285,7 @@ async function classifyOpenReviewEvents(options: {
         continue;
       }
       if (item.parsed.kind === "command" && item.parsed.command.kind !== "answer" &&
+        !isMemoryCommand(item.parsed.command) &&
         !isExecutableConversationCommand(item.parsed.command)) {
         console.log(
           `tgd-review-agent: recognized ${item.parsed.normalized} on review #${item.event.reviewNumber} (executor unavailable)`,
@@ -486,6 +504,12 @@ async function resolveLatestAction(
 
 type ReplyPlan =
   | { readonly kind: "usage" }
+  | {
+      readonly kind: "memory";
+      readonly reply: MemoryReply;
+      /** Absent for a listing or a refusal: those change nothing locally. */
+      readonly operation?: MemoryEntry;
+    }
   | { readonly kind: "scope" }
   | { readonly kind: "history" }
   | { readonly kind: "inactive"; readonly ruleName: string }
@@ -555,6 +579,7 @@ async function planConversationReply(input: {
   readonly options: {
     readonly adapter: ConversationAdapter;
     readonly store: ConversationStateStore;
+    readonly now: () => string;
     readonly config: ResolvedPollConfig;
     readonly deps: PollDependencies;
   };
@@ -564,6 +589,12 @@ async function planConversationReply(input: {
 > {
   const { item, reviewIdentity, options } = input;
   if (item.parsed.kind === "invalid") return { status: "ready", plan: { kind: "usage" } };
+  // Memory commands need no marked thread, no rules, and no model: they are
+  // deterministic local operations valid in any comment on the review. They are
+  // resolved before the model-backed gate below, which only admits the two
+  // commands that reason about a finding.
+  const memory = await planMemoryCommand(item, options);
+  if (memory !== undefined) return { status: "ready", plan: memory };
   if (item.parsed.kind !== "command" || !isExecutableConversationCommand(item.parsed.command)) {
     return { status: "ready", plan: { kind: "usage" } };
   }
@@ -643,6 +674,69 @@ async function planConversationReply(input: {
   return { status: "ready", plan: planned };
 }
 
+/**
+ * Returns undefined for any non-memory command so the caller falls through to
+ * the finding-thread path. The plan carries both the reply to render and the
+ * exact ledger entry to apply; publication applies it under the lock.
+ */
+/** Deterministic local commands: no marked thread, no trusted rules, no model. */
+function isMemoryCommand(command: ConversationCommand): command is
+  | { readonly kind: "memories" }
+  | { readonly kind: "remember"; readonly lesson: string }
+  | { readonly kind: "forget"; readonly memoryId: string } {
+  return command.kind === "memories" || command.kind === "remember" || command.kind === "forget";
+}
+
+async function planMemoryCommand(
+  item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult },
+  options: { readonly store: ConversationStateStore; readonly now: () => string },
+): Promise<ReplyPlan | undefined> {
+  if (item.parsed.kind !== "command" || !isMemoryCommand(item.parsed.command)) return undefined;
+  const command = item.parsed.command;
+
+  const snapshot = await options.store.readContextSnapshot();
+  if (command.kind === "memories") {
+    return { kind: "memory", reply: { kind: "list", items: listMemories(snapshot.memoryLedger) } };
+  }
+
+  const binding = options.store.repositoryBinding;
+  const actionId = identityFor(item.event, item.parsed).actionId;
+  const at = options.now();
+  if (command.kind === "remember") {
+    const plan = planRemember({
+      binding,
+      actionId,
+      lesson: command.lesson,
+      attribution: item.event.authorLogin ?? "unknown",
+      source: item.event.url,
+      at,
+      activeMemories: snapshot.memories,
+    });
+    if (plan.kind === "at-capacity") {
+      return { kind: "memory", reply: { kind: "at-capacity", limit: plan.limit } };
+    }
+    return {
+      kind: "memory",
+      reply: { kind: "remembered", publicId: encodeMemoryPublicId(plan.entry.id) },
+      operation: plan.kind === "created" ? plan.entry : undefined,
+    };
+  }
+
+  const plan = planForget({
+    binding,
+    actionId,
+    publicId: command.memoryId,
+    at,
+    ledger: snapshot.memoryLedger,
+  });
+  if (plan.kind === "not-found") return { kind: "memory", reply: { kind: "not-found" } };
+  return {
+    kind: "memory",
+    reply: { kind: "forgotten", publicId: encodeMemoryPublicId(plan.entry.id) },
+    operation: plan.kind === "tombstoned" ? plan.entry : undefined,
+  };
+}
+
 async function publishReplyPlan(input: {
   readonly event: ReviewActivityEvent;
   readonly identity: { actionId: string; identityDigest: string };
@@ -662,6 +756,7 @@ async function publishReplyPlan(input: {
     const latest = await resolveLatestAction(input.options.store, identity);
     if (latest?.state === "completed") return "completed";
     const actionIdentity = latest === undefined ? identity : { actionId: latest.actionId, identityDigest: latest.identityDigest };
+    const memoryOperation = plan.kind === "memory" ? plan.operation : undefined;
     const capturedHead = plan.kind === "explain" || plan.kind === "reconsider" ||
       (plan.kind === "clarification" && plan.outcome !== "stale")
       ? plan.headSha
@@ -714,7 +809,20 @@ async function publishReplyPlan(input: {
         writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event),
         now: input.options.now,
         hooks: {
-          beforeFreeze: capturedHead === undefined ? undefined : async (session, current) => {
+          beforeFreeze: capturedHead === undefined && memoryOperation === undefined
+            ? undefined
+            : async (session, current) => {
+            // `remember`/`forget` must land locally BEFORE the acknowledgement is
+            // frozen, so a crash between the two leaves a memory whose reply is
+            // still owed rather than a reply for a memory that was never stored.
+            // The entry is deterministic in the action identity, so re-applying
+            // on retry is a no-op rather than a second write.
+            if (memoryOperation !== undefined) {
+              const applied = session.snapshot().memoryLedger.some((entry) =>
+                entry.operation === memoryOperation.operation && entry.id === memoryOperation.id);
+              if (!applied) await session.commit((tx) => { tx.appendMemory(memoryOperation); });
+            }
+            if (capturedHead === undefined) return;
             const metadata = await loadReviewMetadata(input.event.reviewNumber, input.options);
             if (metadata === undefined) throw Object.assign(new Error("review metadata unavailable"), { transient: true });
             if (metadata.headSha.toLowerCase() === capturedHead.toLowerCase()) return;
@@ -838,6 +946,7 @@ function buildReplyChild(input: {
   const parentId = `act_${input.actionId.slice("action_".length)}`;
   const render = (marker: string): RenderedConversationBody => {
     if (input.plan.kind === "usage") return renderUsageReply(marker);
+    if (input.plan.kind === "memory") return renderMemoryReply(input.plan.reply, marker);
     if (input.plan.kind === "scope") return renderScopeErrorReply(marker);
     if (input.plan.kind === "history") return renderUnsupportedHistoryReply(marker);
     if (input.plan.kind === "inactive") return renderInactiveRuleReply({ ruleName: input.plan.ruleName }, marker);

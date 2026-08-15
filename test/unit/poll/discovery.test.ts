@@ -480,7 +480,7 @@ describe("poll discovery and bootstrap", () => {
       commentEvent(1, "new-1", "later on one", "2026-08-14T00:00:00.000Z"),
     ]);
     eventsByReview.set(2, [
-      commentEvent(2, "created-1", "@tgdbot memories", "2026-08-14T00:00:00.000Z"),
+      commentEvent(2, "created-1", "@tgdbot check latest", "2026-08-14T00:00:00.000Z"),
     ]);
     adapter["options"].openReviewPages = [[summary(1), summary(2)]];
 

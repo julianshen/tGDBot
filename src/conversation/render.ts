@@ -231,6 +231,61 @@ export function renderFocusReply(
   ], marker);
 }
 
+/**
+ * Every memory reply in one renderer, because they share a hard rule: the only
+ * untrusted text that reaches a public body is a lesson a human wrote, and it
+ * is always escaped. IDs are generated, so they are safe by construction.
+ */
+export type MemoryReply =
+  | { readonly kind: "remembered"; readonly publicId: string }
+  | { readonly kind: "forgotten"; readonly publicId: string }
+  | { readonly kind: "not-found" }
+  | { readonly kind: "at-capacity"; readonly limit: number }
+  | {
+      readonly kind: "list";
+      readonly items: readonly {
+        readonly publicId: string;
+        readonly text: string;
+        readonly attribution: string;
+        readonly at: string;
+      }[];
+    };
+
+export function renderMemoryReply(reply: MemoryReply, marker: string): RenderedConversationBody {
+  if (reply.kind === "remembered") {
+    return renderSections("## Memory recorded", [
+      `Recorded as \`${reply.publicId}\`. Use \`forget ${reply.publicId}\` to remove it.`,
+    ], marker);
+  }
+  if (reply.kind === "forgotten") {
+    return renderSections("## Memory forgotten", [
+      `\`${reply.publicId}\` is no longer applied to reviews in this repository.`,
+    ], marker);
+  }
+  // Deliberately identical for an ID that never existed, one already forgotten,
+  // and one belonging to another repository: the reply must not confirm which.
+  if (reply.kind === "not-found") {
+    return renderSections("## Memory not found", [
+      "No active memory with that ID exists for this repository. Use `memories` to list the active ones.",
+    ], marker);
+  }
+  if (reply.kind === "at-capacity") {
+    return renderSections("## Memory limit reached", [
+      `This repository already holds the maximum of ${reply.limit} active memories, so nothing was recorded.`,
+      "Use `memories` to review them and `forget <memory-id>` to free a slot, then issue `remember` again.",
+    ], marker);
+  }
+  if (reply.items.length === 0) {
+    return renderSections("## Active memories", [
+      "This repository has no active memories.",
+    ], marker);
+  }
+  return renderSections("## Active memories", [
+    ...reply.items.map((item) =>
+      `- \`${item.publicId}\` — ${sanitizeMemoryText(item.text)} _(${sanitizeMemoryText(item.attribution)})_`),
+  ], marker);
+}
+
 export function renderUsageReply(marker: string): RenderedConversationBody {
   return renderSections("## Command usage", [
     "tGDBot accepts exactly one command per comment. Use one of:",
