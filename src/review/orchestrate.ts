@@ -7,16 +7,18 @@
 // module is a plain formatting/safety-net layer on top of its output.
 import { selectClarification } from "../conversation/clarification.js";
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
-import type { ClarificationPresentation, RenderOptions } from "./comment-format.js";
+import type { ClarificationPresentation, FindingContext, RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
 import {
   changedFiles,
   commentableLines,
+  hunkSnippet,
   diffPositionRange,
   isCommentable,
   parseDiffPositions,
   rangeIsCommentable,
 } from "./diff-anchors.js";
+import { clusterFindings } from "./finding-clusters.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./existing-discussion.js";
@@ -93,22 +95,10 @@ function dedupeKey(finding: Finding): string {
   return JSON.stringify([finding.file, finding.line ?? null, normalizeMessage(finding.message)]);
 }
 
-// Two findings are "the same" if file + line + normalized message are
-// equal — keep one, preferring the higher-severity duplicate (TASKS.md
-// Task 7 step 1, AC-7.1).
-function dedupeFindings(findings: Finding[]): Finding[] {
-  const bestByKey = new Map<string, Finding>();
-
-  for (const finding of findings) {
-    const key = dedupeKey(finding);
-    const existing = bestByKey.get(key);
-    if (!existing || SEVERITY_RANK[finding.severity] < SEVERITY_RANK[existing.severity]) {
-      bestByKey.set(key, finding);
-    }
-  }
-
-  return [...bestByKey.values()];
-}
+// Exact-duplicate collapsing now lives in clusterFindings, which performs the
+// same "keep the higher-severity copy" rule (AC-7.1) while ALSO retaining every
+// contributing rule name. dedupeKey stays: it still identifies addressed
+// findings above.
 
 function issueAnchorKey(file: string, line: number): string {
   return JSON.stringify([file, line]);
@@ -205,16 +195,50 @@ export function orchestrate(
   const existingIssueAnchors = new Set(
     (options.existingIssues ?? []).map((issue) => issueAnchorKey(issue.file, issue.line)),
   );
-  const dedupedFindings = dedupeFindings(actionable).filter(
+  // NOT pre-deduped: clusterFindings collapses exact duplicates itself and
+  // keeps every contributing rule name while doing so. Collapsing here first
+  // threw the second rule away before clustering could ever see it, which made
+  // the rule-attribution logic unreachable in production (Codex review).
+  const candidates = actionable.filter(
     (finding) => finding.line === undefined || finding.line === null ||
       !existingIssueAnchors.has(issueAnchorKey(finding.file, finding.line)),
-  ).sort(
-    (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
   );
+
+  // Several rules recognising ONE defect used to produce one entry each — five
+  // statements of the same race on PR #281, three of them anchored to the very
+  // same line. Cluster first, then present one entry per root cause with its
+  // contributing rules as metadata, so the reader meets each defect once.
+  const clusters = clusterFindings(candidates);
+  // Every surviving finding, exact duplicates already collapsed. This is the
+  // set the COUNTS describe: clustering decides what is SHOWN, never how many
+  // findings a run had or what severities they carried.
+  const allFindings = clusters.flatMap((cluster) => cluster.members);
   const inlineEnabled = options.inline !== false && diff !== "";
 
   const positions = inlineEnabled ? parseDiffPositions(diff) : undefined;
   const anchors = positions ? commentableLines(positions) : new Map<string, Set<number>>();
+
+  // Only representatives enter the placement loop, so a representative chosen
+  // purely on severity/detail can throw away an anchor the cluster genuinely
+  // had — members often disagree about which line of a construct to blame.
+  // Prefer an anchorable member, keeping the severity ordering among those.
+  const representativeOf = (cluster: (typeof clusters)[number]): Finding =>
+    cluster.members.find((member) => isCommentable(anchors, member.file, member.line)) ??
+    cluster.representative;
+
+  const contributingRules = new Map<Finding, readonly string[]>();
+  // The members a cluster did NOT promote still have to be rendered somewhere,
+  // or a similarity heuristic silently deletes a finding (Codex review of
+  // PR #23, P1). Every surface that shows a representative shows these too.
+  const mergedMembers = new Map<Finding, readonly Finding[]>();
+  for (const cluster of clusters) {
+    const representative = representativeOf(cluster);
+    contributingRules.set(representative, cluster.rules);
+    mergedMembers.set(representative, cluster.members.filter((member) => member !== representative));
+  }
+  const dedupedFindings = clusters
+    .map(representativeOf)
+    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
 
   const inlineComments: InlineComment[] = [];
   const unanchored: Finding[] = [];
@@ -273,9 +297,17 @@ export function orchestrate(
     const showFix =
       suggestion !== undefined && !rangeMalformed && !rangeInverted && (!wantsRange || rangeOk);
 
+    const alsoReported = mergedMembers.get(finding) ?? [];
+    // Corroboration by several rules belongs on the inline comment too, not
+    // only in the summary — it is the same finding either way.
+    const rules = contributingRules.get(finding) ?? [];
     const rendered = renderInlineComment(
       showFix ? { ...finding, suggestion } : { ...finding, suggestion: undefined },
-      { suggestions: committable },
+      {
+        suggestions: committable,
+        ...(alsoReported.length > 0 ? { alsoReported } : {}),
+        ...(rules.length > 1 ? { rules } : {}),
+      },
     );
 
     // Only anchor across a range when a COMMITTABLE suggestion will actually use it —
@@ -306,10 +338,36 @@ export function orchestrate(
     });
   }
 
+  // Built for EVERY finding, not just the currently-unanchored ones: an inline
+  // comment can still be rejected at publication time, and renderSummary must be
+  // able to give it its excerpt then without re-parsing the diff.
+  const context = new Map<Finding, FindingContext>(
+    dedupedFindings.map((finding) => [
+      finding,
+      {
+        ...(inlineEnabled
+          ? { snippet: hunkSnippet(diff, finding.file, finding.line, finding.endLine) }
+          : {}),
+        ...(() => {
+          const rules = contributingRules.get(finding);
+          return rules && rules.length > 1 ? { rules } : {};
+        })(),
+        ...(() => {
+          const members = mergedMembers.get(finding);
+          return members && members.length > 0 ? { alsoReported: members } : {};
+        })(),
+      },
+    ]),
+  );
+
   const summaryInput = {
-    allFindings: dedupedFindings,
+    allFindings,
     inlineCount: inlineComments.length,
     unanchored,
+    publishFailed: [] as Finding[],
+    findingCount: allFindings.length,
+    uniqueIssueCount: clusters.length,
+    context,
     filesReviewed: changedFiles(diff),
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
@@ -327,7 +385,10 @@ export function orchestrate(
   return {
     commentBody,
     inlineComments,
-    findingsCount: dedupedFindings.length,
+    // Pre-cluster: this value feeds terminal results, recovery markers and
+    // status logs. Clustering is a presentation choice and must not redefine
+    // how many findings a run reports (Codex review of PR #23).
+    findingsCount: allFindings.length,
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
     findingByClientId,
@@ -335,22 +396,54 @@ export function orchestrate(
   };
 }
 
+/**
+ * Re-renders the summary once publication outcomes are known.
+ *
+ * `failedIds` are findings whose anchors were VALID — they were accepted by
+ * every check this tool makes and then refused by the provider. Merging them
+ * into `unanchored` (which is what this did) made the comment tell the reader
+ * their line numbers were not in the diff, sending them to audit anchors that
+ * were never wrong. They get their own group, and `reason` carries the
+ * provider's own words so the failure is diagnosable from the comment alone.
+ */
 export function renderSummary(
   presentation: OrchestrationResult,
   failedIds: ReadonlySet<string>,
   maxLength?: number,
+  reason?: string | ReadonlyMap<string, string>,
 ): string {
   const failed = [...failedIds].map((id) => {
     const finding = presentation.findingByClientId.get(id);
     if (!finding) throw new Error(`unknown inline finding clientId: ${id}`);
     return finding;
   });
+
+  // A per-clientId map attributes each rejection to the finding it actually
+  // describes; a bare string keeps the older "one cause for the batch" form,
+  // which is still the truth for a single atomic rejection.
+  const perFinding = typeof reason === "object" ? reason : undefined;
+  const sharedReason = typeof reason === "string" ? reason : undefined;
+  const context = perFinding
+    ? new Map(presentation.summaryInput.context ?? [])
+    : presentation.summaryInput.context;
+  if (perFinding && context instanceof Map) {
+    for (const id of failedIds) {
+      const finding = presentation.findingByClientId.get(id);
+      const why = perFinding.get(id);
+      if (!finding || why === undefined) continue;
+      context.set(finding, { ...context.get(finding), publishFailureReason: why });
+    }
+  }
+
   return renderSummaryComment({
     ...presentation.summaryInput,
+    ...(context === undefined ? {} : { context }),
     inlineCount: presentation.inlineComments.length - failed.length,
-    unanchored: [...presentation.summaryInput.unanchored, ...failed].sort(
-      (a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity],
-    ),
+    publishFailed: [
+      ...(presentation.summaryInput.publishFailed ?? []),
+      ...failed,
+    ].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]),
+    ...(sharedReason === undefined ? {} : { publishFailureReason: sharedReason }),
     inlineUnavailable: presentation.summaryInput.inlineUnavailable,
   }, maxLength);
 }

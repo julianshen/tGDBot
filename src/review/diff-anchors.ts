@@ -96,6 +96,147 @@ export function changedFiles(diff: string): string[] {
   return files;
 }
 
+/** One rendered line of a fallback excerpt, with its diff marker preserved. */
+export interface SnippetLine {
+  /** `+` added, `-` removed, ` ` context — as it appears in the diff. */
+  readonly marker: " " | "+" | "-";
+  readonly text: string;
+  /** NEW-file line number; undefined for a removed line (it has no right side). */
+  readonly newLine: number | undefined;
+  /** True when this line is inside the finding's own range. */
+  readonly target: boolean;
+}
+
+export interface HunkSnippet {
+  readonly startLine: number;
+  readonly endLine: number;
+  readonly lines: readonly SnippetLine[];
+}
+
+/**
+ * The diff excerpt around `line`..`endLine`, for a finding that could NOT be
+ * shown inline.
+ *
+ * An inline comment sits on the diff, so the provider renders the surrounding
+ * code for free. A finding relocated to the summary loses exactly that, and
+ * becomes a claim about code the reader has to go and find. This recovers it.
+ *
+ * Presentation only — never consulted when deciding whether a line is
+ * anchorable. That keeps it free to be forgiving where `parseDiffPositions` is
+ * strict: a hunk whose declared counts don't add up still yields a usable
+ * excerpt here, and the worst case is `undefined` (the entry renders without
+ * context) rather than a lost finding.
+ */
+export function hunkSnippet(
+  diff: string,
+  file: string,
+  line: number | null | undefined,
+  endLine?: number,
+  context = 3,
+): HunkSnippet | undefined {
+  if (typeof line !== "number" || !Number.isInteger(line)) return undefined;
+  const last = Number.isInteger(endLine) && (endLine as number) > line ? (endLine as number) : line;
+
+  let newPath: string | undefined;
+  let newLine = 0;
+  // Two separate facts. `insideHunk` says we are in SOME file's hunk body, where
+  // `--- `/`+++ ` are content rather than headers; `capturing` narrows that to
+  // the file being searched.
+  let insideHunk = false;
+  let capturing = false;
+  let lines: SnippetLine[] = [];
+
+  // The excerpt is whichever hunk contains the range's FIRST line: a finding's
+  // range is single-hunk by construction (see rangeIsCommentable).
+  const finish = (): HunkSnippet | undefined => {
+    const first = lines.findIndex((l) => l.target);
+    if (first === -1) return undefined;
+    let end = first;
+    for (let i = lines.length - 1; i >= first; i -= 1) {
+      if (lines[i]!.target) {
+        end = i;
+        break;
+      }
+    }
+    return {
+      startLine: line,
+      endLine: last,
+      lines: lines.slice(Math.max(0, first - context), end + context + 1),
+    };
+  };
+
+  for (const raw of diff.split("\n")) {
+    // `diff --git ` is the only header that stays unambiguous inside a hunk: a
+    // removed line renders as `-` + content and an added one as `+` + content,
+    // so neither can ever produce this prefix.
+    if (raw.startsWith("diff --git ")) {
+      if (capturing) {
+        const found = finish();
+        if (found) return found;
+      }
+      insideHunk = false;
+      capturing = false;
+      newPath = undefined;
+      continue;
+    }
+    // `--- ` and `+++ ` are file headers ONLY outside a hunk body. Inside one
+    // they are ordinary content: a removed line whose text starts "-- " renders
+    // as "--- ", and an added line starting "++ " renders as "+++ ". Markdown
+    // rules and SQL comments produce these constantly, and reading them as
+    // headers truncated the hunk and lost the excerpt.
+    if (!insideHunk) {
+      if (raw.startsWith("--- ")) continue;
+      if (raw.startsWith("+++ ")) {
+        const path = raw.slice(4).trim();
+        newPath = path === "/dev/null" ? undefined : stripDiffPathPrefix(path);
+        continue;
+      }
+    }
+    // A hunk header is likewise unambiguous: content would carry a leading
+    // marker character before the `@@`.
+    const hunk = HUNK_RE.exec(raw);
+    if (hunk) {
+      if (capturing) {
+        const found = finish();
+        if (found) return found;
+      }
+      newLine = Number(hunk[3]);
+      insideHunk = true;
+      capturing = newPath === file;
+      lines = [];
+      continue;
+    }
+    if (!insideHunk) continue;
+    if (!capturing) {
+      // Still consume the body so a later hunk header is read in the right
+      // state, but nothing from another file is ever recorded.
+      if (!/^[-+ \\]/u.test(raw)) insideHunk = false;
+      continue;
+    }
+
+    const marker = raw[0];
+    if (marker === "+" || marker === " ") {
+      lines.push({
+        marker,
+        text: raw.slice(1),
+        newLine,
+        target: newLine >= line && newLine <= last,
+      });
+      newLine += 1;
+    } else if (marker === "-") {
+      lines.push({ marker, text: raw.slice(1), newLine: undefined, target: false });
+    } else if (marker === "\\") {
+      // `\ No newline at end of file` is not a line of either side.
+    } else {
+      const found = finish();
+      if (found) return found;
+      insideHunk = false;
+      capturing = false;
+    }
+  }
+  return capturing ? finish() : undefined;
+}
+
 /**
  * True iff EVERY line in `start`..`end` (inclusive) is commentable.
  *

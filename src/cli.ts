@@ -1089,6 +1089,7 @@ export async function review(
     failedIds: ReadonlySet<string>,
     marker = formatMarker(pr.headSha, configHash),
     providerLimit = true,
+    publishFailureReason?: string | ReadonlyMap<string, string>,
   ): string => {
     const suffixParts: string[] = [];
     if (loadErrors.length > 0) suffixParts.push(renderLoadErrorsSection(loadErrors));
@@ -1099,7 +1100,7 @@ export async function review(
       throw new Error("Review metadata is too large for a provider comment");
     }
     const commentBody = o.summaryInput
-      ? renderSummary(o, failedIds, maxSummaryLength)
+      ? renderSummary(o, failedIds, maxSummaryLength, publishFailureReason)
       : o.commentBody;
     const body = `${commentBody}${suffix}`;
     if (providerLimit && body.length > 65_536) {

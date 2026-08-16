@@ -9,6 +9,7 @@ import {
 } from "../../../src/review/comment-format.js";
 import { formatChildMarker } from "../../../src/conversation/markers.js";
 import type { Finding } from "../../../src/review/types.js";
+import type { SummaryInput } from "../../../src/review/comment-format.js";
 import type { RelatedWorkItem } from "../../../src/review/related-work.js";
 
 // Every inline body ends with the tool's trailing marker (what stale-thread
@@ -172,7 +173,7 @@ describe("renderSummaryComment", () => {
     ];
     const body = renderSummaryComment({ ...base, allFindings: findings, inlineCount: 3 });
 
-    expect(body).toContain("**Actionable comments posted: 3**");
+    expect(body).toContain("**3 findings · 3 inline comments posted**");
     expect(body).toContain("🔴 2 blocking");
     expect(body).toContain("🔵 1 suggestion");
     expect(body).not.toContain("warning"); // zero counts are omitted
@@ -379,7 +380,7 @@ describe("renderSummaryComment", () => {
         message: "m".repeat(2_000),
       }),
     );
-    const header = "**Actionable comments posted: 2** — 🟠 2 warning";
+    const header = "**2 findings · 0 inline comments posted** — 🟠 2 warning";
     const notice =
       "> [!WARNING]\n" +
       "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
@@ -516,7 +517,7 @@ describe("renderSummaryComment", () => {
       contextUnavailable: ["discussion", "memory"],
     });
 
-    expect(body).toContain("**Actionable comments posted: 1**");
+    expect(body).toContain("**1 finding · 1 inline comment posted**");
     expect(body).toContain("### Needs clarification");
     expect(body).not.toMatch(/Needs clarifications/i);
     expect(body).toContain("Is the fallback path intentional?");
@@ -542,7 +543,7 @@ describe("renderSummaryComment", () => {
     expect(body).toContain("**No actionable comments.** ✅");
     expect(body).toContain("### Needs clarification");
     expect(body).toContain("Should this stay?");
-    expect(body).not.toContain("**Actionable comments posted:");
+    expect(body).not.toMatch(/\*\*\d+ findings? ·/u);
     expect(body).not.toContain("Additional comments");
   });
 
@@ -748,5 +749,262 @@ describe("ADR-007/008: review fixes", () => {
       const body = renderInlineComment(makeFinding({ message: m }));
       expect(body, m).not.toMatch(/(?:`{3,})\s*suggestions?\b/i);
     }
+  });
+});
+
+// PR #281 shipped 14 findings under the heading "Actionable comments posted: 14"
+// with the note "These couldn't be anchored to a line in the diff" — while zero
+// review comments existed on the PR and every anchor had in fact been valid.
+// Both statements were false, and they pointed a reader at the wrong problem.
+// Typed on purpose: `as never` would disable field-name checking, and a
+// renamed SummaryInput key would then make assertions like "the publication
+// section is absent" pass because the key was never recognised.
+function summaryInput(overrides: Partial<SummaryInput> = {}): SummaryInput {
+  return {
+    allFindings: [],
+    inlineCount: 0,
+    unanchored: [],
+    filesReviewed: [],
+    rulesRun: [],
+    rulesFailed: [],
+    ...overrides,
+  };
+}
+
+describe("renderSummaryComment — failure attribution", () => {
+  const anchored = makeFinding({ file: "a.go", line: 10, message: "Rejected by the provider." });
+  const unanchorable = makeFinding({ file: "b.go", line: undefined, message: "No line at all." });
+
+  function summary(overrides: Record<string, unknown> = {}) {
+    return renderSummaryComment(summaryInput({
+      allFindings: [anchored, unanchorable],
+      inlineCount: 0,
+      unanchored: [unanchorable],
+      publishFailed: [anchored],
+      publishFailureReason: "GitHub rejected the atomic inline review (HTTP 422)",
+      filesReviewed: ["a.go", "b.go"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+      ...overrides,
+    }));
+  }
+
+  it("separates publication failures from findings with no valid anchor", () => {
+    const body = summary();
+    expect(body).toContain("### 📌 Inline publication failed (1)");
+    expect(body).toContain("### 💬 Additional comments (1)");
+  });
+
+  it("does not blame the diff for a finding whose anchor was valid", () => {
+    const body = summary();
+    const failedSection = body.slice(body.indexOf("### 📌 Inline publication failed"));
+    const publicationBlock = failedSection.slice(0, failedSection.indexOf("### 💬"));
+    expect(publicationBlock).not.toContain("couldn't be anchored");
+    expect(publicationBlock).toContain("a.go:10");
+  });
+
+  it("names the provider's reason so the failure is diagnosable", () => {
+    expect(summary()).toContain("GitHub rejected the atomic inline review (HTTP 422)");
+  });
+
+  it("omits the publication-failure section when everything published", () => {
+    const body = summary({ publishFailed: [], publishFailureReason: undefined, inlineCount: 1 });
+    expect(body).not.toContain("Inline publication failed");
+  });
+});
+
+describe("renderSummaryComment — headline", () => {
+  it("reports findings, unique issues and inline comments actually posted", () => {
+    const findings = [
+      makeFinding({ file: "a.go", line: 1, message: "One." }),
+      makeFinding({ file: "a.go", line: 2, message: "Two." }),
+    ];
+    const body = renderSummaryComment(summaryInput({
+      allFindings: findings,
+      inlineCount: 0,
+      unanchored: [],
+      publishFailed: findings,
+      publishFailureReason: "GitHub rejected the atomic inline review (HTTP 422)",
+      uniqueIssueCount: 1,
+      filesReviewed: ["a.go"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    }));
+
+    expect(body.split("\n")[0]).toContain("2 findings · 1 unique issue · 0 inline comments posted");
+  });
+
+  it("never claims comments were posted when none were", () => {
+    const finding = makeFinding();
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+      filesReviewed: [],
+      rulesRun: [],
+      rulesFailed: [],
+    }));
+
+    expect(body).not.toContain("Actionable comments posted: 1");
+    expect(body.split("\n")[0]).toContain("0 inline comments posted");
+  });
+});
+
+describe("renderSummaryComment — diff context", () => {
+  const finding = makeFinding({ file: "a.go", line: 11, severity: "blocking", message: "Race." });
+
+  it("renders the diff excerpt for a finding that fell back to the summary", () => {
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [],
+      publishFailed: [finding],
+      publishFailureReason: "rejected",
+      context: new Map([[finding, {
+        snippet: {
+          startLine: 11,
+          endLine: 11,
+          lines: [
+            { marker: " ", text: "ctx", newLine: 10, target: false },
+            { marker: "+", text: "boom()", newLine: 11, target: true },
+          ],
+        },
+      }]]),
+      filesReviewed: ["a.go"],
+      rulesRun: [],
+      rulesFailed: [],
+    }));
+
+    expect(body).toContain("```diff");
+    expect(body).toContain("+boom()");
+    expect(body).toContain(" ctx");
+  });
+
+  it("lists the contributing rules when several rules found one issue", () => {
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+      context: new Map([[finding, { rules: ["mongodb", "nats", "tgd-review"] }]]),
+      filesReviewed: [],
+      rulesRun: [],
+      rulesFailed: [],
+    }));
+
+    expect(body).toContain("`mongodb`");
+    expect(body).toContain("`nats`");
+    expect(body).toContain("3 rules");
+  });
+
+  it("renders without context when none is supplied", () => {
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+      filesReviewed: [],
+      rulesRun: [],
+      rulesFailed: [],
+    }));
+
+    expect(body).toContain("a.go:11");
+    expect(body).not.toContain("```diff");
+  });
+});
+
+// Codex review of PR #23 (P2): compact mode is a SIZE fallback, so it must not
+// also be an ATTRIBUTION fallback — it previously merged both groups into one
+// undifferentiated list and dropped the provider's reason entirely.
+describe("renderSummaryComment — compact mode keeps attribution", () => {
+  it("labels publication failures and keeps the reason when compacted", () => {
+    const rejected = makeFinding({ file: "a.go", line: 10, message: "x".repeat(400) });
+    const unanchorable = makeFinding({ file: "b.go", line: undefined, message: "y".repeat(400) });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [rejected, unanchorable],
+      inlineCount: 0,
+      unanchored: [unanchorable],
+      publishFailed: [rejected],
+      publishFailureReason: "GitHub rejected the atomic inline review (HTTP 422)",
+      filesReviewed: [],
+      rulesRun: [],
+      rulesFailed: [],
+    }), 900);
+
+    expect(body).toContain("HTTP 422");
+    expect(body.toLowerCase()).toContain("publication failed");
+  });
+});
+
+// Codex round 3 on PR #23: compact mode built entries from cluster
+// representatives only, so merged members disappeared again in exactly the
+// path where the summary is already under pressure — while the headline kept
+// counting them.
+describe("renderSummaryComment — compact mode keeps merged members", () => {
+  it("lists every clustered member, not just the representative", () => {
+    const representative = makeFinding({ file: "a.go", line: 10, message: "r".repeat(2000) });
+    const member = makeFinding({ file: "a.go", line: 11, ruleName: "nats", message: "DISTINCT-MEMBER-CLAIM" });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [representative],
+      inlineCount: 0,
+      unanchored: [representative],
+      findingCount: 2,
+      uniqueIssueCount: 1,
+      context: new Map([[representative, { alsoReported: [member] }]]),
+    }), 700);
+
+    // Guard that this actually exercised the compact renderer, not the full one.
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("DISTINCT-MEMBER-CLAIM");
+  });
+});
+
+// Codex review of PR #23: renderAlsoReported serialized rule/line/message only,
+// so a merged member's structured `suggestion` was still being discarded — the
+// data-loss fix was only partial.
+describe("renderSummaryComment — merged members keep their proposed fix", () => {
+  it("renders a non-representative member's suggestion", () => {
+    const representative = makeFinding({ file: "a.go", line: 10, message: "Primary claim." });
+    const member = makeFinding({
+      file: "a.go",
+      line: 10,
+      ruleName: "nats",
+      message: "Secondary claim.",
+      suggestion: "committed, err := store.AdoptIfAbsent(ctx, roomID, *newPair)",
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [representative],
+      inlineCount: 0,
+      unanchored: [representative],
+      context: new Map([[representative, { alsoReported: [member] }]]),
+    }));
+
+    expect(body).toContain("store.AdoptIfAbsent");
+  });
+});
+
+// Codex round 5 on PR #23: with per-client reasons the shared field is
+// undefined, so compact mode kept the publication-failure label but dropped
+// every provider diagnosis.
+describe("renderSummaryComment — compact mode renders mapped reasons", () => {
+  it("surfaces per-finding reasons when there is no single shared reason", () => {
+    const a = makeFinding({ file: "a.go", line: 10, message: "a".repeat(1200) });
+    const b = makeFinding({ file: "b.go", line: 20, message: "b".repeat(1200) });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [a, b],
+      inlineCount: 0,
+      unanchored: [],
+      publishFailed: [a, b],
+      context: new Map([
+        [a, { publishFailureReason: "GitHub rejected this inline comment (HTTP 422) at a.go:10" }],
+        [b, { publishFailureReason: "GitHub rejected this inline comment (HTTP 403) at b.go:20" }],
+      ]),
+    }), 900);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("HTTP 422");
+    expect(body).toContain("HTTP 403");
   });
 });

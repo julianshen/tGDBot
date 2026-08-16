@@ -429,7 +429,7 @@ describe("inline anchoring", () => {
     expect(result.inlineComments[0].body).toContain("🔴 Blocking");
     expect(result.inlineComments[0].body).toContain("Prompt for AI Agents");
     // Counted, not repeated, in the summary.
-    expect(result.commentBody).toContain("Actionable comments posted: 1");
+    expect(result.commentBody).toContain("1 finding · 1 inline comment posted");
     expect(result.commentBody).not.toContain("Bad thing here.");
   });
 
@@ -450,7 +450,7 @@ describe("inline anchoring", () => {
     expect(result.commentBody).toContain("No line at all.");
     expect(result.commentBody).toContain("Additional comments (3)");
     // Total = inline + summary, so nothing is double-counted.
-    expect(result.commentBody).toContain("Actionable comments posted: 4");
+    expect(result.commentBody).toContain("4 findings · 1 inline comment posted");
   });
 
   it("never duplicates: an anchored finding appears inline and NOT in the summary body", () => {
@@ -796,9 +796,9 @@ describe("finding decisions", () => {
       expect.stringContaining("fresh"),
       expect.stringContaining("still there"),
     ]);
-    expect(result.commentBody).toContain("**Actionable comments posted: 2**");
+    expect(result.commentBody).toContain("**2 findings · 2 inline comments posted**");
     expect(result.commentBody).not.toContain("fixed");
-    expect(result.commentBody).not.toMatch(/Actionable comments posted: [345]/);
+    expect(result.commentBody).not.toMatch(/^\*\*[345] findings ·/mu);
   });
 
   it("suppresses a repeated finding once any copy is addressed", () => {
@@ -830,7 +830,7 @@ describe("finding decisions", () => {
     expect(result.commentBody).toMatch(/no actionable comments/i);
     expect(result.commentBody).toMatch(/### Disputed/i);
     expect(result.commentBody).toContain("Maybe a race");
-    expect(result.commentBody).not.toContain("**Actionable comments posted:");
+    expect(result.commentBody).not.toMatch(/\*\*\d+ findings? ·/u);
   });
 
   it("selects the first deterministic clarification and renders the deferred count separately", () => {
@@ -871,7 +871,356 @@ describe("finding decisions", () => {
     expect(result.commentBody).not.toContain("Should later-rule win?");
     expect(result.commentBody).not.toContain("And this later earlier-rule question?");
     expect(result.commentBody).toMatch(/2 additional (?:questions|clarifications) deferred/i);
-    expect(result.commentBody).not.toContain("**Actionable comments posted:");
+    expect(result.commentBody).not.toMatch(/\*\*\d+ findings? ·/u);
     expect(result.commentBody).not.toMatch(/🔴|🟠|🔵/);
+  });
+});
+
+// PR #281: 14 findings, 9 distinct defects, 0 inline comments posted, and a
+// summary that blamed the diff for a provider rejection.
+describe("orchestrate — outcome groups and clustering", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return {
+      file: "a.go",
+      line: 11,
+      severity: "blocking",
+      category: "concurrency",
+      ruleName: "rule-a",
+      ...overrides,
+    };
+  }
+
+  it("collapses one defect reported by several rules into a single entry", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "mongodb", message: "Set followed by Get is not atomic." }),
+          f({ ruleName: "nats", message: "Set followed by Get is not atomic here." }),
+          f({ ruleName: "tgd-review", message: "Set followed by Get is not atomic at all." }),
+        ],
+        rulesRun: ["mongodb", "nats", "tgd-review"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.commentBody).toContain("3 findings · 1 unique issue");
+  });
+
+  it("keeps distinct defects apart", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "a", message: "Set followed by Get is not atomic." }),
+          f({ ruleName: "b", message: "Clock skew shortens the retention window." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(2);
+    expect(result.summaryInput.uniqueIssueCount).toBe(2);
+  });
+
+  it("still renders a fallback finding when the diff has no excerpt for it", () => {
+    const result = orchestrate(
+      { findings: [f({ line: 999, message: "Off the diff." })], rulesRun: ["a"], rulesFailed: [] } as never,
+      DIFF,
+      {},
+    );
+
+    // Line 999 is not in the diff, so there is no excerpt to show — but the
+    // finding must still be rendered rather than dropped.
+    expect(result.summaryInput.unanchored).toHaveLength(1);
+    expect(result.commentBody).toContain("a.go:999");
+  });
+
+  it("routes a publish failure to publishFailed, never to unanchored", () => {
+    const result = orchestrate(
+      { findings: [f({ message: "Anchored fine." })], rulesRun: ["a"], rulesFailed: [] } as never,
+      DIFF,
+      {},
+    );
+    expect(result.inlineComments).toHaveLength(1);
+
+    const body = renderSummary(
+      result,
+      new Set([result.inlineComments[0]!.clientId]),
+      undefined,
+      "GitHub rejected the atomic inline review (HTTP 422)",
+    );
+
+    expect(body).toContain("### 📌 Inline publication failed (1)");
+    expect(body).toContain("HTTP 422");
+    expect(body).not.toContain("### 💬 Additional comments");
+    expect(body).toContain("0 inline comments posted");
+  });
+
+  it("gives a rejected finding the diff excerpt it lost by not being inline", () => {
+    const result = orchestrate(
+      { findings: [f({ message: "Anchored fine." })], rulesRun: ["a"], rulesFailed: [] } as never,
+      DIFF,
+      {},
+    );
+
+    const body = renderSummary(result, new Set([result.inlineComments[0]!.clientId]), undefined, "rejected");
+
+    expect(body).toContain("```diff");
+    expect(body).toContain("+added");
+  });
+});
+
+// Codex review of PR #23 (P1): clusterFindings documents itself as
+// presentation-only and "retains every member", but orchestrate mapped each
+// cluster to its representative and nothing ever rendered the rest — so a
+// merged finding's message vanished from both surfaces. The safety property
+// that justifies tuning the similarity threshold for recall only holds if the
+// other members are actually SHOWN.
+describe("orchestrate — clustering never loses a member", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "r", ...overrides };
+  }
+
+  it("shows a merged member's claim in the inline comment body", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          // The LONGER message wins the representative slot, so the assertion
+          // below is about the member that clustering actually discards.
+          f({ ruleName: "mongodb", message: "Set followed by Get is not atomic because the two calls are separate operations that interleave." }),
+          f({ ruleName: "nats", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["mongodb", "nats"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]!.body).toContain("under retry");
+  });
+
+  it("shows a merged member's claim in a summary fallback entry", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ line: 999, ruleName: "mongodb", message: "Set followed by Get is not atomic because the two calls are separate operations that interleave." }),
+          f({ line: 999, ruleName: "nats", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["mongodb", "nats"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.unanchored).toHaveLength(1);
+    expect(result.commentBody).toContain("under retry");
+  });
+});
+
+// Codex round 3 on PR #23.
+describe("orchestrate — clustering must not distort counts or placement", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "r", ...overrides };
+  }
+
+  // findingsCount feeds terminal results, recovery markers and status logs.
+  // Clustering is a PRESENTATION choice; it must not silently redefine how many
+  // findings a run reports programmatically.
+  it("reports the pre-cluster finding count", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "a", message: "Set followed by Get is not atomic because the calls are separate." }),
+          f({ ruleName: "b", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.findingsCount).toBe(2);
+  });
+
+  // Only representatives enter the placement loop, so choosing one that has no
+  // anchor throws away an anchor the cluster genuinely had.
+  it("promotes an anchorable member to representative when the longest is off-diff", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          // Longer message, so it would win the representative slot on merit —
+          // but line 999 is not in the diff.
+          f({ line: 999, ruleName: "a", message: "Set followed by Get is not atomic in this fallback path here." }),
+          f({ line: 11, ruleName: "b", message: "Set followed by Get is not atomic." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]!.line).toBe(11);
+  });
+});
+
+// Codex round 3 on PR #23: bisection isolates comments that can fail for
+// DIFFERENT reasons (different statuses, different paths), and GitLab rejects
+// discussions independently. Reporting the first reason as the explanation for
+// every rejected finding tells the reader something false about most of them.
+describe("renderSummary — per-finding failure reasons", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function two() {
+    return orchestrate(
+      {
+        findings: [
+          { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "a", message: "Race between the Set and Get calls." },
+          { file: "a.go", line: 12, severity: "warning", category: "configuration", ruleName: "b", message: "Compose file hardcodes the retention window." },
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+  }
+
+  it("gives each rejected finding the reason that actually applies to it", () => {
+    const result = two();
+    expect(result.inlineComments).toHaveLength(2);
+    const [first, second] = result.inlineComments;
+
+    const body = renderSummary(result, new Set([first!.clientId, second!.clientId]), undefined, new Map([
+      [first!.clientId, "GitHub rejected this inline comment (HTTP 422) at a.go:11"],
+      [second!.clientId, "GitHub rejected this inline comment (HTTP 403) at a.go:12"],
+    ]));
+
+    expect(body).toContain("HTTP 422");
+    expect(body).toContain("HTTP 403");
+  });
+
+  it("still accepts one shared reason for the whole batch", () => {
+    const result = two();
+    const ids = result.inlineComments.map((c) => c.clientId);
+
+    const body = renderSummary(result, new Set(ids), undefined, "GitHub rejected the atomic inline review (HTTP 422)");
+
+    expect(body).toContain("GitHub rejected the atomic inline review (HTTP 422)");
+  });
+});
+
+// Codex round 5 on PR #23.
+describe("orchestrate — counts and attribution span every member", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "r", ...overrides };
+  }
+
+  // orchestrate collapsed exact duplicates BEFORE clustering, so the rule-name
+  // preservation inside clusterFindings never saw the second rule in production.
+  it("credits both rules when two rules emit the identical claim", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "mongodb", message: "Set followed by Get is not atomic." }),
+          f({ ruleName: "nats", message: "Set followed by Get is not atomic." }),
+        ],
+        rulesRun: ["mongodb", "nats"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]!.body).toContain("mongodb");
+    expect(result.inlineComments[0]!.body).toContain("nats");
+  });
+
+  // The severity breakdown described representatives only, so a summary could
+  // say "3 findings" while showing one blocking — hiding the nested severities.
+  it("counts every clustered member in the severity breakdown", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "a", severity: "blocking", message: "Set followed by Get is not atomic because the calls are separate." }),
+          f({ ruleName: "b", severity: "blocking", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.commentBody).toContain("2 findings · 1 unique issue");
+    expect(result.commentBody).toContain("🔴 2 blocking");
   });
 });

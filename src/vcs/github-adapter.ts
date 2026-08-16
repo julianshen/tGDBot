@@ -22,6 +22,13 @@ import type {
 import type { GitHubRepositoryRef, RepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
+import { bisectRejected } from "./inline-batch-bisect.js";
+
+// Statuses a SINGLE bad comment can plausibly cause, and which splitting can
+// therefore isolate. 422 is GitHub's validation failure — the invalid-anchor
+// case bisection exists for. 401/403/404/410 describe the request as a whole:
+// every subset would fail identically, so splitting only multiplies the damage.
+const ISOLATABLE_REJECTION_STATUSES = new Set(["422"]);
 import { computeContentDigest, computeRepositoryDigest, parseChildMarker, verifyChildMarkerBinding } from "../conversation/markers.js";
 import type { BotIdentity, ConversationItemIdentity, ReviewIdentity } from "../conversation/types.js";
 import {
@@ -1457,34 +1464,111 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       return comments.map((comment, index) => ({ clientId: comment.clientId, status: "posted", identity: existing[index]! }));
     }
     if (existing.some((identity) => identity !== null)) throw new AmbiguousInlinePublishError("Partial inline marker set exists before atomic review write");
-    const payload = {
+    const payloadFor = (indices: readonly number[]): string => JSON.stringify({
       commit_id: headSha,
       event: "COMMENT",
       body: "tGD inline review",
-      comments: comments.map((comment, index) => ({
-        path: comment.path, line: comment.line, side: "RIGHT",
-        ...(comment.startLine === undefined ? {} : { start_line: comment.startLine, start_side: "RIGHT" }),
-        body: `${canonicalInlineBody(comment.body)}\n${INLINE_COMMENT_MARKER}\n${markers[index]}`,
-      })),
+      comments: indices.map((index) => {
+        const comment = comments[index]!;
+        return {
+          path: comment.path, line: comment.line, side: "RIGHT",
+          ...(comment.startLine === undefined ? {} : { start_line: comment.startLine, start_side: "RIGHT" }),
+          body: `${canonicalInlineBody(comment.body)}\n${INLINE_COMMENT_MARKER}\n${markers[index]}`,
+        };
+      }),
+    });
+    const postBatch = async (indices: readonly number[]): Promise<void> => {
+      await this.execGh(["api", `${apiRepo(repo)}/pulls/${resolved.id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"], payloadFor(indices));
     };
-    try {
-      await this.execGh(["api", `${apiRepo(repo)}/pulls/${resolved.id}/reviews`, ...apiHost(repo), "-X", "POST", "--input", "-"], JSON.stringify(payload));
-    } catch (error) {
+
+    // A DEFINITE refusal — the provider read the request and said no. 408/409/
+    // 425/429 are retryable and a non-4xx may simply be a lost response, and in
+    // both cases the write may still have landed, so neither counts.
+    const definiteRejection = (error: unknown): string | undefined => {
       const message = error instanceof Error ? error.message : "";
       const status = /HTTP (4\d\d)/u.exec(message)?.[1];
-      if (status && !["408", "409", "425", "429"].includes(status)) {
-        return comments.map(({ clientId }) => ({ clientId, status: "failed", reason: `GitHub rejected the atomic inline review (HTTP ${status})` }));
+      return status !== undefined && !["408", "409", "425", "429"].includes(status) ? status : undefined;
+    };
+
+    const allIndices = comments.map((_, index) => index);
+    let rejectedIndices = new Set<number>();
+    let rejectionStatus: string | undefined;
+    // The whole-batch status is not necessarily an individual comment's status:
+    // the batch may fail 422 while one member is refused with a different 4xx.
+    // The reason claims to name THIS comment, so it must be exact.
+    const statusByIndex = new Map<number, string>();
+    try {
+      await postBatch(allIndices);
+    } catch (error) {
+      rejectionStatus = definiteRejection(error);
+      if (rejectionStatus !== undefined && !ISOLATABLE_REJECTION_STATUSES.has(rejectionStatus)) {
+        // Batch-wide: splitting cannot isolate an authorization or not-found
+        // failure, because every subset carries the same fault. Retrying subsets
+        // would only fire doomed POSTs and give a rate limiter more chances to
+        // turn a clean failure into an ambiguous publication.
+        return comments.map(({ clientId }) => ({
+          clientId,
+          status: "failed" as const,
+          reason: `GitHub rejected the atomic inline review (HTTP ${rejectionStatus})`,
+        }));
       }
-      // Response loss is indistinguishable from acceptance. Recovery below is
-      // authoritative; if incomplete, the typed error prevents fallback writes.
+      if (rejectionStatus === undefined) {
+        // Response loss is indistinguishable from acceptance. Recovery below is
+        // authoritative; if incomplete, the typed error prevents fallback writes.
+      } else {
+        // The endpoint is atomic, so this rejection condemned every comment in
+        // the batch — including the ones GitHub would have been happy to take.
+        // Bisect to find the actual offender(s) and publish the rest, instead of
+        // relocating a whole review's worth of findings over one bad anchor.
+        // Tracked alongside bisectRejected's own bookkeeping so a mid-bisect
+        // abort still knows which comments were DEFINITELY refused.
+        const provenRejected = new Set<number>();
+        try {
+          rejectedIndices = await bisectRejected(comments.length, async (indices) => {
+            // The full batch was just proven to fail; re-sending it would be a
+            // wasted request with a known answer.
+            if (indices.length === comments.length) return "rejected";
+            try {
+              await postBatch(indices);
+              return "accepted";
+            } catch (cause) {
+              const status = definiteRejection(cause);
+              if (status === undefined) throw cause;
+              if (indices.length === 1) {
+                provenRejected.add(indices[0]!);
+                statusByIndex.set(indices[0]!, status);
+              }
+              return "rejected";
+            }
+          });
+        } catch {
+          // Inconclusive mid-bisect. An earlier half may already be live, so
+          // reporting a blanket failure would duplicate those comments into the
+          // summary while they sit on the diff. Marker recovery below is the
+          // only authority on what landed; if it comes back incomplete, the
+          // typed ambiguous error stops any fallback write.
+          rejectedIndices = provenRejected;
+        }
+      }
     }
     let recovered: Array<ConversationItemIdentity | null>;
     try { recovered = await recover(); } catch (cause) {
       if (cause instanceof AmbiguousInlinePublishError) throw cause;
       throw new AmbiguousInlinePublishError("Could not recover identities after atomic inline review write");
     }
-    if (!recovered.every((identity) => identity !== null)) throw new AmbiguousInlinePublishError();
-    return comments.map((comment, index) => ({ clientId: comment.clientId, status: "posted", identity: recovered[index]! }));
+    // Only comments we did NOT prove rejected are required to have landed.
+    if (recovered.some((identity, index) => identity === null && !rejectedIndices.has(index))) {
+      throw new AmbiguousInlinePublishError();
+    }
+    return comments.map((comment, index) => rejectedIndices.has(index)
+      ? {
+          clientId: comment.clientId,
+          status: "failed" as const,
+          // Isolated to THIS comment by bisection, so the reason can name it
+          // rather than blaming the batch it happened to travel in.
+          reason: `GitHub rejected this inline comment (HTTP ${statusByIndex.get(index) ?? rejectionStatus ?? "4xx"}) at ${comment.path}:${comment.line}`,
+        }
+      : { clientId: comment.clientId, status: "posted" as const, identity: recovered[index]! });
   }
 
   async recoverInlineReview(locator: ReviewLocator, recovery: InlineRecoveryState): Promise<"complete" | "none" | "ambiguous"> {

@@ -8,6 +8,7 @@
 //
 // Both are plain string builders: pure, synchronous, no I/O.
 import type { Finding } from "./types.js";
+import type { HunkSnippet } from "./diff-anchors.js";
 import type { DiscussionMemory } from "./existing-discussion.js";
 import {
   isValidRelatedWorkProjectPath,
@@ -192,7 +193,10 @@ function splitHeadline(message: string): { headline: string; body: string } {
  * already names the file and line, so acting on the finding doesn't require
  * re-deriving the context.
  */
-export function renderInlineComment(finding: Finding, options: RenderOptions = {}): string {
+export function renderInlineComment(
+  finding: Finding,
+  options: RenderOptions & { alsoReported?: readonly Finding[]; rules?: readonly string[] } = {},
+): string {
   const full = sanitizeText(finding.message);
   const file = sanitizeInline(finding.file);
   const { headline, body } = resolveHeadline(finding, full);
@@ -202,7 +206,7 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
   //   headline + body : a short first sentence as the title, the rest as prose
   //   headline only   : the finding IS one short sentence
   //   prose only      : no sentence short enough to be a title (see splitHeadline)
-  const parts = [metaLine(finding), ""];
+  const parts = [metaLine(finding, options.rules), ""];
   if (headline) {
     parts.push(`**${headline}**`);
     if (body) parts.push("", body);
@@ -217,6 +221,10 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
     // delete the fix: the reviewer who picked the safe mode is the last person who
     // should lose information (caught in review — the first draft dropped it).
     parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
+  }
+
+  if (options.alsoReported && options.alsoReported.length > 0) {
+    parts.push("", renderAlsoReported(options.alsoReported));
   }
 
   const prompt = `In \`${file}\`${lineRef}: ${full}\n\nFix only this issue, keep the change minimal, and make sure the tests still pass.`;
@@ -243,8 +251,14 @@ export function renderInlineComment(finding: Finding, options: RenderOptions = {
   return parts.join("\n");
 }
 
-function metaLine(finding: Finding): string {
-  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | _\`${sanitizeInline(finding.ruleName)}\`_`;
+function metaLine(finding: Finding, contributingRules?: readonly string[]): string {
+  // When several rules independently found ONE defect, the interesting fact is
+  // that corroboration — not which rule happened to win the representative slot.
+  const rules =
+    contributingRules && contributingRules.length > 1
+      ? `${contributingRules.map((rule) => `\`${sanitizeInline(rule)}\``).join(", ")} (${contributingRules.length} rules)`
+      : `\`${sanitizeInline(finding.ruleName)}\``;
+  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | _${rules}_`;
 }
 
 export interface RenderOptions {
@@ -317,6 +331,29 @@ function capSuggestion(suggestion: string): string | undefined {
   return suggestion.length > SUGGESTION_MAX ? undefined : suggestion;
 }
 
+/** Presentation extras attached to one finding in a fallback section. */
+export interface FindingContext {
+  /** The diff excerpt around the finding, recovering the context inline gives free. */
+  readonly snippet?: HunkSnippet;
+  /** Every rule that reported this root cause, when clustering merged several. */
+  readonly rules?: readonly string[];
+  /**
+   * Why THIS finding's inline comment was rejected. Bisection isolates comments
+   * that can fail for different statuses at different paths, and GitLab rejects
+   * discussions independently — so one section-level reason would misdescribe
+   * most of them (Codex review of PR #23).
+   */
+  readonly publishFailureReason?: string;
+  /**
+   * The other members of this finding's cluster. Clustering keeps ONE entry per
+   * root cause, and these must still be rendered: a merge is a judgement call
+   * made by a similarity heuristic, and silently deleting the losing member's
+   * text would turn a presentation choice into data loss. (Codex review of
+   * PR #23, P1 — the invariant was documented but never actually honoured.)
+   */
+  readonly alsoReported?: readonly Finding[];
+}
+
 export interface ClarificationPresentation {
   readonly id: string;
   readonly question: string;
@@ -332,6 +369,29 @@ export interface SummaryInput {
   inlineCount: number;
   /** Findings that could NOT be anchored to the diff; rendered in full here. */
   unanchored: Finding[];
+  /**
+   * Findings whose anchors WERE valid but whose inline publication the provider
+   * rejected. Kept apart from `unanchored` because merging them (as this code
+   * used to) makes the summary blame the diff for a provider failure — the
+   * reader then goes looking for a bad line number that does not exist.
+   */
+  publishFailed?: Finding[];
+  /** The provider's own reason, so a rejection is diagnosable from the comment. */
+  publishFailureReason?: string;
+  /** Distinct root causes across `allFindings` (see finding-clusters). */
+  uniqueIssueCount?: number;
+  /**
+   * Findings BEFORE clustering. The rendered entries are one per root cause, so
+   * without this the headline could only report the post-clustering number and
+   * "14 findings · 9 unique issues" would be unsayable.
+   */
+  findingCount?: number;
+  /**
+   * Per-finding presentation extras, keyed by finding IDENTITY — the same object
+   * references that appear in `unanchored`/`publishFailed`. Identity keying
+   * avoids inventing a synthetic key that two findings on one line would share.
+   */
+  context?: ReadonlyMap<Finding, FindingContext>;
   filesReviewed: string[];
   rulesRun: string[];
   rulesFailed: string[];
@@ -420,13 +480,68 @@ export function normalizeRelatedWorkForRender(items: readonly unknown[]): string
   });
 }
 
-function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): string {
+// The diff excerpt is the whole point of the fallback rendering: an inline
+// comment gets the provider's own code context for free, and a finding pushed
+// into the summary otherwise becomes an assertion about code the reader has to
+// go and look up. Rendered as ```diff so +/- lines keep their colouring.
+//
+// The excerpt comes from the diff we already fetched, NOT from finding text, so
+// it needs no sanitizing for injection — but it is fenced with a run longer than
+// any inside it for the same reason renderSuggestionBlock is: a crafted source
+// line containing ``` must not be able to close the block early and let the rest
+// render as markdown.
+function renderDiffExcerpt(snippet: HunkSnippet): string {
+  const body = snippet.lines.map((line) => `${line.marker}${line.text}`).join("\n");
+  const longestRun = Math.max(2, ...[...body.matchAll(/`+/gu)].map((m) => m[0].length));
+  const fence = "`".repeat(longestRun + 1);
+  return `${fence}diff\n${body}\n${fence}`;
+}
+
+// Collapsed so one entry stays scannable, present so nothing is lost.
+function renderAlsoReported(members: readonly Finding[]): string {
+  const items = members.flatMap((member) => {
+    const rule = sanitizeInline(member.ruleName);
+    const loc = typeof member.line === "number" ? `:${member.line}` : "";
+    const line = `- **\`${rule}\`**${loc}: ${sanitizeText(member.message)}`;
+    // A member carries structured content beyond its prose. Dropping its
+    // `suggestion` would leave the data-loss fix half done — so the fix is
+    // shown, always NON-committable: a merged member is a similarity judgement,
+    // and a one-click commit should never rest on one.
+    const suggestion = member.suggestion?.trim() ? capSuggestion(member.suggestion) : undefined;
+    return suggestion === undefined
+      ? [line]
+      : [line, "", renderSuggestionBlock(suggestion, false), ""];
+  });
+  return detailsBlock(
+    `Also reported by ${members.length} other rule${members.length === 1 ? "" : "s"}`,
+    items,
+  );
+}
+
+function renderUnanchoredFinding(
+  finding: Finding,
+  includeSuggestion = true,
+  context?: FindingContext,
+): string {
   const file = sanitizeInline(finding.file);
-  const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
+  const snippet = context?.snippet;
+  // A finding whose excerpt spans several lines names the range, so the heading
+  // matches what the reader is about to see rather than a single line inside it.
+  const lineLabel =
+    snippet && snippet.endLine > snippet.startLine
+      ? `${snippet.startLine}-${snippet.endLine}`
+      : typeof finding.line === "number"
+        ? String(finding.line)
+        : undefined;
+  const loc = lineLabel === undefined ? file : `${file}:${lineLabel}`;
   const full = sanitizeText(finding.message);
   const { headline, body } = resolveHeadline(finding, full);
 
-  const parts = [`**\`${loc}\`**`, "", metaLine(finding), ""];
+  const parts = [`**\`${loc}\`**`, "", metaLine(finding, context?.rules), ""];
+  if (context?.publishFailureReason) {
+    parts.push(`> ${sanitizeInline(context.publishFailureReason)}`, "");
+  }
+  if (snippet) parts.push(renderDiffExcerpt(snippet), "");
   if (headline) {
     parts.push(`**${headline}**`);
     if (body) parts.push("", body);
@@ -442,7 +557,36 @@ function renderUnanchoredFinding(finding: Finding, includeSuggestion = true): st
         : "> Proposed fix omitted because the summary size budget was exhausted.",
     );
   }
+  if (context?.alsoReported && context.alsoReported.length > 0) {
+    parts.push("", renderAlsoReported(context.alsoReported));
+  }
   return parts.join("\n");
+}
+
+function plural(count: number, noun: string): string {
+  return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * The headline, which has to survive being the ONLY line a busy reader reads.
+ *
+ * "Actionable comments posted: 14" counted findings, not comments, and PR #281
+ * printed it while zero review comments existed on the PR. Three separate
+ * numbers are reported instead, because they answer three different questions:
+ * how much was found, how much of it is actually distinct, and how much of it
+ * the reader will find sitting on the diff.
+ *
+ * The unique-issue count is omitted when clustering merged nothing — "8 findings
+ * · 8 unique issues" is a fact about the renderer, not about the review.
+ */
+function summaryHeadline(input: SummaryInput, total: number): string {
+  const findings = input.findingCount ?? total;
+  const segments = [plural(findings, "finding")];
+  if (input.uniqueIssueCount !== undefined && input.uniqueIssueCount < findings) {
+    segments.push(plural(input.uniqueIssueCount, "unique issue"));
+  }
+  segments.push(`${plural(input.inlineCount, "inline comment")} posted`);
+  return segments.join(" · ");
 }
 
 // The number that decides whether a reviewer reads this now or later.
@@ -572,30 +716,70 @@ export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
 ): string {
-  const includedSuggestions = new Set<number>();
+  const includedSuggestions = new Set<Finding>();
   let best = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
   if (best.length > maxLength) return renderCompactSummary(input, maxLength);
 
-  for (const [index, finding] of input.unanchored.entries()) {
+  // BOTH relocated groups are charged against the budget. Previously only
+  // `unanchored` was, while publication failures rendered their fixes
+  // unconditionally — so one large suggestion on a rejected finding could push
+  // the render over the limit and drop the whole thing into compact mode, which
+  // loses every excerpt and every fix.
+  for (const finding of [...input.unanchored, ...(input.publishFailed ?? [])]) {
     if (!finding.suggestion?.trim() || !capSuggestion(finding.suggestion)) continue;
-    includedSuggestions.add(index);
+    includedSuggestions.add(finding);
     const candidate = renderSummaryCommentWithIncludedSuggestions(input, includedSuggestions);
     if (candidate.length <= maxLength) {
       best = candidate;
     } else {
-      includedSuggestions.delete(index);
+      includedSuggestions.delete(finding);
     }
   }
   return best;
 }
 
+// The reason may arrive as ONE shared string or as a per-finding value on each
+// context. Compact mode read only the shared field, so the normal mapped-reason
+// path kept the failure label and lost every diagnosis (Codex review).
+function compactFailureReasons(input: SummaryInput, failed: ReadonlySet<Finding>): string {
+  if (input.publishFailureReason) {
+    return `: ${truncate(sanitizeInline(input.publishFailureReason), 240)}`;
+  }
+  const distinct = [...new Set(
+    [...failed]
+      .map((finding) => input.context?.get(finding)?.publishFailureReason)
+      .filter((value): value is string => value !== undefined),
+  )];
+  if (distinct.length === 0) return ".";
+  // Bounded like every other compact field: a handful of reasons, each capped.
+  const shown = distinct.slice(0, 3).map((reason) => truncate(sanitizeInline(reason), 160));
+  const more = distinct.length > shown.length ? ` (+${distinct.length - shown.length} more)` : "";
+  return `:\n> ${shown.map((reason) => `- ${reason}`).join("\n> ")}${more}`;
+}
+
 function renderCompactSummary(input: SummaryInput, maxLength: number): string {
+  // Compact mode must carry the SAME finding set as the full renderer — it is a
+  // size fallback, not a scope fallback. Publication failures were previously
+  // absent from this list because they only ever reached it via `unanchored`;
+  // now that they are their own group they must be appended explicitly, or a
+  // long review would silently drop them.
+  const relocated = [...input.unanchored, ...(input.publishFailed ?? [])].flatMap(
+    (finding) => [finding, ...(input.context?.get(finding)?.alsoReported ?? [])],
+  );
   const header =
-    `**Actionable comments posted: ${input.inlineCount + input.unanchored.length}**` +
+    `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
+  const publishFailedSet = new Set(input.publishFailed ?? []);
   const notice =
     "> [!WARNING]\n" +
-    "> Review details were compacted to fit the provider limit; proposed fixes were omitted.";
+    "> Review details were compacted to fit the provider limit; proposed fixes were omitted." +
+    // Compact mode is a SIZE fallback, not an ATTRIBUTION fallback: a large
+    // review must not lose WHY its findings are not inline (Codex review of
+    // PR #23, P2). The reason is bounded like every other compact field.
+    (publishFailedSet.size > 0
+      ? `\n> ${publishFailedSet.size} inline comment(s) had valid anchors but publication failed` +
+        compactFailureReasons(input, publishFailedSet)
+      : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);
   const disputed = renderDisputedSection(input);
@@ -615,12 +799,13 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // against the same provider-size budget as failed rules and finding labels.
   const relatedWork = renderRelatedWorkSection(input);
   const discussionMemory = renderDiscussionMemorySection(input);
-  const findings = input.unanchored.map((finding) => {
+  const findings = relocated.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const rule = truncate(sanitizeInline(finding.ruleName), 80);
     const message = sanitizeInline(finding.message);
-    return { prefix: `- ${SEVERITY_BADGE[finding.severity]} \`${loc}\` (\`${rule}\`): `, message };
+    const group = publishFailedSet.has(finding) ? " 📌" : "";
+    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${group} \`${loc}\` (\`${rule}\`): `, message };
   });
   const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
@@ -651,7 +836,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     input.rulesFailed.length > 0
       ? `${input.rulesFailed.length} rule(s) failed to run.`
       : undefined,
-    `${input.unanchored.length} finding(s) could not fit in the provider comment.`,
+    `${relocated.length} finding(s) could not fit in the provider comment.`,
   ].filter((part): part is string => part !== undefined);
   const withRelatedWork = relatedWork
     ? [...compactStatus.slice(0, 2), relatedWork, ...compactStatus.slice(2)].join("\n\n")
@@ -688,9 +873,10 @@ function allocateCompactMessageBudgets(lengths: number[], available: number): nu
 
 function renderSummaryCommentWithIncludedSuggestions(
   input: SummaryInput,
-  includedSuggestions: ReadonlySet<number>,
+  includedSuggestions: ReadonlySet<Finding>,
 ): string {
-  const total = input.inlineCount + input.unanchored.length;
+  const publishFailed = input.publishFailed ?? [];
+  const total = input.inlineCount + input.unanchored.length + publishFailed.length;
   const parts: string[] = [];
 
   if (total === 0) {
@@ -702,7 +888,7 @@ function renderSummaryCommentWithIncludedSuggestions(
         : "**No actionable comments.** ✅",
     );
   } else {
-    parts.push(`**Actionable comments posted: ${total}**${severityCounts(input)}`);
+    parts.push(`**${summaryHeadline(input, total)}**${severityCounts(input)}`);
   }
 
   if (input.inlineUnavailable && total > 0) {
@@ -715,6 +901,40 @@ function renderSummaryCommentWithIncludedSuggestions(
   const contextUnavailable = renderContextUnavailable(input);
   if (contextUnavailable) parts.push(contextUnavailable);
 
+  // Anchors were VALID; the provider refused the write. Named separately so the
+  // reader chases the right problem — and so nobody re-checks line numbers that
+  // were never wrong.
+  if (publishFailed.length > 0) {
+    const distinctReasons = new Set(
+      publishFailed
+        .map((finding) => input.context?.get(finding)?.publishFailureReason)
+        .filter((value): value is string => value !== undefined),
+    );
+    const shared = input.publishFailureReason ??
+      (distinctReasons.size === 1 ? [...distinctReasons][0] : undefined);
+    const reason = shared
+      ? ` Reason: ${sanitizeInline(shared)}.`
+      : distinctReasons.size > 1
+        ? " Each finding carries the reason that applies to it."
+        : "";
+    parts.push(
+      [
+        `### 📌 Inline publication failed (${publishFailed.length})`,
+        `\n_These anchor to lines that ARE in the diff, but the provider rejected the inline comment.${reason}_\n`,
+        "",
+        publishFailed
+          .map((finding) =>
+            renderUnanchoredFinding(
+              finding,
+              !finding.suggestion?.trim() || includedSuggestions.has(finding),
+              input.context?.get(finding),
+            ),
+          )
+          .join("\n\n---\n\n"),
+      ].join("\n"),
+    );
+  }
+
   // Findings that have no home on the diff still have to be SEEN. This is the
   // section that guarantees the inline path can never silently drop a finding.
   if (input.unanchored.length > 0) {
@@ -724,12 +944,12 @@ function renderSummaryCommentWithIncludedSuggestions(
     const note = input.inlineUnavailable
       ? ""
       : "\n_These couldn't be anchored to a line in the diff (no line number, or the line isn't part of this PR's changes)._\n";
-    const findings = input.unanchored.map((finding, index) => {
+    const findings = input.unanchored.map((finding) => {
       const suggestion = finding.suggestion?.trim()
         ? capSuggestion(finding.suggestion)
         : undefined;
-      const includeSuggestion = suggestion === undefined || includedSuggestions.has(index);
-      return renderUnanchoredFinding(finding, includeSuggestion);
+      const includeSuggestion = suggestion === undefined || includedSuggestions.has(finding);
+      return renderUnanchoredFinding(finding, includeSuggestion, input.context?.get(finding));
     });
     parts.push(
       `${heading}${note}\n\n${findings.join("\n\n---\n\n")}`,

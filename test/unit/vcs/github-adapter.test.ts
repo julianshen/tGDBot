@@ -2114,3 +2114,84 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
     ])).toThrow(/unknown/i);
   });
 });
+
+// Codex review of PR #23 (P1): bisection can accept an early half and then hit
+// a timeout on a later one. Propagating that error before marker recovery runs
+// makes the publication layer treat the WHOLE batch as failed — so the already-
+// posted subset ends up both live inline and duplicated in the summary, with no
+// ledgered identity. An inconclusive outcome must reach recovery, which is the
+// only thing that can say what actually landed.
+describe("createInlineReview: bisection after a partial acceptance", () => {
+  it("runs marker recovery instead of propagating an inconclusive error", async () => {
+    const calls: { args: string[]; stdin?: string }[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      calls.push({ args, stdin });
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args.includes("POST")) {
+        const paths = (JSON.parse(stdin!) as { comments: { path: string }[] }).comments.map((c) => c.path);
+        // The whole batch is refused outright.
+        if (paths.length === 4) throw new Error("GitHub rejected request (HTTP 422)");
+        // The second half never gets a verdict — the write may or may not have landed.
+        if (paths.includes("c.ts")) throw new Error("connection reset");
+        return "{}";
+      }
+      return "[]";
+    };
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(execGh, repo);
+    const comments = ["a.ts", "b.ts", "c.ts", "d.ts"].map((path, index) => ({
+      clientId: `finding-${index}`, path, line: 10 + index, body: `finding ${index}`, position: {} as never,
+    }));
+
+    await expect(
+      adapter.createInlineReview({ kind: "repository", repo, number: 42 }, "d".repeat(40), comments),
+    ).rejects.toBeInstanceOf(AmbiguousInlinePublishError);
+
+    // Recovery must have been attempted AFTER the failed writes, not skipped.
+    const lastPost = calls.map((c) => c.args.includes("POST")).lastIndexOf(true);
+    const recoveryListing = calls.findIndex(
+      (c, i) => i > lastPost && c.args.some((a) => a.includes("/pulls/42/comments")),
+    );
+    expect(recoveryListing).toBeGreaterThan(lastPost);
+  });
+});
+
+// Codex review of PR #23 (P1): splitting can only isolate a fault that belongs
+// to an individual comment. A batch-wide 401/403 rejects every subset too, so
+// bisecting it just fires doomed POSTs and gives a rate limiter more chances to
+// turn a clean failure into an ambiguous publication.
+describe("createInlineReview: only bisects isolatable rejections", () => {
+  async function attempt(status: string) {
+    const posts: number[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args.includes("POST")) {
+        posts.push((JSON.parse(stdin!) as { comments: unknown[] }).comments.length);
+        throw new Error(`GitHub rejected request (HTTP ${status})`);
+      }
+      return "[]";
+    };
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(execGh, repo);
+    const comments = ["a.ts", "b.ts", "c.ts", "d.ts"].map((path, index) => ({
+      clientId: `finding-${index}`, path, line: 10 + index, body: `finding ${index}`, position: {} as never,
+    }));
+    const outcomes = await adapter.createInlineReview(
+      { kind: "repository", repo, number: 42 }, "d".repeat(40), comments,
+    );
+    return { posts, outcomes };
+  }
+
+  it("does not split a batch-wide authorization failure", async () => {
+    const { posts, outcomes } = await attempt("403");
+
+    expect(posts).toEqual([4]);
+    expect(outcomes.every((o) => o.status === "failed")).toBe(true);
+  });
+
+  it("still splits a validation failure, which a single comment can cause", async () => {
+    const { posts } = await attempt("422");
+
+    expect(posts.length).toBeGreaterThan(1);
+  });
+});
