@@ -3824,6 +3824,48 @@ describe("review: discussion context failures are diagnosable and non-blocking",
     warn.mockRestore();
   });
 
+  // Bot review of PR #27 (P1): classifyConversationContextError treats ANY
+  // message containing "cursor" as an integrity failure, so rethrowIfIntegrityFailure
+  // inside the activity-walk catch re-raised it and aborted the review anyway —
+  // leaving the fix working only for messages that happen to dodge that keyword.
+  // The adapter's own pagination errors ("nonadvancing cursor", "repeated
+  // cursor") all contain it.
+  it("still publishes when the activity walk fails with a cursor error", async () => {
+    const h = makeHarness({ args: makeArgs({ stateDir: isolatedStateDir() }) });
+    const counters = pagedThreadsHarness(h, new Error("GitHub review thread scan nonadvancing cursor"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(counters.eventCalls()).toBeGreaterThanOrEqual(3);
+    expect(warn.mock.calls.map((c) => String(c[0])).join("\n")).toContain("nonadvancing cursor");
+    warn.mockRestore();
+  });
+
+  // Bot review of PR #27 (P1): a hand-rolled pattern list missed forms the
+  // shared redactor already covers. A surfaced diagnostic goes to CI and
+  // support logs, so a partial redactor is a credential-leak path.
+  it.each([
+    ["authorization header", "listReviewThreads failed: Authorization: Basic dXNlcjpwYXNzd29yZA=="],
+    ["url credentials", "listReviewThreads failed for https://user:sup3rs3cret@github.com/acme/app.git"],
+    ["gitlab trigger token", "listReviewThreads failed: glptt-0123456789abcdef0123456789abcdef01234567"],
+  ])("redacts %s from the surfaced cause", async (_name, message) => {
+    const h = conversationHarness();
+    h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(new Error(message));
+    h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
+    h.vcsAdapter.getReviewThread = vi.fn();
+    h.orchestrate.mockImplementation(buildPresentation);
+
+    const error = await review(h.args, depsFrom(h)).then(() => undefined, (e: unknown) => e as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error!.message).toMatch(/refusing to publish/u);
+    for (const secret of ["dXNlcjpwYXNzd29yZA==", "sup3rs3cret", "0123456789abcdef0123456789abcdef01234567"]) {
+      expect(error!.message).not.toContain(secret);
+    }
+  });
+
   it("paginates every review-thread page", async () => {
     const h = makeHarness({ args: makeArgs({ stateDir: isolatedStateDir() }) });
     const counters = pagedThreadsHarness(h);

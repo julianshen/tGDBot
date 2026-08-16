@@ -277,21 +277,6 @@ function openConversationStore(
   }
 }
 
-// Credentials can appear in a provider error's echoed request. The reason is
-// printed and can reach a comment body, so scrub before it travels anywhere.
-const SECRET_PATTERNS: readonly RegExp[] = [
-  /gh[pousr]_[A-Za-z0-9]{10,}/gu,
-  /github_pat_[A-Za-z0-9_]{10,}/gu,
-  /glpat-[A-Za-z0-9_-]{10,}/gu,
-  /\b(?:Bearer|token|authorization)[:=\s]+[A-Za-z0-9._~+/=-]{8,}/giu,
-];
-
-function redactSecrets(text: string): string {
-  let out = text;
-  for (const pattern of SECRET_PATTERNS) out = out.replace(pattern, "[redacted]");
-  return out;
-}
-
 /**
  * Why the discussion context could not be loaded, in a form safe to print.
  *
@@ -301,8 +286,10 @@ function redactSecrets(text: string): string {
  * first so the operator knows immediately whether to retry.
  */
 function describeDiscussionFailure(error: unknown): string {
-  const raw = error instanceof Error ? error.message : String(error);
-  const message = redactSecrets(raw).replace(/\s+/gu, " ").trim().slice(0, 500);
+  // redactedMessage is the shared, audited redactor: it also covers
+  // Authorization headers, Basic credentials, https://user:pass@host URLs and
+  // GitLab trigger tokens, which a hand-rolled list here missed.
+  const message = redactedMessage(error).replace(/\s+/gu, " ").trim().slice(0, 500);
   const kind =
     /bounded resource limit|exceeded safe page bound|page exceeds requested bound/iu.test(message)
       ? "resource limit"
@@ -359,7 +346,13 @@ async function fetchReviewDiscussion(
           eventToken = page.nextPageToken;
         } while (eventToken !== undefined);
       } catch (error) {
-        rethrowIfIntegrityFailure(error);
+        // Deliberately NOT rethrowIfIntegrityFailure: that classifier treats any
+        // message containing "cursor" as a state-integrity failure, and the
+        // adapter's own pagination errors ("nonadvancing cursor", "repeated
+        // cursor") all contain it — which re-aborted the very reviews this is
+        // meant to save. Nothing here touches conversation state: the catch
+        // wraps provider reads whose results are discarded, so a genuine state
+        // integrity failure cannot originate inside it.
         console.warn(`tgd-review-agent: review activity pagination failed (${describeDiscussionFailure(error)}); continuing (no discussion data depends on it)`);
       }
     }
