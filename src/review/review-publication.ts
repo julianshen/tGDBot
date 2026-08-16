@@ -465,7 +465,11 @@ export async function publishReviewFromManifest(options: {
         const found = await vcsAdapter.findPublishedMarker(locator, child.marker);
         if (found !== null) return found;
       }
-      const findBotChildMarker = (vcsAdapter as VcsAdapter & Partial<ConversationAdapter>).findBotChildMarker;
+      // Bound: the adapters implement this as a CLASS METHOD that reaches for
+      // `this.repositoryForReview(...)`. Detaching it made `this` undefined, so
+      // every inline lookup threw a TypeError that the executor swallowed into
+      // "inline publication failed" — without ever calling the provider.
+      const findBotChildMarker = (vcsAdapter as VcsAdapter & Partial<ConversationAdapter>).findBotChildMarker?.bind(vcsAdapter);
       const parsed = parseChildMarker(child.marker)
         ?? parseChildMarker((child.body.split(/\r?\n/u).at(-1) ?? "").trim());
       if (typeof findBotChildMarker === "function" && parsed !== null) {
