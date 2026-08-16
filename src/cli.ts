@@ -235,7 +235,7 @@ async function resolveConversationIdentity(
   adapter: Partial<ConversationAdapter>,
   repository: RepositoryRef,
   pr: PullRequestInfo,
-): Promise<{ identity?: ReviewIdentity; unavailable?: "discussion" }> {
+): Promise<{ identity?: ReviewIdentity; unavailable?: "discussion"; reason?: string }> {
   if (typeof adapter.resolveReviewIdentity === "function") {
     try {
       return {
@@ -243,7 +243,7 @@ async function resolveConversationIdentity(
       };
     } catch (error) {
       rethrowIfIntegrityFailure(error);
-      return { unavailable: "discussion" };
+      return { unavailable: "discussion", reason: describeDiscussionFailure(error) };
     }
   }
   return { identity: reviewIdentityFor(repository, pr) };
@@ -277,10 +277,38 @@ function openConversationStore(
   }
 }
 
+/**
+ * Why the discussion context could not be loaded, in a form safe to print.
+ *
+ * Issue #26: the CLI reported only "Discussion context is unavailable", leaving
+ * no way to tell a pagination defect from malformed provider data from an
+ * outage — the three have completely different responses. The class is named
+ * first so the operator knows immediately whether to retry.
+ */
+function describeDiscussionFailure(error: unknown): string {
+  // redactedMessage is the shared, audited redactor: it also covers
+  // Authorization headers, Basic credentials, https://user:pass@host URLs and
+  // GitLab trigger tokens, which a hand-rolled list here missed.
+  const message = redactedMessage(error).replace(/\s+/gu, " ").trim().slice(0, 500);
+  const kind =
+    /bounded resource limit|exceeded safe page bound|page exceeds requested bound/iu.test(message)
+      ? "resource limit"
+      : /cutoff rank mismatch|nonadvancing cursor|continuation|cursor binding|repeated cursor/iu.test(message)
+        ? "pagination"
+        : /changed during/iu.test(message)
+          ? "concurrent modification"
+          : /^invalid |^malformed |binding mismatch|is missing its/iu.test(message)
+            ? "malformed provider data"
+            : /HTTP 5\d\d|ETIMEDOUT|ENOTFOUND|ECONNRESET|rate limit|HTTP 429|timed out/iu.test(message)
+              ? "transient provider failure"
+              : "unknown";
+  return `${kind}: ${message}`;
+}
+
 async function fetchReviewDiscussion(
   adapter: Partial<ConversationAdapter>,
   identity: ReviewIdentity,
-): Promise<{ threads: readonly ReviewThreadSnapshot[]; unavailable?: "discussion" }> {
+): Promise<{ threads: readonly ReviewThreadSnapshot[]; unavailable?: "discussion"; reason?: string }> {
   if (typeof adapter.listReviewThreads !== "function" || typeof adapter.getReviewThread !== "function") {
     return { threads: [] };
   }
@@ -291,24 +319,42 @@ async function fetchReviewDiscussion(
     do {
       pages += 1;
       if (pages > MAX_REVIEW_CONTEXT_PAGES) {
-        return { threads: [], unavailable: "discussion" };
+        return { threads: [], unavailable: "discussion", reason: `resource limit: review threads exceeded ${MAX_REVIEW_CONTEXT_PAGES} pages` };
       }
       const page = await adapter.listReviewThreads(identity, pageToken);
       summaries.push(...page.threads);
       pageToken = page.nextPageToken;
     } while (pageToken !== undefined);
 
+    // The activity-event walk reads ONLY nextPageToken and discards every
+    // page.events it receives, so nothing it returns can affect duplicate
+    // finding suppression. Letting it fail the run therefore cost a whole
+    // review for no informational gain — observed on a PR whose event
+    // pagination breaks at page 3 (issue #26). It is still walked, and its
+    // failure still reported, but it can no longer block publication.
     if (typeof adapter.listReviewEvents === "function") {
-      let eventToken = undefined;
-      let eventPages = 0;
-      do {
-        eventPages += 1;
-        if (eventPages > MAX_REVIEW_CONTEXT_PAGES) {
-          return { threads: [], unavailable: "discussion" };
-        }
-        const page = await adapter.listReviewEvents(identity, undefined, eventToken);
-        eventToken = page.nextPageToken;
-      } while (eventToken !== undefined);
+      try {
+        let eventToken = undefined;
+        let eventPages = 0;
+        do {
+          eventPages += 1;
+          if (eventPages > MAX_REVIEW_CONTEXT_PAGES) {
+            console.warn(`tgd-review-agent: review activity pagination stopped after ${MAX_REVIEW_CONTEXT_PAGES} pages; continuing (no discussion data depends on it)`);
+            break;
+          }
+          const page = await adapter.listReviewEvents(identity, undefined, eventToken);
+          eventToken = page.nextPageToken;
+        } while (eventToken !== undefined);
+      } catch (error) {
+        // Deliberately NOT rethrowIfIntegrityFailure: that classifier treats any
+        // message containing "cursor" as a state-integrity failure, and the
+        // adapter's own pagination errors ("nonadvancing cursor", "repeated
+        // cursor") all contain it — which re-aborted the very reviews this is
+        // meant to save. Nothing here touches conversation state: the catch
+        // wraps provider reads whose results are discarded, so a genuine state
+        // integrity failure cannot originate inside it.
+        console.warn(`tgd-review-agent: review activity pagination failed (${describeDiscussionFailure(error)}); continuing (no discussion data depends on it)`);
+      }
     }
 
     const threads: ReviewThreadSnapshot[] = [];
@@ -318,7 +364,7 @@ async function fetchReviewDiscussion(
     return { threads };
   } catch (error) {
     rethrowIfIntegrityFailure(error);
-    return { threads: [], unavailable: "discussion" };
+    return { threads: [], unavailable: "discussion", reason: describeDiscussionFailure(error) };
   }
 }
 
@@ -332,22 +378,28 @@ async function loadOptionalReviewContext(options: {
   readonly stateRoot?: string;
   readonly identity?: ReviewIdentity;
   readonly identityUnavailable?: "discussion";
+  readonly identityUnavailableReason?: string;
 }): Promise<{
   conversationContext?: { text: string; digest: string };
   fingerprint?: string;
   existingIssues: readonly ExistingReviewIssue[];
   discussionMemories: readonly DiscussionMemory[];
   unavailable: string[];
+  unavailableReason?: string;
 }> {
   const unavailable: string[] = [];
+  let unavailableReason: string | undefined;
   const resolved = options.identity !== undefined || options.identityUnavailable !== undefined
-    ? { identity: options.identity, unavailable: options.identityUnavailable }
+    ? { identity: options.identity, unavailable: options.identityUnavailable, reason: options.identityUnavailableReason }
     : await resolveConversationIdentity(options.adapter, options.repository, options.pr);
-  if (resolved.unavailable !== undefined) unavailable.push("discussion");
+  if (resolved.unavailable !== undefined) { unavailable.push("discussion"); unavailableReason ??= resolved.reason; }
   const discussion = resolved.identity === undefined
     ? { threads: [] as const, unavailable: "discussion" as const }
     : await fetchReviewDiscussion(options.adapter, resolved.identity);
-  if (discussion.unavailable !== undefined && !unavailable.includes("discussion")) unavailable.push("discussion");
+  if (discussion.unavailable !== undefined) {
+    if (!unavailable.includes("discussion")) unavailable.push("discussion");
+    unavailableReason ??= discussion.reason;
+  }
 
   let memories: readonly import("./conversation/state-schema.js").MemoryCreateEntry[] = [];
   let pending: readonly import("./conversation/state-schema.js").PendingClarification[] = [];
@@ -400,6 +452,7 @@ async function loadOptionalReviewContext(options: {
     existingIssues: existingDiscussion.existingIssues,
     discussionMemories: existingDiscussion.discussionMemories,
     unavailable,
+    ...(unavailableReason === undefined ? {} : { unavailableReason }),
   };
 }
 
@@ -830,10 +883,15 @@ export async function review(
     stateRoot,
     identity: resolvedIdentity.identity,
     identityUnavailable: resolvedIdentity.unavailable,
+    identityUnavailableReason: resolvedIdentity.reason,
   });
   if (!config.dryRun && loadedContext.unavailable.includes("discussion")) {
+    // Issue #26: the bare refusal left no way to tell a pagination defect from
+    // malformed data from an outage, so the cause travels with it.
+    const cause = loadedContext.unavailableReason;
     throw new Error(
-      "Discussion context is unavailable; refusing to publish because duplicate finding suppression cannot be guaranteed",
+      "Discussion context is unavailable; refusing to publish because duplicate finding suppression cannot be guaranteed" +
+        (cause === undefined ? "" : ` (${cause})`),
     );
   }
   const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);

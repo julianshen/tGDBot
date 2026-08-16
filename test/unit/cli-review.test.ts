@@ -3773,3 +3773,124 @@ describe("clarification question publication", () => {
     expect(snapshot.pending.clarifications).toHaveLength(1);
   });
 });
+
+// Issue #26, reproduced against hmchangw/newchat#222 (118 review threads over 2
+// pages, 250 activity events). Two distinct defects, both exercised here.
+describe("review: discussion context failures are diagnosable and non-blocking", () => {
+  function pagedThreadsHarness(h: Harness, eventFailure?: Error) {
+    // Two pages of review threads, the shape the issue reports (hasNextPage true).
+    const page2Token = {
+      scope: "review-thread-page" as const,
+      provider: "github" as const,
+      repositoryDigest: conversationBinding().repositoryDigest,
+      reviewNumber: 42,
+      opaque: "cursor-page-2",
+    };
+    let threadCalls = 0;
+    h.vcsAdapter.listReviewThreads = vi.fn().mockImplementation(() => {
+      threadCalls += 1;
+      return Promise.resolve(threadCalls === 1 ? { threads: [], nextPageToken: page2Token } : { threads: [] });
+    });
+    h.vcsAdapter.getReviewThread = vi.fn().mockRejectedValue(new Error("no threads expected"));
+    let eventCalls = 0;
+    h.vcsAdapter.listReviewEvents = vi.fn().mockImplementation(() => {
+      eventCalls += 1;
+      // Pages 1-2 succeed, page 3 fails — exactly the observed behaviour.
+      if (eventCalls >= 3 && eventFailure) return Promise.reject(eventFailure);
+      return Promise.resolve(
+        eventCalls <= 2
+          ? { ...emptyEventPage(), nextPageToken: { scope: "review-event-page" as const, provider: "github" as const, repositoryDigest: conversationBinding().repositoryDigest, reviewNumber: 42, opaque: `ev-${eventCalls}` } }
+          : emptyEventPage(),
+      );
+    });
+    return { threadCalls: () => threadCalls, eventCalls: () => eventCalls };
+  }
+
+  // The activity-event walk reads only nextPageToken and throws every page away,
+  // so it cannot affect duplicate-finding suppression. Letting it abort the run
+  // cost a whole review for no informational gain.
+  it("still publishes when the discarded activity-event walk fails", async () => {
+    const h = makeHarness({ args: makeArgs({ stateDir: isolatedStateDir() }) });
+    const counters = pagedThreadsHarness(h, new Error("GitHub review event continuation cutoff rank mismatch"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(counters.eventCalls()).toBeGreaterThanOrEqual(3);
+    // The cause is reported rather than swallowed.
+    const warned = warn.mock.calls.map((c) => String(c[0])).join("\n");
+    expect(warned).toContain("cutoff rank mismatch");
+    warn.mockRestore();
+  });
+
+  // Bot review of PR #27 (P1): classifyConversationContextError treats ANY
+  // message containing "cursor" as an integrity failure, so rethrowIfIntegrityFailure
+  // inside the activity-walk catch re-raised it and aborted the review anyway —
+  // leaving the fix working only for messages that happen to dodge that keyword.
+  // The adapter's own pagination errors ("nonadvancing cursor", "repeated
+  // cursor") all contain it.
+  it("still publishes when the activity walk fails with a cursor error", async () => {
+    const h = makeHarness({ args: makeArgs({ stateDir: isolatedStateDir() }) });
+    const counters = pagedThreadsHarness(h, new Error("GitHub review thread scan nonadvancing cursor"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(counters.eventCalls()).toBeGreaterThanOrEqual(3);
+    expect(warn.mock.calls.map((c) => String(c[0])).join("\n")).toContain("nonadvancing cursor");
+    warn.mockRestore();
+  });
+
+  // Bot review of PR #27 (P1): a hand-rolled pattern list missed forms the
+  // shared redactor already covers. A surfaced diagnostic goes to CI and
+  // support logs, so a partial redactor is a credential-leak path.
+  it.each([
+    ["authorization header", "listReviewThreads failed: Authorization: Basic dXNlcjpwYXNzd29yZA=="],
+    ["url credentials", "listReviewThreads failed for https://user:sup3rs3cret@github.com/acme/app.git"],
+    ["gitlab trigger token", "listReviewThreads failed: glptt-0123456789abcdef0123456789abcdef01234567"],
+  ])("redacts %s from the surfaced cause", async (_name, message) => {
+    const h = conversationHarness();
+    h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(new Error(message));
+    h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
+    h.vcsAdapter.getReviewThread = vi.fn();
+    h.orchestrate.mockImplementation(buildPresentation);
+
+    const error = await review(h.args, depsFrom(h)).then(() => undefined, (e: unknown) => e as Error);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error!.message).toMatch(/refusing to publish/u);
+    for (const secret of ["dXNlcjpwYXNzd29yZA==", "sup3rs3cret", "0123456789abcdef0123456789abcdef01234567"]) {
+      expect(error!.message).not.toContain(secret);
+    }
+  });
+
+  it("paginates every review-thread page", async () => {
+    const h = makeHarness({ args: makeArgs({ stateDir: isolatedStateDir() }) });
+    const counters = pagedThreadsHarness(h);
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(counters.threadCalls()).toBe(2);
+  });
+
+  // When the discussion genuinely cannot be loaded the run still refuses, but
+  // the operator must be told WHY: the issue reports the message alone, with no
+  // way to tell pagination from malformed data from a provider outage.
+  it("names the underlying cause when it refuses to publish", async () => {
+    const h = conversationHarness();
+    h.vcsAdapter.listReviewThreads = vi.fn().mockRejectedValue(new Error("HTTP 502 upstream unavailable"));
+    h.vcsAdapter.listReviewEvents = vi.fn().mockResolvedValue(emptyEventPage());
+    h.vcsAdapter.getReviewThread = vi.fn();
+    h.orchestrate.mockImplementation(buildPresentation);
+
+    const error = await review(h.args, depsFrom(h)).then(() => undefined, (e: unknown) => e as Error);
+    expect(error).toBeInstanceOf(Error);
+    // It must still refuse — and say why. The issue reports the refusal alone,
+    // with no way to tell pagination from malformed data from an outage.
+    expect(error!.message).toMatch(/refusing to publish/u);
+    expect(error!.message).toMatch(/HTTP 502 upstream unavailable/u);
+  });
+});
