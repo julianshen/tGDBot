@@ -1008,3 +1008,33 @@ describe("renderSummaryComment — compact mode renders mapped reasons", () => {
     expect(body).toContain("HTTP 403");
   });
 });
+
+// Verified against hmchangw/newchat#281: inline publication can fail without a
+// single provider call (a local TypeError aborted it). Asserting "the provider
+// rejected the inline comment" then states something that never happened, and
+// points the reader at GitHub instead of at the code.
+describe("renderSummaryComment — publication-failure wording", () => {
+  const finding = makeFinding({ file: "a.go", line: 10, message: "Anchored fine." });
+
+  function body(extra: Record<string, unknown>) {
+    return renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [],
+      publishFailed: [finding],
+      ...extra,
+    }));
+  }
+
+  it("does not blame the provider when no reason was recorded", () => {
+    const rendered = body({});
+    expect(rendered).toContain("### 📌 Inline publication failed (1)");
+    expect(rendered).not.toContain("the provider rejected");
+  });
+
+  it("blames the provider only when it actually gave a reason", () => {
+    const rendered = body({ publishFailureReason: "GitHub rejected the atomic inline review (HTTP 422)" });
+    expect(rendered).toContain("the provider rejected");
+    expect(rendered).toContain("HTTP 422");
+  });
+});

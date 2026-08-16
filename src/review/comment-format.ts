@@ -912,15 +912,24 @@ function renderSummaryCommentWithIncludedSuggestions(
     );
     const shared = input.publishFailureReason ??
       (distinctReasons.size === 1 ? [...distinctReasons][0] : undefined);
+    // Only claim a provider REJECTION when the provider actually said
+    // something. Publication can fail before any request is made — verified on
+    // hmchangw/newchat#281, where a local TypeError aborted it and no call was
+    // ever sent — and blaming the provider there sends the reader to the wrong
+    // system entirely.
+    const blameProvider = shared !== undefined || distinctReasons.size > 0;
     const reason = shared
       ? ` Reason: ${sanitizeInline(shared)}.`
       : distinctReasons.size > 1
         ? " Each finding carries the reason that applies to it."
         : "";
+    const cause = blameProvider
+      ? `but the provider rejected the inline comment.${reason}`
+      : "but publication did not complete, and no provider reason was recorded.";
     parts.push(
       [
         `### 📌 Inline publication failed (${publishFailed.length})`,
-        `\n_These anchor to lines that ARE in the diff, but the provider rejected the inline comment.${reason}_\n`,
+        `\n_These anchor to lines that ARE in the diff, ${cause}_\n`,
         "",
         publishFailed
           .map((finding) =>

@@ -547,6 +547,70 @@ describe("review", () => {
   // A focused run should anchor what it finds to the code, the same as a normal
   // review — the difference is where the narrative goes, not whether findings
   // are actionable in place.
+  // Regression: publication detached `findBotChildMarker` from the adapter and
+  // called it unbound. Both real adapters implement it as a CLASS METHOD that
+  // reaches for `this.repositoryForReview(...)`, so `this` was undefined and every
+  // inline lookup threw a TypeError. The manifest executor swallowed it, marked
+  // every inline child failed, and relocated the findings to the summary — WITHOUT
+  // ever calling the provider. Verified against hmchangw/newchat#281, where the
+  // review reported "inline publication failed" while no request was ever sent.
+  //
+  // Every fake in this file is an object literal whose methods ignore `this`,
+  // which is precisely why the suite could not see the bug. This one does not.
+  it("calls findBotChildMarker bound to the adapter, so a class method keeps its receiver", async () => {
+    const args = makeArgs({ stateDir: isolatedStateDir() });
+    const finding = {
+      ruleName: "rule-a",
+      severity: "warning" as const,
+      category: "correctness",
+      file: "x.ts",
+      line: 1,
+      message: "the error path drops the cause",
+    };
+    const h = makeHarness({
+      args,
+      dispatchResult: { findings: [finding], rulesRun: ["rule-a"], rulesFailed: [] },
+      orchestrationResult: {
+        commentBody: "- x.ts:1 — the error path drops the cause",
+        inlineComments: [{
+          clientId: "finding-0",
+          path: "x.ts",
+          line: 1,
+          body: "the error path drops the cause",
+          position: {
+            oldPath: "x.ts",
+            newPath: "x.ts",
+            start: { type: "new" as const, newLine: 1 },
+            end: { type: "new" as const, newLine: 1 },
+            sameHunk: true as const,
+          },
+        }],
+        findingsCount: 1,
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+      },
+    });
+
+    // Stands in for the real adapters' `this.repositoryForReview(review)`.
+    const receivers: unknown[] = [];
+    function findBotChildMarker(this: unknown) {
+      receivers.push(this);
+      if (this === undefined || this === null) {
+        throw new TypeError("Cannot read properties of undefined (reading 'repositoryForReview')");
+      }
+      return Promise.resolve(null);
+    }
+    h.vcsAdapter.findBotChildMarker = findBotChildMarker as never;
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(receivers.length).toBeGreaterThan(0);
+    expect(receivers.every((receiver) => receiver !== undefined && receiver !== null)).toBe(true);
+    // The point of the fix: publication actually reaches the provider.
+    expect(h.vcsAdapter.createInlineReview).toHaveBeenCalled();
+  });
+
   it("a focused-command invocation anchors its findings as inline children", async () => {
     const args = makeArgs({ stateDir: isolatedStateDir() });
     const finding = {
