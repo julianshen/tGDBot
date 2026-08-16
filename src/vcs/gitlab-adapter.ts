@@ -12,6 +12,7 @@ import {
   validateInlinePublishOutcomes,
   validateConversationItemIdentity,
 } from "./adapter.js";
+import { compareOrderKeys } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -1441,7 +1442,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
           if (state === "opened" && afterBoundary && cutoff && item.orderKey <= cutoff) cutoffRank += 1;
           if (state === "opened" && afterBoundary && (!cutoff || item.orderKey > cutoff)) {
             candidates.push(item);
-            candidates.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+            candidates.sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
             if (candidates.length > 101) candidates.pop();
           }
         }
@@ -1560,7 +1561,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       if (afterBoundary && cutoff && event.orderKey <= cutoff) { cutoffRank += 1; return; }
       if (afterBoundary && (!cutoff || event.orderKey > cutoff)) {
         events.push(event);
-        events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+        events.sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
         if (events.length > 101) events.pop();
       }
     };
@@ -1602,7 +1603,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       for (const event of thread.events) keep(event);
       keep(thread.resolution);
     }
-    events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    events.sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
     return { candidates: events, witness: hash.digest("hex"), count, cutoffRank };
   }
 
@@ -1717,7 +1718,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       .map(parseConversationDiscussion)
       .map((discussion) => this.normalizeDiscussion(review, discussion, mr)?.summary)
       .filter((summary): summary is ReviewThreadSummary => summary !== undefined)
-      .sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+      .sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
     return {
       threads,
       ...(rows.length === 100 ? { nextPageToken: { scope: "review-thread-page" as const, ...binding, opaque: String(page + 1) } } : {}),
@@ -1750,7 +1751,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     };
     const normalized = this.normalizeDiscussion(review, discussion, mr, bot);
     if (!normalized) throw new Error("GitLab review thread not found in target review");
-    return { ...normalized.summary, events: [...normalized.events].sort((left, right) => left.orderKey.localeCompare(right.orderKey)) };
+    return { ...normalized.summary, events: [...normalized.events].sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey)) };
   }
 
   private async fetchNoteThumbsUpReactions(

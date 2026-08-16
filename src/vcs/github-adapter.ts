@@ -9,7 +9,7 @@ import {
   type InlineRecoveryChild,
   type InlineRecoveryState,
 } from "../review/comment-marker.js";
-import { AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
+import { compareOrderKeys, AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -620,7 +620,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
           if (state === "open" && afterBoundary && cutoff && item.orderKey <= cutoff) cutoffRank += 1;
           if (state === "open" && afterBoundary && (!cutoff || item.orderKey > cutoff)) {
             candidates.push(item);
-            candidates.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+            candidates.sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
             if (candidates.length > 101) candidates.pop();
           }
         }
@@ -781,7 +781,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       if (boundary && (candidate.updatedAt < boundary.at || (candidate.updatedAt === boundary.at && (boundary.cutoff ? candidate.orderKey <= boundary.cutoff : boundary.seen.includes(candidate.revisionId))))) return;
       if (cutoff && candidate.orderKey <= cutoff) { cutoffRank += 1; return; }
       rawCandidates.push(candidate);
-      rawCandidates.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+      rawCandidates.sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
       if (rawCandidates.length > 101) rawCandidates.pop();
     };
     for (const stream of ["issue", "inline"] as const) {
@@ -861,7 +861,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         if (afterBoundary && cutoff && event.orderKey <= cutoff) cutoffRank += 1;
         if (afterBoundary && (!cutoff || event.orderKey > cutoff)) {
           events.push(event);
-          events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+          events.sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
           if (events.length > 101) events.pop();
         }
       }
@@ -870,7 +870,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       if (next !== undefined && next === threadCursor) throw new Error("GitHub review thread scan nonadvancing cursor");
       threadCursor = next;
     } while (threadCursor);
-    events.sort((left, right) => left.orderKey.localeCompare(right.orderKey));
+    events.sort((left, right) => compareOrderKeys(left.orderKey, right.orderKey));
     return { candidates: events, witness: hash.digest("hex"), count, cutoffRank };
   }
 
@@ -975,7 +975,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       void _nodes;
       void _comments;
       return summary;
-    }))).sort((a, b) => a.orderKey.localeCompare(b.orderKey));
+    }))).sort((a, b) => compareOrderKeys(a.orderKey, b.orderKey));
     const pageInfo = object(connection.pageInfo, "review thread page info");
     if (typeof pageInfo.hasNextPage !== "boolean") throw new Error("Invalid GitHub review thread page info");
     const next = pageInfo.hasNextPage ? textField(pageInfo.endCursor, "review thread end cursor") : undefined;
@@ -1029,7 +1029,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         orderKey: orderKey(updatedAt, "review-comment", commentId, revisionId), authorLogin, authorIsBot: authorLogin === bot,
         createdAt, updatedAt, body, url: eventUrl, commentId, ...(reactions.length === 0 ? {} : { reactions }),
         threadId: found!.threadId, ...(index === 0 ? {} : { parentCommentId: providerId(object(node.replyTo ?? {}, "review thread reply").databaseId ?? found!.rootCommentId, "review thread parent id") }), placement: found!.placement } as ReviewActivityEvent;
-    }).sort((a, b) => a.orderKey.localeCompare(b.orderKey));
+    }).sort((a, b) => compareOrderKeys(a.orderKey, b.orderKey));
     const { nodes: _nodes, comments: _comments, ...summary } = found;
     void _nodes;
     void _comments;
