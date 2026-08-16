@@ -195,7 +195,7 @@ function splitHeadline(message: string): { headline: string; body: string } {
  */
 export function renderInlineComment(
   finding: Finding,
-  options: RenderOptions & { alsoReported?: readonly Finding[] } = {},
+  options: RenderOptions & { alsoReported?: readonly Finding[]; rules?: readonly string[] } = {},
 ): string {
   const full = sanitizeText(finding.message);
   const file = sanitizeInline(finding.file);
@@ -206,7 +206,7 @@ export function renderInlineComment(
   //   headline + body : a short first sentence as the title, the rest as prose
   //   headline only   : the finding IS one short sentence
   //   prose only      : no sentence short enough to be a title (see splitHeadline)
-  const parts = [metaLine(finding), ""];
+  const parts = [metaLine(finding, options.rules), ""];
   if (headline) {
     parts.push(`**${headline}**`);
     if (body) parts.push("", body);
@@ -738,6 +738,25 @@ export function renderSummaryComment(
   return best;
 }
 
+// The reason may arrive as ONE shared string or as a per-finding value on each
+// context. Compact mode read only the shared field, so the normal mapped-reason
+// path kept the failure label and lost every diagnosis (Codex review).
+function compactFailureReasons(input: SummaryInput, failed: ReadonlySet<Finding>): string {
+  if (input.publishFailureReason) {
+    return `: ${truncate(sanitizeInline(input.publishFailureReason), 240)}`;
+  }
+  const distinct = [...new Set(
+    [...failed]
+      .map((finding) => input.context?.get(finding)?.publishFailureReason)
+      .filter((value): value is string => value !== undefined),
+  )];
+  if (distinct.length === 0) return ".";
+  // Bounded like every other compact field: a handful of reasons, each capped.
+  const shown = distinct.slice(0, 3).map((reason) => truncate(sanitizeInline(reason), 160));
+  const more = distinct.length > shown.length ? ` (+${distinct.length - shown.length} more)` : "";
+  return `:\n> ${shown.map((reason) => `- ${reason}`).join("\n> ")}${more}`;
+}
+
 function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // Compact mode must carry the SAME finding set as the full renderer — it is a
   // size fallback, not a scope fallback. Publication failures were previously
@@ -759,9 +778,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     // PR #23, P2). The reason is bounded like every other compact field.
     (publishFailedSet.size > 0
       ? `\n> ${publishFailedSet.size} inline comment(s) had valid anchors but publication failed` +
-        (input.publishFailureReason
-          ? `: ${truncate(sanitizeInline(input.publishFailureReason), 240)}`
-          : ".")
+        compactFailureReasons(input, publishFailedSet)
       : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);

@@ -95,22 +95,10 @@ function dedupeKey(finding: Finding): string {
   return JSON.stringify([finding.file, finding.line ?? null, normalizeMessage(finding.message)]);
 }
 
-// Two findings are "the same" if file + line + normalized message are
-// equal — keep one, preferring the higher-severity duplicate (TASKS.md
-// Task 7 step 1, AC-7.1).
-function dedupeFindings(findings: Finding[]): Finding[] {
-  const bestByKey = new Map<string, Finding>();
-
-  for (const finding of findings) {
-    const key = dedupeKey(finding);
-    const existing = bestByKey.get(key);
-    if (!existing || SEVERITY_RANK[finding.severity] < SEVERITY_RANK[existing.severity]) {
-      bestByKey.set(key, finding);
-    }
-  }
-
-  return [...bestByKey.values()];
-}
+// Exact-duplicate collapsing now lives in clusterFindings, which performs the
+// same "keep the higher-severity copy" rule (AC-7.1) while ALSO retaining every
+// contributing rule name. dedupeKey stays: it still identifies addressed
+// findings above.
 
 function issueAnchorKey(file: string, line: number): string {
   return JSON.stringify([file, line]);
@@ -207,7 +195,11 @@ export function orchestrate(
   const existingIssueAnchors = new Set(
     (options.existingIssues ?? []).map((issue) => issueAnchorKey(issue.file, issue.line)),
   );
-  const allFindings = dedupeFindings(actionable).filter(
+  // NOT pre-deduped: clusterFindings collapses exact duplicates itself and
+  // keeps every contributing rule name while doing so. Collapsing here first
+  // threw the second rule away before clustering could ever see it, which made
+  // the rule-attribution logic unreachable in production (Codex review).
+  const candidates = actionable.filter(
     (finding) => finding.line === undefined || finding.line === null ||
       !existingIssueAnchors.has(issueAnchorKey(finding.file, finding.line)),
   );
@@ -216,7 +208,11 @@ export function orchestrate(
   // statements of the same race on PR #281, three of them anchored to the very
   // same line. Cluster first, then present one entry per root cause with its
   // contributing rules as metadata, so the reader meets each defect once.
-  const clusters = clusterFindings(allFindings);
+  const clusters = clusterFindings(candidates);
+  // Every surviving finding, exact duplicates already collapsed. This is the
+  // set the COUNTS describe: clustering decides what is SHOWN, never how many
+  // findings a run had or what severities they carried.
+  const allFindings = clusters.flatMap((cluster) => cluster.members);
   const inlineEnabled = options.inline !== false && diff !== "";
 
   const positions = inlineEnabled ? parseDiffPositions(diff) : undefined;
@@ -302,9 +298,16 @@ export function orchestrate(
       suggestion !== undefined && !rangeMalformed && !rangeInverted && (!wantsRange || rangeOk);
 
     const alsoReported = mergedMembers.get(finding) ?? [];
+    // Corroboration by several rules belongs on the inline comment too, not
+    // only in the summary — it is the same finding either way.
+    const rules = contributingRules.get(finding) ?? [];
     const rendered = renderInlineComment(
       showFix ? { ...finding, suggestion } : { ...finding, suggestion: undefined },
-      { suggestions: committable, ...(alsoReported.length > 0 ? { alsoReported } : {}) },
+      {
+        suggestions: committable,
+        ...(alsoReported.length > 0 ? { alsoReported } : {}),
+        ...(rules.length > 1 ? { rules } : {}),
+      },
     );
 
     // Only anchor across a range when a COMMITTABLE suggestion will actually use it —
@@ -358,7 +361,7 @@ export function orchestrate(
   );
 
   const summaryInput = {
-    allFindings: dedupedFindings,
+    allFindings,
     inlineCount: inlineComments.length,
     unanchored,
     publishFailed: [] as Finding[],

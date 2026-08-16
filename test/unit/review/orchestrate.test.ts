@@ -1164,3 +1164,63 @@ describe("renderSummary — per-finding failure reasons", () => {
     expect(body).toContain("GitHub rejected the atomic inline review (HTTP 422)");
   });
 });
+
+// Codex round 5 on PR #23.
+describe("orchestrate — counts and attribution span every member", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "r", ...overrides };
+  }
+
+  // orchestrate collapsed exact duplicates BEFORE clustering, so the rule-name
+  // preservation inside clusterFindings never saw the second rule in production.
+  it("credits both rules when two rules emit the identical claim", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "mongodb", message: "Set followed by Get is not atomic." }),
+          f({ ruleName: "nats", message: "Set followed by Get is not atomic." }),
+        ],
+        rulesRun: ["mongodb", "nats"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]!.body).toContain("mongodb");
+    expect(result.inlineComments[0]!.body).toContain("nats");
+  });
+
+  // The severity breakdown described representatives only, so a summary could
+  // say "3 findings" while showing one blocking — hiding the nested severities.
+  it("counts every clustered member in the severity breakdown", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "a", severity: "blocking", message: "Set followed by Get is not atomic because the calls are separate." }),
+          f({ ruleName: "b", severity: "blocking", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.commentBody).toContain("2 findings · 1 unique issue");
+    expect(result.commentBody).toContain("🔴 2 blocking");
+  });
+});

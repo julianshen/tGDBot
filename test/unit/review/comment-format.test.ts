@@ -983,3 +983,28 @@ describe("renderSummaryComment — merged members keep their proposed fix", () =
     expect(body).toContain("store.AdoptIfAbsent");
   });
 });
+
+// Codex round 5 on PR #23: with per-client reasons the shared field is
+// undefined, so compact mode kept the publication-failure label but dropped
+// every provider diagnosis.
+describe("renderSummaryComment — compact mode renders mapped reasons", () => {
+  it("surfaces per-finding reasons when there is no single shared reason", () => {
+    const a = makeFinding({ file: "a.go", line: 10, message: "a".repeat(1200) });
+    const b = makeFinding({ file: "b.go", line: 20, message: "b".repeat(1200) });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [a, b],
+      inlineCount: 0,
+      unanchored: [],
+      publishFailed: [a, b],
+      context: new Map([
+        [a, { publishFailureReason: "GitHub rejected this inline comment (HTTP 422) at a.go:10" }],
+        [b, { publishFailureReason: "GitHub rejected this inline comment (HTTP 403) at b.go:20" }],
+      ]),
+    }), 900);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("HTTP 422");
+    expect(body).toContain("HTTP 403");
+  });
+});
