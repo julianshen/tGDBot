@@ -1089,7 +1089,7 @@ export async function review(
     failedIds: ReadonlySet<string>,
     marker = formatMarker(pr.headSha, configHash),
     providerLimit = true,
-    publishFailureReason?: string,
+    publishFailureReason?: string | ReadonlyMap<string, string>,
   ): string => {
     const suffixParts: string[] = [];
     if (loadErrors.length > 0) suffixParts.push(renderLoadErrorsSection(loadErrors));

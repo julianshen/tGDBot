@@ -23,6 +23,12 @@ import type { GitHubRepositoryRef, RepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
 import { bisectRejected } from "./inline-batch-bisect.js";
+
+// Statuses a SINGLE bad comment can plausibly cause, and which splitting can
+// therefore isolate. 422 is GitHub's validation failure — the invalid-anchor
+// case bisection exists for. 401/403/404/410 describe the request as a whole:
+// every subset would fail identically, so splitting only multiplies the damage.
+const ISOLATABLE_REJECTION_STATUSES = new Set(["422"]);
 import { computeContentDigest, computeRepositoryDigest, parseChildMarker, verifyChildMarkerBinding } from "../conversation/markers.js";
 import type { BotIdentity, ConversationItemIdentity, ReviewIdentity } from "../conversation/types.js";
 import {
@@ -1495,6 +1501,17 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       await postBatch(allIndices);
     } catch (error) {
       rejectionStatus = definiteRejection(error);
+      if (rejectionStatus !== undefined && !ISOLATABLE_REJECTION_STATUSES.has(rejectionStatus)) {
+        // Batch-wide: splitting cannot isolate an authorization or not-found
+        // failure, because every subset carries the same fault. Retrying subsets
+        // would only fire doomed POSTs and give a rate limiter more chances to
+        // turn a clean failure into an ambiguous publication.
+        return comments.map(({ clientId }) => ({
+          clientId,
+          status: "failed" as const,
+          reason: `GitHub rejected the atomic inline review (HTTP ${rejectionStatus})`,
+        }));
+      }
       if (rejectionStatus === undefined) {
         // Response loss is indistinguishable from acceptance. Recovery below is
         // authoritative; if incomplete, the typed error prevents fallback writes.

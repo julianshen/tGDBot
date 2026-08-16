@@ -934,3 +934,52 @@ describe("renderSummaryComment — compact mode keeps attribution", () => {
     expect(body.toLowerCase()).toContain("publication failed");
   });
 });
+
+// Codex round 3 on PR #23: compact mode built entries from cluster
+// representatives only, so merged members disappeared again in exactly the
+// path where the summary is already under pressure — while the headline kept
+// counting them.
+describe("renderSummaryComment — compact mode keeps merged members", () => {
+  it("lists every clustered member, not just the representative", () => {
+    const representative = makeFinding({ file: "a.go", line: 10, message: "r".repeat(2000) });
+    const member = makeFinding({ file: "a.go", line: 11, ruleName: "nats", message: "DISTINCT-MEMBER-CLAIM" });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [representative],
+      inlineCount: 0,
+      unanchored: [representative],
+      findingCount: 2,
+      uniqueIssueCount: 1,
+      context: new Map([[representative, { alsoReported: [member] }]]),
+    }), 700);
+
+    // Guard that this actually exercised the compact renderer, not the full one.
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("DISTINCT-MEMBER-CLAIM");
+  });
+});
+
+// Codex review of PR #23: renderAlsoReported serialized rule/line/message only,
+// so a merged member's structured `suggestion` was still being discarded — the
+// data-loss fix was only partial.
+describe("renderSummaryComment — merged members keep their proposed fix", () => {
+  it("renders a non-representative member's suggestion", () => {
+    const representative = makeFinding({ file: "a.go", line: 10, message: "Primary claim." });
+    const member = makeFinding({
+      file: "a.go",
+      line: 10,
+      ruleName: "nats",
+      message: "Secondary claim.",
+      suggestion: "committed, err := store.AdoptIfAbsent(ctx, roomID, *newPair)",
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [representative],
+      inlineCount: 0,
+      unanchored: [representative],
+      context: new Map([[representative, { alsoReported: [member] }]]),
+    }));
+
+    expect(body).toContain("store.AdoptIfAbsent");
+  });
+});

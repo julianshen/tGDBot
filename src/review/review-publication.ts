@@ -294,7 +294,7 @@ export async function publishReviewFromManifest(options: {
     failedIds: ReadonlySet<string>,
     marker?: string,
     providerLimit?: boolean,
-    publishFailureReason?: string,
+    publishFailureReason?: string | ReadonlyMap<string, string>,
   ) => string;
   readonly terminalResult?: TerminalReviewResult;
   readonly inlineRecovery?: InlineRecoveryState;
@@ -337,18 +337,25 @@ export async function publishReviewFromManifest(options: {
     options.logStatus?.(log);
   };
 
-  // Any one provider reason explains the batch: an atomic review fails for a
-  // single cause, and bisection reports each isolated comment with its own.
-  const firstFailureReason = (): string | undefined => {
-    for (const result of inlineResults.values()) {
-      if (result.status === "failed" && result.reason !== undefined) return result.reason;
+  // One reason per rejected finding, keyed by the client ID the summary uses.
+  // Bisection isolates comments that can fail with different statuses at
+  // different paths, and GitLab rejects discussions independently, so a single
+  // batch-wide reason would misdescribe most of them. `inlineResults` is keyed
+  // by child id, which is not the client id — hence the translation.
+  const failureReasons = (action: PublicationAction): Map<string, string> | undefined => {
+    const reasons = new Map<string, string>();
+    for (const child of action.children) {
+      const result = inlineResults.get(child.id);
+      if (result?.status === "failed" && result.reason !== undefined) {
+        reasons.set(clientIdOf(child), result.reason);
+      }
     }
-    return undefined;
+    return reasons.size > 0 ? reasons : undefined;
   };
 
   const bodyFor = (action: PublicationAction, failedIds: ReadonlySet<string>, marker: string): string => {
     if (orchestration !== undefined && buildBody !== undefined) {
-      return buildBody(orchestration, failedIds, marker, undefined, firstFailureReason());
+      return buildBody(orchestration, failedIds, marker, undefined, failureReasons(action));
     }
     return composeFrozenSummary(action, failedIds, marker);
   };

@@ -1047,3 +1047,120 @@ describe("orchestrate — clustering never loses a member", () => {
     expect(result.commentBody).toContain("under retry");
   });
 });
+
+// Codex round 3 on PR #23.
+describe("orchestrate — clustering must not distort counts or placement", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function f(overrides: Partial<Finding> & { message: string }): Finding {
+    return { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "r", ...overrides };
+  }
+
+  // findingsCount feeds terminal results, recovery markers and status logs.
+  // Clustering is a PRESENTATION choice; it must not silently redefine how many
+  // findings a run reports programmatically.
+  it("reports the pre-cluster finding count", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          f({ ruleName: "a", message: "Set followed by Get is not atomic because the calls are separate." }),
+          f({ ruleName: "b", message: "Set followed by Get is not atomic under retry." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.findingsCount).toBe(2);
+  });
+
+  // Only representatives enter the placement loop, so choosing one that has no
+  // anchor throws away an anchor the cluster genuinely had.
+  it("promotes an anchorable member to representative when the longest is off-diff", () => {
+    const result = orchestrate(
+      {
+        findings: [
+          // Longer message, so it would win the representative slot on merit —
+          // but line 999 is not in the diff.
+          f({ line: 999, ruleName: "a", message: "Set followed by Get is not atomic in this fallback path here." }),
+          f({ line: 11, ruleName: "b", message: "Set followed by Get is not atomic." }),
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+
+    expect(result.summaryInput.uniqueIssueCount).toBe(1);
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]!.line).toBe(11);
+  });
+});
+
+// Codex round 3 on PR #23: bisection isolates comments that can fail for
+// DIFFERENT reasons (different statuses, different paths), and GitLab rejects
+// discussions independently. Reporting the first reason as the explanation for
+// every rejected finding tells the reader something false about most of them.
+describe("renderSummary — per-finding failure reasons", () => {
+  const DIFF = [
+    "diff --git a/a.go b/a.go",
+    "--- a/a.go",
+    "+++ b/a.go",
+    "@@ -10,2 +10,3 @@",
+    " ctx",
+    "+added",
+    " tail",
+    "",
+  ].join("\n");
+
+  function two() {
+    return orchestrate(
+      {
+        findings: [
+          { file: "a.go", line: 11, severity: "blocking", category: "concurrency", ruleName: "a", message: "Race between the Set and Get calls." },
+          { file: "a.go", line: 12, severity: "warning", category: "configuration", ruleName: "b", message: "Compose file hardcodes the retention window." },
+        ],
+        rulesRun: ["a", "b"],
+        rulesFailed: [],
+      } as never,
+      DIFF,
+      {},
+    );
+  }
+
+  it("gives each rejected finding the reason that actually applies to it", () => {
+    const result = two();
+    expect(result.inlineComments).toHaveLength(2);
+    const [first, second] = result.inlineComments;
+
+    const body = renderSummary(result, new Set([first!.clientId, second!.clientId]), undefined, new Map([
+      [first!.clientId, "GitHub rejected this inline comment (HTTP 422) at a.go:11"],
+      [second!.clientId, "GitHub rejected this inline comment (HTTP 403) at a.go:12"],
+    ]));
+
+    expect(body).toContain("HTTP 422");
+    expect(body).toContain("HTTP 403");
+  });
+
+  it("still accepts one shared reason for the whole batch", () => {
+    const result = two();
+    const ids = result.inlineComments.map((c) => c.clientId);
+
+    const body = renderSummary(result, new Set(ids), undefined, "GitHub rejected the atomic inline review (HTTP 422)");
+
+    expect(body).toContain("GitHub rejected the atomic inline review (HTTP 422)");
+  });
+});

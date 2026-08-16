@@ -2155,3 +2155,43 @@ describe("createInlineReview: bisection after a partial acceptance", () => {
     expect(recoveryListing).toBeGreaterThan(lastPost);
   });
 });
+
+// Codex review of PR #23 (P1): splitting can only isolate a fault that belongs
+// to an individual comment. A batch-wide 401/403 rejects every subset too, so
+// bisecting it just fires doomed POSTs and gives a rate limiter more chances to
+// turn a clean failure into an ambiguous publication.
+describe("createInlineReview: only bisects isolatable rejections", () => {
+  async function attempt(status: string) {
+    const posts: number[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args.includes("POST")) {
+        posts.push((JSON.parse(stdin!) as { comments: unknown[] }).comments.length);
+        throw new Error(`GitHub rejected request (HTTP ${status})`);
+      }
+      return "[]";
+    };
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(execGh, repo);
+    const comments = ["a.ts", "b.ts", "c.ts", "d.ts"].map((path, index) => ({
+      clientId: `finding-${index}`, path, line: 10 + index, body: `finding ${index}`, position: {} as never,
+    }));
+    const outcomes = await adapter.createInlineReview(
+      { kind: "repository", repo, number: 42 }, "d".repeat(40), comments,
+    );
+    return { posts, outcomes };
+  }
+
+  it("does not split a batch-wide authorization failure", async () => {
+    const { posts, outcomes } = await attempt("403");
+
+    expect(posts).toEqual([4]);
+    expect(outcomes.every((o) => o.status === "failed")).toBe(true);
+  });
+
+  it("still splits a validation failure, which a single comment can cause", async () => {
+    const { posts } = await attempt("422");
+
+    expect(posts.length).toBeGreaterThan(1);
+  });
+});

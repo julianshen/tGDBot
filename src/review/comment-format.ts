@@ -338,6 +338,13 @@ export interface FindingContext {
   /** Every rule that reported this root cause, when clustering merged several. */
   readonly rules?: readonly string[];
   /**
+   * Why THIS finding's inline comment was rejected. Bisection isolates comments
+   * that can fail for different statuses at different paths, and GitLab rejects
+   * discussions independently — so one section-level reason would misdescribe
+   * most of them (Codex review of PR #23).
+   */
+  readonly publishFailureReason?: string;
+  /**
    * The other members of this finding's cluster. Clustering keeps ONE entry per
    * root cause, and these must still be rendered: a merge is a judgement call
    * made by a similarity heuristic, and silently deleting the losing member's
@@ -492,10 +499,18 @@ function renderDiffExcerpt(snippet: HunkSnippet): string {
 
 // Collapsed so one entry stays scannable, present so nothing is lost.
 function renderAlsoReported(members: readonly Finding[]): string {
-  const items = members.map((member) => {
+  const items = members.flatMap((member) => {
     const rule = sanitizeInline(member.ruleName);
     const loc = typeof member.line === "number" ? `:${member.line}` : "";
-    return `- **\`${rule}\`**${loc}: ${sanitizeText(member.message)}`;
+    const line = `- **\`${rule}\`**${loc}: ${sanitizeText(member.message)}`;
+    // A member carries structured content beyond its prose. Dropping its
+    // `suggestion` would leave the data-loss fix half done — so the fix is
+    // shown, always NON-committable: a merged member is a similarity judgement,
+    // and a one-click commit should never rest on one.
+    const suggestion = member.suggestion?.trim() ? capSuggestion(member.suggestion) : undefined;
+    return suggestion === undefined
+      ? [line]
+      : [line, "", renderSuggestionBlock(suggestion, false), ""];
   });
   return detailsBlock(
     `Also reported by ${members.length} other rule${members.length === 1 ? "" : "s"}`,
@@ -523,6 +538,9 @@ function renderUnanchoredFinding(
   const { headline, body } = resolveHeadline(finding, full);
 
   const parts = [`**\`${loc}\`**`, "", metaLine(finding, context?.rules), ""];
+  if (context?.publishFailureReason) {
+    parts.push(`> ${sanitizeInline(context.publishFailureReason)}`, "");
+  }
   if (snippet) parts.push(renderDiffExcerpt(snippet), "");
   if (headline) {
     parts.push(`**${headline}**`);
@@ -726,7 +744,9 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // absent from this list because they only ever reached it via `unanchored`;
   // now that they are their own group they must be appended explicitly, or a
   // long review would silently drop them.
-  const relocated = [...input.unanchored, ...(input.publishFailed ?? [])];
+  const relocated = [...input.unanchored, ...(input.publishFailed ?? [])].flatMap(
+    (finding) => [finding, ...(input.context?.get(finding)?.alsoReported ?? [])],
+  );
   const header =
     `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
@@ -868,9 +888,18 @@ function renderSummaryCommentWithIncludedSuggestions(
   // reader chases the right problem — and so nobody re-checks line numbers that
   // were never wrong.
   if (publishFailed.length > 0) {
-    const reason = input.publishFailureReason
-      ? ` Reason: ${sanitizeInline(input.publishFailureReason)}.`
-      : "";
+    const distinctReasons = new Set(
+      publishFailed
+        .map((finding) => input.context?.get(finding)?.publishFailureReason)
+        .filter((value): value is string => value !== undefined),
+    );
+    const shared = input.publishFailureReason ??
+      (distinctReasons.size === 1 ? [...distinctReasons][0] : undefined);
+    const reason = shared
+      ? ` Reason: ${sanitizeInline(shared)}.`
+      : distinctReasons.size > 1
+        ? " Each finding carries the reason that applies to it."
+        : "";
     parts.push(
       [
         `### 📌 Inline publication failed (${publishFailed.length})`,

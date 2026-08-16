@@ -217,25 +217,32 @@ export function orchestrate(
   // same line. Cluster first, then present one entry per root cause with its
   // contributing rules as metadata, so the reader meets each defect once.
   const clusters = clusterFindings(allFindings);
-  const contributingRules = new Map<Finding, readonly string[]>(
-    clusters.map((cluster) => [cluster.representative, cluster.rules]),
-  );
-  // The members a cluster did NOT promote still have to be rendered somewhere,
-  // or a similarity heuristic silently deletes a finding (Codex review of
-  // PR #23, P1). Every surface that shows a representative shows these too.
-  const mergedMembers = new Map<Finding, readonly Finding[]>(
-    clusters.map((cluster) => [
-      cluster.representative,
-      cluster.members.filter((member) => member !== cluster.representative),
-    ]),
-  );
-  const dedupedFindings = clusters
-    .map((cluster) => cluster.representative)
-    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
   const inlineEnabled = options.inline !== false && diff !== "";
 
   const positions = inlineEnabled ? parseDiffPositions(diff) : undefined;
   const anchors = positions ? commentableLines(positions) : new Map<string, Set<number>>();
+
+  // Only representatives enter the placement loop, so a representative chosen
+  // purely on severity/detail can throw away an anchor the cluster genuinely
+  // had — members often disagree about which line of a construct to blame.
+  // Prefer an anchorable member, keeping the severity ordering among those.
+  const representativeOf = (cluster: (typeof clusters)[number]): Finding =>
+    cluster.members.find((member) => isCommentable(anchors, member.file, member.line)) ??
+    cluster.representative;
+
+  const contributingRules = new Map<Finding, readonly string[]>();
+  // The members a cluster did NOT promote still have to be rendered somewhere,
+  // or a similarity heuristic silently deletes a finding (Codex review of
+  // PR #23, P1). Every surface that shows a representative shows these too.
+  const mergedMembers = new Map<Finding, readonly Finding[]>();
+  for (const cluster of clusters) {
+    const representative = representativeOf(cluster);
+    contributingRules.set(representative, cluster.rules);
+    mergedMembers.set(representative, cluster.members.filter((member) => member !== representative));
+  }
+  const dedupedFindings = clusters
+    .map(representativeOf)
+    .sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]);
 
   const inlineComments: InlineComment[] = [];
   const unanchored: Finding[] = [];
@@ -375,7 +382,10 @@ export function orchestrate(
   return {
     commentBody,
     inlineComments,
-    findingsCount: dedupedFindings.length,
+    // Pre-cluster: this value feeds terminal results, recovery markers and
+    // status logs. Clustering is a presentation choice and must not redefine
+    // how many findings a run reports (Codex review of PR #23).
+    findingsCount: allFindings.length,
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
     findingByClientId,
@@ -397,21 +407,40 @@ export function renderSummary(
   presentation: OrchestrationResult,
   failedIds: ReadonlySet<string>,
   maxLength?: number,
-  reason?: string,
+  reason?: string | ReadonlyMap<string, string>,
 ): string {
   const failed = [...failedIds].map((id) => {
     const finding = presentation.findingByClientId.get(id);
     if (!finding) throw new Error(`unknown inline finding clientId: ${id}`);
     return finding;
   });
+
+  // A per-clientId map attributes each rejection to the finding it actually
+  // describes; a bare string keeps the older "one cause for the batch" form,
+  // which is still the truth for a single atomic rejection.
+  const perFinding = typeof reason === "object" ? reason : undefined;
+  const sharedReason = typeof reason === "string" ? reason : undefined;
+  const context = perFinding
+    ? new Map(presentation.summaryInput.context ?? [])
+    : presentation.summaryInput.context;
+  if (perFinding && context instanceof Map) {
+    for (const id of failedIds) {
+      const finding = presentation.findingByClientId.get(id);
+      const why = perFinding.get(id);
+      if (!finding || why === undefined) continue;
+      context.set(finding, { ...context.get(finding), publishFailureReason: why });
+    }
+  }
+
   return renderSummaryComment({
     ...presentation.summaryInput,
+    ...(context === undefined ? {} : { context }),
     inlineCount: presentation.inlineComments.length - failed.length,
     publishFailed: [
       ...(presentation.summaryInput.publishFailed ?? []),
       ...failed,
     ].sort((a, b) => SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity]),
-    ...(reason === undefined ? {} : { publishFailureReason: reason }),
+    ...(sharedReason === undefined ? {} : { publishFailureReason: sharedReason }),
     inlineUnavailable: presentation.summaryInput.inlineUnavailable,
   }, maxLength);
 }
