@@ -6,6 +6,23 @@ import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-wo
 import type { ConversationItemIdentity } from "../conversation/types.js";
 import type { RepositoryRef } from "../target/types.js";
 
+/**
+ * Total order over `orderKey` strings, matching the `<` / `>` / `<=` operators
+ * used everywhere a key is compared against a page cutoff or boundary.
+ *
+ * MUST be used for every orderKey sort. `String.prototype.localeCompare` is a
+ * DIFFERENT total order: it reorders "_", "-" and case relative to codepoint
+ * order. Sorting a candidate window one way and then counting it against a
+ * cutoff the other way makes a paginated scan emit one set and account for
+ * another — which is exactly how the review-event traversal broke its
+ * `cutoffRank === emittedRank` invariant on a real pull request, where GitHub's
+ * base64url node ids ("PRRT_kwDOTX0Oys...") contain the characters the two
+ * orders disagree about.
+ */
+export function compareOrderKeys(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 export type ReviewLocator =
   | {
       readonly kind: "ambient";

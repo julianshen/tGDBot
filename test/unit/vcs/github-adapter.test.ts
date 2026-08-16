@@ -1276,6 +1276,55 @@ describe("GitHub conversation activity", () => {
     expect(execGh.mock.calls.flatMap(([args]) => args as string[])).not.toEqual(expect.arrayContaining(["--paginate", "--slurp"]));
   });
 
+  // Regression: the scan SORTS orderKeys with localeCompare but compares them
+  // against the page cutoff with < and >. Those are different total orders —
+  // localeCompare reorders "_", "-" and case — so the window emitted one order
+  // while the continuation counted another, and the cutoffRank === emittedRank
+  // invariant blew up mid-traversal.
+  //
+  // The existing traversal test above uses thread ids "T0".."T119", where the
+  // two orders happen to agree. Real GitHub node ids are base64url and contain
+  // exactly the characters that make them diverge, which is why this only ever
+  // showed up against a live PR (hmchangw/newchat#222, 250 events, page 3).
+  it("pages an activity traversal whose ids contain base64url characters", async () => {
+    const at = (index: number) => new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString();
+    // Mixed case plus "_" and "-", as GitHub's node ids are.
+    const threadId = (index: number) => `PRRT_kwDOTX0Oys${index % 2 === 0 ? "-" : "_"}${index}Ab`;
+    const issueRows = Array.from({ length: 120 }, (_, index) => ({ id: 1000 + index, body: `issue-${index}`, user: { login: "alice" }, created_at: at(index), updated_at: at(index), html_url: `${review.url}#issuecomment-${1000 + index}` }));
+    const inlineRows = Array.from({ length: 120 }, (_, index) => ({ id: 2000 + index, body: `inline-${index}`, user: { login: "bob" }, created_at: at(index), updated_at: at(index), html_url: `${review.url}#discussion_r${2000 + index}`, pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42", path: `src/${index}.ts`, line: 1, side: "RIGHT", commit_id: "a".repeat(40) }));
+    // Every thread resolution shares ONE timestamp, exactly as the adapter
+    // stamps them from pull.updatedAt — so their whole ordering rests on the id.
+    const threadNodes = inlineRows.map((row, index) => ({ id: threadId(index), isResolved: index % 2 === 0, isOutdated: false, subjectType: "LINE", diffSide: "RIGHT", path: row.path, line: 1, originalLine: 1,
+      comments: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ databaseId: row.id, body: row.body, author: { login: "bob" }, createdAt: at(index), updatedAt: at(index), url: row.html_url, commit: { oid: "a".repeat(40) }, originalCommit: { oid: "a".repeat(40) }, replyTo: null }] } }));
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") {
+        const cursorArg = args.find((arg) => arg.startsWith("cursor="));
+        const start = cursorArg === undefined ? 0 : Number(cursorArg.slice("cursor=".length));
+        const nodes = threadNodes.slice(start, start + 100);
+        const end = start + nodes.length;
+        return JSON.stringify({ data: { repository: { pullRequest: { id: review.reviewId, url: review.url, headRefOid: "a".repeat(40), updatedAt: "2026-09-01T00:00:00Z",
+          reviewThreads: { pageInfo: { hasNextPage: end < threadNodes.length, endCursor: end < threadNodes.length ? String(end) : null }, nodes } } } } });
+      }
+      const pageArg = args.find((arg) => arg.startsWith("page="));
+      const start = ((Number(pageArg?.slice(5) ?? "1")) - 1) * 50;
+      return JSON.stringify((args.some((arg) => arg.includes("issues/42/comments")) ? issueRows : inlineRows).slice(start, start + 50));
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    const found = new Set<string>();
+    let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
+    do {
+      const page = await adapter.listReviewEvents(review, undefined, token);
+      for (const event of page.events) {
+        const key = `${event.eventId}:${event.revisionId}`;
+        expect(found.has(key)).toBe(false);
+        found.add(key);
+      }
+      token = page.nextPageToken;
+    } while (token);
+    expect(found.size).toBe(360);
+  });
+
   it("continues 300 equal-time activity revisions and terminally advances without starvation", async () => {
     const at = "2026-08-12T10:00:00Z";
     const rows = Array.from({ length: 300 }, (_, index) => ({ id: index + 1, body: `issue-${index}`, user: { login: "alice" }, created_at: at,
