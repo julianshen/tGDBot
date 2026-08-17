@@ -22,6 +22,7 @@ import type {
 import type { GitHubRepositoryRef, RepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
+import { redactSecrets } from "../conversation/redact.js";
 import { bisectRejected } from "./inline-batch-bisect.js";
 
 // Statuses a SINGLE bad comment can plausibly cause, and which splitting can
@@ -1404,6 +1405,20 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       canonicalUrl: `https://github.com/${owner}/${name}`,
     }));
     const bot = await this.getBotLogin(repo);
+    // Set when the pull request moved on while we were publishing. Not an
+    // error: the review describes the head it actually read, and the marker
+    // records that head so a later run reviews the new one. Surfaced so a
+    // mixed-head situation is visible rather than silent (issue #29).
+    let headAdvancedTo: string | undefined;
+    let headAdvanceWarned = false;
+    const warnIfHeadAdvanced = (): void => {
+      if (headAdvancedTo === undefined || headAdvanceWarned) return;
+      headAdvanceWarned = true;
+      console.warn(
+        `GitHubAdapter: the pull request head advanced to ${headAdvancedTo} while publishing the review of ${headSha}; ` +
+        `the published review describes ${headSha} and a later run will review the newer head`,
+      );
+    };
     const prepared = validateInlineRecoveryState(recovery ?? await this.prepareInlineReviewRecovery(locator, headSha, comments, "legacy-inline-publication"));
     if (prepared.children.length !== comments.length || prepared.children.some((child, index) => {
       const comment = comments[index]!;
@@ -1448,8 +1463,26 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
         const id = providerId(row.id, "inline recovery comment id");
         const metadata = threads.get(id);
         const expected = comments[index]!;
-        if (!metadata || metadata.placement.file !== expected.path || metadata.placement.line !== expected.line || metadata.placement.currentHeadSha !== headSha) {
-          throw new AmbiguousInlinePublishError("Recovered inline comment GraphQL binding mismatch");
+        if (!metadata) {
+          throw new AmbiguousInlinePublishError(`Recovered inline comment ${id} has no GraphQL thread binding`);
+        }
+        // The PR's head is deliberately NOT part of this check.
+        // placement.currentHeadSha is the pull request's head AT QUERY TIME — a
+        // property of the PR, not of the comment — so anyone pushing mid-run made
+        // a correctly-bound comment look like a binding failure. That is issue
+        // #29: GitHub had accepted the comments, the run reported ambiguous, and
+        // the summary claimed zero were posted. Each comment's own binding is
+        // already verified above against row.commit_id, which is the precise and
+        // sufficient test.
+        if (metadata.placement.file !== expected.path || metadata.placement.line !== expected.line) {
+          throw new AmbiguousInlinePublishError(redactSecrets(
+            `Recovered inline comment ${id} GraphQL binding mismatch: thread reports ` +
+            `${metadata.placement.file}:${String(metadata.placement.line)}, expected ` +
+            `${expected.path}:${String(expected.line)}`,
+          ));
+        }
+        if (metadata.placement.currentHeadSha !== undefined && metadata.placement.currentHeadSha !== headSha) {
+          headAdvancedTo ??= metadata.placement.currentHeadSha;
         }
         const threadId = metadata.threadId;
         if (!threadId) throw new AmbiguousInlinePublishError("Recovered inline comment has no GraphQL thread identity");
@@ -1460,6 +1493,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       });
     };
     const existing = await recover();
+    warnIfHeadAdvanced();
     if (existing.every((identity) => identity !== null)) {
       return comments.map((comment, index) => ({ clientId: comment.clientId, status: "posted", identity: existing[index]! }));
     }

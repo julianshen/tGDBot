@@ -46,7 +46,7 @@ const locator = (number: number): ReviewLocator => ({
 });
 const locator42 = locator(42);
 
-function inlineThreadsFixture(ids: number[], paths: string[], head = "d".repeat(40), lines = [13, 5]): string {
+function inlineThreadsFixture(ids: number[], paths: string[], head = "d".repeat(40), lines = [13, 5], currentHead = head): string {
   const nodes = ids.map((id, index) => ({
     id: `T${id}`, isResolved: false, isOutdated: false, path: paths[index],
     line: lines[index] ?? 5, originalLine: null,
@@ -58,7 +58,7 @@ function inlineThreadsFixture(ids: number[], paths: string[], head = "d".repeat(
     }] },
   }));
   return JSON.stringify({ data: { repository: { pullRequest: {
-    id: "PR_kwDO42", url: "https://github.com/octo-org/octo-repo/pull/42", headRefOid: head,
+    id: "PR_kwDO42", url: "https://github.com/octo-org/octo-repo/pull/42", headRefOid: currentHead,
     reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes },
   } } } });
 }
@@ -1948,6 +1948,88 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
       body: `finding\n${findingMarker}`,
     }], recovery)).resolves.toMatchObject([{ clientId: "finding-0", status: "failed" }]);
     expect(post).toHaveBeenCalledOnce();
+  });
+
+  // Issue #29, from hmchangw/newchat#285: someone pushed while the review was
+  // running (5806533a -> 25cc388a). Recovery compared each comment's THREAD
+  // metadata — whose currentHeadSha is the PULL REQUEST's head at query time,
+  // not a property of the comment — against the review head, so a head advance
+  // read as a binding mismatch. GitHub had accepted the comments; the run
+  // reported ambiguous and the summary claimed "0 inline comments posted".
+  //
+  // Each comment's own binding is already checked against row.commit_id, which
+  // is the correct and sufficient test.
+  it("accepts recovered comments when the PR head advanced during the run", async () => {
+    const reviewHead = "d".repeat(40);
+    const advancedHead = "e".repeat(40);
+    const calls: { args: string[]; stdin?: string }[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      calls.push({ args, stdin });
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      // The PR has moved on: headRefOid is the NEW head, while the comments
+      // remain bound to the commit they were written against.
+      if (args[1] === "graphql") return inlineThreadsFixture([100, 101], ["a.ts", "b.ts"], reviewHead, [13, 5], advancedHead);
+      if (args.includes("POST")) return "{}";
+      const posted = calls.find((call) => call.args.includes("POST"));
+      if (!posted) return "[]";
+      const bodies = (JSON.parse(posted.stdin!) as { comments: { body: string }[] }).comments.map((comment, index) => ({
+        id: 100 + index, body: comment.body, user: { login: "octo-bot" },
+        path: index === 0 ? "a.ts" : "b.ts", line: index === 0 ? 13 : 5, side: "RIGHT",
+        commit_id: reviewHead,
+        html_url: `https://github.com/octo-org/octo-repo/pull/42#discussion_r${100 + index}`,
+        pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42",
+      }));
+      return JSON.stringify(bodies);
+    };
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(execGh, repo);
+    const comments = [
+      { clientId: "finding-0", path: "a.ts", line: 13, body: "first", position: {} as never },
+      { clientId: "finding-1", path: "b.ts", line: 5, body: "second", position: {} as never },
+    ];
+
+    const outcomes = await adapter.createInlineReview({ kind: "repository", repo, number: 42 }, reviewHead, comments);
+
+    // Never report zero when GitHub accepted them.
+    expect(outcomes).toMatchObject([
+      { clientId: "finding-0", status: "posted" },
+      { clientId: "finding-1", status: "posted" },
+    ]);
+  });
+
+  // A genuine placement mismatch must still fail — and say exactly what differed.
+  it("names the specific binding difference when a recovered comment really is wrong", async () => {
+    const reviewHead = "d".repeat(40);
+    const calls: { args: string[]; stdin?: string }[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      calls.push({ args, stdin });
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      // The thread reports a DIFFERENT file than the comment claims.
+      if (args[1] === "graphql") return inlineThreadsFixture([100], ["elsewhere.ts"], reviewHead, [13]);
+      if (args.includes("POST")) return "{}";
+      const posted = calls.find((call) => call.args.includes("POST"));
+      if (!posted) return "[]";
+      const bodies = (JSON.parse(posted.stdin!) as { comments: { body: string }[] }).comments.map((comment) => ({
+        id: 100, body: comment.body, user: { login: "octo-bot" },
+        path: "a.ts", line: 13, side: "RIGHT", commit_id: reviewHead,
+        html_url: "https://github.com/octo-org/octo-repo/pull/42#discussion_r100",
+        pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42",
+      }));
+      return JSON.stringify(bodies);
+    };
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(execGh, repo);
+    const comments = [{ clientId: "finding-0", path: "a.ts", line: 13, body: "first", position: {} as never }];
+
+    const error = await adapter
+      .createInlineReview({ kind: "repository", repo, number: 42 }, reviewHead, comments)
+      .then(() => undefined, (e: unknown) => e as Error);
+
+    expect(error).toBeInstanceOf(AmbiguousInlinePublishError);
+    // The operator must be able to see WHAT differed without re-running.
+    expect(error!.message).toContain("100");
+    expect(error!.message).toContain("a.ts");
+    expect(error!.message).toContain("elsewhere.ts");
   });
 
   it("posts one atomic review and recovers every identity after an incomplete direct response", async () => {
