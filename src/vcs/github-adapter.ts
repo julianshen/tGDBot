@@ -1591,6 +1591,9 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       throw new AmbiguousInlinePublishError("Could not recover identities after atomic inline review write");
     }
     // Only comments we did NOT prove rejected are required to have landed.
+    // Also here: on a fresh publication the first recover() finds nothing, so the
+    // post-write pass is the only one that can observe an advanced head.
+    warnIfHeadAdvanced();
     if (recovered.some((identity, index) => identity === null && !rejectedIndices.has(index))) {
       throw new AmbiguousInlinePublishError();
     }

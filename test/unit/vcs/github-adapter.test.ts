@@ -1997,6 +1997,45 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
     ]);
   });
 
+  // Bot review of PR #31: on a NORMAL new publication the first recover() finds
+  // nothing, so only the post-write recovery can observe the advanced head. The
+  // warning was wired to the first call site alone, leaving the primary mid-run
+  // scenario silent — the very case this reports on.
+  it("warns about a head advance observed only by the post-write recovery", async () => {
+    const reviewHead = "d".repeat(40);
+    const advancedHead = "e".repeat(40);
+    const calls: { args: string[]; stdin?: string }[] = [];
+    const execGh: ExecGh = async (args, stdin) => {
+      calls.push({ args, stdin });
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") return inlineThreadsFixture([100], ["a.ts"], reviewHead, [13], advancedHead);
+      if (args.includes("POST")) return "{}";
+      // Nothing exists until the POST happens: the first recover() sees an empty
+      // list, exactly as a fresh publication does.
+      const posted = calls.find((call) => call.args.includes("POST"));
+      if (!posted) return "[]";
+      const bodies = (JSON.parse(posted.stdin!) as { comments: { body: string }[] }).comments.map((comment) => ({
+        id: 100, body: comment.body, user: { login: "octo-bot" },
+        path: "a.ts", line: 13, side: "RIGHT", commit_id: reviewHead,
+        html_url: "https://github.com/octo-org/octo-repo/pull/42#discussion_r100",
+        pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42",
+      }));
+      return JSON.stringify(bodies);
+    };
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(execGh, repo);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const outcomes = await adapter.createInlineReview({ kind: "repository", repo, number: 42 }, reviewHead,
+      [{ clientId: "finding-0", path: "a.ts", line: 13, body: "first", position: {} as never }]);
+
+    expect(outcomes).toMatchObject([{ clientId: "finding-0", status: "posted" }]);
+    const warned = warn.mock.calls.map((c) => String(c[0])).join("\n");
+    warn.mockRestore();
+    expect(warned).toContain(advancedHead);
+    expect(warned).toContain("head advanced");
+  });
+
   // A genuine placement mismatch must still fail — and say exactly what differed.
   it("names the specific binding difference when a recovered comment really is wrong", async () => {
     const reviewHead = "d".repeat(40);
