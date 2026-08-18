@@ -5,6 +5,7 @@ import {
   type RelatedWorkState,
 } from "../review/related-work.js";
 import type { ExecGh } from "./github-adapter.js";
+import { isTransientGhFailure } from "./gh-retry.js";
 
 const LOOKUP_OPTIONS = { timeoutMs: 5_000 } as const;
 
@@ -62,11 +63,22 @@ async function resolveOne(reference: RelatedWorkReference, execGh: ExecGh): Prom
     return validateResolvedRelatedWork(reference, {
       kind: "pull_request", title: pull.title, state: normalizedState(pull.state), url: pull.url,
     });
-  } catch {
+  } catch (error) {
     console.warn(`Failed to resolve github related work ${diagnosticIdentifier(reference)}`);
+    if (isTransientGhFailure(error)) throw new ProviderUnreachableError();
     return reference;
   }
 }
+
+/**
+ * Raised once the provider is proven unreachable, so the remaining references
+ * are left unresolved instead of repeating a dead lookup.
+ *
+ * Every reference fails identically when the network is down, and each retry
+ * budget multiplies the wait before the review can carry on (issue #30). The
+ * references are still RETURNED — unresolved, never dropped.
+ */
+class ProviderUnreachableError extends Error {}
 
 export async function resolveGitHubRelatedWork(
   references: readonly RelatedWorkReference[],
@@ -74,10 +86,21 @@ export async function resolveGitHubRelatedWork(
 ): Promise<readonly RelatedWorkItem[]> {
   const results: RelatedWorkItem[] = new Array(references.length);
   let next = 0;
+  let unreachable = false;
   const worker = async (): Promise<void> => {
     while (next < references.length) {
       const index = next++;
-      results[index] = await resolveOne(references[index]!, execGh);
+      if (unreachable) {
+        results[index] = references[index]!;
+        continue;
+      }
+      try {
+        results[index] = await resolveOne(references[index]!, execGh);
+      } catch (error) {
+        if (!(error instanceof ProviderUnreachableError)) throw error;
+        unreachable = true;
+        results[index] = references[index]!;
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(3, references.length) }, worker));

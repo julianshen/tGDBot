@@ -31,6 +31,7 @@ import type { ClarificationPresentation } from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
+import { isTransientGhFailure } from "./vcs/gh-retry.js";
 import {
   buildConversationContext,
   MAX_REVIEW_CONTEXT_PAGES,
@@ -1318,6 +1319,23 @@ export interface MainDependencies {
   runPoll?: (args: PollArgs, deps: Pick<PollDependencies, "runReview">) => Promise<number>;
 }
 
+/**
+ * Classifies a fatal command failure before it is printed.
+ *
+ * Issue #30: a momentary network failure surfaced as a raw command dump —
+ * "Command failed: gh api -X GET ... error connecting to api.github.com" —
+ * which reads like a tGDBot logic failure. The operator needs to know at a
+ * glance whether to investigate the tool or simply run it again. A definite
+ * rejection (4xx) is deliberately left unlabelled: retrying it would only
+ * repeat the same answer.
+ */
+export function describeCommandFailure(error: unknown): string {
+  const message = redactedMessage(error).replace(/\s+/gu, " ").trim();
+  return isTransientGhFailure(error)
+    ? `transient provider failure (safe to retry): ${message}`
+    : message;
+}
+
 export async function main(
   argv: string[] = process.argv.slice(2),
   dependencies: MainDependencies = {},
@@ -1329,8 +1347,7 @@ export async function main(
       : await (dependencies.runPoll ?? poll)(args, { runReview: review });
     process.exit(exitCode);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`tgd-review-agent: ${message}`);
+    console.error(`tgd-review-agent: ${describeCommandFailure(err)}`);
     process.exit(EXIT_FATAL);
   }
 }

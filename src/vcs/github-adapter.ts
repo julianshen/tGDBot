@@ -22,6 +22,7 @@ import type {
 import type { GitHubRepositoryRef, RepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
+import { retryTransientGh } from "./gh-retry.js";
 import { redactSecrets } from "../conversation/redact.js";
 import { bisectRejected } from "./inline-batch-bisect.js";
 
@@ -101,7 +102,7 @@ export type ExecGh = (
  * support piping stdin, so this wraps the callback form directly and writes
  * `stdin` to the child process before awaiting completion.
  */
-export const realExecGh: ExecGh = (args, stdin, options) =>
+const baseExecGh: ExecGh = (args, stdin, options) =>
   new Promise((resolve, reject) => {
     const child = execFile(
       "gh",
@@ -122,6 +123,13 @@ export const realExecGh: ExecGh = (args, stdin, options) =>
       child.stdin?.end(stdin);
     }
   });
+
+/**
+ * A momentary network failure should not cost a whole review. Reads are
+ * retried; writes and definite rejections are passed straight through, so a
+ * retry can never publish a comment twice (issue #30).
+ */
+export const realExecGh: ExecGh = retryTransientGh(baseExecGh);
 
 export class GitHubThreadSnapshotTooLargeError extends Error {
   readonly code = "GITHUB_THREAD_SNAPSHOT_TOO_LARGE";
