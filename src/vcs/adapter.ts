@@ -56,8 +56,16 @@ export interface VcsAdapter {
    * mismatch rather than return a diff of a different commit: findings
    * computed from newer code but published against the older SHA anchor to
    * lines that may not exist there.
+   *
+   * `expectedBaseSha` pins the other half of the comparison. A diff is
+   * base..head, so retargeting the review or force-pushing its base changes
+   * what the diff CONTAINS while the head sits still — and the caller has
+   * already sourced its rules from the base it pinned.
    */
-  getDiff(locator: ReviewLocator, options?: { expectedHeadSha?: string }): Promise<string>;
+  getDiff(
+    locator: ReviewLocator,
+    options?: { expectedHeadSha?: string; expectedBaseSha?: string },
+  ): Promise<string>;
   findBotComment(locator: ReviewLocator): Promise<BotComment | null>;
   /**
    * Creates or updates the summary and returns the exact provider-confirmed

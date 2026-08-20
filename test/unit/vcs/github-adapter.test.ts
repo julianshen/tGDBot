@@ -2375,6 +2375,7 @@ describe("GitHubAdapter large-diff fallback", () => {
   const repo = parseRepositoryRef("hmchangw/newchat", "github");
   const locator188: ReviewLocator = { kind: "repository", repo, number: 188 };
   const HEAD = "d5e396b14fd0252cda0d035cfe3e190ade9f4e5f";
+  const BASE = "b".repeat(40);
 
   const diffTooLarge = (): Error =>
     new Error(
@@ -2395,14 +2396,17 @@ describe("GitHubAdapter large-diff fallback", () => {
     pages: unknown[][],
     head: string | string[] = HEAD,
     changedFiles?: number,
+    base: string | string[] = BASE,
   ) => {
     const heads = Array.isArray(head) ? [...head] : [head];
+    const bases = Array.isArray(base) ? [...base] : [base];
     const total = changedFiles ?? pages.reduce((sum, page) => sum + page.length, 0);
     return vi.fn(async (args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") throw diffTooLarge();
       if (args[0] === "pr" && args[1] === "view") {
         return JSON.stringify({
           headRefOid: heads.length > 1 ? heads.shift() : heads[0],
+          baseRefOid: bases.length > 1 ? bases.shift() : bases[0],
           changedFiles: total,
         });
       }
@@ -2535,7 +2539,7 @@ describe("GitHubAdapter large-diff fallback", () => {
     expect(views).toHaveLength(2);
     expect(views[0]?.[0]).toEqual([
       "pr", "view", "188", "--repo", "github.com/hmchangw/newchat",
-      "--json", "headRefOid,changedFiles",
+      "--json", "headRefOid,baseRefOid,changedFiles",
     ]);
   });
 
@@ -2570,6 +2574,39 @@ describe("GitHubAdapter large-diff fallback", () => {
     const adapter = new GitHubAdapter(execGh);
 
     await expect(adapter.getDiff(locator188)).rejects.toThrow(/head advanced/i);
+  });
+
+  // Codex review, PR #34: head is only half of "which comparison is this?".
+  // The files endpoint returns base..head, so retargeting the pull request or
+  // force-pushing its base moves the diff while headRefOid sits still. The
+  // run would then review that new comparison while sourcing rules from — and
+  // recording publication state under — the base it cached.
+  it("refuses a diff whose base is not the one the review was prepared against", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(
+      adapter.getDiff(locator188, { expectedHeadSha: HEAD, expectedBaseSha: "c".repeat(40) }),
+    ).rejects.toThrow(/base/i);
+  });
+
+  it("refuses a diff assembled across a base change, with the head unmoved", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], HEAD, undefined, [BASE, "c".repeat(40)]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/base/i);
+  });
+
+  it("accepts a diff at exactly the head and base the review expects", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188, {
+      expectedHeadSha: HEAD,
+      expectedBaseSha: BASE,
+    });
+
+    expect(diff).toContain("a/src/a.ts");
   });
 
   // "Report whether the complete diff was loaded before dispatching rules."

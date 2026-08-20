@@ -1262,7 +1262,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
 
   async getDiff(
     locator: ReviewLocator,
-    options?: { expectedHeadSha?: string },
+    options?: { expectedHeadSha?: string; expectedBaseSha?: string },
   ): Promise<string> {
     const { repo, id } = resolvePullLocator(locator);
     try {
@@ -1274,7 +1274,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       // review is never dispatched against a diff we scraped after a
       // failure we did not understand.
       if (!isDiffTooLargeError(error)) throw error;
-      return await this.getDiffFromFiles(repo, id, options?.expectedHeadSha);
+      return await this.getDiffFromFiles(repo, id, options);
     }
   }
 
@@ -1291,21 +1291,25 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
   private async pullHeadAndFileCount(
     repo: GitHubRepositoryRef | undefined,
     id: string,
-  ): Promise<{ headSha: string; changedFiles?: number }> {
+  ): Promise<{ headSha: string; baseSha: string; changedFiles?: number }> {
     const parsed = object(
       JSON.parse(
-        await this.execGh(["pr", "view", id, ...repoFlag(repo), "--json", "headRefOid,changedFiles"]),
+        await this.execGh([
+          "pr", "view", id, ...repoFlag(repo), "--json", "headRefOid,baseRefOid,changedFiles",
+        ]),
       ),
       "pull request head",
     );
     const headSha = textField(parsed.headRefOid, "pull request head SHA");
     if (!SHA_RE.test(headSha)) throw new Error("Invalid GitHub pull request head SHA");
+    const baseSha = textField(parsed.baseRefOid, "pull request base SHA");
+    if (!SHA_RE.test(baseSha)) throw new Error("Invalid GitHub pull request base SHA");
     const changedFiles = parsed.changedFiles;
-    if (changedFiles === undefined || changedFiles === null) return { headSha };
+    if (changedFiles === undefined || changedFiles === null) return { headSha, baseSha };
     if (typeof changedFiles !== "number" || !Number.isSafeInteger(changedFiles) || changedFiles < 0) {
       throw new Error("Invalid GitHub pull request changed file count");
     }
-    return { headSha, changedFiles };
+    return { headSha, baseSha, changedFiles };
   }
 
   /**
@@ -1323,17 +1327,27 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
   private async getDiffFromFiles(
     repo: GitHubRepositoryRef | undefined,
     id: string,
-    expectedHeadSha?: string,
+    expected?: { expectedHeadSha?: string; expectedBaseSha?: string },
   ): Promise<string> {
-    const { headSha: headBefore, changedFiles } = await this.pullHeadAndFileCount(repo, id);
-    // Agreeing with itself is not enough. The caller pinned a head before this
-    // ran and will publish against THAT one, so a diff of any other commit is
-    // the wrong diff however self-consistent it is (Codex review, PR #34).
-    if (expectedHeadSha !== undefined && headBefore !== expectedHeadSha) {
+    const { headSha: headBefore, baseSha: baseBefore, changedFiles } =
+      await this.pullHeadAndFileCount(repo, id);
+    // Agreeing with itself is not enough. The caller pinned this comparison
+    // before this ran and will publish against it, so a diff of any other
+    // head — or against any other base — is the wrong diff however
+    // self-consistent it is (Codex review, PR #34).
+    if (expected?.expectedHeadSha !== undefined && headBefore !== expected.expectedHeadSha) {
       throw new Error(
-        `GitHubAdapter: the pull request head is ${headBefore}, no longer the ${expectedHeadSha} ` +
-          `this review was prepared against; a diff read now would be published against the older ` +
-          `commit. Re-run the review against ${headBefore}.`,
+        `GitHubAdapter: the pull request head is ${headBefore}, no longer the ` +
+          `${expected.expectedHeadSha} this review was prepared against; a diff read now would be ` +
+          `published against the older commit. Re-run the review against ${headBefore}.`,
+      );
+    }
+    if (expected?.expectedBaseSha !== undefined && baseBefore !== expected.expectedBaseSha) {
+      throw new Error(
+        `GitHubAdapter: the pull request base is ${baseBefore}, no longer the ` +
+          `${expected.expectedBaseSha} this review was prepared against — it was retargeted or ` +
+          `its base was force-pushed. The diff would cover a different comparison than the rules ` +
+          `were sourced from. Re-run the review.`,
       );
     }
 
@@ -1364,7 +1378,14 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     // arrived; only when it is unavailable does the page shape decide.
     const truncated = changedFiles === undefined ? ranOutOfPages : rows.length < changedFiles;
 
-    const { headSha: headAfter } = await this.pullHeadAndFileCount(repo, id);
+    const { headSha: headAfter, baseSha: baseAfter } = await this.pullHeadAndFileCount(repo, id);
+    if (baseAfter !== baseBefore) {
+      throw new Error(
+        `GitHubAdapter: the pull request base moved from ${baseBefore} to ${baseAfter} while the ` +
+          `diff was being read file by file; the pages could straddle two different comparisons, ` +
+          `so the assembled diff was discarded. Re-run the review.`,
+      );
+    }
     if (headAfter !== headBefore) {
       throw new Error(
         `GitHubAdapter: the pull request head advanced from ${headBefore} to ${headAfter} while ` +

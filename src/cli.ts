@@ -838,7 +838,10 @@ export async function review(
 
   let diff: string;
   try {
-    diff = await config.vcsAdapter.getDiff(config.locator, { expectedHeadSha: pr.headSha });
+    diff = await config.vcsAdapter.getDiff(config.locator, {
+      expectedHeadSha: pr.headSha,
+      expectedBaseSha: pr.baseSha,
+    });
   } catch (err) {
     // Issue #33: GitHub would not send the diff as one response, and the
     // per-file fallback could not load all of it either. What DID load is a
