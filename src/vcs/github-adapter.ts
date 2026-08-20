@@ -23,6 +23,12 @@ import type { GitHubRepositoryRef, RepositoryRef } from "../target/types.js";
 import type { RelatedWorkItem, RelatedWorkReference } from "../review/related-work.js";
 import { resolveGitHubRelatedWork } from "./github-related-work.js";
 import { retryTransientGh } from "./gh-retry.js";
+import {
+  GITHUB_PULL_FILES_CAP,
+  assertCompleteDiff,
+  isDiffTooLargeError,
+  reconstructDiffFromFiles,
+} from "./github-large-diff.js";
 import { redactSecrets } from "../conversation/redact.js";
 import { bisectRejected } from "./inline-batch-bisect.js";
 
@@ -1256,7 +1262,87 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
 
   async getDiff(locator: ReviewLocator): Promise<string> {
     const { repo, id } = resolvePullLocator(locator);
-    return this.execGh(["pr", "diff", id, ...repoFlag(repo)]);
+    try {
+      return await this.execGh(["pr", "diff", id, ...repoFlag(repo)]);
+    } catch (error) {
+      // GitHub refuses a diff over 20,000 lines outright (issue #33). Only
+      // that specific refusal falls back to the per-file endpoint; every
+      // other failure — network, auth, a missing PR — stays fatal, so a
+      // review is never dispatched against a diff we scraped after a
+      // failure we did not understand.
+      if (!isDiffTooLargeError(error)) throw error;
+      return await this.getDiffFromFiles(repo, id);
+    }
+  }
+
+  /** Reads the PR's current head SHA, validated. */
+  private async currentHeadSha(repo: GitHubRepositoryRef | undefined, id: string): Promise<string> {
+    const parsed = object(
+      JSON.parse(await this.execGh(["pr", "view", id, ...repoFlag(repo), "--json", "headRefOid"])),
+      "pull request head",
+    );
+    const headSha = textField(parsed.headRefOid, "pull request head SHA");
+    if (!SHA_RE.test(headSha)) throw new Error("Invalid GitHub pull request head SHA");
+    return headSha;
+  }
+
+  /**
+   * Rebuilds the diff GitHub would not send as one response, from
+   * `/pulls/{number}/files`.
+   *
+   * Two things make this safe to review. The head SHA is read either side of
+   * paging and must match: paging is many round trips, and a diff assembled
+   * across a push would describe two commits at once, invalidating every
+   * inline anchor computed from it. And the result is only returned when it
+   * is provably whole — `assertCompleteDiff` rejects a diff missing patches
+   * or truncated by GitHub's file cap rather than let a subset of the pull
+   * request be reviewed as if it were all of it.
+   */
+  private async getDiffFromFiles(
+    repo: GitHubRepositoryRef | undefined,
+    id: string,
+  ): Promise<string> {
+    const headBefore = await this.currentHeadSha(repo, id);
+
+    const perPage = 100;
+    const maxPages = GITHUB_PULL_FILES_CAP / perPage;
+    const rows: Record<string, unknown>[] = [];
+    let truncated = false;
+    for (let page = 1; page <= maxPages; page += 1) {
+      // `-X GET` is REQUIRED alongside `-f`: `gh api` silently switches to
+      // POST once any `-f`/`-F` is present. See findBotComment's doc comment.
+      const batch = parseSlurpedArray(
+        await this.execGh([
+          "api", "-X", "GET", `${apiRepo(repo)}/pulls/${id}/files`, ...apiHost(repo),
+          "-f", `per_page=${perPage}`, "-f", `page=${page}`,
+        ]),
+        "pull request files",
+      );
+      if (batch.length > perPage) throw new Error("GitHub pull request file page exceeds requested bound");
+      rows.push(...batch);
+      if (batch.length < perPage) break;
+      // A full page at the cap means GitHub stopped listing, not that the
+      // pull request happens to end there.
+      if (page === maxPages) truncated = true;
+    }
+
+    const headAfter = await this.currentHeadSha(repo, id);
+    if (headAfter !== headBefore) {
+      throw new Error(
+        `GitHubAdapter: the pull request head advanced from ${headBefore} to ${headAfter} while ` +
+          `the diff was being read file by file; the assembled diff would mix two commits, so it ` +
+          `was discarded. Re-run the review against ${headAfter}.`,
+      );
+    }
+
+    const reconstructed = reconstructDiffFromFiles(rows);
+    const diff = assertCompleteDiff(reconstructed, { truncated, fileCount: rows.length });
+    // Whether the whole diff was loaded is reported BEFORE any rule sees it.
+    console.warn(
+      `GitHubAdapter: the pull request diff exceeds GitHub's single-diff limit; rebuilt the ` +
+        `complete diff from ${rows.length} file(s) via the per-file API at ${headBefore}.`,
+    );
+    return diff;
   }
 
   /**

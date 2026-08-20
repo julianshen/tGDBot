@@ -32,6 +32,7 @@ import type { FindingReviewOptions, PendingClarification } from "./conversation/
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
 import { isTransientGhFailure } from "./vcs/gh-retry.js";
+import { isDiffIncompleteError } from "./vcs/github-large-diff.js";
 import {
   buildConversationContext,
   MAX_REVIEW_CONTEXT_PAGES,
@@ -837,6 +838,27 @@ export async function review(
   try {
     diff = await config.vcsAdapter.getDiff(config.locator);
   } catch (err) {
+    // Issue #33: GitHub would not send the diff as one response, and the
+    // per-file fallback could not load all of it either. What DID load is a
+    // subset of the pull request, and reviewing a subset would report on code
+    // nobody looked at — so this never proceeds. With --max-diff-chars set the
+    // operator has already asked for oversized pull requests to be skipped
+    // rather than fail the build, so it joins that graceful skip; without the
+    // flag the rejection stays fatal, carrying the diagnostic with it.
+    if (config.maxDiffChars !== undefined && isDiffIncompleteError(err)) {
+      console.warn(
+        `tgd-review-agent: ${redactedMessage(err)} With --max-diff-chars ${config.maxDiffChars} ` +
+          `set, this counts as an oversized pull request: skipping the review (nothing was posted).`,
+      );
+      logStatus({
+        status: "skipped",
+        findingsCount: 0,
+        rulesRun: [],
+        rulesFailed: [],
+        reason: "diff-incomplete",
+      });
+      return EXIT_OK;
+    }
     if (config.maxDiffChars === undefined || !isOutputBufferExceededError(err)) throw err;
     console.warn(
       `tgd-review-agent: the diff is too large to fetch within the VCS adapter's output buffer ` +

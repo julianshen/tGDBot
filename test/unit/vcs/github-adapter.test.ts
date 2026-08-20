@@ -2365,3 +2365,161 @@ describe("createInlineReview: only bisects isolatable rejections", () => {
     expect(posts.length).toBeGreaterThan(1);
   });
 });
+
+// Issue #33: GitHub caps a pull request's single-diff response at 20,000
+// lines and refuses anything larger with HTTP 406. The review used to exit
+// there, before a single rule ran. `getDiff` now rebuilds the diff from the
+// per-file endpoint, which has no such ceiling — but only ever hands back a
+// diff it can prove is COMPLETE.
+describe("GitHubAdapter large-diff fallback", () => {
+  const repo = parseRepositoryRef("hmchangw/newchat", "github");
+  const locator188: ReviewLocator = { kind: "repository", repo, number: 188 };
+  const HEAD = "d5e396b14fd0252cda0d035cfe3e190ade9f4e5f";
+
+  const diffTooLarge = (): Error =>
+    new Error(
+      "Command failed: gh pr diff 188 --repo github.com/hmchangw/newchat\n" +
+        "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum " +
+        "number of lines (20000)\nPullRequest.diff_too_large",
+    );
+
+  const fileRow = (name: string, patch = "@@ -1 +1 @@\n-const a = 1;\n+const a = 2;") => ({
+    filename: name, status: "modified", additions: 1, deletions: 1, changes: 2, patch,
+  });
+
+  /**
+   * Builds an execGh that refuses `gh pr diff` the way GitHub does, answers
+   * `gh pr view` with `head`, and serves `pages` to the files endpoint.
+   */
+  const execGhServing = (pages: unknown[][], head: string | string[] = HEAD) => {
+    const heads = Array.isArray(head) ? [...head] : [head];
+    return vi.fn(async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") throw diffTooLarge();
+      if (args[0] === "pr" && args[1] === "view") {
+        return JSON.stringify({ headRefOid: heads.length > 1 ? heads.shift() : heads[0] });
+      }
+      const page = Number(args.find((arg) => arg.startsWith("page="))?.slice("page=".length));
+      return JSON.stringify(pages[page - 1] ?? []);
+    });
+  };
+
+  it("rebuilds the diff from the per-file endpoint when GitHub refuses the whole one", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188);
+
+    expect(diff).toBe(
+      "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n" +
+        "@@ -1 +1 @@\n-const a = 1;\n+const a = 2;\n",
+    );
+  });
+
+  // `-X GET` is mandatory once any `-f` is present, or `gh api` silently
+  // switches to POST — the same trap documented on findBotComment.
+  it("requests the files endpoint with explicit GET and explicit paging", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.getDiff(locator188);
+
+    expect(execGh).toHaveBeenCalledWith([
+      "api", "-X", "GET", "repos/hmchangw/newchat/pulls/188/files",
+      "--hostname", "github.com", "-f", "per_page=100", "-f", "page=1",
+    ]);
+  });
+
+  it("pages until a short page, concatenating the files in order", async () => {
+    const firstPage = Array.from({ length: 100 }, (_unused, index) => fileRow(`src/f${index}.ts`));
+    const execGh = execGhServing([firstPage, [fileRow("src/last.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188);
+
+    expect(diff).toContain("a/src/f0.ts");
+    expect(diff).toContain("a/src/last.ts");
+    expect(diff.indexOf("a/src/f99.ts")).toBeLessThan(diff.indexOf("a/src/last.ts"));
+    const pages = execGh.mock.calls.filter((call) => call[0][0] === "api").length;
+    expect(pages).toBe(2);
+  });
+
+  // A network or auth failure must NOT be quietly converted into a scrape.
+  it("lets an unrelated `gh pr diff` failure stay fatal", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") throw new Error("error connecting to api.github.com");
+      return "[]";
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/error connecting/);
+    expect(execGh).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses to return a diff whose patches GitHub withheld", async () => {
+    const execGh = execGhServing([[
+      fileRow("src/a.ts"),
+      { filename: "src/huge.ts", status: "modified", additions: 9000, deletions: 12, changes: 9012 },
+    ]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toMatchObject({
+      code: "GITHUB_DIFF_INCOMPLETE",
+      omittedPatches: ["src/huge.ts"],
+    });
+  });
+
+  it("refuses to return a diff truncated by GitHub's 3,000-file cap", async () => {
+    const fullPage = (page: number) =>
+      Array.from({ length: 100 }, (_unused, index) => fileRow(`src/p${page}-${index}.ts`));
+    const execGh = execGhServing(Array.from({ length: 30 }, (_unused, index) => fullPage(index)));
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toMatchObject({
+      code: "GITHUB_DIFF_INCOMPLETE",
+      truncated: true,
+    });
+  });
+
+  // Paging takes many round trips. If the head moves partway through, the
+  // assembled patch describes two different commits at once — and every
+  // inline anchor computed from it would point into the wrong tree.
+  it("refuses a diff assembled across a head advance", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], [HEAD, "0".repeat(40)]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/head advanced/i);
+  });
+
+  it("pins the diff to one head by checking the SHA either side of paging", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.getDiff(locator188);
+
+    const views = execGh.mock.calls.filter((call) => call[0][1] === "view");
+    expect(views).toHaveLength(2);
+    expect(views[0]?.[0]).toEqual([
+      "pr", "view", "188", "--repo", "github.com/hmchangw/newchat", "--json", "headRefOid",
+    ]);
+  });
+
+  // "Report whether the complete diff was loaded before dispatching rules."
+  it("says on stderr that the diff was rebuilt, and that it is complete", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+
+    try {
+      await new GitHubAdapter(execGh).getDiff(locator188);
+      expect(warn.mock.calls.flat().join(" ")).toMatch(/rebuilt the complete diff from 1 file/i);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("rejects a files page larger than the one it asked for", async () => {
+    const execGh = execGhServing([Array.from({ length: 101 }, (_u, i) => fileRow(`src/f${i}.ts`))]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/exceeds requested bound/i);
+  });
+});

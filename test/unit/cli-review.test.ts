@@ -18,6 +18,7 @@ import { poll } from "../../src/poll/poll.js";
 import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
 import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
+import { GitHubDiffIncompleteError } from "../../src/vcs/github-large-diff.js";
 import { deriveInlineChildId, formatInlineRecoveryMarker, formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
 import { resolveReviewLocator } from "../../src/config.js";
@@ -984,6 +985,58 @@ describe("review", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/maxBuffer/);
+    expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+
+    vi.restoreAllMocks();
+  });
+
+  // Issue #33: GitHub refuses a diff over 20,000 lines, and the per-file
+  // fallback could not load all of it either (a withheld patch, or more files
+  // than GitHub will list). There is no honest review to run: what DID load is
+  // a subset of the pull request, and reviewing it would report "clean" on
+  // code nobody looked at. With the ceiling flag set — the operator has
+  // already said oversized pull requests should be skipped, not fail the
+  // build — this joins the graceful skip.
+  it("issue #33: an incomplete large diff with --max-diff-chars set skips instead of reviewing a subset", async () => {
+    const h = makeHarness({ args: makeArgs({ maxDiffChars: 500000 }), botComment: null });
+    h.vcsAdapter.getDiff.mockRejectedValue(
+      new GitHubDiffIncompleteError("GitHub sent no patch for 1 changed file (src/huge.ts)", {
+        omittedPatches: ["src/huge.ts"],
+        truncated: false,
+      }),
+    );
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.loadRules).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    // The notice names the file whose patch is missing, so the skip is actionable.
+    expect(warnSpy.mock.calls.map((c) => c.join(" ")).join("\n")).toContain("src/huge.ts");
+    // A distinct reason: this is NOT "the diff is bigger than your ceiling",
+    // it is "the complete diff could not be loaded at all".
+    expect(logSpy).toHaveBeenCalledWith(
+      `TGD_REVIEW_RESULT: ${JSON.stringify({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [], reason: "diff-incomplete" })}`,
+    );
+
+    vi.restoreAllMocks();
+  });
+
+  it("issue #33: an incomplete large diff WITHOUT --max-diff-chars fails loudly rather than reviewing a subset", async () => {
+    const h = makeHarness({ botComment: null });
+    h.vcsAdapter.getDiff.mockRejectedValue(
+      new GitHubDiffIncompleteError("GitHub sent no patch for 1 changed file (src/huge.ts)", {
+        omittedPatches: ["src/huge.ts"],
+        truncated: false,
+      }),
+    );
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/src\/huge\.ts/);
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
     expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
 
     vi.restoreAllMocks();
