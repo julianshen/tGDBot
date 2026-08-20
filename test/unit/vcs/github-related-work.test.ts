@@ -220,3 +220,55 @@ describe("resolveGitHubRelatedWork", () => {
     expect(maximum).toBe(3);
   });
 });
+
+// Issue #30: when the GitHub API is unreachable, every reference lookup fails
+// the same way. Retrying each one multiplies a dead network by the reference
+// count — up to ten references times the retry budget — before the review can
+// continue. The first transient failure is enough to know the rest will fail.
+describe("resolveGitHubRelatedWork: transient outage short-circuits", () => {
+  it("stops calling the provider once the network is proven unreachable", async () => {
+    const execGh = vi.fn(async () => {
+      throw new Error("error connecting to api.github.com");
+    });
+    const references = Array.from({ length: 8 }, (_, index) => ({
+      provider: "github" as const,
+      kind: "issue" as const,
+      identifier: `#${index + 1}`,
+      projectPath: "acme/app",
+      number: index + 1,
+    }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const resolved = await resolveGitHubRelatedWork(references as never, execGh as never);
+
+    warn.mockRestore();
+    // Every reference still comes back — unresolved, never dropped.
+    expect(resolved).toHaveLength(8);
+    // But the provider is not hammered once it is clearly down.
+    expect(execGh.mock.calls.length).toBeLessThanOrEqual(3);
+  });
+
+  it("keeps resolving after an ordinary per-reference failure", async () => {
+    let call = 0;
+    const execGh = vi.fn(async () => {
+      call += 1;
+      if (call === 1) throw new Error("gh: Not Found (HTTP 404)");
+      return JSON.stringify({ title: "ok", state: "OPEN", url: "https://github.com/acme/app/issues/2" });
+    });
+    const references = Array.from({ length: 4 }, (_, index) => ({
+      provider: "github" as const,
+      kind: "issue" as const,
+      identifier: `#${index + 1}`,
+      projectPath: "acme/app",
+      number: index + 1,
+    }));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const resolved = await resolveGitHubRelatedWork(references as never, execGh as never);
+
+    warn.mockRestore();
+    expect(resolved).toHaveLength(4);
+    // A 404 says nothing about the network, so the rest are still attempted.
+    expect(execGh.mock.calls.length).toBeGreaterThan(1);
+  });
+});

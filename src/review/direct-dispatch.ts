@@ -66,6 +66,7 @@ import type { DispatchResult, Finding } from "./types.js";
 import type { ReviewDispatchInput } from "./types.js";
 import { validateDispatchContext } from "./dispatch-context.js";
 import { planReviewWorkflow } from "./workflow.js";
+import { redactSecrets } from "../conversation/redact.js";
 
 /** Creates one rule's review session. Tests inject stubs; the real factory below is the only SDK toucher. */
 export type DirectSessionFactory = (rule: EffectiveRule, cwd: string) => Promise<DispatchSession>;
@@ -295,7 +296,10 @@ export async function dispatchRulesDirect(
     >;
     for (const name of unresolvedNames) ruleFailureReasons[name] = unresolved[name];
 
-    interface RuleOutcome {
+    // Enough to see what the model actually did without dumping a full response.
+const UNPARSEABLE_EXCERPT_CHARS = 2_000;
+
+interface RuleOutcome {
       readonly ruleName: string;
       readonly succeeded: boolean;
       readonly findings: readonly Finding[];
@@ -322,10 +326,19 @@ export async function dispatchRulesDirect(
         // (undefined — the rule FAILED to follow its output contract) from
         // a genuinely empty review ([] — a SUCCESS).
         if (text === undefined || extractFindingsArray(text) === undefined) {
+          // Preserve WHAT the reviewer actually said. Discarding it left four
+          // rules failing on one run with nothing to diagnose from, since the
+          // "see the CI logs" it pointed at did not contain the output either
+          // (issue #30). Bounded and redacted: this is model output over an
+          // attacker-controlled diff, and it goes to logs.
+          const excerpt = text === undefined
+            ? "<no assistant message>"
+            : `${redactSecrets(text).slice(0, UNPARSEABLE_EXCERPT_CHARS)}${text.length > UNPARSEABLE_EXCERPT_CHARS ? "… (truncated)" : ""}`;
           const failureReason =
-            "the reviewer returned no parseable findings array (see the CI logs)";
+            `the reviewer returned no parseable findings array (${text === undefined ? 0 : text.length} chars)`;
           console.warn(
-            `dispatchRulesDirect: rule "${rule.name}" produced no parseable findings array`,
+            `dispatchRulesDirect: rule "${rule.name}" produced no parseable findings array; ` +
+              `it returned: ${excerpt}`,
           );
           return { ruleName: rule.name, succeeded: false, findings: [], failureReason };
         }

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { main, parseArgs } from "../../src/cli.js";
+import { describeCommandFailure, main, parseArgs } from "../../src/cli.js";
 import { parseCommandArgs } from "../../src/cli-args.js";
 
 describe("parseCommandArgs", () => {
@@ -282,5 +282,41 @@ describe("main poll exit codes", () => {
     } finally {
       exit.mockRestore();
     }
+  });
+});
+
+// Issue #30: a transient network failure surfaced as a raw command dump —
+// "Command failed: gh api -X GET ... error connecting to api.github.com" —
+// which reads like a tGDBot logic failure rather than "the network blipped".
+describe("describeCommandFailure", () => {
+  it("names a transient provider failure", () => {
+    const described = describeCommandFailure(new Error(
+      "Command failed: gh api -X GET -f per_page=50 repos/o/r/issues/279/comments\nerror connecting to api.github.com",
+    ));
+    expect(described).toContain("transient provider failure");
+    expect(described).toContain("error connecting to api.github.com");
+  });
+
+  it("marks it retryable so an operator knows to run it again", () => {
+    const described = describeCommandFailure(new Error("HTTP 503: No server is currently available"));
+    expect(described.toLowerCase()).toContain("retry");
+  });
+
+  it("leaves a definite rejection unclassified rather than mislabelling it", () => {
+    const described = describeCommandFailure(new Error("gh: Not Found (HTTP 404)"));
+    expect(described).not.toContain("transient provider failure");
+    expect(described).toContain("HTTP 404");
+  });
+
+  it("leaves an ordinary logic error alone", () => {
+    const described = describeCommandFailure(new Error("Review metadata is too large for a provider comment"));
+    expect(described).toBe("Review metadata is too large for a provider comment");
+  });
+
+  it("redacts credentials echoed by a failing command", () => {
+    const described = describeCommandFailure(new Error(
+      "Command failed: gh api https://user:sup3rs3cret@github.com/o/r\nerror connecting to api.github.com",
+    ));
+    expect(described).not.toContain("sup3rs3cret");
   });
 });

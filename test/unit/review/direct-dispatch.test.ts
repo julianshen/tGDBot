@@ -791,3 +791,43 @@ describe("finding decision contract", () => {
     expect(result.rulesRun).toEqual(["rule-a"]);
   });
 });
+
+// Issue #30: when a rule returned no parseable findings array the model's actual
+// output was thrown away, leaving only "(see the CI logs)" — and the CI logs did
+// not contain it either. Four rules failed this way on one run with nothing to
+// diagnose from.
+describe("dispatchRulesDirect: unparseable rule output is diagnosable", () => {
+  it("logs a bounded excerpt of what the reviewer actually returned", async () => {
+    const output = "I could not review this diff because the context looked truncated. Sorry!";
+    const createSession: DirectSessionFactory = async () => ({
+      async prompt() {},
+      getLastAssistantText: () => output,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const result = await dispatchRulesDirect([makeRule({ name: "oom" })], "diff", false, { createSession });
+
+    const warned = warn.mock.calls.map((call) => String(call[0])).join("\n");
+    warn.mockRestore();
+    expect(result.rulesFailed).toEqual(["oom"]);
+    expect(warned).toContain("oom");
+    expect(warned).toContain("could not review this diff");
+  });
+
+  it("bounds a very large unparseable output instead of dumping it", async () => {
+    const output = `PREFIX-${"x".repeat(20_000)}-SUFFIX`;
+    const createSession: DirectSessionFactory = async () => ({
+      async prompt() {},
+      getLastAssistantText: () => output,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await dispatchRulesDirect([makeRule({ name: "oom" })], "diff", false, { createSession });
+
+    const warned = warn.mock.calls.map((call) => String(call[0])).join("\n");
+    warn.mockRestore();
+    expect(warned).toContain("PREFIX-");
+    expect(warned).not.toContain("-SUFFIX");
+    expect(warned.length).toBeLessThan(4000);
+  });
+});
