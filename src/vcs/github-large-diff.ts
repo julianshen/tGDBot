@@ -45,6 +45,14 @@ export interface ReconstructedDiff {
    * the diff is INCOMPLETE — some changed lines are simply not in it.
    */
   readonly omittedPatches: readonly string[];
+  /**
+   * Files with no patch and no changed lines: a binary file, or a mode-only
+   * change. The endpoint renders the two identically, so which one this is
+   * cannot be known from here — see `reconstructDiffFromFiles`. No line
+   * content is missing (there is none), so these do not make the diff
+   * incomplete; they are reported so an operator can see them.
+   */
+  readonly contentless: readonly string[];
 }
 
 /** Raised when the complete diff could not be loaded, naming what is missing. */
@@ -125,6 +133,7 @@ export function reconstructDiffFromFiles(
 ): ReconstructedDiff {
   const lines: string[] = [];
   const omittedPatches: string[] = [];
+  const contentless: string[] = [];
 
   for (const row of rows) {
     const newPath = fileText(row.filename, "path");
@@ -168,19 +177,23 @@ export function reconstructDiffFromFiles(
       continue;
     }
 
-    // No patch and nothing changed textually: a binary file, a pure
-    // rename/copy, or a mode-only change. All three are already fully
-    // described — `gh pr diff` would render exactly this.
-    if (!moved) {
-      const left = added ? "/dev/null" : `a/${oldPath}`;
-      const right = removed ? "/dev/null" : `b/${newPath}`;
-      lines.push(`Binary files ${left} and ${right} differ`);
-    }
+    // No patch and nothing changed textually. A pure rename or copy is
+    // already fully described by the headers above. Anything else is either a
+    // binary file or a mode-only change, and this endpoint renders those
+    // IDENTICALLY — no patch, no additions, no deletions, and no mode field.
+    // Guessing would put a falsehood in the diff: "Binary files differ" on a
+    // chmod hides the permission change behind a wrong label, and `old mode`/
+    // `new mode` on a PNG is simply untrue. The header alone states only what
+    // is known — this file is part of the change, with no line content to
+    // show — and the path is reported so the gap is visible. (Codex review,
+    // PR #34.)
+    if (!moved) contentless.push(newPath);
   }
 
   return {
     diff: lines.length === 0 ? "" : `${lines.join("\n")}\n`,
     omittedPatches,
+    contentless,
   };
 }
 

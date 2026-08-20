@@ -42,6 +42,11 @@ afterEach(() => {
   for (const directory of temporaryStateRoots.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
   }
+  // Tests here spy on console.log/warn and restore at the end of the body. A
+  // FAILING assertion skips that call, leaking the spy into every later test
+  // and turning one red test into a confusing cascade. Restoring here runs on
+  // both paths (CodeRabbit review, PR #34).
+  vi.restoreAllMocks();
 });
 
 function isolatedStateDir(): string {

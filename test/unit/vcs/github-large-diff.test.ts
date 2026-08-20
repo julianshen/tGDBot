@@ -148,26 +148,56 @@ describe("reconstructDiffFromFiles", () => {
     expect(omittedPatches).toEqual([]);
   });
 
-  // git renders binary files exactly this way, and so does `gh pr diff`.
-  // Nothing reviewable is lost, so this must not be reported as an omission.
-  it("renders a binary file the way git does, and calls it complete", () => {
+  // A binary file and a mode-only change are INDISTINGUISHABLE in this
+  // endpoint's output: both are a no-patch entry with zero additions and
+  // deletions. Claiming either one would be inventing a fact — "Binary files
+  // differ" on a chmod hides the permission change behind a false label, and
+  // `old mode`/`new mode` on a PNG is simply wrong. The header alone says
+  // what is actually known: this file is part of the change, with no
+  // line-level content to show. (Codex review, PR #34.)
+  it("does not invent content for an entry with no patch and no changed lines", () => {
     const { diff, omittedPatches } = reconstructDiffFromFiles([
       { filename: "docs/logo.png", status: "modified", additions: 0, deletions: 0, changes: 0 },
     ]);
 
-    expect(diff).toBe(
-      "diff --git a/docs/logo.png b/docs/logo.png\n" +
-        "Binary files a/docs/logo.png and b/docs/logo.png differ\n",
-    );
+    expect(diff).toBe("diff --git a/docs/logo.png b/docs/logo.png\n");
     expect(omittedPatches).toEqual([]);
   });
 
-  it("renders an added binary file against /dev/null", () => {
+  it("never labels a mode-only change as binary", () => {
     const { diff } = reconstructDiffFromFiles([
-      { filename: "docs/logo.png", status: "added", additions: 0, deletions: 0, changes: 0 },
+      { filename: "scripts/build.sh", status: "modified", additions: 0, deletions: 0, changes: 0 },
     ]);
 
-    expect(diff).toContain("Binary files /dev/null and b/docs/logo.png differ\n");
+    expect(diff).not.toMatch(/Binary files/);
+  });
+
+  // These entries are still surfaced, so an operator can see the reconstruction
+  // could not show line content for them.
+  it("names the entries it could show no content for", () => {
+    const { contentless } = reconstructDiffFromFiles([
+      modifiedRow,
+      { filename: "docs/logo.png", status: "modified", additions: 0, deletions: 0, changes: 0 },
+    ]);
+
+    expect(contentless).toEqual(["docs/logo.png"]);
+  });
+
+  // A rename is fully described by its headers, so it is not "contentless" in
+  // the sense above — nothing about it is unknown.
+  it("does not count a pure rename as contentless", () => {
+    const { contentless } = reconstructDiffFromFiles([
+      {
+        filename: "src/new-name.ts",
+        previous_filename: "src/old-name.ts",
+        status: "renamed",
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+      },
+    ]);
+
+    expect(contentless).toEqual([]);
   });
 
   // THE case that must never pass silently: GitHub reports the file changed

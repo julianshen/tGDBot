@@ -1275,15 +1275,34 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     }
   }
 
-  /** Reads the PR's current head SHA, validated. */
-  private async currentHeadSha(repo: GitHubRepositoryRef | undefined, id: string): Promise<string> {
+  /**
+   * Reads the PR's current head SHA and its own changed-file tally, validated.
+   *
+   * The tally is what makes truncation provable: a full final page is NOT
+   * evidence that GitHub stopped listing, because a pull request may simply
+   * change a multiple of the page size (Codex review, PR #34). Comparing the
+   * rows actually loaded against the pull request's own count says which it
+   * was. `changedFiles` is absent on older/partial responses, so it is
+   * optional here and the caller falls back accordingly.
+   */
+  private async pullHeadAndFileCount(
+    repo: GitHubRepositoryRef | undefined,
+    id: string,
+  ): Promise<{ headSha: string; changedFiles?: number }> {
     const parsed = object(
-      JSON.parse(await this.execGh(["pr", "view", id, ...repoFlag(repo), "--json", "headRefOid"])),
+      JSON.parse(
+        await this.execGh(["pr", "view", id, ...repoFlag(repo), "--json", "headRefOid,changedFiles"]),
+      ),
       "pull request head",
     );
     const headSha = textField(parsed.headRefOid, "pull request head SHA");
     if (!SHA_RE.test(headSha)) throw new Error("Invalid GitHub pull request head SHA");
-    return headSha;
+    const changedFiles = parsed.changedFiles;
+    if (changedFiles === undefined || changedFiles === null) return { headSha };
+    if (typeof changedFiles !== "number" || !Number.isSafeInteger(changedFiles) || changedFiles < 0) {
+      throw new Error("Invalid GitHub pull request changed file count");
+    }
+    return { headSha, changedFiles };
   }
 
   /**
@@ -1302,12 +1321,15 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     repo: GitHubRepositoryRef | undefined,
     id: string,
   ): Promise<string> {
-    const headBefore = await this.currentHeadSha(repo, id);
+    const { headSha: headBefore, changedFiles } = await this.pullHeadAndFileCount(repo, id);
 
     const perPage = 100;
-    const maxPages = GITHUB_PULL_FILES_CAP / perPage;
+    // One page beyond the cap, so a pull request that changes exactly
+    // GITHUB_PULL_FILES_CAP files can still be proven complete by a final
+    // empty page rather than assumed truncated.
+    const maxPages = GITHUB_PULL_FILES_CAP / perPage + 1;
     const rows: Record<string, unknown>[] = [];
-    let truncated = false;
+    let ranOutOfPages = false;
     for (let page = 1; page <= maxPages; page += 1) {
       // `-X GET` is REQUIRED alongside `-f`: `gh api` silently switches to
       // POST once any `-f`/`-F` is present. See findBotComment's doc comment.
@@ -1321,12 +1343,14 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       if (batch.length > perPage) throw new Error("GitHub pull request file page exceeds requested bound");
       rows.push(...batch);
       if (batch.length < perPage) break;
-      // A full page at the cap means GitHub stopped listing, not that the
-      // pull request happens to end there.
-      if (page === maxPages) truncated = true;
+      if (page === maxPages) ranOutOfPages = true;
     }
 
-    const headAfter = await this.currentHeadSha(repo, id);
+    // The pull request's own tally is the authority on whether every file
+    // arrived; only when it is unavailable does the page shape decide.
+    const truncated = changedFiles === undefined ? ranOutOfPages : rows.length < changedFiles;
+
+    const { headSha: headAfter } = await this.pullHeadAndFileCount(repo, id);
     if (headAfter !== headBefore) {
       throw new Error(
         `GitHubAdapter: the pull request head advanced from ${headBefore} to ${headAfter} while ` +
@@ -1337,10 +1361,18 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
 
     const reconstructed = reconstructDiffFromFiles(rows);
     const diff = assertCompleteDiff(reconstructed, { truncated, fileCount: rows.length });
-    // Whether the whole diff was loaded is reported BEFORE any rule sees it.
+    // Whether the whole diff was loaded is reported BEFORE any rule sees it,
+    // including the files whose line content the endpoint could not express.
+    const { contentless } = reconstructed;
+    const contentlessNote = contentless.length === 0
+      ? ""
+      : ` ${contentless.length} file(s) carry no line content (binary or mode-only; the ` +
+        `endpoint does not distinguish them): ${contentless.slice(0, 10).join(", ")}` +
+        `${contentless.length > 10 ? `, and ${contentless.length - 10} more` : ""}.`;
     console.warn(
       `GitHubAdapter: the pull request diff exceeds GitHub's single-diff limit; rebuilt the ` +
-        `complete diff from ${rows.length} file(s) via the per-file API at ${headBefore}.`,
+        `complete diff from ${rows.length} file(s) via the per-file API at ${headBefore}.` +
+        contentlessNote,
     );
     return diff;
   }

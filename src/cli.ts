@@ -598,9 +598,11 @@ interface StatusLog {
   // serialized, never mutated.
   rulesRun: readonly string[];
   rulesFailed: readonly string[];
-  // Design-review #13: distinguishes WHY a run was skipped. Only present for
-  // the --max-diff-chars ceiling skip ("diff-too-large"); the original dedup
-  // skip keeps its exact pre-existing shape (no reason field) so anyone
+  // Design-review #13: distinguishes WHY a run was skipped. Present for the
+  // --max-diff-chars ceiling skip ("diff-too-large") and, since issue #33,
+  // for a diff GitHub could not hand over completely ("diff-incomplete") —
+  // the two mean different things and are reported separately. The original
+  // dedup skip keeps its exact pre-existing shape (no reason field) so anyone
   // already parsing that line sees no change.
   reason?: string;
   // Task 8 review fix #1: only present (and non-empty) when one or more

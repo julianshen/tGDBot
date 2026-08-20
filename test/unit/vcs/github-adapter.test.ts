@@ -2391,12 +2391,20 @@ describe("GitHubAdapter large-diff fallback", () => {
    * Builds an execGh that refuses `gh pr diff` the way GitHub does, answers
    * `gh pr view` with `head`, and serves `pages` to the files endpoint.
    */
-  const execGhServing = (pages: unknown[][], head: string | string[] = HEAD) => {
+  const execGhServing = (
+    pages: unknown[][],
+    head: string | string[] = HEAD,
+    changedFiles?: number,
+  ) => {
     const heads = Array.isArray(head) ? [...head] : [head];
+    const total = changedFiles ?? pages.reduce((sum, page) => sum + page.length, 0);
     return vi.fn(async (args: string[]) => {
       if (args[0] === "pr" && args[1] === "diff") throw diffTooLarge();
       if (args[0] === "pr" && args[1] === "view") {
-        return JSON.stringify({ headRefOid: heads.length > 1 ? heads.shift() : heads[0] });
+        return JSON.stringify({
+          headRefOid: heads.length > 1 ? heads.shift() : heads[0],
+          changedFiles: total,
+        });
       }
       const page = Number(args.find((arg) => arg.startsWith("page="))?.slice("page=".length));
       return JSON.stringify(pages[page - 1] ?? []);
@@ -2468,10 +2476,37 @@ describe("GitHubAdapter large-diff fallback", () => {
     });
   });
 
+  const fullPages = (count: number): unknown[][] =>
+    Array.from({ length: count }, (_unused, page) =>
+      Array.from({ length: 100 }, (_u, index) => fileRow(`src/p${page}-${index}.ts`)));
+
   it("refuses to return a diff truncated by GitHub's 3,000-file cap", async () => {
-    const fullPage = (page: number) =>
-      Array.from({ length: 100 }, (_unused, index) => fileRow(`src/p${page}-${index}.ts`));
-    const execGh = execGhServing(Array.from({ length: 30 }, (_unused, index) => fullPage(index)));
+    // 3,000 loaded, but the pull request says it changed more than that.
+    const execGh = execGhServing(fullPages(30), HEAD, 3200);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toMatchObject({
+      code: "GITHUB_DIFF_INCOMPLETE",
+      truncated: true,
+    });
+  });
+
+  // Codex review, PR #34: a full final page is not proof of truncation — a
+  // pull request may simply change exactly 3,000 files. Refusing that one
+  // would reject a diff that had in fact loaded completely.
+  it("reviews a pull request that changes exactly 3,000 files", async () => {
+    const execGh = execGhServing(fullPages(30), HEAD, 3000);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188);
+
+    expect(diff).toContain("a/src/p29-99.ts");
+  });
+
+  // The file count is the authority in both directions: a list shorter than
+  // the pull request's own tally is missing files, whatever the page shape.
+  it("refuses a file list shorter than the pull request's own changed-file count", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], HEAD, 7);
     const adapter = new GitHubAdapter(execGh);
 
     await expect(adapter.getDiff(locator188)).rejects.toMatchObject({
@@ -2499,7 +2534,8 @@ describe("GitHubAdapter large-diff fallback", () => {
     const views = execGh.mock.calls.filter((call) => call[0][1] === "view");
     expect(views).toHaveLength(2);
     expect(views[0]?.[0]).toEqual([
-      "pr", "view", "188", "--repo", "github.com/hmchangw/newchat", "--json", "headRefOid",
+      "pr", "view", "188", "--repo", "github.com/hmchangw/newchat",
+      "--json", "headRefOid,changedFiles",
     ]);
   });
 
