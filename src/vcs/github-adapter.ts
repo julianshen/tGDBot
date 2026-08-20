@@ -1260,7 +1260,10 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     };
   }
 
-  async getDiff(locator: ReviewLocator): Promise<string> {
+  async getDiff(
+    locator: ReviewLocator,
+    options?: { expectedHeadSha?: string },
+  ): Promise<string> {
     const { repo, id } = resolvePullLocator(locator);
     try {
       return await this.execGh(["pr", "diff", id, ...repoFlag(repo)]);
@@ -1271,7 +1274,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       // review is never dispatched against a diff we scraped after a
       // failure we did not understand.
       if (!isDiffTooLargeError(error)) throw error;
-      return await this.getDiffFromFiles(repo, id);
+      return await this.getDiffFromFiles(repo, id, options?.expectedHeadSha);
     }
   }
 
@@ -1320,8 +1323,19 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
   private async getDiffFromFiles(
     repo: GitHubRepositoryRef | undefined,
     id: string,
+    expectedHeadSha?: string,
   ): Promise<string> {
     const { headSha: headBefore, changedFiles } = await this.pullHeadAndFileCount(repo, id);
+    // Agreeing with itself is not enough. The caller pinned a head before this
+    // ran and will publish against THAT one, so a diff of any other commit is
+    // the wrong diff however self-consistent it is (Codex review, PR #34).
+    if (expectedHeadSha !== undefined && headBefore !== expectedHeadSha) {
+      throw new Error(
+        `GitHubAdapter: the pull request head is ${headBefore}, no longer the ${expectedHeadSha} ` +
+          `this review was prepared against; a diff read now would be published against the older ` +
+          `commit. Re-run the review against ${headBefore}.`,
+      );
+    }
 
     const perPage = 100;
     // One page beyond the cap, so a pull request that changes exactly
@@ -1366,8 +1380,8 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     const { contentless } = reconstructed;
     const contentlessNote = contentless.length === 0
       ? ""
-      : ` ${contentless.length} file(s) carry no line content (binary or mode-only; the ` +
-        `endpoint does not distinguish them): ${contentless.slice(0, 10).join(", ")}` +
+      : ` ${contentless.length} file(s) carry no line content (binary, empty, or mode-only; ` +
+        `the endpoint does not distinguish them): ${contentless.slice(0, 10).join(", ")}` +
         `${contentless.length > 10 ? `, and ${contentless.length - 10} more` : ""}.`;
     console.warn(
       `GitHubAdapter: the pull request diff exceeds GitHub's single-diff limit; rebuilt the ` +

@@ -170,7 +170,10 @@ describe("review — default dependency wiring", () => {
     // mocked class) and review() must have driven it correctly.
     expect(hoisted.getPullRequest).toHaveBeenCalledWith(ambientLocator);
     expect(hoisted.findBotComment).toHaveBeenCalledWith(ambientLocator);
-    expect(hoisted.getDiff).toHaveBeenCalledWith(ambientLocator);
+    // The diff is requested against the SAME head this run pinned and will
+    // publish against, so an oversized-PR fallback cannot hand back a diff of
+    // a newer commit (Codex review, PR #34).
+    expect(hoisted.getDiff).toHaveBeenCalledWith(ambientLocator, { expectedHeadSha: "abc12345" });
     expect(hoisted.upsertComment).toHaveBeenCalledTimes(2);
 
     const [prId, pendingBody, existing] = hoisted.upsertComment.mock.calls[0];

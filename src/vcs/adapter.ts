@@ -47,7 +47,17 @@ export interface VcsAdapter {
    */
   resolveRelatedWork(references: readonly RelatedWorkReference[]): Promise<readonly RelatedWorkItem[]>;
   getPullRequest(locator: ReviewLocator): Promise<PullRequestInfo>;
-  getDiff(locator: ReviewLocator): Promise<string>;
+  /**
+   * Fetches the review's diff.
+   *
+   * `expectedHeadSha`, when given, is the head the CALLER has already pinned
+   * and will publish against (dedup fingerprint, inline `commit_id`). An
+   * implementation that can observe the head it actually read must reject a
+   * mismatch rather than return a diff of a different commit: findings
+   * computed from newer code but published against the older SHA anchor to
+   * lines that may not exist there.
+   */
+  getDiff(locator: ReviewLocator, options?: { expectedHeadSha?: string }): Promise<string>;
   findBotComment(locator: ReviewLocator): Promise<BotComment | null>;
   /**
    * Creates or updates the summary and returns the exact provider-confirmed

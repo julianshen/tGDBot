@@ -2539,6 +2539,39 @@ describe("GitHubAdapter large-diff fallback", () => {
     ]);
   });
 
+  // Codex review, PR #34: agreeing with ITSELF is not enough. review() caches
+  // pr.headSha before calling getDiff, and publishes against that SHA — inline
+  // comments carry it as commit_id. If the head advances in between, both of
+  // this fallback's own checks see the NEW head and hand back a new-head diff,
+  // while the run goes on to publish findings from that code against the OLD
+  // commit. The caller's expected head is the one that matters.
+  it("refuses a diff whose head is not the one the review is publishing against", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(
+      adapter.getDiff(locator188, { expectedHeadSha: "9".repeat(40) }),
+    ).rejects.toThrow(/head.*(advanced|no longer)/i);
+  });
+
+  it("accepts a diff at exactly the head the review expects", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188, { expectedHeadSha: HEAD });
+
+    expect(diff).toContain("a/src/a.ts");
+  });
+
+  // Without an expected head the fallback still guarantees the diff describes
+  // ONE commit — the pre-existing internal check.
+  it("still rejects a mid-paging head advance when no expected head is given", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], [HEAD, "0".repeat(40)]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/head advanced/i);
+  });
+
   // "Report whether the complete diff was loaded before dispatching rules."
   it("says on stderr that the diff was rebuilt, and that it is complete", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);

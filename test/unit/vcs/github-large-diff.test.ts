@@ -172,6 +172,52 @@ describe("reconstructDiffFromFiles", () => {
     expect(diff).not.toMatch(/Binary files/);
   });
 
+  // Codex review, PR #34: only "binary vs mode-only" is unknown for these
+  // entries — whether the file was ADDED or REMOVED is stated plainly by the
+  // API, and dropping it made an addition read as an unspecified
+  // modification. The /dev/null side says which it was without inventing
+  // anything about the content.
+  it("keeps the add visible for a contentless added file", () => {
+    const { diff, omittedPatches } = reconstructDiffFromFiles([
+      { filename: "docs/logo.png", status: "added", additions: 0, deletions: 0, changes: 0 },
+    ]);
+
+    expect(diff).toBe(
+      "diff --git a/docs/logo.png b/docs/logo.png\n--- /dev/null\n+++ b/docs/logo.png\n",
+    );
+    expect(omittedPatches).toEqual([]);
+  });
+
+  it("keeps the delete visible for a contentless removed file", () => {
+    const { diff } = reconstructDiffFromFiles([
+      { filename: "docs/logo.png", status: "removed", additions: 0, deletions: 0, changes: 0 },
+    ]);
+
+    expect(diff).toBe(
+      "diff --git a/docs/logo.png b/docs/logo.png\n--- a/docs/logo.png\n+++ /dev/null\n",
+    );
+  });
+
+  // A MODIFIED contentless entry is the genuinely ambiguous one: binary or
+  // mode-only, with nothing further known. It stays header-only.
+  it("says nothing beyond the header for a contentless modification", () => {
+    const { diff } = reconstructDiffFromFiles([
+      { filename: "docs/logo.png", status: "modified", additions: 0, deletions: 0, changes: 0 },
+    ]);
+
+    expect(diff).toBe("diff --git a/docs/logo.png b/docs/logo.png\n");
+  });
+
+  // A file header with no hunk yields no anchors, so these can never attract
+  // an inline comment that has nowhere to land.
+  it("offers no commentable lines for a contentless entry", () => {
+    const { diff } = reconstructDiffFromFiles([
+      { filename: "docs/logo.png", status: "added", additions: 0, deletions: 0, changes: 0 },
+    ]);
+
+    expect(commentableLines(diff).size).toBe(0);
+  });
+
   // These entries are still surfaced, so an operator can see the reconstruction
   // could not show line content for them.
   it("names the entries it could show no content for", () => {

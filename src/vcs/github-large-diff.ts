@@ -183,11 +183,17 @@ export function reconstructDiffFromFiles(
     // IDENTICALLY — no patch, no additions, no deletions, and no mode field.
     // Guessing would put a falsehood in the diff: "Binary files differ" on a
     // chmod hides the permission change behind a wrong label, and `old mode`/
-    // `new mode` on a PNG is simply untrue. The header alone states only what
-    // is known — this file is part of the change, with no line content to
-    // show — and the path is reported so the gap is visible. (Codex review,
-    // PR #34.)
-    if (!moved) contentless.push(newPath);
+    // `new mode` on a PNG is simply untrue. (Codex review, PR #34.)
+    //
+    // What IS known is whether the file was added or removed — the API states
+    // it — so the `/dev/null` side is emitted to say so. Only a MODIFIED entry
+    // is wholly ambiguous, and that one gets the header alone. Either way the
+    // path is reported so the gap in line content stays visible.
+    if (!moved) {
+      if (added) lines.push("--- /dev/null", `+++ b/${newPath}`);
+      else if (removed) lines.push(`--- a/${oldPath}`, "+++ /dev/null");
+      contentless.push(newPath);
+    }
   }
 
   return {
