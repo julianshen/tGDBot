@@ -53,21 +53,34 @@ export interface ReconstructedDiff {
    * incomplete; they are reported so an operator can see them.
    */
   readonly contentless: readonly string[];
+  /**
+   * Files whose patch arrived but accounts for fewer changed lines than the
+   * entry itself reports. A non-null `patch` is not automatically a WHOLE
+   * patch, and a fragment would let a rule review the prefix of a large file
+   * and call it clean. Non-empty means the diff is INCOMPLETE.
+   */
+  readonly truncatedPatches: readonly string[];
 }
 
 /** Raised when the complete diff could not be loaded, naming what is missing. */
 export class GitHubDiffIncompleteError extends Error {
   readonly code = "GITHUB_DIFF_INCOMPLETE";
   readonly omittedPatches: readonly string[];
+  readonly truncatedPatches: readonly string[];
   readonly truncated: boolean;
 
   constructor(
     message: string,
-    detail: { readonly omittedPatches: readonly string[]; readonly truncated: boolean },
+    detail: {
+      readonly omittedPatches: readonly string[];
+      readonly truncated: boolean;
+      readonly truncatedPatches?: readonly string[];
+    },
   ) {
     super(message);
     this.name = "GitHubDiffIncompleteError";
     this.omittedPatches = detail.omittedPatches;
+    this.truncatedPatches = detail.truncatedPatches ?? [];
     this.truncated = detail.truncated;
   }
 }
@@ -134,6 +147,7 @@ export function reconstructDiffFromFiles(
   const lines: string[] = [];
   const omittedPatches: string[] = [];
   const contentless: string[] = [];
+  const truncatedPatches: string[] = [];
 
   for (const row of rows) {
     const newPath = fileText(row.filename, "path");
@@ -161,11 +175,31 @@ export function reconstructDiffFromFiles(
       // headers from hunk content by the hunk's own line counts.
       if (typeof row.patch !== "string") throw new Error("Invalid GitHub pull request file patch");
       const patch = row.patch.replace(/\n$/, "");
+      const body = patch.split("\n");
       lines.push(
         added ? "--- /dev/null" : `--- a/${oldPath}`,
         removed ? "+++ /dev/null" : `+++ b/${newPath}`,
-        ...patch.split("\n"),
+        ...body,
       );
+      // GitHub's `patch` carries hunks only — no `---`/`+++` file headers — so
+      // every line starting with + or - is a changed line, including a removed
+      // line whose content happens to read "--". Counting them against the
+      // entry's own totals is what catches a patch that arrived in fragments
+      // (Codex review, PR #34).
+      let patchAdditions = 0;
+      let patchDeletions = 0;
+      for (const line of body) {
+        if (line.startsWith("+")) patchAdditions += 1;
+        else if (line.startsWith("-")) patchDeletions += 1;
+      }
+      // Only a SHORTFALL is evidence of loss. If the counts ever exceed what
+      // the entry reports, that is a disagreement about how GitHub counts,
+      // not missing content, and must not fail an otherwise whole diff.
+      const reportedAdditions = fileCount(row.additions, "addition count");
+      const reportedDeletions = fileCount(row.deletions, "deletion count");
+      if (patchAdditions < reportedAdditions || patchDeletions < reportedDeletions) {
+        truncatedPatches.push(newPath);
+      }
       continue;
     }
 
@@ -200,6 +234,7 @@ export function reconstructDiffFromFiles(
     diff: lines.length === 0 ? "" : `${lines.join("\n")}\n`,
     omittedPatches,
     contentless,
+    truncatedPatches,
   };
 }
 
@@ -212,8 +247,10 @@ export function assertCompleteDiff(
   reconstructed: ReconstructedDiff,
   detail: { readonly truncated: boolean; readonly fileCount: number },
 ): string {
-  const { omittedPatches } = reconstructed;
-  if (omittedPatches.length === 0 && !detail.truncated) return reconstructed.diff;
+  const { omittedPatches, truncatedPatches } = reconstructed;
+  if (omittedPatches.length === 0 && truncatedPatches.length === 0 && !detail.truncated) {
+    return reconstructed.diff;
+  }
 
   const reasons: string[] = [];
   if (detail.truncated) {
@@ -231,11 +268,20 @@ export function assertCompleteDiff(
     );
   }
 
+  if (truncatedPatches.length > 0) {
+    const shown = truncatedPatches.slice(0, 10).join(", ");
+    const rest = truncatedPatches.length > 10 ? `, and ${truncatedPatches.length - 10} more` : "";
+    reasons.push(
+      `${truncatedPatches.length} patch(es) account for fewer changed lines than the file ` +
+        `reports, so part of the change is missing from them (${shown}${rest})`,
+    );
+  }
+
   throw new GitHubDiffIncompleteError(
     `the pull request diff exceeds GitHub's single-diff limit, and the per-file fallback could ` +
       `not load all of it: ${reasons.join("; ")}. Reviewing the ${detail.fileCount} file(s) that ` +
       `did load would silently review a subset of the pull request, so nothing was posted. ` +
       `Split the pull request, or set --max-diff-chars to skip oversized ones instead of failing.`,
-    { omittedPatches, truncated: detail.truncated },
+    { omittedPatches, truncatedPatches, truncated: detail.truncated },
   );
 }

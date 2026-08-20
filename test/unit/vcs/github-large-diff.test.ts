@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   GitHubDiffIncompleteError,
+  assertCompleteDiff,
   isDiffIncompleteError,
   isDiffTooLargeError,
   reconstructDiffFromFiles,
@@ -256,6 +257,87 @@ describe("reconstructDiffFromFiles", () => {
     ]);
 
     expect(omittedPatches).toEqual(["src/huge.ts"]);
+  });
+
+  // Codex review, PR #34: a non-null `patch` is not automatically a WHOLE
+  // patch. `additions`/`deletions` describe the entire file change, so hunks
+  // carrying fewer changed lines than that mean content is missing — and
+  // accepting the fragment would let rules review a prefix of a large file
+  // and report it clean.
+  it("reports a patch carrying fewer changed lines than the file claims", () => {
+    const { truncatedPatches } = reconstructDiffFromFiles([
+      {
+        filename: "src/big.ts",
+        status: "modified",
+        additions: 900,
+        deletions: 12,
+        changes: 912,
+        patch: "@@ -1,2 +1,2 @@\n-const a = 1;\n+const a = 2;\n const b = 3;",
+      },
+    ]);
+
+    expect(truncatedPatches).toEqual(["src/big.ts"]);
+  });
+
+  it("accepts a patch whose hunks account for every changed line", () => {
+    const { truncatedPatches, omittedPatches } = reconstructDiffFromFiles([modifiedRow]);
+
+    expect(truncatedPatches).toEqual([]);
+    expect(omittedPatches).toEqual([]);
+  });
+
+  // A removed line whose CONTENT is "--" renders as "---", and an added line
+  // reading "++" renders as "+++". Inside a hunk body those are ordinary
+  // changed lines, not file headers — GitHub's `patch` carries no headers —
+  // so they must count, or a legitimate diff would look truncated.
+  it("counts hunk-body lines that look like file headers", () => {
+    const { truncatedPatches } = reconstructDiffFromFiles([
+      {
+        filename: "src/dashes.md",
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        patch: "@@ -1,2 +1,2 @@\n---\n+++\n context",
+      },
+    ]);
+
+    expect(truncatedPatches).toEqual([]);
+  });
+
+  // The hunk header itself starts with neither + nor -, and "\ No newline at
+  // end of file" must not be mistaken for content either.
+  it("does not count hunk headers or no-newline markers as changed lines", () => {
+    const { truncatedPatches } = reconstructDiffFromFiles([
+      {
+        filename: "src/eof.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        patch: "@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file",
+      },
+    ]);
+
+    expect(truncatedPatches).toEqual([]);
+  });
+
+  it("refuses the whole diff when a patch is truncated", () => {
+    expect(() =>
+      assertCompleteDiff(
+        reconstructDiffFromFiles([
+          {
+            filename: "src/big.ts",
+            status: "modified",
+            additions: 900,
+            deletions: 0,
+            changes: 900,
+            patch: "@@ -1 +1,2 @@\n const a = 1;\n+const b = 2;",
+          },
+        ]),
+        { truncated: false, fileCount: 1 },
+      ),
+    ).toThrow(/src\/big\.ts/);
   });
 
   it("keeps every file that did arrive when another was omitted", () => {
