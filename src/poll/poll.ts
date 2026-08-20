@@ -1223,7 +1223,7 @@ async function loadReviewMetadata(
     if (options.deps.getReviewMetadata !== undefined) return await options.deps.getReviewMetadata(reviewNumber);
     const locator = { kind: "repository" as const, repo: options.config.repository, number: reviewNumber };
     const pr = await options.config.vcsAdapter.getPullRequest(locator);
-    const diff = await options.config.vcsAdapter.getDiff(locator);
+    const diff = await options.config.vcsAdapter.getDiff(locator, { expectedHeadSha: pr.headSha, expectedBaseSha: pr.baseSha });
     return { headSha: pr.headSha, baseSha: pr.baseSha, diff };
   } catch (error) {
     console.warn(`tgd-review-agent: could not load review metadata (${redactedMessage(error)})`);

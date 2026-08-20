@@ -2365,3 +2365,267 @@ describe("createInlineReview: only bisects isolatable rejections", () => {
     expect(posts.length).toBeGreaterThan(1);
   });
 });
+
+// Issue #33: GitHub caps a pull request's single-diff response at 20,000
+// lines and refuses anything larger with HTTP 406. The review used to exit
+// there, before a single rule ran. `getDiff` now rebuilds the diff from the
+// per-file endpoint, which has no such ceiling — but only ever hands back a
+// diff it can prove is COMPLETE.
+describe("GitHubAdapter large-diff fallback", () => {
+  const repo = parseRepositoryRef("hmchangw/newchat", "github");
+  const locator188: ReviewLocator = { kind: "repository", repo, number: 188 };
+  const HEAD = "d5e396b14fd0252cda0d035cfe3e190ade9f4e5f";
+  const BASE = "b".repeat(40);
+
+  const diffTooLarge = (): Error =>
+    new Error(
+      "Command failed: gh pr diff 188 --repo github.com/hmchangw/newchat\n" +
+        "could not find pull request diff: HTTP 406: Sorry, the diff exceeded the maximum " +
+        "number of lines (20000)\nPullRequest.diff_too_large",
+    );
+
+  const fileRow = (name: string, patch = "@@ -1 +1 @@\n-const a = 1;\n+const a = 2;") => ({
+    filename: name, status: "modified", additions: 1, deletions: 1, changes: 2, patch,
+  });
+
+  /**
+   * Builds an execGh that refuses `gh pr diff` the way GitHub does, answers
+   * `gh pr view` with `head`, and serves `pages` to the files endpoint.
+   */
+  const execGhServing = (
+    pages: unknown[][],
+    head: string | string[] = HEAD,
+    changedFiles?: number,
+    base: string | string[] = BASE,
+  ) => {
+    const heads = Array.isArray(head) ? [...head] : [head];
+    const bases = Array.isArray(base) ? [...base] : [base];
+    const total = changedFiles ?? pages.reduce((sum, page) => sum + page.length, 0);
+    return vi.fn(async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") throw diffTooLarge();
+      if (args[0] === "pr" && args[1] === "view") {
+        return JSON.stringify({
+          headRefOid: heads.length > 1 ? heads.shift() : heads[0],
+          baseRefOid: bases.length > 1 ? bases.shift() : bases[0],
+          changedFiles: total,
+        });
+      }
+      const page = Number(args.find((arg) => arg.startsWith("page="))?.slice("page=".length));
+      return JSON.stringify(pages[page - 1] ?? []);
+    });
+  };
+
+  it("rebuilds the diff from the per-file endpoint when GitHub refuses the whole one", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188);
+
+    expect(diff).toBe(
+      "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n" +
+        "@@ -1 +1 @@\n-const a = 1;\n+const a = 2;\n",
+    );
+  });
+
+  // `-X GET` is mandatory once any `-f` is present, or `gh api` silently
+  // switches to POST — the same trap documented on findBotComment.
+  it("requests the files endpoint with explicit GET and explicit paging", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.getDiff(locator188);
+
+    expect(execGh).toHaveBeenCalledWith([
+      "api", "-X", "GET", "repos/hmchangw/newchat/pulls/188/files",
+      "--hostname", "github.com", "-f", "per_page=100", "-f", "page=1",
+    ]);
+  });
+
+  it("pages until a short page, concatenating the files in order", async () => {
+    const firstPage = Array.from({ length: 100 }, (_unused, index) => fileRow(`src/f${index}.ts`));
+    const execGh = execGhServing([firstPage, [fileRow("src/last.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188);
+
+    expect(diff).toContain("a/src/f0.ts");
+    expect(diff).toContain("a/src/last.ts");
+    expect(diff.indexOf("a/src/f99.ts")).toBeLessThan(diff.indexOf("a/src/last.ts"));
+    const pages = execGh.mock.calls.filter((call) => call[0][0] === "api").length;
+    expect(pages).toBe(2);
+  });
+
+  // A network or auth failure must NOT be quietly converted into a scrape.
+  it("lets an unrelated `gh pr diff` failure stay fatal", async () => {
+    const execGh = vi.fn(async (args: string[]) => {
+      if (args[0] === "pr" && args[1] === "diff") throw new Error("error connecting to api.github.com");
+      return "[]";
+    });
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/error connecting/);
+    expect(execGh).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses to return a diff whose patches GitHub withheld", async () => {
+    const execGh = execGhServing([[
+      fileRow("src/a.ts"),
+      { filename: "src/huge.ts", status: "modified", additions: 9000, deletions: 12, changes: 9012 },
+    ]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toMatchObject({
+      code: "GITHUB_DIFF_INCOMPLETE",
+      omittedPatches: ["src/huge.ts"],
+    });
+  });
+
+  const fullPages = (count: number): unknown[][] =>
+    Array.from({ length: count }, (_unused, page) =>
+      Array.from({ length: 100 }, (_u, index) => fileRow(`src/p${page}-${index}.ts`)));
+
+  it("refuses to return a diff truncated by GitHub's 3,000-file cap", async () => {
+    // 3,000 loaded, but the pull request says it changed more than that.
+    const execGh = execGhServing(fullPages(30), HEAD, 3200);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toMatchObject({
+      code: "GITHUB_DIFF_INCOMPLETE",
+      truncated: true,
+    });
+  });
+
+  // Codex review, PR #34: a full final page is not proof of truncation — a
+  // pull request may simply change exactly 3,000 files. Refusing that one
+  // would reject a diff that had in fact loaded completely.
+  it("reviews a pull request that changes exactly 3,000 files", async () => {
+    const execGh = execGhServing(fullPages(30), HEAD, 3000);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188);
+
+    expect(diff).toContain("a/src/p29-99.ts");
+  });
+
+  // The file count is the authority in both directions: a list shorter than
+  // the pull request's own tally is missing files, whatever the page shape.
+  it("refuses a file list shorter than the pull request's own changed-file count", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], HEAD, 7);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toMatchObject({
+      code: "GITHUB_DIFF_INCOMPLETE",
+      truncated: true,
+    });
+  });
+
+  // Paging takes many round trips. If the head moves partway through, the
+  // assembled patch describes two different commits at once — and every
+  // inline anchor computed from it would point into the wrong tree.
+  it("refuses a diff assembled across a head advance", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], [HEAD, "0".repeat(40)]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/head advanced/i);
+  });
+
+  it("pins the diff to one head by checking the SHA either side of paging", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await adapter.getDiff(locator188);
+
+    const views = execGh.mock.calls.filter((call) => call[0][1] === "view");
+    expect(views).toHaveLength(2);
+    expect(views[0]?.[0]).toEqual([
+      "pr", "view", "188", "--repo", "github.com/hmchangw/newchat",
+      "--json", "headRefOid,baseRefOid,changedFiles",
+    ]);
+  });
+
+  // Codex review, PR #34: agreeing with ITSELF is not enough. review() caches
+  // pr.headSha before calling getDiff, and publishes against that SHA — inline
+  // comments carry it as commit_id. If the head advances in between, both of
+  // this fallback's own checks see the NEW head and hand back a new-head diff,
+  // while the run goes on to publish findings from that code against the OLD
+  // commit. The caller's expected head is the one that matters.
+  it("refuses a diff whose head is not the one the review is publishing against", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(
+      adapter.getDiff(locator188, { expectedHeadSha: "9".repeat(40) }),
+    ).rejects.toThrow(/head.*(advanced|no longer)/i);
+  });
+
+  it("accepts a diff at exactly the head the review expects", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188, { expectedHeadSha: HEAD });
+
+    expect(diff).toContain("a/src/a.ts");
+  });
+
+  // Without an expected head the fallback still guarantees the diff describes
+  // ONE commit — the pre-existing internal check.
+  it("still rejects a mid-paging head advance when no expected head is given", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], [HEAD, "0".repeat(40)]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/head advanced/i);
+  });
+
+  // Codex review, PR #34: head is only half of "which comparison is this?".
+  // The files endpoint returns base..head, so retargeting the pull request or
+  // force-pushing its base moves the diff while headRefOid sits still. The
+  // run would then review that new comparison while sourcing rules from — and
+  // recording publication state under — the base it cached.
+  it("refuses a diff whose base is not the one the review was prepared against", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(
+      adapter.getDiff(locator188, { expectedHeadSha: HEAD, expectedBaseSha: "c".repeat(40) }),
+    ).rejects.toThrow(/base/i);
+  });
+
+  it("refuses a diff assembled across a base change, with the head unmoved", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]], HEAD, undefined, [BASE, "c".repeat(40)]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/base/i);
+  });
+
+  it("accepts a diff at exactly the head and base the review expects", async () => {
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+    const adapter = new GitHubAdapter(execGh);
+
+    const diff = await adapter.getDiff(locator188, {
+      expectedHeadSha: HEAD,
+      expectedBaseSha: BASE,
+    });
+
+    expect(diff).toContain("a/src/a.ts");
+  });
+
+  // "Report whether the complete diff was loaded before dispatching rules."
+  it("says on stderr that the diff was rebuilt, and that it is complete", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const execGh = execGhServing([[fileRow("src/a.ts")]]);
+
+    try {
+      await new GitHubAdapter(execGh).getDiff(locator188);
+      expect(warn.mock.calls.flat().join(" ")).toMatch(/rebuilt the complete diff from 1 file/i);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("rejects a files page larger than the one it asked for", async () => {
+    const execGh = execGhServing([Array.from({ length: 101 }, (_u, i) => fileRow(`src/f${i}.ts`))]);
+    const adapter = new GitHubAdapter(execGh);
+
+    await expect(adapter.getDiff(locator188)).rejects.toThrow(/exceeds requested bound/i);
+  });
+});
