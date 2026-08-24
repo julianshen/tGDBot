@@ -816,7 +816,13 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const rule = truncate(sanitizeInline(finding.ruleName), 80);
     const message = sanitizeInline(finding.message);
     const group = publishFailedSet.has(finding) ? " 📌" : "";
-    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${group} \`${loc}\` (\`${rule}\`): `, message };
+    // Issue #38: this path builds its own prefix rather than going through
+    // metaLine, so the estimate has to be repeated here — and this is the path
+    // that fires on the LARGE reviews where ordering the list matters most.
+    // The badge is charged against the same budget as everything else below,
+    // so it costs message characters rather than overflowing the limit.
+    const effort = finding.effort === undefined ? "" : ` ${EFFORT_BADGE[finding.effort]}`;
+    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `, message };
   });
   const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)

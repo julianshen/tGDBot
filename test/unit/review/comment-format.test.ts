@@ -1073,3 +1073,57 @@ describe("renderInlineComment — effort estimate", () => {
     expect(body.split("\n")[0]).toBe("_🔒 security_ | _🔴 Blocking_ | _`rule-a`_");
   });
 });
+
+// PR #39 review: the compact summary builds its own finding prefix instead of
+// going through metaLine, so it dropped the estimate — and it is exactly the
+// path that fires on the big reviews where triage matters most.
+describe("renderSummaryComment — effort in compact summaries", () => {
+  const base = {
+    allFindings: [] as Finding[],
+    inlineCount: 0,
+    unanchored: [] as Finding[],
+    filesReviewed: ["src/a.ts"],
+    rulesRun: ["rule-a"],
+    rulesFailed: [] as string[],
+  };
+
+  it("keeps the estimate in the compact finding prefix", () => {
+    const findings = [
+      makeFinding({ file: "src/a.ts", ruleName: "rule-a", effort: "quick", message: "m".repeat(2_000) }),
+      makeFinding({ file: "src/b.ts", ruleName: "rule-b", effort: "heavy", message: "m".repeat(2_000) }),
+    ];
+
+    const body = renderSummaryComment({ ...base, allFindings: findings, unanchored: findings }, 400);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("⚡ Quick fix");
+    expect(body).toContain("🏗️ Heavy lift");
+  });
+
+  it("leaves the compact prefix unchanged when no estimate is given", () => {
+    const findings = [makeFinding({ file: "src/a.ts", ruleName: "rule-a", message: "m".repeat(2_000) })];
+
+    const body = renderSummaryComment({ ...base, allFindings: findings, unanchored: findings }, 400);
+
+    expect(body).toContain("- 🟠 Warning `src/a.ts:12` (`rule-a`): ");
+  });
+
+  // The compact path exists BECAUSE the summary blew a size budget, so a badge
+  // that pushed it back over would defeat the point.
+  it("still fits the provider limit with estimates present", () => {
+    const findings = Array.from({ length: 12 }, (_, index) =>
+      makeFinding({
+        file: `src/file-${index}.ts`,
+        ruleName: `rule-${index}`,
+        effort: index % 2 === 0 ? "quick" : "heavy",
+        message: "m".repeat(2_000),
+      }),
+    );
+
+    for (const limit of [600, 1_200, 4_000]) {
+      const body = renderSummaryComment({ ...base, allFindings: findings, unanchored: findings }, limit);
+
+      expect(body.length).toBeLessThanOrEqual(limit);
+    }
+  });
+});
