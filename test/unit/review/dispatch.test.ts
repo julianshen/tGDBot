@@ -2379,4 +2379,17 @@ describe("suggestions keep their indentation", () => {
   it("still rejects an empty suggestion", () => {
     expect(withSuggestion("")).toBeUndefined();
   });
+
+  // Asymmetric on purpose. renderSuggestionBlock strips trailing whitespace, so
+  // accepting it here would publish a committable block that no longer
+  // byte-matches the value validated and persisted — the provenance the
+  // structured `suggestion` field exists to provide (PR #45 review).
+  it("still rejects trailing whitespace, which the renderer would strip", () => {
+    expect(withSuggestion("const x = 1;\n")).toBeUndefined();
+    expect(withSuggestion("const x = 1;  ")).toBeUndefined();
+  });
+
+  it("accepts leading indentation and trailing content together", () => {
+    expect(withSuggestion("    const x = 1;")).toBe("    const x = 1;");
+  });
 });

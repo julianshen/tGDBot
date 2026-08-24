@@ -797,4 +797,10 @@ describe("persisted suggestions keep their indentation", () => {
   it("still requires a trimmed message", () => {
     expect(persist({ message: "Off by one.  " })).toThrow(/normalized/i);
   });
+
+  // Leading whitespace only: the renderer strips trailing whitespace, so
+  // storing it would leave the published block differing from the stored value.
+  it("still rejects a suggestion with trailing whitespace", () => {
+    expect(persist({ suggestion: "return revalidate(ctx)\n" })).toThrow(/normalized/i);
+  });
 });

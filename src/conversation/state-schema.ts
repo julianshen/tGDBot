@@ -468,14 +468,16 @@ function array(value: unknown, name: string, maximum = MAX_COLLECTION): readonly
  * `text()` requires a trimmed value, which is right for a title or a category
  * and wrong for a suggestion: a suggestion replaces a whole line range, so it
  * carries the file's indentation (issue #43). Only that one field is exempt,
- * and only from the trim — the length bound, the control-character rejection
- * and NFC normalization all still apply.
+ * and only from LEADING whitespace — the length bound, the control-character
+ * rejection and NFC normalization all still apply, and trailing whitespace is
+ * still refused because the renderer strips it, which would leave the
+ * published block differing from the value stored here.
  */
 function indentableText(value: unknown, name: string, maximum = MAX_TEXT): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maximum || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
     throw new Error(`${name} must be bounded non-empty text`);
   }
-  if (value !== value.normalize("NFC")) throw new Error(`${name} must be normalized`);
+  if (value !== value.normalize("NFC").trimEnd()) throw new Error(`${name} must be normalized`);
   return value;
 }
 
