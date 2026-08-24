@@ -126,27 +126,58 @@ const UBIQUITOUS_IDENTIFIERS = new Set([
  * Code identifiers named by a finding, lowercased.
  *
  * Two sources, because findings name code both ways: spans in backticks (which
- * is how a reviewer quotes a symbol, and which may hold a compound like
- * `sub:{roomID}:{account}` worth splitting), and bare words that LOOK like code
- * — an internal capital or an underscore. A plain lowercase English word is
- * never taken from prose, or every finding would "share" its whole sentence.
+ * is how a reviewer quotes a symbol) and bare words that LOOK like code — an
+ * internal capital or an underscore. A plain lowercase English word is never
+ * taken from prose, or every finding would "share" its whole sentence.
+ *
+ * Grouped BY SYMBOL, not flattened, because a single reference can yield
+ * several tokens: `Cache.readL2` splits into two, and so does a compound key
+ * like `sub:{roomID}:{account}`. Flattened, one shared symbol would satisfy a
+ * threshold meant to require two independent ones (PR #42 review). Splitting is
+ * still worth doing — it is what lets `readL2` match `Cache.readL2` — so the
+ * parts stay together as one signal rather than being discarded.
  */
-function identifierTokens(finding: Finding): Set<string> {
+function identifierSignals(finding: Finding): Set<string>[] {
   const text = `${finding.title ?? ""} ${finding.message}`;
-  const found = new Set<string>();
-  const add = (raw: string): void => {
-    const token = raw.toLowerCase();
-    if (token.length < MIN_IDENTIFIER_LENGTH) return;
-    if (UBIQUITOUS_IDENTIFIERS.has(token)) return;
-    found.add(token);
+  const signals: Set<string>[] = [];
+  const collect = (parts: readonly string[]): void => {
+    const signal = new Set<string>();
+    for (const part of parts) {
+      const token = part.toLowerCase();
+      if (token.length < MIN_IDENTIFIER_LENGTH) continue;
+      if (UBIQUITOUS_IDENTIFIERS.has(token)) continue;
+      signal.add(token);
+    }
+    if (signal.size > 0) signals.push(signal);
   };
   for (const match of text.matchAll(/`([^`\n]{1,200})`/gu)) {
-    for (const part of (match[1] ?? "").split(/[^A-Za-z0-9_]+/u)) if (part) add(part);
+    collect((match[1] ?? "").split(/[^A-Za-z0-9_]+/u).filter(Boolean));
   }
-  for (const match of text.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+\b/gu)) {
-    add(match[0]);
+  // Quoted spans are removed before the bare scan, or a camelCase name INSIDE
+  // one would be counted a second time and a single `Cache.readL2` would look
+  // like two independent symbols.
+  const unquoted = text.replace(/`[^`\n]{1,200}`/gu, " ");
+  for (const match of unquoted.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+\b/gu)) {
+    collect([match[0]]);
   }
-  return found;
+  return signals;
+}
+
+/**
+ * How many DISTINCT symbols the two findings both name.
+ *
+ * Counted on each side and reduced to the smaller: one finding naming
+ * `Cache.readL2` against another naming `readL2` and `FetchFromMongo` shares
+ * one symbol, not two, however the tokens happen to line up.
+ */
+function sharedIdentifierCount(left: Set<string>[], right: Set<string>[]): number {
+  const intersects = (a: Set<string>, b: Set<string>): boolean => {
+    for (const token of a) if (b.has(token)) return true;
+    return false;
+  };
+  const matched = (from: Set<string>[], against: Set<string>[]): number =>
+    from.filter((signal) => against.some((other) => intersects(signal, other))).length;
+  return Math.min(matched(left, right), matched(right, left));
 }
 
 function claimText(finding: Finding): string {
@@ -181,8 +212,8 @@ function sameRootCause(
   right: Finding,
   leftTokens: Set<string>,
   rightTokens: Set<string>,
-  leftIdentifiers: Set<string>,
-  rightIdentifiers: Set<string>,
+  leftIdentifiers: Set<string>[],
+  rightIdentifiers: Set<string>[],
 ): boolean {
   // The cross-file gate is deliberately NOT relaxed by the identifier signal.
   // Only a cluster's representative receives an inline comment (orchestrate.ts),
@@ -190,7 +221,7 @@ function sameRootCause(
   // about — trading one presentation problem for a worse one.
   if (left.file !== right.file) return false;
   // Naming the same code is evidence the prose can miss entirely.
-  if (sharedTokens(leftIdentifiers, rightIdentifiers) >= SHARED_IDENTIFIERS) return true;
+  if (sharedIdentifierCount(leftIdentifiers, rightIdentifiers) >= SHARED_IDENTIFIERS) return true;
   const shared = sharedTokens(leftTokens, rightTokens);
   if (shared < MIN_SHARED_TOKENS) return false;
   const score = jaccard(leftTokens, rightTokens, shared);
@@ -258,7 +289,7 @@ function collapseExactDuplicates(
 export function clusterFindings(findings: readonly Finding[]): FindingCluster[] {
   const { unique, rulesByFinding } = collapseExactDuplicates(findings);
   const tokens = unique.map(claimTokens);
-  const identifiers = unique.map(identifierTokens);
+  const identifiers = unique.map(identifierSignals);
 
   // Union-find over finding indices.
   const parent = unique.map((_, index) => index);

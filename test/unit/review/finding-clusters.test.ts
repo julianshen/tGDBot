@@ -254,3 +254,38 @@ describe("clusterFindings — shared identifiers", () => {
     expect(clusters[0]?.representative.severity).toBe("blocking");
   });
 });
+
+// PR #42 review: the safeguard is "two independently named symbols", but a
+// single quoted span can yield several tokens — `Cache.readL2` splits into two
+// — so one shared symbol reference could satisfy it on its own.
+describe("clusterFindings — one symbol is one signal", () => {
+  it("does not merge two findings that share a single qualified symbol", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "`Cache.readL2` returns a stale entry." }),
+      finding({ line: 400, message: "`Cache.readL2` is called without a timeout budget." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  it("does not merge on a single shared compound key", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "The `sub:{roomID}:{account}` entry is written unconditionally." }),
+      finding({ line: 400, message: "Nothing bounds the size of `sub:{roomID}:{account}`." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // Reviewers quote the same symbol at different qualifications, so matching
+  // still has to work token-wise across `readL2` and `Cache.readL2` — it is the
+  // COUNT that must be per-symbol, not the matching.
+  it("still merges when two distinct symbols match at different qualifications", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "`readL2` returns before `FetchFromMongo` runs." }),
+      finding({ line: 400, message: "`Cache.readL2` hits, so `Store.FetchFromMongo` never revalidates." }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+  });
+});
