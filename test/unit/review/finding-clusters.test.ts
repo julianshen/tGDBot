@@ -179,3 +179,113 @@ describe("clusterFindings", () => {
     expect(clusters).toHaveLength(1);
   });
 });
+
+// Issue #37: rule prompts push each rule into its OWN domain vocabulary, which
+// works directly against prose similarity. On hmchangw/newchat#188 six findings
+// described one revocation-propagation defect as a consistency problem, a
+// security problem, an ordering problem and an idempotency problem — sharing
+// almost no words, and so staying six separate entries.
+//
+// What they DO share is the code they name. Identifiers come from the source,
+// not from the rule's vocabulary, so two rules describing the same defect name
+// the same symbols however differently they phrase the claim.
+describe("clusterFindings — shared identifiers", () => {
+  it("groups same-file findings that share code identifiers but almost no prose", () => {
+    const clusters = clusterFindings([
+      finding({
+        line: 120,
+        ruleName: "distributed-system",
+        message: "`readL2` returns before consulting `FetchFromMongo`, so a revocation is invisible.",
+      }),
+      finding({
+        line: 205,
+        ruleName: "cassandra",
+        message: "Extending the entry keeps stale history access alive; `FetchFromMongo` never runs while `readL2` hits.",
+      }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+    expect(clusters[0]?.rules).toEqual(["distributed-system", "cassandra"]);
+  });
+
+  // One shared symbol is co-occurrence, not corroboration: half the findings in
+  // a file will name the function the file is about.
+  it("keeps findings apart when they share only one identifier", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "`readL2` returns a stale entry." }),
+      finding({ line: 400, message: "`readL2` is called without a timeout budget." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // Ubiquitous names appear in every Go file alive and say nothing about WHICH
+  // defect is meant.
+  it("ignores identifiers too common to identify a defect", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "The `err` value is discarded before `ctx` is checked." }),
+      finding({ line: 400, message: "A nil `ctx` reaches the retry loop while `err` is shadowed." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // The cross-file gate is NOT relaxed by this signal. Only the cluster's
+  // representative receives an inline comment, so merging across files would
+  // move a finding's comment off the file it is about — see orchestrate.ts.
+  it("still never merges across files, however many identifiers match", () => {
+    const clusters = clusterFindings([
+      finding({ file: "a.go", message: "`readL2` skips `FetchFromMongo` and `SetJSONWithTTL` entirely." }),
+      finding({ file: "b.go", message: "`SetJSONWithTTL` races `FetchFromMongo` after `readL2` misses." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // Identifiers corroborate; they do not license merging unrelated claims that
+  // merely mention the same well-known symbol pair in passing.
+  it("keeps every member when an identifier merge happens", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, severity: "warning", message: "`readL2` returns before `FetchFromMongo` runs." }),
+      finding({ line: 205, severity: "blocking", message: "Sliding keeps `readL2` hitting, so `FetchFromMongo` never revalidates." }),
+    ]);
+
+    expect(clusters[0]?.members).toHaveLength(2);
+    expect(clusters[0]?.representative.severity).toBe("blocking");
+  });
+});
+
+// PR #42 review: the safeguard is "two independently named symbols", but a
+// single quoted span can yield several tokens — `Cache.readL2` splits into two
+// — so one shared symbol reference could satisfy it on its own.
+describe("clusterFindings — one symbol is one signal", () => {
+  it("does not merge two findings that share a single qualified symbol", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "`Cache.readL2` returns a stale entry." }),
+      finding({ line: 400, message: "`Cache.readL2` is called without a timeout budget." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  it("does not merge on a single shared compound key", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "The `sub:{roomID}:{account}` entry is written unconditionally." }),
+      finding({ line: 400, message: "Nothing bounds the size of `sub:{roomID}:{account}`." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // Reviewers quote the same symbol at different qualifications, so matching
+  // still has to work token-wise across `readL2` and `Cache.readL2` — it is the
+  // COUNT that must be per-symbol, not the matching.
+  it("still merges when two distinct symbols match at different qualifications", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "`readL2` returns before `FetchFromMongo` runs." }),
+      finding({ line: 400, message: "`Cache.readL2` hits, so `Store.FetchFromMongo` never revalidates." }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+  });
+});
