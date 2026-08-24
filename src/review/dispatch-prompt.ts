@@ -11,7 +11,7 @@ import type { ReviewConversationContext } from "./types.js";
 
 // Appended to every rule's task automatically — rule authors never write
 // this themselves (TASKS.md Task 5 technical design).
-const FINDING_JSON_CONTRACT = `
+export const FINDING_JSON_CONTRACT = `
 Respond with ONLY a JSON array matching this shape (no prose, no markdown fences):
 [{
   "file": string,
