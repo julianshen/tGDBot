@@ -63,7 +63,7 @@ import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
-import type { DispatchResult, ReviewDispatchInput } from "./review/types.js";
+import type { DispatchResult, Finding, ReviewDispatchInput } from "./review/types.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
@@ -624,9 +624,17 @@ interface StatusLog {
 // keeps the JSON status line's own shape untouched for anyone already
 // parsing it directly off the end of stdout.
 const STATUS_LOG_PREFIX = "TGD_REVIEW_RESULT: ";
+const SEVERITY_LOG_PREFIX = "TGD_REVIEW_SEVERITIES: ";
 
 function logStatus(log: StatusLog): void {
   console.log(`${STATUS_LOG_PREFIX}${JSON.stringify(log)}`);
+}
+
+/** Issue #36: one line per run, countable across runs. */
+function logSeverityMix(findings: readonly Finding[]): void {
+  const mix = { blocking: 0, warning: 0, suggestion: 0 };
+  for (const finding of findings) mix[finding.severity] += 1;
+  console.log(`${SEVERITY_LOG_PREFIX}${JSON.stringify(mix)}`);
 }
 
 function publicationContext(
@@ -1158,6 +1166,23 @@ export async function review(
     ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
     ...(loadedContext.unavailable.length === 0 ? {} : { contextUnavailable: loadedContext.unavailable }),
   });
+  // Issue #36: the severity mix, on its own machine-readable line so
+  // calibration drift is trackable ACROSS runs. A rule set returning 80%
+  // blocking over a sample of pull requests is describing its own prompt rather
+  // than the code it reviewed, and that is only visible in aggregate.
+  //
+  // Deliberately NOT folded into TGD_REVIEW_RESULT. A normal run publishes
+  // through the manifest and logs from the PERSISTED terminal result, so
+  // carrying it there would mean threading a new field through the manifest,
+  // its strict state schema, and the publication log type — a lot of surface,
+  // and a lot of ways to lose it, for a number. Emitted here, where the
+  // findings are actually in hand, it cannot drift out of sync with them.
+  // Guarded like buildBody below: an orchestration result can reach here
+  // without a summaryInput, and a mix of zeroes would be a lie rather than an
+  // absence.
+  if (orchestration.summaryInput !== undefined) {
+    logSeverityMix(orchestration.summaryInput.allFindings);
+  }
   const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
   const terminalResult = {
     status: hasFailure ? "partial" as const : "posted" as const,

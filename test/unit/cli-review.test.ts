@@ -1312,6 +1312,43 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+
+  // Issue #36: the severity mix goes on the machine-readable status line, so
+  // calibration drift is trackable ACROSS runs. A rule set that returns 80%
+  // blocking over a sample of pull requests is describing its own prompt, not
+  // the code — and that is only visible in aggregate, never in one comment.
+  it("issue #36: the status line reports the severity mix", async () => {
+    const h = makeHarness({ botComment: null });
+    h.dispatchRules.mockResolvedValue({
+      findings: [
+        { file: "a.ts", line: 1, severity: "blocking", category: "c", message: "One.", ruleName: "rule-a" },
+        { file: "a.ts", line: 2, severity: "warning", category: "c", message: "Two.", ruleName: "rule-a" },
+        { file: "a.ts", line: 3, severity: "warning", category: "c", message: "Three.", ruleName: "rule-a" },
+        { file: "a.ts", line: 4, severity: "suggestion", category: "c", message: "Four.", ruleName: "rule-a" },
+      ],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    });
+    // The real orchestrator, so the mix is counted from what a run actually
+    // produces rather than from a canned presentation object.
+    h.orchestrate.mockImplementation(buildPresentation);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const lines = logSpy.mock.calls.map(([entry]) => String(entry));
+    const mixLine = lines.find((entry) => entry.startsWith("TGD_REVIEW_SEVERITIES: "));
+    const statusLine = lines.find((entry) => entry.startsWith("TGD_REVIEW_RESULT: "));
+
+    expect(JSON.parse(mixLine!.slice("TGD_REVIEW_SEVERITIES: ".length)))
+      .toEqual({ blocking: 1, warning: 2, suggestion: 1 });
+    // The mix describes the FINDINGS, not what was shown — clustering changes
+    // presentation only, so the two lines agree on the total.
+    expect(JSON.parse(statusLine!.slice("TGD_REVIEW_RESULT: ".length)).findingsCount).toBe(4);
+
+    vi.restoreAllMocks();
+  });
+
   // Review fix #1: rules LOADED fine (loadErrors is empty, rules.length >
   // 0), but every rule failed at DISPATCH time (e.g. a total LLM/provider
   // outage sends dispatchRules down its fallback path, which returns

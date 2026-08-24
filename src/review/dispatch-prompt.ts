@@ -30,6 +30,17 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
 - "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
   e.g. "The loop uses <= n, so it sums one element too many." Write it as a
   statement of the problem, not a restatement of the file name.
+- "severity": how much this matters, on a bar you must be able to defend.
+    * "blocking" — a reachable execution path leads to data loss, corruption, a
+      security failure, or a materially wrong result a user or operator would
+      see. If you cannot describe that path in "message", it is not blocking.
+    * "warning" — a real defect whose impact is bounded, or whose path you
+      cannot demonstrate. This is the right label for most true findings.
+    * "suggestion" — correct as written, but worth improving.
+  Most findings in a healthy review are NOT blocking. Severity is what a
+  reviewer reads first to decide where to start, so marking everything blocking
+  destroys the ordering they depend on and makes the label mean nothing. Reach
+  for it only when you have actually traced the path.
 - "message": the full explanation — why it is wrong and what to do.
 - "effort": how much work the fix you just described is, or null if unsure.
     * "quick" — a local edit: a guard, a condition, an argument, a call moved.
