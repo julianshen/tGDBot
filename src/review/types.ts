@@ -65,6 +65,24 @@ export interface Finding {
    * itself is still posted).
    */
   endLine?: number;
+
+  /**
+   * Issue #38: roughly how much work the fix is — NOT how much it matters.
+   *
+   * Severity orders findings against each other; effort orders them within a
+   * severity band, which is what makes a run of eight blocking findings
+   * something a reviewer can plan around instead of just absorb.
+   *
+   * Deliberately two buckets, not a scale. The decision a reader is making is
+   * "now or later", and a middle value would collect everything the model was
+   * unsure about, which answers nothing. Coarse also keeps it honest: this is
+   * an impression formed while writing the finding, not an estimate anyone
+   * costed.
+   *
+   * Optional, and unrecognized values are dropped rather than rejected — a
+   * finding is worth posting whether or not its metadata parsed.
+   */
+  effort?: "quick" | "heavy";
 }
 
 export interface DispatchResult {

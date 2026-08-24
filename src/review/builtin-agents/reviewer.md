@@ -70,7 +70,7 @@ the whole review unusable.
   be `]`.
 - Each element is one finding, in exactly this shape:
 
-  `{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null }`
+  `{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "effort": "quick" | "heavy" | null }`
 
   - `file`: the repo-relative path the finding is about (must be a real path
     from the diff/files you inspected — never null, never a placeholder).
@@ -82,6 +82,11 @@ the whole review unusable.
     (optional). Use exactly one of these three lowercase strings.
   - `category`: a short free-form label, e.g. `"correctness"`, `"security"`,
     `"tests"`, `"readability"`.
+  - `effort`: how much work YOUR suggested fix is — `quick` for a local edit (a
+    guard, a condition, an argument), `heavy` when it needs a design decision,
+    a new abstraction, or coordination across components. Use `null` if unsure.
+    This is independent of `severity`: a `blocking` finding whose fix is a
+    redesign stays `blocking`. Never trade one for the other.
   - `title`: a SHORT one-line headline — 80 characters or fewer, no newlines.
     State the problem, e.g. `"The loop uses <= n, so it sums one element too
     many."` Not a restatement of the file name, and not a full paragraph.

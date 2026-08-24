@@ -1038,3 +1038,38 @@ describe("renderSummaryComment — publication-failure wording", () => {
     expect(rendered).toContain("HTTP 422");
   });
 });
+
+// Issue #38: severity says how much a finding matters; effort says how much
+// work it is. A run that returns eight blocking findings is only triageable if
+// a reader can tell the one-line guard from the protocol redesign without
+// reading all eight in full.
+describe("renderInlineComment — effort estimate", () => {
+  it("shows a quick fix as its own chip, after severity", () => {
+    const body = renderInlineComment(makeFinding({ severity: "blocking", effort: "quick" }));
+
+    expect(body.split("\n")[0]).toBe("_🎯 correctness_ | _🔴 Blocking_ | _⚡ Quick fix_ | _`rule-a`_");
+  });
+
+  it("shows a heavy lift", () => {
+    const body = renderInlineComment(makeFinding({ effort: "heavy" }));
+
+    expect(body.split("\n")[0]).toContain("_🏗️ Heavy lift_");
+  });
+
+  // Effort must never soften severity: a heavy blocker is still a blocker.
+  // The chips are independent, and both have to survive together.
+  it("keeps severity intact alongside a heavy effort", () => {
+    const body = renderInlineComment(makeFinding({ severity: "blocking", effort: "heavy" }));
+
+    expect(body.split("\n")[0]).toContain("_🔴 Blocking_");
+    expect(body.split("\n")[0]).toContain("_🏗️ Heavy lift_");
+  });
+
+  // Older rules, and any rule that declines to estimate, must render exactly
+  // as before — no empty chip, no stray separator.
+  it("renders the pre-existing line unchanged when no effort is given", () => {
+    const body = renderInlineComment(makeFinding({ severity: "blocking", category: "security" }));
+
+    expect(body.split("\n")[0]).toBe("_🔒 security_ | _🔴 Blocking_ | _`rule-a`_");
+  });
+});

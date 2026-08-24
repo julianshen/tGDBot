@@ -56,6 +56,14 @@ const SEVERITY_BADGE: Record<Finding["severity"], string> = {
   suggestion: "🔵 Suggestion",
 };
 
+// Issue #38: how much work the fix is, as its own chip. Kept visually distinct
+// from the severity badge so the two are never read as one grade — a heavy
+// blocker is still a blocker.
+const EFFORT_BADGE: Record<NonNullable<Finding["effort"]>, string> = {
+  quick: "⚡ Quick fix",
+  heavy: "🏗️ Heavy lift",
+};
+
 // `category` is free-form (rule authors pick it), so this is a best-effort
 // prettifier with a neutral fallback — never a validation gate.
 const CATEGORY_ICONS: { match: RegExp; icon: string }[] = [
@@ -258,7 +266,10 @@ function metaLine(finding: Finding, contributingRules?: readonly string[]): stri
     contributingRules && contributingRules.length > 1
       ? `${contributingRules.map((rule) => `\`${sanitizeInline(rule)}\``).join(", ")} (${contributingRules.length} rules)`
       : `\`${sanitizeInline(finding.ruleName)}\``;
-  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | _${rules}_`;
+  // Omitted entirely when the rule gave no estimate, so output that predates
+  // the field — or a rule that declines to guess — renders exactly as before.
+  const effort = finding.effort === undefined ? "" : `_${EFFORT_BADGE[finding.effort]}_ | `;
+  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | ${effort}_${rules}_`;
 }
 
 export interface RenderOptions {

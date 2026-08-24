@@ -2292,3 +2292,49 @@ describe("finding decision contract", () => {
     });
   });
 });
+
+// Issue #38: the effort estimate is advisory metadata. It must never be able
+// to cost us a finding — a rule returning no parseable findings array is
+// already a live failure mode (#30), and a new optional field is not worth
+// widening it.
+describe("finding effort contract", () => {
+  it("keeps a quick estimate", () => {
+    const parsed = parseDispatchResult(dispatchJson([{ ...coreFinding, effort: "quick" }]), [makeRule()]);
+
+    expect(parsed.findings[0]?.effort).toBe("quick");
+  });
+
+  it("keeps a heavy estimate", () => {
+    const parsed = parseDispatchResult(dispatchJson([{ ...coreFinding, effort: "heavy" }]), [makeRule()]);
+
+    expect(parsed.findings[0]?.effort).toBe("heavy");
+  });
+
+  it("treats an absent estimate as absent, leaving old output untouched", () => {
+    const parsed = parseDispatchResult(dispatchJson([coreFinding]), [makeRule()]);
+
+    expect(parsed.findings[0]?.effort).toBeUndefined();
+    expect(parsed.findings[0]).toMatchObject({ ...coreFinding, decision: "new" });
+  });
+
+  // A value outside the contract is dropped, NOT escalated: the finding itself
+  // is still worth posting, and refusing it would trade a real defect report
+  // for a metadata quibble.
+  it("drops an unrecognized estimate but keeps the finding", () => {
+    for (const effort of ["medium", "QUICK", "", 3, null, {}]) {
+      const parsed = parseDispatchResult(dispatchJson([{ ...coreFinding, effort }]), [makeRule()]);
+
+      expect(parsed.findings).toHaveLength(1);
+      expect(parsed.findings[0]?.effort).toBeUndefined();
+    }
+  });
+
+  it("applies the same contract on the recovery path", () => {
+    const recovered = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, effort: "heavy" }]),
+      "rule-a",
+    );
+
+    expect(recovered[0]?.effort).toBe("heavy");
+  });
+});
