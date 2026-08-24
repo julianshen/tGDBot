@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FINDING_JSON_CONTRACT } from "../../../src/review/dispatch-prompt.js";
 import { parseDispatchResult } from "../../../src/review/dispatch-results.js";
+import { renderInlineComment, renderSummaryComment } from "../../../src/review/comment-format.js";
 import { toFindingSnapshot } from "../../../src/review/review-publication.js";
 import {
   createPreparedClarification,
@@ -131,7 +132,7 @@ describe("every Finding field survives every representation", () => {
   });
 
   it("round-trips through the publication snapshot", () => {
-    const snapshot = toFindingSnapshot(COMPLETE) as Record<string, unknown>;
+    const snapshot = toFindingSnapshot(COMPLETE) as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
       expect(snapshot[field], `toFindingSnapshot drops ${field}`).toEqual(COMPLETE[field]);
@@ -139,7 +140,7 @@ describe("every Finding field survives every representation", () => {
   });
 
   it("round-trips through the clarification snapshot", () => {
-    const snapshot = toClarificationFindingSnapshot(COMPLETE) as Record<string, unknown>;
+    const snapshot = toClarificationFindingSnapshot(COMPLETE) as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
       expect(snapshot[field], `toClarificationFindingSnapshot drops ${field}`).toEqual(COMPLETE[field]);
@@ -164,7 +165,7 @@ describe("every Finding field survives every representation", () => {
       { version: 1, repository, clarifications: [prepared], directions: [] },
       repository,
     );
-    const stored = validated.clarifications[0]?.finding as Record<string, unknown>;
+    const stored = validated.clarifications[0]?.finding as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
       expect(stored[field], `the state schema drops ${field}`).toEqual(COMPLETE[field]);
@@ -179,7 +180,7 @@ describe("every Finding field survives every representation", () => {
     });
 
     const parsed = parseDispatchResult(raw, [
-      { name: COMPLETE.ruleName, body: "rule body", sourcePath: "rules/x.md" },
+      { name: COMPLETE.ruleName, body: "rule body", sourcePath: "rules/x.md", dependsOn: [] },
     ]);
     const finding = parsed.findings[0] as unknown as Record<string, unknown>;
 
@@ -235,6 +236,76 @@ describe("every Finding field is described to the model", () => {
       ...Object.keys(NOT_COPIED_THROUGH),
     ];
     for (const field of excepted) {
+      expect(FIELDS, `${field} is excepted but is not a Finding field`).toContain(field);
+    }
+  });
+});
+
+describe("every Finding field reaches the reader", () => {
+  /**
+   * What each field looks like ONCE RENDERED.
+   *
+   * Matching the raw value would be wrong for the closed vocabularies —
+   * `severity: "blocking"` is shown as a badge, never as the word — so the
+   * expected rendered form is stated per field instead.
+   */
+  const RENDERED_AS: Partial<Record<keyof Finding, string>> = {
+    category: COMPLETE.category,
+    severity: "🔴 Blocking",
+    effort: "🏗️ Heavy lift",
+    ruleName: COMPLETE.ruleName,
+    title: COMPLETE.title,
+    message: COMPLETE.message,
+    suggestion: COMPLETE.suggestion,
+  };
+
+  /** Fields an inline comment deliberately does not print. */
+  const NOT_IN_INLINE_BODY: Partial<Record<keyof Finding, string>> = {
+    file: "the comment is anchored to the file; repeating the path would be noise",
+    line: "likewise — the anchor IS the line",
+    endLine: "structural: it bounds a suggestion rather than being shown",
+    decision: "routes the finding between sections; never printed in the body",
+    question: "surfaced by the clarification flow, not by an inline finding",
+  };
+
+  it("renders every field the inline comment is responsible for", () => {
+    const body = renderInlineComment(COMPLETE);
+
+    for (const field of FIELDS) {
+      if (NOT_IN_INLINE_BODY[field]) continue;
+      const expected = RENDERED_AS[field];
+      expect(expected, `${field} has no expected rendered form`).toBeDefined();
+      expect(body, `the inline comment drops ${field}`).toContain(expected as string);
+    }
+  });
+
+  // The compact summary builds its own prefix instead of reusing the inline
+  // metadata line, which is exactly how `effort` came to be missing from it
+  // (#38). It gets its own walk.
+  it("renders every field the compact summary is responsible for", () => {
+    const body = renderSummaryComment(
+      {
+        allFindings: [COMPLETE],
+        inlineCount: 0,
+        unanchored: [COMPLETE],
+        filesReviewed: [COMPLETE.file],
+        rulesRun: [COMPLETE.ruleName],
+        rulesFailed: [],
+      },
+      400,
+    );
+
+    expect(body).toContain("compacted to fit the provider limit");
+    for (const field of ["severity", "effort", "file", "ruleName"] as (keyof Finding)[]) {
+      const expected = field === "severity" ? "🔴 Blocking"
+        : field === "effort" ? "🏗️ Heavy lift"
+        : String(COMPLETE[field]);
+      expect(body, `the compact summary drops ${field}`).toContain(expected);
+    }
+  });
+
+  it("has no rendering exception for a field that no longer exists", () => {
+    for (const field of Object.keys(NOT_IN_INLINE_BODY)) {
       expect(FIELDS, `${field} is excepted but is not a Finding field`).toContain(field);
     }
   });

@@ -4,6 +4,10 @@
     "noEmit": true,
     "rootDir": "."
   },
-  "include": ["src/**/*.ts", "test/**/*.test-d.ts"],
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.test-d.ts",
+    "test/unit/review/finding-field-coverage.test.ts"
+  ],
   "exclude": ["node_modules", "dist"]
 }
