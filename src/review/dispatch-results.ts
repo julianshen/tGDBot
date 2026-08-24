@@ -132,6 +132,12 @@ export function normalizeUnknownFinding(value: unknown, ruleName?: string): Find
     decision: contract.decision,
   };
   if (typeof candidate.title === "string") finding.title = candidate.title;
+  // Issue #38: advisory metadata, so an unrecognized value is dropped and the
+  // finding still posts. Exact match only — no lowercasing or trimming, which
+  // would invent a contract the prompt never stated.
+  if (candidate.effort === "quick" || candidate.effort === "heavy") {
+    finding.effort = candidate.effort;
+  }
   const suggestion = stateSafeSuggestion(candidate.suggestion);
   if (suggestion !== undefined) finding.suggestion = suggestion;
   if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;

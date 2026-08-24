@@ -164,6 +164,7 @@ export function toClarificationFindingSnapshot(finding: Finding | FindingSnapsho
     ...(finding.question === undefined ? {} : { question: finding.question }),
     ...(finding.title === undefined ? {} : { title: finding.title }),
     ...(finding.suggestion === undefined ? {} : { suggestion: finding.suggestion }),
+    ...(finding.effort === undefined ? {} : { effort: finding.effort }),
   };
 }
 

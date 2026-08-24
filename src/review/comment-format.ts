@@ -56,6 +56,14 @@ const SEVERITY_BADGE: Record<Finding["severity"], string> = {
   suggestion: "🔵 Suggestion",
 };
 
+// Issue #38: how much work the fix is, as its own chip. Kept visually distinct
+// from the severity badge so the two are never read as one grade — a heavy
+// blocker is still a blocker.
+const EFFORT_BADGE: Record<NonNullable<Finding["effort"]>, string> = {
+  quick: "⚡ Quick fix",
+  heavy: "🏗️ Heavy lift",
+};
+
 // `category` is free-form (rule authors pick it), so this is a best-effort
 // prettifier with a neutral fallback — never a validation gate.
 const CATEGORY_ICONS: { match: RegExp; icon: string }[] = [
@@ -258,7 +266,10 @@ function metaLine(finding: Finding, contributingRules?: readonly string[]): stri
     contributingRules && contributingRules.length > 1
       ? `${contributingRules.map((rule) => `\`${sanitizeInline(rule)}\``).join(", ")} (${contributingRules.length} rules)`
       : `\`${sanitizeInline(finding.ruleName)}\``;
-  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | _${rules}_`;
+  // Omitted entirely when the rule gave no estimate, so output that predates
+  // the field — or a rule that declines to guess — renders exactly as before.
+  const effort = finding.effort === undefined ? "" : `_${EFFORT_BADGE[finding.effort]}_ | `;
+  return `_${categoryBadge(sanitizeInline(finding.category))}_ | _${SEVERITY_BADGE[finding.severity]}_ | ${effort}_${rules}_`;
 }
 
 export interface RenderOptions {
@@ -805,7 +816,13 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const rule = truncate(sanitizeInline(finding.ruleName), 80);
     const message = sanitizeInline(finding.message);
     const group = publishFailedSet.has(finding) ? " 📌" : "";
-    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${group} \`${loc}\` (\`${rule}\`): `, message };
+    // Issue #38: this path builds its own prefix rather than going through
+    // metaLine, so the estimate has to be repeated here — and this is the path
+    // that fires on the LARGE reviews where ordering the list matters most.
+    // The badge is charged against the same budget as everything else below,
+    // so it costs message characters rather than overflowing the limit.
+    const effort = finding.effort === undefined ? "" : ` ${EFFORT_BADGE[finding.effort]}`;
+    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `, message };
   });
   const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)

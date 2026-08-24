@@ -10,6 +10,7 @@ import {
   explainFinding,
   focusReview,
   isExecutableConversationCommand,
+  parseReconsiderOutput,
   reassessClarification,
   reconsiderFinding,
   resolveMarkedFindingThread,
@@ -556,5 +557,71 @@ describe("conversation action identities and thread scope", () => {
     expect(resolveMarkedFindingThread({
       event: reply, thread, findings: [], repository: ledger.repository, markerRepositoryDigest: publicDigest,
     })).toEqual({ status: "unsupported-history" });
+  });
+});
+
+// PR #39 review: the reassessment returns a WHOLE finding that replaces the
+// stored one rather than being merged into it, so any field the contract does
+// not describe is dropped on the way through — the estimate included.
+describe("effort survives clarification reassessment", () => {
+  const original = {
+    file: "src/a.ts",
+    line: 4,
+    severity: "warning" as const,
+    category: "correctness",
+    message: "unclear",
+    ruleName: "rule-a",
+    effort: "heavy" as const,
+  };
+
+  const answer = (finding: Record<string, unknown>) =>
+    JSON.stringify({ outcome: "confirmed", rationale: "still holds", finding });
+
+  it("inherits the original estimate when the reassessment omits it", () => {
+    const result = parseReconsiderOutput(answer({ ...original, effort: undefined }), original);
+
+    expect(result?.outcome).toBe("confirmed");
+    expect(result?.finding?.effort).toBe("heavy");
+  });
+
+  // A "revised" outcome may legitimately change the fix, and with it the work
+  // involved — a restated estimate must win over the inherited one.
+  it("prefers an estimate the reassessment restated", () => {
+    const revised = JSON.stringify({
+      outcome: "revised",
+      rationale: "smaller than thought",
+      finding: { ...original, effort: "quick" },
+    });
+
+    expect(parseReconsiderOutput(revised, original)?.finding?.effort).toBe("quick");
+  });
+
+  it("invents nothing when neither side has an estimate", () => {
+    const { effort, ...withoutEffort } = original;
+    void effort;
+
+    expect(parseReconsiderOutput(answer(withoutEffort), withoutEffort)?.finding?.effort).toBeUndefined();
+  });
+
+  it("still works with no original to inherit from", () => {
+    expect(parseReconsiderOutput(answer(original))?.finding?.effort).toBe("heavy");
+  });
+});
+
+// PR #39 review: FOCUS_CONTRACT told the model to match "the normal review
+// finding contract" without ever including it, so the focus path had no schema
+// at all — not just no effort guidance.
+describe("focus prompts carry the real finding contract", () => {
+  it("spells out the finding schema instead of referring to an absent one", () => {
+    const prompt = buildFocusPrompt({
+      rules: [currentRule],
+      diff: currentHunk,
+      direction: "Look at auth.",
+    });
+
+    expect(prompt).toContain('"severity"');
+    expect(prompt).toContain('"effort"');
+    expect(prompt).toContain('"title"');
+    expect(prompt).not.toMatch(/the normal review finding contract/i);
   });
 });

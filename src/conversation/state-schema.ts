@@ -213,6 +213,12 @@ export interface FindingSnapshot {
   readonly title?: string;
   readonly suggestion?: string;
   readonly endLine?: number;
+  /**
+   * Issue #38. Present here for the same reason `title` and `suggestion` are:
+   * a finding that round-trips through the ledger is rendered from THIS shape,
+   * so a field the snapshot cannot hold is a field the reader never sees.
+   */
+  readonly effort?: "quick" | "heavy";
 }
 
 export interface FindingReviewOptions {
@@ -1038,7 +1044,7 @@ export function materializeMemories(entries: readonly MemoryEntry[]): readonly M
 
 function findingSnapshot(value: unknown, name: string): FindingSnapshot {
   const object = exact(value, name, ["file", "severity", "category", "message", "ruleName"],
-    ["line", "decision", "question", "title", "suggestion", "endLine"]);
+    ["line", "decision", "question", "title", "suggestion", "endLine", "effort"]);
   if (object.severity !== "blocking" && object.severity !== "warning" && object.severity !== "suggestion") {
     throw new Error(`${name}.severity is invalid`);
   }
@@ -1059,6 +1065,12 @@ function findingSnapshot(value: unknown, name: string): FindingSnapshot {
   if (object.question !== undefined) result.question = text(object.question, `${name}.question`, 4_096);
   if (object.title !== undefined) result.title = text(object.title, `${name}.title`, 1_000);
   if (object.suggestion !== undefined) result.suggestion = text(object.suggestion, `${name}.suggestion`, 20_000);
+  // Strict, unlike the reviewer-output parser that drops an unrecognized value:
+  // this is state we wrote ourselves, so a bad value means a corrupt ledger.
+  if (object.effort !== undefined) {
+    if (object.effort !== "quick" && object.effort !== "heavy") throw new Error(`${name}.effort is invalid`);
+    result.effort = object.effort;
+  }
   return result;
 }
 

@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { parseConversationCommand } from "../../../src/conversation/command-parser.js";
+import { toFindingSnapshot } from "../../../src/review/review-publication.js";
+import { validatePendingSnapshot } from "../../../src/conversation/state-schema.js";
 import {
   associateClarificationEvent,
   createPreparedClarification,
@@ -11,6 +13,7 @@ import {
   mayBeClarificationAnswer,
   parseAnswerSyntax,
   selectClarification,
+  toClarificationFindingSnapshot,
   transitionClarification,
 } from "../../../src/conversation/clarification.js";
 import {
@@ -687,5 +690,71 @@ describe("confirmed clarification finding graph", () => {
     expect(prepared.preparedFindings[0]?.finding.decision).toBe("still-valid");
     expect(prepared.preparedFindings[0]?.finding.decision).not.toBe("needs-clarification");
     expect(prepared.preparedFindings[0]?.finding.message).toBe(confirmed.message);
+  });
+});
+
+// Issue #38 / PR #39 review: a finding that goes through the ledger comes back
+// out to be rendered, so any field the snapshot cannot represent is silently
+// lost between asking a clarifying question and publishing the confirmed
+// finding. `effort` was the only field on Finding without a counterpart here.
+describe("effort survives persistence", () => {
+  it("keeps the estimate through the clarification snapshot", () => {
+    const snapshot = toClarificationFindingSnapshot(
+      finding({ message: "unclear", effort: "heavy" }),
+    );
+
+    expect(snapshot.effort).toBe("heavy");
+  });
+
+  it("keeps the estimate through the publication snapshot", () => {
+    expect(toFindingSnapshot(finding({ message: "unclear", effort: "quick" })).effort).toBe("quick");
+  });
+
+  it("leaves a finding without an estimate untouched", () => {
+    expect(toClarificationFindingSnapshot(finding({ message: "unclear" }))).not.toHaveProperty("effort");
+    expect(toFindingSnapshot(finding({ message: "unclear" }))).not.toHaveProperty("effort");
+  });
+
+  // The persisted form is validated strictly on read-back: an unknown key is an
+  // integrity failure, so the schema has to KNOW about effort, not merely
+  // tolerate it.
+  it("round-trips the estimate through the strict pending schema", () => {
+    const prepared = createPreparedClarification({
+      id: encodeClarificationPublicId(createHash("sha256").update("effort-a").digest()),
+      reviewNumber: 7,
+      headSha: BINDING.headSha,
+      question: "Is this intended?",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      finding: finding({ message: "unclear", effort: "heavy" }),
+    });
+    const repository = { provider: "github" as const, repositoryDigest: BINDING.repositoryDigest };
+    const pending = { version: 1, repository, clarifications: [prepared], directions: [] };
+
+    const validated = validatePendingSnapshot(pending, repository);
+
+    expect(validated.clarifications[0]?.finding.effort).toBe("heavy");
+  });
+
+  // Unlike reviewer OUTPUT — where an unrecognized value is dropped so the
+  // finding still posts — state we wrote ourselves is strictly validated. A
+  // bad value here means the ledger is corrupt, not that a model was sloppy.
+  it("rejects a persisted estimate outside the contract", () => {
+    const prepared = createPreparedClarification({
+      id: encodeClarificationPublicId(createHash("sha256").update("effort-b").digest()),
+      reviewNumber: 7,
+      headSha: BINDING.headSha,
+      question: "Is this intended?",
+      createdAt: "2026-08-14T00:00:00.000Z",
+      finding: finding({ message: "unclear" }),
+    });
+    const repository = { provider: "github" as const, repositoryDigest: BINDING.repositoryDigest };
+    const corrupt = {
+      version: 1,
+      repository,
+      clarifications: [{ ...prepared, finding: { ...prepared.finding, effort: "medium" } }],
+      directions: [],
+    };
+
+    expect(() => validatePendingSnapshot(corrupt, repository)).toThrow(/effort/i);
   });
 });

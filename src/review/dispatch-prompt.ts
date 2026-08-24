@@ -11,7 +11,7 @@ import type { ReviewConversationContext } from "./types.js";
 
 // Appended to every rule's task automatically — rule authors never write
 // this themselves (TASKS.md Task 5 technical design).
-const FINDING_JSON_CONTRACT = `
+export const FINDING_JSON_CONTRACT = `
 Respond with ONLY a JSON array matching this shape (no prose, no markdown fences):
 [{
   "file": string,
@@ -23,13 +23,23 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
   "message": string,
   "suggestion": string | null,
   "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification",
-  "question": string | null
+  "question": string | null,
+  "effort": "quick" | "heavy" | null
 }]
 
 - "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
   e.g. "The loop uses <= n, so it sums one element too many." Write it as a
   statement of the problem, not a restatement of the file name.
 - "message": the full explanation — why it is wrong and what to do.
+- "effort": how much work the fix you just described is, or null if unsure.
+    * "quick" — a local edit: a guard, a condition, an argument, a call moved.
+      Roughly, something the author could land in one sitting without design work.
+    * "heavy" — needs a design decision, a new abstraction, coordination across
+      components, or a migration.
+  This is INDEPENDENT of "severity". A "blocking" finding that needs a redesign
+  is still "blocking" — never soften severity because the fix is expensive, and
+  never raise it because the fix is cheap. Effort only orders findings that are
+  already equally severe.
 - "suggestion": the EXACT replacement text for lines "line".."endLine", or null.
   DO provide one whenever the fix is a concrete, local edit you are confident in
   — an off-by-one, a wrong operator or comparison, a missing nil/error check, a
@@ -244,7 +254,7 @@ export function buildDispatchPrompt(
 
   parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
-    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
+    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
     // ADR-007/ADR-008: the orchestrator MERGES the subagents' findings and re-emits
     // them, so every field it is not told to keep is silently dropped at this last
     // hop. That is exactly what happened on the first live run: the reviewers were
@@ -253,7 +263,7 @@ export function buildDispatchPrompt(
     // Copy them through VERBATIM; never rewrite a suggestion (it is literal code
     // destined for the file, and a paraphrase would commit something the reviewer
     // never proposed).
-    `Copy each finding's "title", "message", "suggestion", "endLine", "decision" and "question" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
+    `Copy each finding's "title", "message", "suggestion", "endLine", "decision", "question" and "effort" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
     // Attribution fix (see order-mapping note above): the old wording defined
     // rulesFailed as tasks that "produced no usable output", which the
     // orchestrator wrongly applied to a task that RAN and returned an empty or
