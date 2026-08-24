@@ -758,3 +758,43 @@ describe("effort survives persistence", () => {
     expect(() => validatePendingSnapshot(corrupt, repository)).toThrow(/effort/i);
   });
 });
+
+
+// Issue #43: `text()` requires trimmed values, which is right for a title or a
+// category and wrong for a suggestion — a suggestion carries the file's
+// indentation, and rejecting it here would make a suggestion that PARSES fail
+// to persist. The relaxation is scoped to that one field.
+describe("persisted suggestions keep their indentation", () => {
+  const repository = { provider: "github" as const, repositoryDigest: "a".repeat(64) };
+
+  const persist = (overrides: Partial<Finding>) => {
+    const prepared = createPreparedClarification({
+      id: encodeClarificationPublicId(createHash("sha256").update("indent").digest()),
+      reviewNumber: 7,
+      headSha: BINDING.headSha,
+      question: "Is this intended?",
+      createdAt: "2026-08-24T00:00:00.000Z",
+      finding: finding({ message: "unclear", ...overrides }),
+    });
+    return () => validatePendingSnapshot(
+      { version: 1, repository, clarifications: [prepared], directions: [] },
+      repository,
+    );
+  };
+
+  it("round-trips an indented suggestion", () => {
+    const suggestion = "\tif stale(entry) {\n\t\treturn revalidate(ctx)\n\t}";
+
+    expect(persist({ suggestion })().clarifications[0]?.finding.suggestion).toBe(suggestion);
+  });
+
+  // The scope of the change: everything else still has to be trimmed, or an
+  // untrimmed title would render with stray whitespace in the comment body.
+  it("still requires a trimmed title", () => {
+    expect(persist({ title: "  Off by one." })).toThrow(/normalized/i);
+  });
+
+  it("still requires a trimmed message", () => {
+    expect(persist({ message: "Off by one.  " })).toThrow(/normalized/i);
+  });
+});

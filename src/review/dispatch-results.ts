@@ -57,7 +57,12 @@ function stateSafeSuggestion(value: unknown): string | undefined {
     value.length === 0 ||
     value.length > MAX_STATE_SUGGESTION_CHARS ||
     /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value) ||
-    value !== value.normalize("NFC").trim()
+    // NFC only — deliberately NOT `.trim()` (issue #43). A suggestion REPLACES
+    // its whole line range, so it carries the file's existing indentation, and
+    // the contract asks for exactly that. Comparing against a trimmed value
+    // rejected every suggestion whose first line was indented, which is nearly
+    // all of them, and dropped them silently.
+    value !== value.normalize("NFC")
   ) {
     return undefined;
   }

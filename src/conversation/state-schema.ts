@@ -462,6 +462,23 @@ function array(value: unknown, name: string, maximum = MAX_COLLECTION): readonly
   return value;
 }
 
+/**
+ * Text that may legitimately begin with whitespace.
+ *
+ * `text()` requires a trimmed value, which is right for a title or a category
+ * and wrong for a suggestion: a suggestion replaces a whole line range, so it
+ * carries the file's indentation (issue #43). Only that one field is exempt,
+ * and only from the trim — the length bound, the control-character rejection
+ * and NFC normalization all still apply.
+ */
+function indentableText(value: unknown, name: string, maximum = MAX_TEXT): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > maximum || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
+    throw new Error(`${name} must be bounded non-empty text`);
+  }
+  if (value !== value.normalize("NFC")) throw new Error(`${name} must be normalized`);
+  return value;
+}
+
 function text(value: unknown, name: string, maximum = MAX_TEXT): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maximum || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)) {
     throw new Error(`${name} must be bounded non-empty text`);
@@ -1064,7 +1081,7 @@ function findingSnapshot(value: unknown, name: string): FindingSnapshot {
   if (object.decision !== undefined) result.decision = object.decision;
   if (object.question !== undefined) result.question = text(object.question, `${name}.question`, 4_096);
   if (object.title !== undefined) result.title = text(object.title, `${name}.title`, 1_000);
-  if (object.suggestion !== undefined) result.suggestion = text(object.suggestion, `${name}.suggestion`, 20_000);
+  if (object.suggestion !== undefined) result.suggestion = indentableText(object.suggestion, `${name}.suggestion`, 20_000);
   // Strict, unlike the reviewer-output parser that drops an unrecognized value:
   // this is state we wrote ourselves, so a bad value means a corrupt ledger.
   if (object.effort !== undefined) {
