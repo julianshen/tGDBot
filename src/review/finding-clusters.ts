@@ -94,6 +94,61 @@ function stem(word: string): string {
  * sentence plays that role, since reviewers lead with the claim and follow with
  * the evidence.
  */
+// Issue #37: prose similarity is the wrong instrument when each rule is
+// deliberately pushed into its own domain vocabulary. On hmchangw/newchat#188
+// one revocation-propagation defect was reported as a consistency problem, a
+// security problem, an ordering problem and an idempotency problem, sharing
+// almost no words between them.
+//
+// Identifiers are a better signal precisely because they are NOT the rule's
+// words: they come from the source, so two rules describing one defect name the
+// same symbols however differently they phrase the claim.
+//
+// Two, not one. Half the findings in a file will name the function the file is
+// about, so a single shared symbol is co-occurrence rather than corroboration.
+const SHARED_IDENTIFIERS = 2;
+
+// Short names (`err`, `ctx`, `id`) appear everywhere and identify nothing.
+const MIN_IDENTIFIER_LENGTH = 4;
+
+// Names common enough that sharing them says nothing about WHICH defect is
+// meant. Deliberately short: the length floor above already removes most noise,
+// and an over-long list would start suppressing real signal.
+const UBIQUITOUS_IDENTIFIERS = new Set([
+  "error", "errors", "context", "nil", "null", "true", "false", "void",
+  "string", "number", "value", "values", "data", "result", "results",
+  "client", "config", "options", "option", "request", "response",
+  "handler", "func", "function", "return", "struct", "interface", "type",
+  "test", "tests", "name", "names", "list", "item", "items",
+]);
+
+/**
+ * Code identifiers named by a finding, lowercased.
+ *
+ * Two sources, because findings name code both ways: spans in backticks (which
+ * is how a reviewer quotes a symbol, and which may hold a compound like
+ * `sub:{roomID}:{account}` worth splitting), and bare words that LOOK like code
+ * — an internal capital or an underscore. A plain lowercase English word is
+ * never taken from prose, or every finding would "share" its whole sentence.
+ */
+function identifierTokens(finding: Finding): Set<string> {
+  const text = `${finding.title ?? ""} ${finding.message}`;
+  const found = new Set<string>();
+  const add = (raw: string): void => {
+    const token = raw.toLowerCase();
+    if (token.length < MIN_IDENTIFIER_LENGTH) return;
+    if (UBIQUITOUS_IDENTIFIERS.has(token)) return;
+    found.add(token);
+  };
+  for (const match of text.matchAll(/`([^`\n]{1,200})`/gu)) {
+    for (const part of (match[1] ?? "").split(/[^A-Za-z0-9_]+/u)) if (part) add(part);
+  }
+  for (const match of text.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+\b/gu)) {
+    add(match[0]);
+  }
+  return found;
+}
+
 function claimText(finding: Finding): string {
   if (finding.title?.trim()) return finding.title;
   const firstSentence = /^(.*?[.!?])(?:\s|$)/su.exec(finding.message.trim())?.[1];
@@ -126,8 +181,16 @@ function sameRootCause(
   right: Finding,
   leftTokens: Set<string>,
   rightTokens: Set<string>,
+  leftIdentifiers: Set<string>,
+  rightIdentifiers: Set<string>,
 ): boolean {
+  // The cross-file gate is deliberately NOT relaxed by the identifier signal.
+  // Only a cluster's representative receives an inline comment (orchestrate.ts),
+  // so merging across files would move a finding's comment off the file it is
+  // about — trading one presentation problem for a worse one.
   if (left.file !== right.file) return false;
+  // Naming the same code is evidence the prose can miss entirely.
+  if (sharedTokens(leftIdentifiers, rightIdentifiers) >= SHARED_IDENTIFIERS) return true;
   const shared = sharedTokens(leftTokens, rightTokens);
   if (shared < MIN_SHARED_TOKENS) return false;
   const score = jaccard(leftTokens, rightTokens, shared);
@@ -195,6 +258,7 @@ function collapseExactDuplicates(
 export function clusterFindings(findings: readonly Finding[]): FindingCluster[] {
   const { unique, rulesByFinding } = collapseExactDuplicates(findings);
   const tokens = unique.map(claimTokens);
+  const identifiers = unique.map(identifierTokens);
 
   // Union-find over finding indices.
   const parent = unique.map((_, index) => index);
@@ -218,7 +282,7 @@ export function clusterFindings(findings: readonly Finding[]): FindingCluster[] 
 
   for (let i = 0; i < unique.length; i += 1) {
     for (let j = i + 1; j < unique.length; j += 1) {
-      if (sameRootCause(unique[i]!, unique[j]!, tokens[i]!, tokens[j]!)) union(i, j);
+      if (sameRootCause(unique[i]!, unique[j]!, tokens[i]!, tokens[j]!, identifiers[i]!, identifiers[j]!)) union(i, j);
     }
   }
 
