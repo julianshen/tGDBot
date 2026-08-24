@@ -57,7 +57,16 @@ function stateSafeSuggestion(value: unknown): string | undefined {
     value.length === 0 ||
     value.length > MAX_STATE_SUGGESTION_CHARS ||
     /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value) ||
-    value !== value.normalize("NFC").trim()
+    // `.trimEnd()`, not `.trim()` (issue #43). A suggestion REPLACES its whole
+    // line range, so it carries the file's existing indentation and the
+    // contract asks for exactly that — comparing against a fully trimmed value
+    // silently dropped every suggestion whose first line was indented, which is
+    // nearly all of them.
+    //
+    // TRAILING whitespace stays rejected, though: renderSuggestionBlock strips
+    // it, so accepting it here would publish a committable block that no longer
+    // byte-matches the value we validated and persisted.
+    value !== value.normalize("NFC").trimEnd()
   ) {
     return undefined;
   }

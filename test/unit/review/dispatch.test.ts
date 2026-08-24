@@ -2338,3 +2338,58 @@ describe("finding effort contract", () => {
     expect(recovered[0]?.effort).toBe("heavy");
   });
 });
+
+
+// Issue #43: the contract tells the model to include "the file's existing
+// indentation", and the sanitizer then rejected exactly that — anything whose
+// first line was indented failed a `!== value.trim()` comparison and was
+// dropped. Almost every line worth suggesting a fix for is inside a block, so
+// the feature was being discarded for most findings that should carry it.
+describe("suggestions keep their indentation", () => {
+  const withSuggestion = (suggestion: string) =>
+    parseDispatchResult(dispatchJson([{ ...coreFinding, suggestion }]), [makeRule()])
+      .findings[0]?.suggestion;
+
+  it("keeps a tab-indented suggestion", () => {
+    const suggestion = "\tif stale(entry) {\n\t\treturn revalidate(ctx)\n\t}";
+
+    expect(withSuggestion(suggestion)).toBe(suggestion);
+  });
+
+  it("keeps a space-indented suggestion", () => {
+    expect(withSuggestion("    const x = 1;")).toBe("    const x = 1;");
+  });
+
+  // A suggestion REPLACES the whole line range, so dedenting it would commit
+  // code at the wrong indentation — the reason this is a correctness bug and
+  // not a formatting nit.
+  it("preserves inner indentation exactly, without reflowing it", () => {
+    expect(withSuggestion("  a\n    b\n  c")).toBe("  a\n    b\n  c");
+  });
+
+  // The checks that actually protect the committable-suggestion surface stay.
+  it("still rejects control characters", () => {
+    expect(withSuggestion("const\u0007x = 1;")).toBeUndefined();
+  });
+
+  it("still rejects text that is not NFC-normalized", () => {
+    expect(withSuggestion("const cafe\u0301 = 1;")).toBeUndefined();
+  });
+
+  it("still rejects an empty suggestion", () => {
+    expect(withSuggestion("")).toBeUndefined();
+  });
+
+  // Asymmetric on purpose. renderSuggestionBlock strips trailing whitespace, so
+  // accepting it here would publish a committable block that no longer
+  // byte-matches the value validated and persisted — the provenance the
+  // structured `suggestion` field exists to provide (PR #45 review).
+  it("still rejects trailing whitespace, which the renderer would strip", () => {
+    expect(withSuggestion("const x = 1;\n")).toBeUndefined();
+    expect(withSuggestion("const x = 1;  ")).toBeUndefined();
+  });
+
+  it("accepts leading indentation and trailing content together", () => {
+    expect(withSuggestion("    const x = 1;")).toBe("    const x = 1;");
+  });
+});

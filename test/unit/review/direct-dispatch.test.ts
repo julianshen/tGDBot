@@ -373,7 +373,10 @@ describe("dispatchRulesDirect", () => {
 
   it.each([
     ["non-NFC", "const caf\u0065\u0301 = true;"],
-    ["surrounding whitespace", "  const value = true;\n"],
+    // Surrounding whitespace used to live here. It is no longer state-unsafe:
+    // a suggestion carries the file's indentation and both the parser and the
+    // state schema now accept it (issue #43). A control character still is.
+    ["control character", "const\u0007value = true;"],
   ])("drops a state-unsafe %s suggestion without losing its finding", async (_label, suggestion) => {
     const unsafeFinding = { ...finding("a.ts", "real bug"), suggestion };
     const { factory } = makeFactory({ "rule-a": JSON.stringify([unsafeFinding]) });
