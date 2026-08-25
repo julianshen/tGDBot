@@ -94,14 +94,15 @@ const RECONSIDER_CONTRACT = `Respond with ONLY a JSON object matching this shape
 "rationale" is a short justification grounded in the current code and trusted rule.
 
 The "finding" is ONE object of the shape below — not an array, and not wrapped
-in anything. "file", "line", "severity", "category" and "message" are ALWAYS
-required, even when unchanged: the finding is validated before anything is
-carried over, so omitting one rejects the whole response. "ruleName" is
-supplied for you; you do not need to repeat it.
+in anything. "file", "severity", "category" and "message" are ALWAYS required,
+even when unchanged: the finding is validated before anything is carried over,
+so omitting one rejects the whole response. "ruleName" is supplied for you; you
+do not need to repeat it.
 
-"title", "suggestion", "endLine" and "effort" may be omitted when unchanged and
-keep their original values. To CLEAR one — a suggestion the answer has made
-wrong, say — set it to null explicitly rather than leaving it out.
+"line", "title", "suggestion", "endLine" and "effort" may be omitted when
+unchanged and keep their original values. To CLEAR one — a suggestion the answer
+has made wrong, or a "line" when the finding is no longer about one place — set
+it to null explicitly rather than leaving it out.
 
 ${FINDING_OBJECT_CONTRACT}`;
 
@@ -233,7 +234,7 @@ export function parseExplainOutput(text: string): ExplainResult | undefined {
  * the finding still holds, so its unrestated parts still hold too. A restated
  * value always wins, since a revision may legitimately change any of them.
  */
-const INHERITED_FINDING_FIELDS = ["title", "suggestion", "endLine", "effort"] as const;
+const INHERITED_FINDING_FIELDS = ["line", "title", "suggestion", "endLine", "effort"] as const;
 
 export function parseReconsiderOutput(
   text: string,
@@ -340,7 +341,10 @@ export async function reconsiderFinding(
       reason: input.reason,
     }),
     input,
-    parseReconsiderOutput,
+    // The same closure the clarification path uses: without the original, a
+    // response following the contract — which says ruleName is supplied — is
+    // rejected, and nothing is inherited (PR #51 review).
+    (text) => parseReconsiderOutput(text, active.ledger.finding),
   );
 }
 

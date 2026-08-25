@@ -850,3 +850,87 @@ describe("an explicit null clears rather than inherits", () => {
     expect(result?.finding?.suggestion).toBe("return stale(ctx)");
   });
 });
+
+
+// PR #51 review, P1. The clarification path was given the original finding to
+// inherit from; its twin was not. One of two call sites is exactly the class of
+// miss this contract change keeps producing, so the guard is end-to-end rather
+// than on the parser alone.
+describe("reconsider inherits from the finding it reassesses", () => {
+  const respond = (patch: Record<string, unknown>) => sessionFor(JSON.stringify({
+    outcome: "confirmed",
+    rationale: "still holds",
+    finding: {
+      file: finding.file,
+      line: finding.line,
+      severity: finding.severity,
+      category: finding.category,
+      message: finding.message,
+      ...patch,
+    },
+  }));
+
+  const reconsiderWith = (patch: Record<string, unknown>) => reconsiderFinding({
+    ledger,
+    currentRule,
+    currentCodeHunk: currentHunk,
+    addressedThread: thread,
+    reason: "please look again",
+    model: MODEL,
+    createSession: respond(patch),
+  });
+
+  // The contract now says ruleName is supplied rather than requested, so a
+  // response omitting it must be accepted — it was rejected before.
+  it("accepts a response that omits ruleName", async () => {
+    const result = await reconsiderWith({});
+
+    expect(result).toMatchObject({ status: "success" });
+    expect((result as { result: { finding: { ruleName: string } } }).result.finding.ruleName)
+      .toBe(finding.ruleName);
+  });
+
+  it("carries an omitted line over from the original", async () => {
+    const { line, ...noLine } = { line: undefined };
+    void line; void noLine;
+    const result = await reconsiderWith({ line: undefined });
+
+    expect((result as { result: { finding: { line?: number } } }).result.finding.line)
+      .toBe(finding.line);
+  });
+});
+
+// PR #51 review. The contract claimed "line" was always required, but the
+// parser accepts a finding without one — file-level findings are legitimate.
+// The contract was the wrong half.
+describe("line is inherited, not demanded", () => {
+  const original = {
+    file: "src/a.ts", line: 12, severity: "warning" as const, category: "correctness",
+    message: "unclear", ruleName: "rule-a",
+  };
+  const parse = (findingPatch: Record<string, unknown>) => parseReconsiderOutput(
+    JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: { ...original, ...findingPatch } }),
+    original,
+  );
+
+  it("keeps the original anchor when the reassessment omits it", () => {
+    expect(parse({ line: undefined })?.finding?.line).toBe(12);
+  });
+
+  it("lets an explicit null make the finding file-level", () => {
+    expect(parse({ line: null })?.finding?.line).toBeUndefined();
+  });
+
+  it("does not claim line is always required", () => {
+    const contract = section("OUTPUT_CONTRACT", buildReconsiderPrompt({
+      finding,
+      historicalRuleSnapshot: ledger.ruleSnapshot,
+      currentTrustedRule: currentRule,
+      currentCodeHunk: currentHunk,
+      addressedThread: thread,
+      reason: "again",
+    })).body;
+
+    expect(contract).not.toMatch(/"file", "line", "severity"/);
+  });
+});
