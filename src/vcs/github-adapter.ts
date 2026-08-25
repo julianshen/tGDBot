@@ -1401,8 +1401,9 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     const { contentless } = reconstructed;
     const contentlessNote = contentless.length === 0
       ? ""
-      : ` ${contentless.length} file(s) carry no line content (binary, empty, or mode-only; ` +
-        `the endpoint does not distinguish them): ${contentless.slice(0, 10).join(", ")}` +
+      : ` ${contentless.length} file(s) carry no line content (binary, empty, a mode-only ` +
+        `change, or a move whose content the endpoint did not send — it does not distinguish ` +
+        `them): ${contentless.slice(0, 10).join(", ")}` +
         `${contentless.length > 10 ? `, and ${contentless.length - 10} more` : ""}.`;
     console.warn(
       `GitHubAdapter: the pull request diff exceeds GitHub's single-diff limit; rebuilt the ` +

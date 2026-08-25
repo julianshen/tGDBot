@@ -578,3 +578,50 @@ describe("reconstructDiffFromFiles — moved entries with no patch", () => {
     expect(contentless).toEqual([]);
   });
 });
+
+
+// PR #52 review, found by both bots. Adding the hunk-integrity check gave
+// `truncatedPatches` a second meaning, but the diagnosis still said every entry
+// "account[s] for fewer changed lines than the file reports" — which is exactly
+// false for the new case, where the totals match and the hunk is short.
+describe("assertCompleteDiff explains which kind of truncation", () => {
+  const shortfall = {
+    filename: "src/short.ts", status: "modified", additions: 900, deletions: 0, changes: 900,
+    patch: "@@ -1 +1,2 @@\n one\n+two",
+  };
+  const shortHunk = {
+    filename: "src/hunk.ts", status: "modified", additions: 1, deletions: 1, changes: 2,
+    patch: "@@ -1,4 +1,4 @@\n one\n-two\n+TWO\n three",
+  };
+  const reasonFor = (rows: Record<string, unknown>[]): string => {
+    try {
+      assertCompleteDiff(reconstructDiffFromFiles(rows), { truncated: false, fileCount: rows.length });
+      return "";
+    } catch (error) {
+      return (error as Error).message;
+    }
+  };
+
+  it("says a shortfall is a shortfall", () => {
+    const reason = reasonFor([shortfall]);
+
+    expect(reason).toMatch(/fewer changed lines/i);
+    expect(reason).toContain("src/short.ts");
+  });
+
+  // The case that was being misdescribed.
+  it("does not call a short hunk a changed-line shortfall", () => {
+    const reason = reasonFor([shortHunk]);
+
+    expect(reason).toContain("src/hunk.ts");
+    expect(reason).toMatch(/hunk/i);
+    expect(reason).not.toMatch(/fewer changed lines/i);
+  });
+
+  it("describes both kinds when both occur, naming the right files", () => {
+    const reason = reasonFor([shortfall, shortHunk]);
+
+    expect(reason).toMatch(/fewer changed lines[^;]*src\/short\.ts/i);
+    expect(reason).toMatch(/hunk[^;]*src\/hunk\.ts/i);
+  });
+});

@@ -54,12 +54,20 @@ export interface ReconstructedDiff {
    */
   readonly contentless: readonly string[];
   /**
-   * Files whose patch arrived but accounts for fewer changed lines than the
-   * entry itself reports. A non-null `patch` is not automatically a WHOLE
-   * patch, and a fragment would let a rule review the prefix of a large file
-   * and call it clean. Non-empty means the diff is INCOMPLETE.
+   * Files whose patch arrived incomplete. Non-empty means the diff is
+   * INCOMPLETE — a fragment would let a rule review the prefix of a large file
+   * and call it clean.
+   *
+   * Two distinct causes, kept apart because the diagnosis has to be TRUE of the
+   * file it names: `shortfall` delivered fewer changed lines than the entry
+   * reports, `shortHunk` delivered a hunk shorter than its own header declares
+   * (PR #52 review).
    */
   readonly truncatedPatches: readonly string[];
+  readonly truncationReasons: {
+    readonly shortfall: readonly string[];
+    readonly shortHunk: readonly string[];
+  };
 }
 
 /** Raised when the complete diff could not be loaded, naming what is missing. */
@@ -193,6 +201,8 @@ export function reconstructDiffFromFiles(
   const omittedPatches: string[] = [];
   const contentless: string[] = [];
   const truncatedPatches: string[] = [];
+  const shortfall: string[] = [];
+  const shortHunk: string[] = [];
 
   for (const row of rows) {
     const newPath = fileText(row.filename, "path");
@@ -242,13 +252,12 @@ export function reconstructDiffFromFiles(
       // not missing content, and must not fail an otherwise whole diff.
       const reportedAdditions = fileCount(row.additions, "addition count");
       const reportedDeletions = fileCount(row.deletions, "deletion count");
-      if (
-        patchAdditions < reportedAdditions ||
-        patchDeletions < reportedDeletions ||
-        !hunksAreComplete(body)
-      ) {
-        truncatedPatches.push(newPath);
-      }
+      const missesChangedLines =
+        patchAdditions < reportedAdditions || patchDeletions < reportedDeletions;
+      const missesHunkLines = !hunksAreComplete(body);
+      if (missesChangedLines) shortfall.push(newPath);
+      else if (missesHunkLines) shortHunk.push(newPath);
+      if (missesChangedLines || missesHunkLines) truncatedPatches.push(newPath);
       continue;
     }
 
@@ -288,6 +297,7 @@ export function reconstructDiffFromFiles(
     omittedPatches,
     contentless,
     truncatedPatches,
+    truncationReasons: { shortfall, shortHunk },
   };
 }
 
@@ -296,6 +306,12 @@ export function reconstructDiffFromFiles(
  * this converts either incompleteness into a typed, diagnosable rejection
  * naming what is missing and how to proceed.
  */
+/** Bounded, comma-separated path list for a diagnostic. */
+function listPaths(paths: readonly string[]): string {
+  const shown = paths.slice(0, 10).join(", ");
+  return paths.length > 10 ? `${shown}, and ${paths.length - 10} more` : shown;
+}
+
 export function assertCompleteDiff(
   reconstructed: ReconstructedDiff,
   detail: { readonly truncated: boolean; readonly fileCount: number },
@@ -313,20 +329,25 @@ export function assertCompleteDiff(
     );
   }
   if (omittedPatches.length > 0) {
-    const shown = omittedPatches.slice(0, 10).join(", ");
-    const rest = omittedPatches.length > 10 ? `, and ${omittedPatches.length - 10} more` : "";
     reasons.push(
       `GitHub sent no patch for ${omittedPatches.length} changed ` +
-        `file${omittedPatches.length === 1 ? "" : "s"} (${shown}${rest})`,
+        `file${omittedPatches.length === 1 ? "" : "s"} (${listPaths(omittedPatches)})`,
     );
   }
 
-  if (truncatedPatches.length > 0) {
-    const shown = truncatedPatches.slice(0, 10).join(", ");
-    const rest = truncatedPatches.length > 10 ? `, and ${truncatedPatches.length - 10} more` : "";
+  // Each cause is described separately: naming a file under the wrong diagnosis
+  // sends an operator looking for the wrong thing (PR #52 review).
+  const { shortfall, shortHunk } = reconstructed.truncationReasons;
+  if (shortfall.length > 0) {
     reasons.push(
-      `${truncatedPatches.length} patch(es) account for fewer changed lines than the file ` +
-        `reports, so part of the change is missing from them (${shown}${rest})`,
+      `${shortfall.length} patch(es) account for fewer changed lines than the file reports, so ` +
+        `part of the change is missing from them (${listPaths(shortfall)})`,
+    );
+  }
+  if (shortHunk.length > 0) {
+    reasons.push(
+      `${shortHunk.length} patch(es) deliver a hunk shorter than its own header declares, so a ` +
+        `hunk is cut off mid-context (${listPaths(shortHunk)})`,
     );
   }
 
