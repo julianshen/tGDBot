@@ -868,6 +868,10 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
   const publishFailedSet = new Set(input.publishFailed ?? []);
+  const unshownReferences = relocated.reduce(
+    (total, finding) => total + Math.max(0, (finding.references?.length ?? 0) - 1),
+    0,
+  );
   const notice =
     "> [!WARNING]\n" +
     "> Review details were compacted to fit the provider limit; proposed fixes were omitted." +
@@ -877,6 +881,9 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     (publishFailedSet.size > 0
       ? `\n> ${publishFailedSet.size} inline comment(s) had valid anchors but publication failed` +
         compactFailureReasons(input, publishFailedSet)
+      : "") +
+    (unshownReferences > 0
+      ? `\n> ${unshownReferences} further reference(s) omitted; one is shown per finding`
       : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);
@@ -912,9 +919,23 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     // The badge is charged against the same budget as everything else below,
     // so it costs message characters rather than overflowing the limit.
     const effort = finding.effort === undefined ? "" : ` ${EFFORT_BADGE[finding.effort]}`;
-    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `, message };
+    // The FIRST citation only. A citation is the evidence a claim rests on, and
+    // dropping it silently on the large reviews — where the reader has least
+    // context — was the worst place to drop it (PR #54 review). It rides in the
+    // prefix so it is charged against the fixed budget and shrinks the message
+    // allowance rather than overflowing the provider limit; the rest are
+    // declared missing in the notice above rather than quietly discarded.
+    const citation = finding.references?.[0];
+    const reference = citation === undefined
+      ? ""
+      : `\n  - Reference: ${truncate(sanitizeInline(citation), 200)}`;
+    return {
+      prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `,
+      message,
+      reference,
+    };
   });
-  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -933,7 +954,8 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     relatedWork,
     crossFile,
     ...findings.map(
-      ({ prefix, message }, index) => `${prefix}${truncate(message, messageBudgets[index] ?? 0)}`,
+      ({ prefix, message, reference }, index) =>
+        `${prefix}${truncate(message, messageBudgets[index] ?? 0)}${reference}`,
     ),
   ].filter((part): part is string => part !== undefined).join("\n\n");
 

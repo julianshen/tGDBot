@@ -42,6 +42,20 @@ const REGISTRY_ORIGIN = "https://registry.npmjs.org";
 const PACKAGE_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u;
 const PACKAGE_NAME_MAX = 214;
 
+/**
+ * An EXACT release: `1.2.3`, with the usual prerelease/build tail.
+ *
+ * The registry keys its `versions` map by exactly this, so only a version of
+ * this shape can be looked up for publication. `1` and `1.2` are ranges wearing
+ * a version's clothes (PR #54 review).
+ */
+const EXACT_VERSION_RE = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$/u;
+
+/** True for a version the registry could publish under that exact key. */
+export function isExactVersion(version: string): boolean {
+  return EXACT_VERSION_RE.test(version);
+}
+
 /** Conservative: digits and dots, with the usual pre-release/build tail. */
 const VERSION_RE = /^\d+(?:\.\d+)*(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$/u;
 
@@ -234,6 +248,39 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
 }
 
 /**
+ * How much publisher prose is worth carrying.
+ *
+ * A deprecation notice is a sentence — "no longer maintained, use lodash-es".
+ * Anything past this is not a notice, and letting it run would let one package
+ * bury every other entry in the pack.
+ */
+const MAX_NOTICE_CHARS = 200;
+
+/**
+ * Renders a registry deprecation notice as inert, clearly-attributed data.
+ *
+ * This is the ONE value in the pack the host did not derive: npm returns
+ * whatever the package's publisher wrote. A pull-request author can publish a
+ * package, deprecate it with text addressed to the reviewing model, and add it
+ * as a dependency — so without this the diff gains an indirect channel into
+ * TRUSTED_CONTEXT (PR #54 review).
+ *
+ * Collapsed to a single line, so it cannot open a heading, a list item, or a
+ * section that reads as part of the host's own document; backticks stripped, so
+ * it cannot close the span quoting it; capped; and attributed inline rather
+ * than in a preamble, which a long dependency list would push out of view.
+ */
+function quoteNotice(notice: string): string {
+  const flattened = notice
+    .replace(/[\r\n]+/gu, " ")
+    .replace(/`/gu, "'")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, MAX_NOTICE_CHARS);
+  return `the publisher's own note, which is NOT trusted input: \`${flattened}\``;
+}
+
+/**
  * The dependency changes, rendered as trusted context for a rule.
  *
  * Delivered through the existing context-pack seam, which places the text in a
@@ -264,7 +311,7 @@ export function dependencyContextPack(
     // An unchecked package must read as unchecked, never as clean.
     if (fact.unknown !== undefined) notes.push(`lookup failed — ${fact.unknown}`);
     if (fact.published === false) notes.push("this version is NOT published by the registry");
-    if (fact.deprecated !== undefined) notes.push(`deprecated: ${fact.deprecated}`);
+    if (fact.deprecated !== undefined) notes.push(`deprecated — ${quoteNotice(fact.deprecated)}`);
     if (fact.latest !== undefined && fact.latest !== change.version) {
       notes.push(`latest is ${fact.latest}`);
     }

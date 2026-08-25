@@ -4114,3 +4114,47 @@ describe("review — dependency facts", () => {
     expect(packFor(h)).toBeUndefined();
   });
 });
+
+// PR #54 review: the legacy orchestrator has no context-pack concept — its
+// prompt builder never receives one — so the map was silently dropped there
+// while the registry requests still went out. Silent is the problem: the
+// operator asked for a dependency review, paid for the lookups, and got a run
+// that could not produce a single dependency finding.
+describe("review — dependency facts under legacy dispatch", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    '-    "lodash": "4.17.20",',
+    '+    "lodash": "4.17.21",',
+  ].join("\n");
+
+  it("asks the registry nothing, and says why, when the engine cannot carry it", async () => {
+    const h = makeHarness({
+      args: makeArgs({ dependencyFacts: "on", dispatch: "legacy" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/dependency.facts.*legacy|legacy.*dependency/i);
+    warn.mockRestore();
+  });
+
+  it("still reaches the rules on the default engine", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" },
+      versions: { "4.17.21": {} },
+    });
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).toHaveBeenCalled();
+  });
+});

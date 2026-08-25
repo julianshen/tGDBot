@@ -1145,12 +1145,26 @@ export async function review(
   // dispatch contract rejects a partial map — and omitted entirely when nothing
   // changed, so an ordinary review gains no empty section.
   const dependencyChanges = dependencyChangesFromDiff(diff);
+  // The legacy orchestrator has no context-pack concept: its prompt builder
+  // never receives one, so the map below would be dropped on the floor while
+  // the registry requests still went out — an operator paying for lookups and
+  // getting a run that cannot produce a dependency finding (PR #54 review).
+  // Say so instead of plumbing trusted-context surface into an engine that is
+  // on its way out.
+  const dependencyFactsUnavailable =
+    args.dependencyFacts === "on" && args.dispatch === "legacy" && dependencyChanges.length > 0;
+  if (dependencyFactsUnavailable) {
+    console.warn(
+      "tgd-review-agent: --dependency-facts needs --dispatch direct; the legacy engine cannot " +
+        "carry host context, so no registry lookup was made and no dependency context was supplied",
+    );
+  }
   // Opt-in, and the only outbound request the tool makes. Without it the pack
   // still ships the parsed versions and says plainly that nothing was checked —
   // which is why leaving this unwired shipped a rule that could never see the
   // facts it exists to check (PR #54 review).
   const dependencyFacts =
-    args.dependencyFacts === "on" && dependencyChanges.length > 0
+    args.dependencyFacts === "on" && !dependencyFactsUnavailable && dependencyChanges.length > 0
       ? await fetchDependencyFacts(dependencyChanges, fetchJsonFn)
       : [];
   const dependencyPack = dependencyContextPack(dependencyChanges, dependencyFacts);

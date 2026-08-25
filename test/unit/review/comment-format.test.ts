@@ -1245,3 +1245,59 @@ describe("renderSummaryComment — cross-file root causes", () => {
     expect(body).toMatch(/root cause/i);
   });
 });
+
+// PR #54 review: compact mode builds its entries from location, rule, effort
+// and message alone, so citations disappeared exactly on the large reviews —
+// where a reader has the least context and needs the evidence most.
+describe("renderSummaryComment — compact mode keeps the evidence", () => {
+  const cited = (references: string[]) => makeFinding({
+    file: "a.go",
+    line: 10,
+    message: "m".repeat(2000),
+    references,
+  });
+
+  it("renders a citation on a relocated finding", () => {
+    const finding = cited(["https://docs.example.com/leases"]);
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 700);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("https://docs.example.com/leases");
+  });
+
+  // Compact mode is a size fallback, so it may show fewer — but it must not
+  // pretend that is all there was.
+  it("says so when it could not show every citation", () => {
+    const finding = cited([
+      "https://docs.example.com/one",
+      "https://docs.example.com/two",
+      "https://docs.example.com/three",
+    ]);
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 700);
+
+    expect(body).toContain("https://docs.example.com/one");
+    expect(body).toMatch(/further reference|additional reference|reference.*omitted/i);
+  });
+
+  it("adds no such note when everything fits", () => {
+    const finding = cited(["https://docs.example.com/only"]);
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 700);
+
+    expect(body).not.toMatch(/further reference|additional reference/i);
+  });
+});

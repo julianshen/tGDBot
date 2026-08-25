@@ -10,7 +10,7 @@
 // that could not check something must say so — implying it checked and found
 // nothing is the silent-degradation failure this project rejects elsewhere
 // (see the large-diff completeness work, #33/#35).
-import { isValidPackageName, registryUrlFor } from "./dependency-changes.js";
+import { isExactVersion, isValidPackageName, registryUrlFor } from "./dependency-changes.js";
 import type { DependencyChange } from "./dependency-changes.js";
 
 /** What the host could establish about one changed dependency. */
@@ -20,7 +20,14 @@ export interface DependencyFact {
   readonly version: string;
   /** The registry's current `latest`, when it could be read. */
   readonly latest?: string;
-  /** Whether the registry publishes this exact version. */
+  /**
+   * Whether the registry publishes this exact version.
+   *
+   * ABSENT for a range like `^1.2`: the registry keys its versions by exact
+   * release, so a partial pin is simply not a question it can answer, and
+   * answering `false` claimed the build would not install for a dependency npm
+   * resolves fine (PR #54 review).
+   */
   readonly published?: boolean;
   /** The registry's deprecation notice for this version, if any. */
   readonly deprecated?: string;
@@ -40,6 +47,23 @@ export type FetchJson = (url: string) => Promise<unknown>;
  */
 const CONCURRENCY = 3;
 
+/**
+ * How long the whole lookup phase may take.
+ *
+ * Per-request timeouts do not bound this: three workers draining the 200-package
+ * ceiling against a registry that hangs is `ceil(200 / 3)` timeouts deep — over
+ * eleven minutes before dispatch even starts (PR #54 review). A review must not
+ * be consumable by someone else's outage, so the phase gives up as a whole and
+ * every package it never reached says so.
+ */
+const DEFAULT_DEADLINE_MS = 60_000;
+
+/** Injectable so the suite can exercise the deadline without waiting on it. */
+export interface DependencyFactOptions {
+  readonly deadlineMs?: number;
+  readonly now?: () => number;
+}
+
 function readRegistryDocument(
   change: DependencyChange,
   body: unknown,
@@ -57,8 +81,11 @@ function readRegistryDocument(
     typeof distTags === "object" && distTags !== null && !Array.isArray(distTags)
       ? (distTags as Record<string, unknown>).latest
       : undefined;
-  const entry = (versions as Record<string, unknown>)[change.version];
-  const published = Object.hasOwn(versions as Record<string, unknown>, change.version);
+  const exact = isExactVersion(change.version);
+  const entry = exact ? (versions as Record<string, unknown>)[change.version] : undefined;
+  const published = exact
+    ? Object.hasOwn(versions as Record<string, unknown>, change.version)
+    : undefined;
   const deprecated =
     typeof entry === "object" && entry !== null && !Array.isArray(entry)
       ? (entry as Record<string, unknown>).deprecated
@@ -66,7 +93,7 @@ function readRegistryDocument(
   return {
     name: change.name,
     version: change.version,
-    published,
+    ...(published === undefined ? {} : { published }),
     ...(typeof latest === "string" ? { latest } : {}),
     ...(typeof deprecated === "string" ? { deprecated } : {}),
   };
@@ -81,7 +108,10 @@ function readRegistryDocument(
 export async function fetchDependencyFacts(
   changes: readonly DependencyChange[],
   fetchJson: FetchJson,
+  options: DependencyFactOptions = {},
 ): Promise<DependencyFact[]> {
+  const now = options.now ?? (() => Date.now());
+  const deadline = now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
   const unique = new Map<string, DependencyChange>();
   for (const change of changes) {
     const key = `${change.name}@${change.version}`;
@@ -95,6 +125,15 @@ export async function fetchDependencyFacts(
     while (next < queue.length) {
       const index = next++;
       const change = queue[index]!;
+      // Never silence: a package nobody got to is UNKNOWN, not clean.
+      if (now() >= deadline) {
+        facts[index] = {
+          name: change.name,
+          version: change.version,
+          unknown: "the lookup budget for this review ran out before this package was checked",
+        };
+        continue;
+      }
       // Defence in depth: the parser cannot emit an invalid name, so this is
       // reachable only by a caller that skipped it. Never let one through to a
       // request.

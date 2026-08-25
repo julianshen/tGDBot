@@ -132,3 +132,87 @@ describe("fetchDependencyFacts", () => {
     expect(fact?.unknown).not.toMatch(/could not be reached/i);
   });
 });
+
+// PR #54 review: `"lodash": "^1.2"` is a RANGE, and `stripRange` leaves `1.2`,
+// which is not a key in the registry's `versions` map. Reporting
+// `published: false` there produced the flatly wrong claim that the build will
+// not install — for a dependency npm resolves perfectly well.
+describe("fetchDependencyFacts — partial versions are ranges, not pins", () => {
+  const document = {
+    "dist-tags": { latest: "1.4.0" },
+    versions: { "1.2.3": {}, "1.4.0": {} },
+  };
+
+  it("makes no publication claim about a partial version", async () => {
+    for (const version of ["1", "1.2"]) {
+      const [fact] = await fetchDependencyFacts(
+        [change("pkg", version)],
+        registry(document),
+      );
+
+      expect(fact?.published, `${version} was treated as a pin`).toBeUndefined();
+    }
+  });
+
+  // The useful half survives: currency is what the rule is mostly for, and it
+  // does not depend on the pin being exact.
+  it("still reports what the latest version is", async () => {
+    const [fact] = await fetchDependencyFacts([change("pkg", "1.2")], registry(document));
+
+    expect(fact?.latest).toBe("1.4.0");
+  });
+
+  it("still answers for an exact pin", async () => {
+    const [absent] = await fetchDependencyFacts([change("pkg", "9.9.9")], registry(document));
+    const [present] = await fetchDependencyFacts([change("pkg", "1.2.3")], registry(document));
+
+    expect(absent?.published).toBe(false);
+    expect(present?.published).toBe(true);
+  });
+
+  it("treats a prerelease pin as exact", async () => {
+    const [fact] = await fetchDependencyFacts(
+      [change("pkg", "2.0.0-beta.1")],
+      registry({ "dist-tags": { latest: "1.4.0" }, versions: { "2.0.0-beta.1": {} } }),
+    );
+
+    expect(fact?.published).toBe(true);
+  });
+});
+
+// PR #54 review: three workers draining 200 packages against a registry that
+// hangs until each request times out is ceil(200/3) * 10s — over eleven minutes
+// before dispatch even starts. A review must not be consumable by an outage.
+describe("fetchDependencyFacts — the lookup phase is bounded overall", () => {
+  it("stops asking once the batch deadline passes", async () => {
+    const changes = Array.from({ length: 30 }, (_, i) => change(`pkg-${i}`, "1.0.0"));
+    let elapsed = 0;
+    const fetchJson = vi.fn(async () => {
+      elapsed += 1000;
+      throw new Error("hung");
+    });
+
+    const facts = await fetchDependencyFacts(changes, fetchJson, {
+      deadlineMs: 5000,
+      now: () => elapsed,
+    });
+
+    // Everything still gets a fact — silence would read as "checked, fine" —
+    // but the ones past the deadline were never asked about.
+    expect(facts).toHaveLength(changes.length);
+    expect(fetchJson.mock.calls.length).toBeLessThan(changes.length);
+    expect(facts.at(-1)?.unknown).toMatch(/time|deadline|budget/i);
+  });
+
+  it("asks about everything when the registry answers promptly", async () => {
+    const changes = Array.from({ length: 10 }, (_, i) => change(`pkg-${i}`, "1.0.0"));
+    const fetchJson = vi.fn(async () => ({
+      "dist-tags": { latest: "1.0.0" },
+      versions: { "1.0.0": {} },
+    }));
+
+    await fetchDependencyFacts(changes, fetchJson, { deadlineMs: 5000, now: () => 0 });
+
+    expect(fetchJson).toHaveBeenCalledTimes(changes.length);
+  });
+});
