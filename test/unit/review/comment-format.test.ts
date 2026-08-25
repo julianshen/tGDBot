@@ -984,6 +984,48 @@ describe("renderSummaryComment — merged members keep their proposed fix", () =
   });
 });
 
+// PR #54 review: a citation reaches the reader only through the representative
+// finding's own block. A merged member and a disputed finding each carry
+// `references` that survived the parser's provenance check and were then
+// silently dropped at the last step — the reader is asked to accept a claim
+// while the evidence for it sits one layer up, unrendered.
+describe("citations reach the reader wherever a finding is rendered", () => {
+  const cited = "https://docs.example.com/leases";
+
+  it("renders a merged member's references", () => {
+    const representative = makeFinding({ file: "a.go", line: 10, message: "Primary claim." });
+    const member = makeFinding({
+      file: "a.go",
+      line: 10,
+      ruleName: "nats",
+      message: "Secondary claim.",
+      references: [cited],
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [representative],
+      inlineCount: 0,
+      unanchored: [representative],
+      context: new Map([[representative, { alsoReported: [member] }]]),
+    }));
+
+    expect(body).toContain(cited);
+  });
+
+  it("renders a disputed finding's references", () => {
+    const finding = makeFinding({ file: "a.go", line: 10, message: "Still argued.", references: [cited] });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [],
+      inlineCount: 0,
+      disputed: [finding],
+    }));
+
+    expect(body).toContain("### Disputed");
+    expect(body).toContain(cited);
+  });
+});
+
 // Codex round 5 on PR #23: with per-client reasons the shared field is
 // undefined, so compact mode kept the publication-failure label but dropped
 // every provider diagnosis.

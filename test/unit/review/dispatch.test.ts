@@ -120,6 +120,7 @@ import {
   MAX_FINDING_QUESTION_CHARS,
   parseDispatchResult,
   extractFindingsArray,
+  referencesDeclaredBy,
   parseFindingsFromFinalOutput,
 } from "../../../src/review/dispatch-results.js";
 
@@ -2423,20 +2424,17 @@ describe("a findings array is all or nothing", () => {
 // a reference it was not given, which makes the guarantee structural rather
 // than a matter of the model behaving.
 describe("finding references are limited to what the rule declared", () => {
-  const ruleWithDocs = {
-    name: "rule-a",
-    body: "See https://docs.example.com/ttl and https://docs.example.com/caching for the contract.",
-    sourcePath: "rules/a.md",
-    dependsOn: [],
-  };
-  const parse = (references: unknown) => parseDispatchResult(
-    JSON.stringify({
-      findings: [{ ...coreFinding, references }],
-      rulesRun: ["rule-a"],
-      rulesFailed: [],
-    }),
-    [ruleWithDocs],
-  ).findings[0];
+  // Exercised through the path that KNOWS which rule produced the finding.
+  // parseDispatchResult deliberately does not: see "citations are not taken on
+  // an unverified rule name" below.
+  const declared = referencesDeclaredBy(
+    "See https://docs.example.com/ttl and https://docs.example.com/caching for the contract.",
+  );
+  const parse = (references: unknown) => parseFindingsFromFinalOutput(
+    JSON.stringify([{ ...coreFinding, references }]),
+    "rule-a",
+    declared,
+  )[0];
 
   it("keeps a citation the rule itself contains", () => {
     expect(parse(["https://docs.example.com/ttl"])?.references).toEqual(["https://docs.example.com/ttl"]);
@@ -2467,8 +2465,6 @@ describe("finding references are limited to what the rule declared", () => {
     }
   });
 
-  // Fail closed: without a rule body there is nothing to check a citation
-  // against, so none survives.
   it("drops every citation when the rule text is unavailable", () => {
     const recovered = parseFindingsFromFinalOutput(
       JSON.stringify([{ ...coreFinding, references: ["https://docs.example.com/ttl"] }]),
@@ -2476,5 +2472,88 @@ describe("finding references are limited to what the rule declared", () => {
     );
 
     expect(recovered[0]?.references).toBeUndefined();
+  });
+});
+
+describe("citations survive the default dispatch path", () => {
+  const ruleBody = "See https://docs.example.com/ttl for the contract.";
+
+  it("keeps a declared citation when the parser is given the rule text", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://docs.example.com/ttl"] }]),
+      "rule-a",
+      referencesDeclaredBy(ruleBody),
+    );
+
+    expect(findings[0]?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("still drops an invented one", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://evil.example/x"] }]),
+      "rule-a",
+      referencesDeclaredBy(ruleBody),
+    );
+
+    expect(findings[0]?.references).toBeUndefined();
+  });
+
+  it("fails closed when no rule text is supplied", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://docs.example.com/ttl"] }]),
+      "rule-a",
+    );
+
+    expect(findings[0]?.references).toBeUndefined();
+  });
+});
+
+// The state schema rejects a persisted array longer than 20, so an unbounded
+// one would parse, publish, and then make the ledger unreadable on the next
+// state read.
+describe("citations are bounded before they can be persisted", () => {
+  it("caps and deduplicates repeated citations", () => {
+    const url = "https://docs.example.com/ttl";
+    const declared = referencesDeclaredBy(`see ${url}`);
+
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: Array.from({ length: 40 }, () => url) }]),
+      "rule-a",
+      declared,
+    );
+
+    expect(findings[0]?.references).toEqual([url]);
+  });
+
+  it("caps distinct citations at the state schema's limit", () => {
+    const urls = Array.from({ length: 30 }, (_unused, index) => `https://docs.example.com/p${index}`);
+    const declared = referencesDeclaredBy(urls.join(" "));
+
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: urls }]),
+      "rule-a",
+      declared,
+    );
+
+    expect(findings[0]?.references?.length).toBeLessThanOrEqual(20);
+  });
+});
+
+// Under legacy dispatch the orchestrating model supplies ruleName, and
+// reconcileWithCapturedResults explicitly does not detect misattribution.
+// Selecting the allowlist from that unverified name would let a finding
+// attributed to rule B cite rule B's URLs even though rule A produced it.
+describe("citations are not taken on an unverified rule name", () => {
+  it("drops citations from the orchestrator's merged output", () => {
+    const parsed = parseDispatchResult(
+      JSON.stringify({
+        findings: [{ ...coreFinding, references: ["https://docs.example.com/ttl"] }],
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+      }),
+      [{ name: "rule-a", body: "See https://docs.example.com/ttl", sourcePath: "r.md", dependsOn: [] }],
+    );
+
+    expect(parsed.findings[0]?.references).toBeUndefined();
   });
 });

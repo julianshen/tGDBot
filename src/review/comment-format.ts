@@ -517,12 +517,29 @@ function renderDiffExcerpt(snippet: HunkSnippet): string {
  * claim rather than take it. Already validated against the rule's own text on
  * parse, so nothing here can be a model invention.
  */
+const MAX_RENDERED_REFERENCES = 5;
+
 function renderReferences(finding: Finding): string | undefined {
   if (!finding.references || finding.references.length === 0) return undefined;
   const items = finding.references
-    .slice(0, 5)
+    .slice(0, MAX_RENDERED_REFERENCES)
     .map((url) => `- ${sanitizeInline(url)}`);
   return [`**Reference**`, "", ...items].join("\n");
+}
+
+/**
+ * The same citations, as sub-bullets, for a finding rendered as a LIST ENTRY.
+ *
+ * A merged member and a disputed finding are one line each, so the standalone
+ * `**Reference**` block would break the list. Dropping them instead — which is
+ * what happened until PR #54's review — asks the reader to weigh a claim while
+ * the evidence for it sits one layer up, unrendered.
+ */
+function referenceBullets(finding: Finding, indent: string): string[] {
+  if (!finding.references || finding.references.length === 0) return [];
+  return finding.references
+    .slice(0, MAX_RENDERED_REFERENCES)
+    .map((url) => `${indent}- Reference: ${sanitizeInline(url)}`);
 }
 
 function renderAlsoReported(members: readonly Finding[]): string {
@@ -535,9 +552,10 @@ function renderAlsoReported(members: readonly Finding[]): string {
     // shown, always NON-committable: a merged member is a similarity judgement,
     // and a one-click commit should never rest on one.
     const suggestion = member.suggestion?.trim() ? capSuggestion(member.suggestion) : undefined;
+    const cited = referenceBullets(member, "  ");
     return suggestion === undefined
-      ? [line]
-      : [line, "", renderSuggestionBlock(suggestion, false), ""];
+      ? [line, ...cited]
+      : [line, ...cited, "", renderSuggestionBlock(suggestion, false), ""];
   });
   return detailsBlock(
     `Also reported by ${members.length} other rule${members.length === 1 ? "" : "s"}`,
@@ -732,11 +750,15 @@ function renderClarificationSection(input: SummaryInput): string | undefined {
 function renderDisputedSection(input: SummaryInput): string | undefined {
   const disputed = input.disputed ?? [];
   if (disputed.length === 0) return undefined;
-  const items = disputed.map((finding) => {
+  const items = disputed.flatMap((finding) => {
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const message = sanitizeText(finding.message);
-    return `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`;
+    // A disputed finding is precisely the one whose evidence a reader needs.
+    return [
+      `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`,
+      ...referenceBullets(finding, "  "),
+    ];
   });
   return `### Disputed\n\n${items.join("\n")}`;
 }

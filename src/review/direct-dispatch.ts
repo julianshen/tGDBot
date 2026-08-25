@@ -53,6 +53,7 @@ import {
   classifyTaskFailure,
   extractFindingsArray,
   parseFindingsFromFinalOutput,
+  referencesDeclaredBy,
 } from "./dispatch-results.js";
 import type { DispatchSession } from "./dispatch.js";
 import { resolveRpivAdvisorExtensionPath } from "./extensions.js";
@@ -345,7 +346,9 @@ interface RuleOutcome {
         return {
           ruleName: rule.name,
           succeeded: true,
-          findings: parseFindingsFromFinalOutput(text, rule.name),
+          // The rule that ran is known here, so its declared citations can be
+          // honoured — unlike the legacy orchestrator's merged output (#49).
+          findings: parseFindingsFromFinalOutput(text, rule.name, referencesDeclaredBy(rule.body)),
         };
       } catch (err) {
         const timedOut = err instanceof PromptTimeoutError;

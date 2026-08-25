@@ -119,6 +119,9 @@ export function readFindingDecision(
  * the security boundary for the citation feature: anything outside it is a
  * model invention.
  */
+/** The state schema refuses a longer array; parsing must not create one. */
+const MAX_PERSISTED_REFERENCES = 20;
+
 export function referencesDeclaredBy(ruleBody: string): Set<string> {
   const declared = new Set<string>();
   for (const match of ruleBody.matchAll(/https?:\/\/[^\s<>()\[\]"'`]+/gu)) {
@@ -170,9 +173,14 @@ export function normalizeUnknownFinding(
   // Fail closed: with no allowed set there is nothing to check a citation
   // against, so none survives (issue #49).
   if (Array.isArray(candidate.references) && allowedReferences !== undefined) {
-    const cited = candidate.references.filter(
-      (url): url is string => typeof url === "string" && allowedReferences.has(url),
-    );
+    // Deduplicated and capped at the state schema's own limit. An unbounded
+    // array parses and publishes, then fails validation on the next state read
+    // and leaves the finding ledger unusable (PR #54 review).
+    const cited = [...new Set(
+      candidate.references.filter(
+        (url): url is string => typeof url === "string" && allowedReferences.has(url),
+      ),
+    )].slice(0, MAX_PERSISTED_REFERENCES);
     if (cited.length > 0) finding.references = cited;
   }
   const suggestion = stateSafeSuggestion(candidate.suggestion);
@@ -186,15 +194,8 @@ function isValidFinding(value: unknown): value is Finding {
   return normalizeUnknownFinding(value) !== undefined;
 }
 
-function normalizeFinding(
-  finding: Finding,
-  declaredByRule: ReadonlyMap<string, ReadonlySet<string>>,
-): Finding {
-  const normalized = normalizeUnknownFinding(
-    finding,
-    undefined,
-    declaredByRule.get(finding.ruleName),
-  );
+function normalizeFinding(finding: Finding): Finding {
+  const normalized = normalizeUnknownFinding(finding);
   if (normalized !== undefined) return normalized;
   // UNREACHABLE today, and deliberately kept. looksLikeDispatchResult has
   // already validated every finding through this same normalization, and the
@@ -258,12 +259,16 @@ export function parseDispatchResult(text: string | undefined, rules: RuleDefinit
     return fallbackResult(rules);
   }
 
-  // A finding may cite only what ITS OWN rule declared, so the allowed set is
-  // keyed by rule name rather than pooled across the run (issue #49).
-  const declaredByRule = new Map(rules.map((rule) => [rule.name, referencesDeclaredBy(rule.body)]));
+  // No citations survive here. This is the legacy orchestrator's MERGED output,
+  // where `ruleName` is supplied by the model and reconcileWithCapturedResults
+  // explicitly does not detect misattribution — so selecting an allowlist from
+  // that name would let a finding attributed to rule B cite rule B's URLs even
+  // though rule A produced it, defeating the per-rule provenance the feature
+  // rests on (PR #54 review). Citations come from paths that know the true
+  // rule: direct dispatch, and recovered task output.
   return {
     ...parsed,
-    findings: parsed.findings.map((finding) => normalizeFinding(finding, declaredByRule)),
+    findings: parsed.findings.map((finding) => normalizeFinding(finding)),
   };
 }
 
@@ -314,7 +319,11 @@ export function extractFindingsArray(text: string): unknown[] | undefined {
 
 // Parses one task's raw finalOutput into Finding[] stamped with ruleName.
 // Best-effort — returns [] on any parse/shape problem, never throws.
-export function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
+export function parseFindingsFromFinalOutput(
+  text: string,
+  ruleName: string,
+  allowedReferences?: ReadonlySet<string>,
+): Finding[] {
   const parsed = extractFindingsArray(text);
   if (!parsed) return [];
   // No entry can be dropped here: extractFindingsArray accepts an array only
@@ -323,7 +332,7 @@ export function parseFindingsFromFinalOutput(text: string, ruleName: string): Fi
   // and the caller reports unusable output rather than a short list — checked
   // in "an array is all or nothing" (issue #41).
   return parsed.flatMap((value) => {
-    const finding = normalizeUnknownFinding(value, ruleName);
+    const finding = normalizeUnknownFinding(value, ruleName, allowedReferences);
     return finding === undefined ? [] : [finding];
   });
 }
@@ -352,7 +361,13 @@ export function suggestionProvenanceKeys(
   captured.forEach((c, i) => {
     const rule = rules[i];
     if (!rule || !c.finalOutput) return;
-    for (const finding of parseFindingsFromFinalOutput(c.finalOutput, rule.name)) {
+    // Recovered from the captured task output, so the producing rule is known
+    // and its declared citations can be honoured (PR #54 review).
+    for (const finding of parseFindingsFromFinalOutput(
+      c.finalOutput,
+      rule.name,
+      referencesDeclaredBy(rule.body),
+    )) {
       if (typeof finding.suggestion === "string") {
         keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
       }
@@ -521,7 +536,11 @@ export function reconcileWithCapturedResults(
     if (!recoverFindings) return;
     const orchestratorHasFindings = orchestrator.findings.some((f) => f.ruleName === rule.name);
     if (!orchestratorHasFindings && c.finalOutput) {
-      recovered.push(...parseFindingsFromFinalOutput(c.finalOutput, rule.name));
+      recovered.push(...parseFindingsFromFinalOutput(
+        c.finalOutput,
+        rule.name,
+        referencesDeclaredBy(rule.body),
+      ));
     }
   });
 

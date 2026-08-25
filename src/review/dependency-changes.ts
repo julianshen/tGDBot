@@ -43,7 +43,7 @@ const PACKAGE_NAME_RE = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u;
 const PACKAGE_NAME_MAX = 214;
 
 /** Conservative: digits and dots, with the usual pre-release/build tail. */
-const VERSION_RE = /^\d+(?:\.\d+)*(?:[-+][A-Za-z0-9.-]+)?$/u;
+const VERSION_RE = /^\d+(?:\.\d+)*(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$/u;
 
 /**
  * Manifests the host knows how to read.
@@ -53,6 +53,18 @@ const VERSION_RE = /^\d+(?:\.\d+)*(?:[-+][A-Za-z0-9.-]+)?$/u;
  * diff invent queries — the exact thing this design exists to prevent.
  */
 const MANIFEST_BASENAMES = new Set(["package.json"]);
+
+/**
+ * Path characters, and nothing else.
+ *
+ * The path is copied from the diff into text a rule reads as TRUSTED_CONTEXT,
+ * and parsing proves only that it sits in a file header — not that its contents
+ * are trustworthy (PR #54 review). Checking the basename alone let a DIRECTORY
+ * carry prose across that boundary: `IGNORE ALL PREVIOUS INSTRUCTIONS/…` has a
+ * perfectly ordinary basename. Restricting the whole path to an inert charset
+ * means no interpolated value can form a sentence.
+ */
+const MANIFEST_PATH_RE = /^[A-Za-z0-9._\/-]{1,512}$/u;
 
 /**
  * How many packages one diff may ask about.
@@ -115,12 +127,12 @@ function manifestContextByLine(diff: string): Map<number, string> {
   const byLine = new Map<number, string>();
   let manifest: string | undefined;
   let inHunk = false;
-  let inDependencySection = false;
+  let section: "dependency" | "other" | "unknown" = "unknown";
   for (const [index, line] of diff.split("\n").entries()) {
     if (line.startsWith("diff --git ")) {
       manifest = undefined;
       inHunk = false;
-      inDependencySection = false;
+      section = "unknown";
       continue;
     }
     if (!inHunk) {
@@ -128,14 +140,21 @@ function manifestContextByLine(diff: string): Map<number, string> {
       if (header) {
         const path = header[1] ?? "";
         const basename = path.slice(path.lastIndexOf("/") + 1);
-        manifest = MANIFEST_BASENAMES.has(basename) ? path : undefined;
+        manifest = MANIFEST_BASENAMES.has(basename) && MANIFEST_PATH_RE.test(path)
+          ? path
+          : undefined;
         continue;
       }
     }
     if (line.startsWith("@@")) {
       inHunk = true;
-      // A hunk starts somewhere unknown in the file, so no section is assumed.
-      inDependencySection = false;
+      // Git's own hunk context often names the enclosing key — use it when it
+      // is there. Otherwise the section is UNKNOWN rather than absent: git
+      // emits only nearby lines, so an ordinary bump in a long dependency list
+      // has no header in its hunk at all, and requiring one omitted most real
+      // changes (PR #54 review).
+      const context = /@@[^@]*@@\s*"?([A-Za-z]+)"?\s*:/u.exec(line);
+      section = context ? (DEPENDENCY_SECTIONS.has(context[1] ?? "") ? "dependency" : "other") : "unknown";
       continue;
     }
     if (manifest === undefined || !inHunk) continue;
@@ -144,14 +163,20 @@ function manifestContextByLine(diff: string): Map<number, string> {
     const content = line.slice(1);
     const opening = /^\s*"([A-Za-z]+)"\s*:\s*\{/u.exec(content);
     if (opening) {
-      inDependencySection = DEPENDENCY_SECTIONS.has(opening[1] ?? "");
+      section = DEPENDENCY_SECTIONS.has(opening[1] ?? "") ? "dependency" : "other";
       continue;
     }
     if (/^\s*\}/u.test(content)) {
-      inDependencySection = false;
+      section = "unknown";
       continue;
     }
-    if (inDependencySection) byLine.set(index, manifest);
+    if (section === "other") continue;
+    // With the section unknown, depth decides: a dependency entry is nested
+    // inside a top-level object, so it is indented further than a top-level
+    // field like "version". Not proof, but the alternative — dropping every
+    // bump whose header git did not include — misses most real ones.
+    if (section === "unknown" && !/^\s{4,}"/u.test(content)) continue;
+    byLine.set(index, manifest);
   }
   return byLine;
 }
