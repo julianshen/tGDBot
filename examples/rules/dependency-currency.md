@@ -2,6 +2,9 @@
 name: dependency-currency
 ---
 
+Requires `--dependency-facts on`. Without it the host lists the changed versions
+but looks nothing up, and this rule will correctly find nothing to say.
+
 Review the dependency changes in this pull request. The review host has already
 parsed the changed manifests and, where it could, looked each version up — its
 findings are in the TRUSTED_CONTEXT section as a list of `name@version` entries

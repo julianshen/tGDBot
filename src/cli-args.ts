@@ -12,6 +12,14 @@ export interface SharedReviewOptions {
   rulesDir: string;
   disableBuiltinRule: boolean;
   advisor: "on" | "off";
+  /**
+   * Whether the host may ask the npm registry about changed dependencies.
+   *
+   * OFF by default: this is the only outbound request the tool makes, it
+   * reveals which packages a private repository depends on, and a review must
+   * not start talking to a third party because someone upgraded the CLI.
+   */
+  dependencyFacts: "on" | "off";
   /** Controls whether findings may render committable suggestion blocks. */
   suggestions: "on" | "off";
   dryRun: boolean;
@@ -41,6 +49,7 @@ const DEFAULTS = {
   rulesDir: ".review/rules",
   disableBuiltinRule: false,
   advisor: "on" as const,
+  dependencyFacts: "off" as const,
   suggestions: "on" as const,
   dryRun: false,
   trustLocalRules: false,
@@ -64,6 +73,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "rules-dir": { type: "string" },
       "disable-builtin-rule": { type: "boolean" },
       advisor: { type: "string" },
+      "dependency-facts": { type: "string" },
       suggestions: { type: "string" },
       model: { type: "string" },
       "dry-run": { type: "boolean" },
@@ -112,6 +122,14 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     throw new Error(`Invalid --advisor value: "${advisor}" (expected "on" or "off")`);
   }
 
+  const dependencyFacts =
+    (values["dependency-facts"] as string | undefined) ?? DEFAULTS.dependencyFacts;
+  if (dependencyFacts !== "on" && dependencyFacts !== "off") {
+    throw new Error(
+      `Invalid --dependency-facts value: "${dependencyFacts}" (expected "on" or "off")`,
+    );
+  }
+
   const suggestions = (values.suggestions as string | undefined) ?? DEFAULTS.suggestions;
   if (suggestions !== "on" && suggestions !== "off") {
     throw new Error(`Invalid --suggestions value: "${suggestions}" (expected "on" or "off")`);
@@ -157,6 +175,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
+    dependencyFacts,
     suggestions,
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
     trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,

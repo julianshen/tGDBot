@@ -34,6 +34,8 @@ import { redactedMessage } from "./conversation/redact.js";
 import { isTransientGhFailure } from "./vcs/gh-retry.js";
 import { isDiffIncompleteError } from "./vcs/github-large-diff.js";
 import { dependencyChangesFromDiff, dependencyContextPack } from "./review/dependency-changes.js";
+import { fetchDependencyFacts } from "./review/dependency-facts.js";
+import type { FetchJson } from "./review/dependency-facts.js";
 import {
   buildConversationContext,
   MAX_REVIEW_CONTEXT_PAGES,
@@ -156,6 +158,12 @@ export type ReviewInvocation =
 
 export interface ReviewDependencies {
   invocation: ReviewInvocation;
+  /**
+   * How a registry lookup is performed, when `--dependency-facts on` asks for
+   * one. Injected so the suite never touches the network, and so the one place
+   * that CAN make an outbound request stays visible in the dependency list.
+   */
+  fetchJson: FetchJson;
   resolveConfig: (args: CliArgs) => ResolvedConfig;
   loadRules: (rulesDir: string, includeBuiltin: boolean) => Promise<LoadResult>;
   dispatchRules: (input: ReviewDispatchInput) => Promise<DispatchResult>;
@@ -767,6 +775,32 @@ async function loadRulesForReview(
 }
 
 /**
+ * The one outbound request this tool makes, and only under
+ * `--dependency-facts on`.
+ *
+ * Asks for npm's ABBREVIATED metadata: a full packument for a popular package
+ * runs to megabytes of historical release data, while the abbreviated form
+ * carries the version list, `dist-tags` and per-version `deprecated` — exactly
+ * what `readRegistryDocument` reads, and nothing else.
+ *
+ * A non-2xx response throws rather than returning a body, so it surfaces as an
+ * explicit `unknown` in the pack instead of an unparseable document. The
+ * timeout is what keeps a hung registry from stalling a review indefinitely.
+ */
+const REGISTRY_TIMEOUT_MS = 10_000;
+
+async function fetchJsonReal(url: string): Promise<unknown> {
+  const response = await fetch(url, {
+    headers: { accept: "application/vnd.npm.install-v1+json" },
+    signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+  }
+  return await response.json();
+}
+
+/**
  * The actual `review` command flow: resolve config, fetch the PR + existing
  * bot comment, decide dedup, load + dispatch rules, orchestrate the merged
  * findings, and upsert (or dry-run print) the final comment.
@@ -797,6 +831,7 @@ export async function review(
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
+  const fetchJsonFn = deps.fetchJson ?? fetchJsonReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
   const publicationHooks = deps.publicationHooks;
   const now = deps.now ?? (() => new Date().toISOString());
@@ -1109,7 +1144,16 @@ export async function review(
   // delivered as trusted context. Supplied for EVERY rule or for none — the
   // dispatch contract rejects a partial map — and omitted entirely when nothing
   // changed, so an ordinary review gains no empty section.
-  const dependencyPack = dependencyContextPack(dependencyChangesFromDiff(diff));
+  const dependencyChanges = dependencyChangesFromDiff(diff);
+  // Opt-in, and the only outbound request the tool makes. Without it the pack
+  // still ships the parsed versions and says plainly that nothing was checked —
+  // which is why leaving this unwired shipped a rule that could never see the
+  // facts it exists to check (PR #54 review).
+  const dependencyFacts =
+    args.dependencyFacts === "on" && dependencyChanges.length > 0
+      ? await fetchDependencyFacts(dependencyChanges, fetchJsonFn)
+      : [];
+  const dependencyPack = dependencyContextPack(dependencyChanges, dependencyFacts);
   const contextPacks = dependencyPack === undefined
     ? undefined
     : Object.fromEntries(rules.map((rule) => [rule.name, dependencyPack]));

@@ -373,6 +373,15 @@ tgd-review-agent review \
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
+  --dependency-facts on|off      # default: OFF. The only outbound request this tool makes: when a
+                                  # pull request changes a package.json, the host asks
+                                  # registry.npmjs.org about each changed package and puts the
+                                  # answer — latest version, deprecation notice, whether the pinned
+                                  # version is published at all — in front of every rule as trusted
+                                  # context. Off by default because it reveals a private
+                                  # repository's dependencies to a third party. With it off the
+                                  # context still lists the changed versions and says plainly that
+                                  # none of them were checked. See examples/rules/dependency-currency.md
   --model <provider>/<model>     # optional: the DEFAULT model. Runs the review's orchestrating
                                   # session AND any rule that doesn't pin its own provider/model
                                   # (pinned rules always keep their pin). Default when absent:

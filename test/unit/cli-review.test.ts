@@ -4033,3 +4033,84 @@ describe("review: discussion context failures are diagnosable and non-blocking",
     expect(error!.message).toMatch(/HTTP 502 upstream unavailable/u);
   });
 });
+
+// PR #54 review: the fetch layer built for #50 was invoked only by its own
+// tests. Every real review called dependencyContextPack with no facts, so the
+// dependency-currency rule could never see a latest version, a deprecation, or
+// a withdrawn release — the facts it exists to check.
+//
+// Wiring it means outbound network from a tool that otherwise makes none, so it
+// is opt-in and OFF by default. The pack's wording already tells the truth in
+// both states: "have NOT been checked" without facts, "do not read silence as
+// approval" with them.
+describe("review — dependency facts", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    '     "left-pad": "1.0.0",',
+    '-    "lodash": "4.17.20",',
+    '+    "lodash": "4.17.21",',
+    '     "react": "18.0.0"',
+  ].join("\n");
+
+  const packFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  it("makes no request, and says nothing was checked, unless asked", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn();
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(packFor(h)).toContain("lodash@4.17.21");
+    expect(packFor(h)).toMatch(/NOT been checked/);
+  });
+
+  it("puts the registry's answer in front of the rule when enabled", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.30" },
+      versions: { "4.17.21": { deprecated: "use lodash-es" } },
+    });
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).toHaveBeenCalledWith("https://registry.npmjs.org/lodash");
+    expect(packFor(h)).toContain("latest is 4.17.30");
+    expect(packFor(h)).toContain("use lodash-es");
+    expect(packFor(h)).not.toMatch(/NOT been checked/);
+  });
+
+  // An outage must not read as a clean bill of health, and must not fail the
+  // review either.
+  it("reports a failed lookup as unchecked rather than as nothing to report", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn().mockRejectedValue(new Error("ECONNRESET"));
+
+    const exitCode = await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(exitCode).toBe(0);
+    expect(packFor(h)).toMatch(/lookup failed/);
+    expect(packFor(h)).toMatch(/ECONNRESET/);
+  });
+
+  it("asks nothing when the diff changes no manifest", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    const fetchJson = vi.fn();
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(packFor(h)).toBeUndefined();
+  });
+});
