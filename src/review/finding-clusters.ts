@@ -351,3 +351,70 @@ export function clusterFindings(findings: readonly Finding[]): FindingCluster[] 
       };
     });
 }
+
+
+/**
+ * Groups that describe ONE defect spread across several files (issue #48).
+ *
+ * Presentation only, and deliberately separate from `clusterFindings`: this
+ * never chooses a representative for placement and never affects where an
+ * inline comment goes. Only a cluster's representative receives an inline
+ * comment, so merging across files in the inline path would move a finding's
+ * comment off the file it is about. Describing the relationship in the summary
+ * costs nothing, because nothing moves.
+ *
+ * The signal is identifiers ONLY — never prose. Same-file clustering can lean
+ * on proximity as corroboration; across files there is none, and similarity
+ * between two rules' vocabularies is exactly the weak evidence that let one
+ * revocation defect be reported six ways on hmchangw/newchat#188. Identifiers
+ * come from the source rather than the rule's words, so they survive that.
+ *
+ * A group confined to one file is dropped: it is already collapsed into a
+ * single inline comment, and repeating it here would be noise.
+ */
+export function crossFileGroups(findings: readonly Finding[]): FindingCluster[] {
+  const identifiers = findings.map(identifierSignals);
+  const parent = findings.map((_, index) => index);
+  const find = (index: number): number => {
+    let root = index;
+    while (parent[root] !== root) root = parent[root]!;
+    return root;
+  };
+  for (let i = 0; i < findings.length; i += 1) {
+    for (let j = i + 1; j < findings.length; j += 1) {
+      if (sharedIdentifierCount(identifiers[i]!, identifiers[j]!) < SHARED_IDENTIFIERS) continue;
+      const left = find(i);
+      const right = find(j);
+      if (left !== right) parent[Math.max(left, right)] = Math.min(left, right);
+    }
+  }
+
+  const byRoot = new Map<number, Finding[]>();
+  for (const [index, finding] of findings.entries()) {
+    const root = find(index);
+    const bucket = byRoot.get(root);
+    if (bucket) bucket.push(finding);
+    else byRoot.set(root, [finding]);
+  }
+
+  return [...byRoot.entries()]
+    .sort(([left], [right]) => left - right)
+    .flatMap(([, members]) => {
+      if (members.length < 2) return [];
+      if (new Set(members.map((member) => member.file)).size < 2) return [];
+      const ordered = [...members].sort(
+        (a, b) =>
+          SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] ||
+          b.message.length - a.message.length,
+      );
+      const lines = [
+        ...new Set(members.map((m) => m.line).filter((line): line is number => typeof line === "number")),
+      ].sort((a, b) => a - b);
+      return [{
+        representative: ordered[0]!,
+        members: ordered,
+        rules: [...new Set(members.map((member) => member.ruleName))],
+        lines,
+      }];
+    });
+}

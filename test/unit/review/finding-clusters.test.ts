@@ -8,7 +8,7 @@
 // instead of dropping it. That safety property is what lets the similarity
 // threshold be tuned for recall rather than precision.
 import { describe, expect, it } from "vitest";
-import { clusterFindings } from "../../../src/review/finding-clusters.js";
+import { clusterFindings, crossFileGroups } from "../../../src/review/finding-clusters.js";
 import type { Finding } from "../../../src/review/types.js";
 
 function finding(overrides: Partial<Finding> & { message: string }): Finding {
@@ -287,5 +287,71 @@ describe("clusterFindings — one symbol is one signal", () => {
     ]);
 
     expect(clusters).toHaveLength(1);
+  });
+});
+
+
+// Issue #48: a defect spread across files stays several inline comments, one
+// per file — deliberately, since only a cluster's representative gets an inline
+// comment and merging across files would move a comment off the file it is
+// about. The relationship is described in the SUMMARY instead, where nothing
+// has to move.
+describe("crossFileGroups", () => {
+  const idFinding = (file: string, message: string, overrides: Partial<Finding> = {}) =>
+    finding({ file, message, ...overrides });
+
+  it("groups findings in different files that name the same code", () => {
+    const groups = crossFileGroups([
+      idFinding("cache.go", "`readL2` returns before `FetchFromMongo` runs."),
+      idFinding("loader.go", "A secondary read repopulates via `FetchFromMongo` after `readL2` misses."),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.members).toHaveLength(2);
+  });
+
+  // Prose similarity is the signal that failed on #188 — different rules
+  // describe one defect in different vocabularies. Only identifiers cross files.
+  it("does not group on prose similarity alone", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "Set followed by Get is not atomic."),
+      idFinding("b.go", "Set followed by Get is not atomic."),
+    ]);
+
+    expect(groups).toEqual([]);
+  });
+
+  it("requires two independently named symbols, as same-file clustering does", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "`readL2` is slow."),
+      idFinding("b.go", "`readL2` is called twice."),
+    ]);
+
+    expect(groups).toEqual([]);
+  });
+
+  // A group entirely inside one file is already collapsed into a single inline
+  // comment, so repeating it in the summary would be noise.
+  it("ignores a group that does not span files", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "`readL2` skips `FetchFromMongo`."),
+      idFinding("a.go", "`FetchFromMongo` never runs while `readL2` hits."),
+    ]);
+
+    expect(groups).toEqual([]);
+  });
+
+  it("returns nothing when every finding stands alone", () => {
+    expect(crossFileGroups([idFinding("a.go", "`readL2` skips `FetchFromMongo`.")])).toEqual([]);
+  });
+
+  it("promotes the highest-severity member as the group's headline", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "`readL2` skips `FetchFromMongo`.", { severity: "warning" }),
+      idFinding("b.go", "`FetchFromMongo` races `readL2`.", { severity: "blocking" }),
+    ]);
+
+    expect(groups[0]?.representative.severity).toBe("blocking");
+    expect(groups[0]?.members).toHaveLength(2);
   });
 });
