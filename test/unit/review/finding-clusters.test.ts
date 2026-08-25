@@ -355,3 +355,62 @@ describe("crossFileGroups", () => {
     expect(groups[0]?.members).toHaveLength(2);
   });
 });
+
+
+// PR #53 review. The bar is "two independently named symbols", but signals were
+// collected per OCCURRENCE — and a finding naturally names its symbol twice,
+// once in the title and again in the message. Two such findings then cleared a
+// two-symbol threshold on the strength of one shared symbol.
+describe("clusterFindings — one symbol stays one signal however often it appears", () => {
+  it("does not merge two findings that share a single symbol named twice each", () => {
+    const clusters = clusterFindings([
+      finding({
+        line: 120,
+        title: "`readL2` returns a stale entry.",
+        message: "`readL2` returns before the loader runs.",
+      }),
+      finding({
+        line: 400,
+        title: "`readL2` lacks a timeout.",
+        message: "`readL2` is called without a budget.",
+      }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // The same symbol at two qualifications is still one symbol.
+  it("treats a qualified and bare reference to one symbol as a single signal", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, title: "`Cache.readL2` is stale.", message: "`readL2` returns early." }),
+      finding({ line: 400, title: "`readL2` is slow.", message: "`Cache.readL2` blocks." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // Two genuinely distinct symbols still corroborate, however often each is named.
+  it("still merges on two distinct symbols repeated across title and message", () => {
+    const clusters = clusterFindings([
+      finding({
+        line: 120,
+        title: "`readL2` skips `FetchFromMongo`.",
+        message: "`readL2` returns before `FetchFromMongo` runs.",
+      }),
+      finding({
+        line: 400,
+        title: "`FetchFromMongo` never revalidates.",
+        message: "Sliding keeps `readL2` hitting, so `FetchFromMongo` is skipped.",
+      }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+  });
+
+  it("applies the same counting across files", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", title: "`readL2` is stale.", message: "`readL2` returns early." }),
+      finding({ file: "b.go", title: "`readL2` is slow.", message: "`readL2` blocks." }),
+    ])).toEqual([]);
+  });
+});

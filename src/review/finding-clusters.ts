@@ -160,7 +160,42 @@ function identifierSignals(finding: Finding): Set<string>[] {
   for (const match of unquoted.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+\b/gu)) {
     collect([match[0]]);
   }
-  return signals;
+  return mergeReferencesToOneSymbol(signals);
+}
+
+/**
+ * Collapses the references WITHIN one finding that name the same symbol.
+ *
+ * Signals are collected per occurrence, and a finding naturally names its
+ * symbol more than once — typically in the title and again in the message. Left
+ * as separate signals, two findings sharing ONE symbol would clear a threshold
+ * that means "two independently named symbols" (PR #53 review).
+ *
+ * Two references in the same finding that share any token are taken to be the
+ * same symbol, which also folds `readL2` into `Cache.readL2` — a qualified and
+ * a bare mention of one function, not two.
+ */
+function mergeReferencesToOneSymbol(signals: readonly Set<string>[]): Set<string>[] {
+  const merged: Set<string>[] = [];
+  for (const signal of signals) {
+    const overlapping = merged.filter((existing) => {
+      for (const token of signal) if (existing.has(token)) return true;
+      return false;
+    });
+    if (overlapping.length === 0) {
+      merged.push(new Set(signal));
+      continue;
+    }
+    // Fold every overlapping group together with this reference: A~B and B~C
+    // means all three name one symbol.
+    const combined = new Set(signal);
+    for (const group of overlapping) {
+      for (const token of group) combined.add(token);
+      merged.splice(merged.indexOf(group), 1);
+    }
+    merged.push(combined);
+  }
+  return merged;
 }
 
 /**
