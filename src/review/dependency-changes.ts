@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ContextPackResult } from "../context/context-pack.js";
+import type { DependencyFact } from "./dependency-facts.js";
 
 // Issue #50: reviewing a dependency bump needs facts the checkout does not
 // contain — whether a version is current, withdrawn, deprecated, or carries a
@@ -205,11 +206,37 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
  */
 export function dependencyContextPack(
   changes: readonly DependencyChange[],
+  facts: readonly DependencyFact[] = [],
 ): ContextPackResult | undefined {
   if (changes.length === 0) return undefined;
-  const lines = changes.map(
-    (change) => `- ${change.name}@${change.version} (${change.manifest})`,
-  );
+  const factFor = new Map(facts.map((fact) => [`${fact.name}@${fact.version}`, fact]));
+  const lines = changes.map((change) => {
+    const head = `- ${change.name}@${change.version} (${change.manifest})`;
+    const fact = factFor.get(`${change.name}@${change.version}`);
+    if (fact === undefined) return head;
+    const notes: string[] = [];
+    // An unchecked package must read as unchecked, never as clean.
+    if (fact.unknown !== undefined) notes.push(`lookup failed — ${fact.unknown}`);
+    if (fact.published === false) notes.push("this version is NOT published by the registry");
+    if (fact.deprecated !== undefined) notes.push(`deprecated: ${fact.deprecated}`);
+    if (fact.latest !== undefined && fact.latest !== change.version) {
+      notes.push(`latest is ${fact.latest}`);
+    }
+    if (fact.latest !== undefined && fact.latest === change.version) notes.push("this is the latest");
+    return notes.length === 0 ? head : `${head}\n${notes.map((note) => `  - ${note}`).join("\n")}`;
+  });
+  const checked = facts.some((fact) => fact.unknown === undefined);
+  const closing = checked
+    ? [
+        "Anything not stated above was not established. A package with no note",
+        "beyond its version was not checked, or the registry said nothing about",
+        "it — do not read silence as approval.",
+      ]
+    : [
+        "These versions have NOT been checked against a registry or advisory",
+        "database: whether each is current, deprecated, withdrawn, or affected by",
+        "a known advisory is unknown here. Do not assert otherwise.",
+      ];
   const text = [
     "## Dependency changes in this pull request",
     "",
@@ -217,9 +244,7 @@ export function dependencyContextPack(
     "",
     ...lines,
     "",
-    "These versions have NOT been checked against a registry or advisory",
-    "database: whether each is current, deprecated, withdrawn, or affected by a",
-    "known advisory is unknown here. Do not assert otherwise.",
+    ...closing,
   ].join("\n");
   return {
     text,

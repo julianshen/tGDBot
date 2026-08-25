@@ -260,3 +260,59 @@ describe("dependencyContextPack", () => {
       .toMatch(/not been checked|no registry|unknown/i);
   });
 });
+
+
+// Issue #50: the pack carries FACTS once they exist, and keeps saying what it
+// does not know when they do not.
+describe("dependencyContextPack with facts", () => {
+  const change = { name: "lodash", version: "4.17.20", manifest: "package.json" };
+
+  it("reports a version that is behind", () => {
+    const pack = dependencyContextPack([change], [
+      { name: "lodash", version: "4.17.20", latest: "4.17.21", published: true },
+    ]);
+
+    expect(pack?.text).toContain("4.17.21");
+    expect(pack?.text).toMatch(/latest/i);
+  });
+
+  it("reports a deprecation", () => {
+    const pack = dependencyContextPack([change], [
+      { name: "lodash", version: "4.17.20", published: true, deprecated: "no longer maintained" },
+    ]);
+
+    expect(pack?.text).toContain("no longer maintained");
+  });
+
+  it("reports a version the registry does not publish", () => {
+    const pack = dependencyContextPack([change], [
+      { name: "lodash", version: "4.17.20", published: false },
+    ]);
+
+    expect(pack?.text).toMatch(/not published/i);
+  });
+
+  // The outage rule again, at the rendering layer: an unchecked package must
+  // read as unchecked, not as clean.
+  it("says a lookup failed rather than staying silent", () => {
+    const pack = dependencyContextPack([change], [
+      { name: "lodash", version: "4.17.20", unknown: "the registry could not be reached (ECONNRESET)" },
+    ]);
+
+    expect(pack?.text).toMatch(/could not be reached/i);
+    expect(pack?.text).toMatch(/unknown|not been checked/i);
+  });
+
+  it("still says nothing was checked when no facts are supplied", () => {
+    expect(dependencyContextPack([change])?.text).toMatch(/not been checked/i);
+  });
+
+  it("changes its hash when the facts change", () => {
+    const withoutFacts = dependencyContextPack([change]);
+    const withFacts = dependencyContextPack([change], [
+      { name: "lodash", version: "4.17.20", latest: "4.17.21", published: true },
+    ]);
+
+    expect(withoutFacts?.manifestHash).not.toBe(withFacts?.manifestHash);
+  });
+});
