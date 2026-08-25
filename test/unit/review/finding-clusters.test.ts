@@ -8,7 +8,7 @@
 // instead of dropping it. That safety property is what lets the similarity
 // threshold be tuned for recall rather than precision.
 import { describe, expect, it } from "vitest";
-import { clusterFindings } from "../../../src/review/finding-clusters.js";
+import { clusterFindings, crossFileGroups } from "../../../src/review/finding-clusters.js";
 import type { Finding } from "../../../src/review/types.js";
 
 function finding(overrides: Partial<Finding> & { message: string }): Finding {
@@ -287,5 +287,200 @@ describe("clusterFindings — one symbol is one signal", () => {
     ]);
 
     expect(clusters).toHaveLength(1);
+  });
+});
+
+
+// Issue #48: a defect spread across files stays several inline comments, one
+// per file — deliberately, since only a cluster's representative gets an inline
+// comment and merging across files would move a comment off the file it is
+// about. The relationship is described in the SUMMARY instead, where nothing
+// has to move.
+describe("crossFileGroups", () => {
+  const idFinding = (file: string, message: string, overrides: Partial<Finding> = {}) =>
+    finding({ file, message, ...overrides });
+
+  it("groups findings in different files that name the same code", () => {
+    const groups = crossFileGroups([
+      idFinding("cache.go", "`readL2` returns before `FetchFromMongo` runs."),
+      idFinding("loader.go", "A secondary read repopulates via `FetchFromMongo` after `readL2` misses."),
+    ]);
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]?.members).toHaveLength(2);
+  });
+
+  // Prose similarity is the signal that failed on #188 — different rules
+  // describe one defect in different vocabularies. Only identifiers cross files.
+  it("does not group on prose similarity alone", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "Set followed by Get is not atomic."),
+      idFinding("b.go", "Set followed by Get is not atomic."),
+    ]);
+
+    expect(groups).toEqual([]);
+  });
+
+  it("requires two independently named symbols, as same-file clustering does", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "`readL2` is slow."),
+      idFinding("b.go", "`readL2` is called twice."),
+    ]);
+
+    expect(groups).toEqual([]);
+  });
+
+  // A group entirely inside one file is already collapsed into a single inline
+  // comment, so repeating it in the summary would be noise.
+  it("ignores a group that does not span files", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "`readL2` skips `FetchFromMongo`."),
+      idFinding("a.go", "`FetchFromMongo` never runs while `readL2` hits."),
+    ]);
+
+    expect(groups).toEqual([]);
+  });
+
+  it("returns nothing when every finding stands alone", () => {
+    expect(crossFileGroups([idFinding("a.go", "`readL2` skips `FetchFromMongo`.")])).toEqual([]);
+  });
+
+  it("promotes the highest-severity member as the group's headline", () => {
+    const groups = crossFileGroups([
+      idFinding("a.go", "`readL2` skips `FetchFromMongo`.", { severity: "warning" }),
+      idFinding("b.go", "`FetchFromMongo` races `readL2`.", { severity: "blocking" }),
+    ]);
+
+    expect(groups[0]?.representative.severity).toBe("blocking");
+    expect(groups[0]?.members).toHaveLength(2);
+  });
+});
+
+
+// PR #53 review. The bar is "two independently named symbols", but signals were
+// collected per OCCURRENCE — and a finding naturally names its symbol twice,
+// once in the title and again in the message. Two such findings then cleared a
+// two-symbol threshold on the strength of one shared symbol.
+describe("clusterFindings — one symbol stays one signal however often it appears", () => {
+  it("does not merge two findings that share a single symbol named twice each", () => {
+    const clusters = clusterFindings([
+      finding({
+        line: 120,
+        title: "`readL2` returns a stale entry.",
+        message: "`readL2` returns before the loader runs.",
+      }),
+      finding({
+        line: 400,
+        title: "`readL2` lacks a timeout.",
+        message: "`readL2` is called without a budget.",
+      }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // The same symbol at two qualifications is still one symbol.
+  it("treats a qualified and bare reference to one symbol as a single signal", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, title: "`Cache.readL2` is stale.", message: "`readL2` returns early." }),
+      finding({ line: 400, title: "`readL2` is slow.", message: "`Cache.readL2` blocks." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  // Two genuinely distinct symbols still corroborate, however often each is named.
+  it("still merges on two distinct symbols repeated across title and message", () => {
+    const clusters = clusterFindings([
+      finding({
+        line: 120,
+        title: "`readL2` skips `FetchFromMongo`.",
+        message: "`readL2` returns before `FetchFromMongo` runs.",
+      }),
+      finding({
+        line: 400,
+        title: "`FetchFromMongo` never revalidates.",
+        message: "Sliding keeps `readL2` hitting, so `FetchFromMongo` is skipped.",
+      }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+  });
+
+  it("applies the same counting across files", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", title: "`readL2` is stale.", message: "`readL2` returns early." }),
+      finding({ file: "b.go", title: "`readL2` is slow.", message: "`readL2` blocks." }),
+    ])).toEqual([]);
+  });
+});
+
+
+// PR #53 review. Folding any two references that share a token was too eager:
+// `Cache.readL2` and `Cache.writeL2` share only their RECEIVER and are two
+// different methods. Collapsing them lost a genuine two-symbol match.
+describe("clusterFindings — a receiver is not the symbol", () => {
+  it("treats two methods on one receiver as two symbols", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "`Cache.readL2` and `Cache.writeL2` disagree about staleness." }),
+      finding({ line: 400, message: "`Cache.writeL2` races `Cache.readL2` during eviction." }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+  });
+
+  it("still folds a bare and a qualified mention of ONE method", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, title: "`Cache.readL2` is stale.", message: "`readL2` returns early." }),
+      finding({ line: 400, title: "`readL2` is slow.", message: "`Cache.readL2` blocks." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  it("groups across files on two sibling methods", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`Cache.readL2` skips `Cache.writeL2`." }),
+      finding({ file: "b.go", message: "`Cache.writeL2` runs before `Cache.readL2`." }),
+    ])).toHaveLength(1);
+  });
+});
+
+
+// PR #53 review, the mirror of the previous fix. Identifying a symbol by its
+// terminal alone lost the receiver, so two methods with a common name on
+// DIFFERENT receivers matched. Both corrections have to hold at once: a bare
+// mention still folds into its qualified form, and two qualified references
+// only match when their receivers agree.
+describe("clusterFindings — receivers separate look-alike methods", () => {
+  it("does not group look-alike methods on different receivers", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`UserCache.loadEntry` races `UserCache.storeEntry`." }),
+      finding({ file: "b.go", message: "`ConfigCache.loadEntry` races `ConfigCache.storeEntry`." }),
+    ])).toEqual([]);
+  });
+
+  it("groups them when the receiver does agree", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`UserCache.loadEntry` races `UserCache.storeEntry`." }),
+      finding({ file: "b.go", message: "`UserCache.storeEntry` runs before `UserCache.loadEntry`." }),
+    ])).toHaveLength(1);
+  });
+
+  // The earlier correction must survive: a bare mention is compatible with any
+  // qualification of the same name, because the reviewer simply did not say.
+  it("still lets a bare mention match its qualified form", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`loadEntry` skips `storeEntry`." }),
+      finding({ file: "b.go", message: "`UserCache.storeEntry` runs before `UserCache.loadEntry`." }),
+    ])).toHaveLength(1);
+  });
+
+  // Two different receivers named in ONE finding are two symbols, not one.
+  it("counts two receivers in one finding as two symbols", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`UserCache.loadEntry` disagrees with `ConfigCache.loadEntry`." }),
+      finding({ file: "b.go", message: "`ConfigCache.loadEntry` disagrees with `UserCache.loadEntry`." }),
+    ])).toHaveLength(1);
   });
 });

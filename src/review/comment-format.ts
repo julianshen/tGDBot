@@ -7,6 +7,7 @@
 //      failed-rule reasons, and any finding that could NOT be anchored.
 //
 // Both are plain string builders: pure, synchronous, no I/O.
+import { crossFileGroups } from "./finding-clusters.js";
 import type { Finding } from "./types.js";
 import type { HunkSnippet } from "./diff-anchors.js";
 import type { DiscussionMemory } from "./existing-discussion.js";
@@ -723,6 +724,56 @@ function renderDisputedSection(input: SummaryInput): string | undefined {
   return `### Disputed\n\n${items.join("\n")}`;
 }
 
+
+/**
+ * Issue #48: one defect spread across several files arrives as several inline
+ * comments, each correct and each looking unrelated. They stay where they are —
+ * an inline comment belongs on the file it is about — and the RELATIONSHIP is
+ * named here instead.
+ *
+ * Pointers, never prose. Every member is already posted inline or rendered
+ * below, so repeating its text would undo the "counted, not repeated" property
+ * the summary depends on. A reader gets "these are one problem" and where to
+ * look.
+ */
+/** A finding's one-line claim: its authored title, else its first sentence. */
+function claimOf(finding: Finding): string {
+  const title = finding.title?.trim();
+  if (title) return title;
+  return /^(.*?[.!?])(?:\s|$)/su.exec(finding.message.trim())?.[1] ?? finding.message;
+}
+
+function renderCrossFileGroupsSection(input: SummaryInput): string | undefined {
+  const groups = crossFileGroups(input.allFindings);
+  if (groups.length === 0) return undefined;
+  const rendered = groups.map((group: import("./finding-clusters.js").FindingCluster) => {
+    const headline = truncate(
+      sanitizeInline(claimOf(group.representative)),
+      160,
+    );
+    const members = group.members.map((member: Finding) => {
+      const loc = typeof member.line === "number"
+        ? `${sanitizeInline(member.file)}:${member.line}`
+        : sanitizeInline(member.file);
+      const rule = sanitizeInline(member.ruleName);
+      const claim = truncate(
+        sanitizeInline(claimOf(member)),
+        120,
+      );
+      return `  - \`${loc}\` (\`${rule}\`) — ${claim}`;
+    });
+    return [`- **${headline}**`, ...members].join("\n");
+  });
+  return [
+    `### 🔗 Findings that share one root cause (${groups.length})`,
+    "",
+    "These are reported separately above, on the files they affect. Listed here",
+    "because they appear to be one problem seen from several places.",
+    "",
+    ...rendered,
+  ].join("\n");
+}
+
 export function renderSummaryComment(
   input: SummaryInput,
   maxLength = SUMMARY_COMMENT_MAX,
@@ -810,6 +861,9 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // against the same provider-size budget as failed rules and finding labels.
   const relatedWork = renderRelatedWorkSection(input);
   const discussionMemory = renderDiscussionMemorySection(input);
+  // Charged against the same budget as every other section: it is review
+  // context, not optional detail.
+  const crossFile = renderCrossFileGroupsSection(input);
   const findings = relocated.map((finding) => {
     const file = truncate(sanitizeInline(finding.file), 160);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
@@ -824,7 +878,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     const effort = finding.effort === undefined ? "" : ` ${EFFORT_BADGE[finding.effort]}`;
     return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `, message };
   });
-  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix }) => prefix)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -841,18 +895,28 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     discussionMemory,
     failedRules,
     relatedWork,
+    crossFile,
     ...findings.map(
       ({ prefix, message }, index) => `${prefix}${truncate(message, messageBudgets[index] ?? 0)}`,
     ),
   ].filter((part): part is string => part !== undefined).join("\n\n");
 
   if (body.length <= maxLength) return body;
+  // The full section is gone by here, but the RELATIONSHIP is the thing this
+  // feature exists to surface, and dropping it wholesale would remove it
+  // exactly when a review is large enough to need it (PR #53 review). One line
+  // costs almost nothing and still tells a reader the findings are connected.
+  const groups = crossFileGroups(input.allFindings);
+  const crossFileSummary = groups.length === 0
+    ? undefined
+    : `${groups.length} group(s) of findings appear to share one root cause across files.`;
   const compactStatus = [
     header,
     notice,
     input.rulesFailed.length > 0
       ? `${input.rulesFailed.length} rule(s) failed to run.`
       : undefined,
+    crossFileSummary,
     `${relocated.length} finding(s) could not fit in the provider comment.`,
   ].filter((part): part is string => part !== undefined);
   const withRelatedWork = relatedWork
@@ -999,6 +1063,9 @@ function renderSummaryCommentWithIncludedSuggestions(
 
   const relatedWork = renderRelatedWorkSection(input);
   if (relatedWork) parts.push(relatedWork);
+
+  const crossFile = renderCrossFileGroupsSection(input);
+  if (crossFile) parts.push(crossFile);
 
   const discussionMemory = renderDiscussionMemorySection(input);
   if (discussionMemory) parts.push(discussionMemory);

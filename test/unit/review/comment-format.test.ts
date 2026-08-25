@@ -1127,3 +1127,79 @@ describe("renderSummaryComment — effort in compact summaries", () => {
     }
   });
 });
+
+
+// Issue #48: the summary is where a cross-file relationship can be described
+// without moving anything — inline comments stay one per file, anchored to
+// their own code.
+describe("renderSummaryComment — cross-file root causes", () => {
+  const base = {
+    allFindings: [] as Finding[],
+    inlineCount: 0,
+    unanchored: [] as Finding[],
+    filesReviewed: ["a.go", "b.go"],
+    rulesRun: ["rule-a"],
+    rulesFailed: [] as string[],
+  };
+  const spread = [
+    makeFinding({
+      file: "cache.go", line: 120, ruleName: "distributed-system", severity: "blocking",
+      title: "L2 hits bypass revalidation.",
+      message: "`readL2` returns before `FetchFromMongo` runs.",
+    }),
+    makeFinding({
+      file: "loader.go", line: 40, ruleName: "mongodb", severity: "warning",
+      title: "Secondary reads repopulate revoked authorization.",
+      message: "A secondary read repopulates via `FetchFromMongo` after `readL2` misses.",
+    }),
+  ];
+
+  it("names the group and points at every member", () => {
+    const body = renderSummaryComment({ ...base, allFindings: spread, inlineCount: 2 });
+
+    expect(body).toMatch(/one root cause|related/i);
+    expect(body).toContain("cache.go:120");
+    expect(body).toContain("loader.go:40");
+    expect(body).toContain("distributed-system");
+    expect(body).toContain("mongodb");
+  });
+
+  // Pointers, not prose: the findings are already posted inline, and repeating
+  // them would undo the "counted, not repeated" property the summary relies on.
+  it("does not repeat the finding bodies", () => {
+    const body = renderSummaryComment({ ...base, allFindings: spread, inlineCount: 2 });
+
+    expect(body).not.toContain("`readL2` returns before `FetchFromMongo` runs.");
+  });
+
+  it("says nothing when no group spans files", () => {
+    const single = [makeFinding({ file: "a.go", message: "`readL2` skips `FetchFromMongo`." })];
+
+    expect(renderSummaryComment({ ...base, allFindings: single, inlineCount: 1 }))
+      .not.toMatch(/one root cause/i);
+  });
+
+  // Asserting only the length was vacuous: the section is dropped under
+  // pressure and a shorter body passes trivially. The relationship has to
+  // SURVIVE, in some bounded form, or the feature quietly disappears exactly
+  // when a review is large enough to need it (PR #53 review).
+  it("keeps the relationship visible in the compact fallback", () => {
+    const body = renderSummaryComment(
+      { ...base, allFindings: spread, unanchored: spread, inlineCount: 0 },
+      500,
+    );
+
+    expect(body.length).toBeLessThanOrEqual(500);
+    expect(body).toMatch(/root cause/i);
+  });
+
+  it("keeps it visible even in the emergency representation", () => {
+    const body = renderSummaryComment(
+      { ...base, allFindings: spread, unanchored: spread, inlineCount: 0 },
+      260,
+    );
+
+    expect(body.length).toBeLessThanOrEqual(260);
+    expect(body).toMatch(/root cause/i);
+  });
+});
