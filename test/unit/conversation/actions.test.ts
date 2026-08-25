@@ -934,3 +934,46 @@ describe("line is inherited, not demanded", () => {
     expect(contract).not.toMatch(/"file", "line", "severity"/);
   });
 });
+
+
+// PR #51 review, P1. Inheritance fired whenever the normalized field came back
+// undefined — including when the model DID supply a replacement that failed
+// validation. A new suggestion with trailing whitespace is rejected, and the
+// original was then restored: the clarification's replacement silently
+// discarded and the superseded code republished as a one-click fix. Worse for
+// endLine, which could pair a NEW suggestion with a STALE range.
+describe("a rejected replacement is not silently reverted", () => {
+  const original = {
+    file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+    message: "unclear", ruleName: "rule-a",
+    suggestion: "return stale(ctx)", endLine: 6, effort: "heavy" as const,
+  };
+  const revise = (patch: Record<string, unknown>) => parseReconsiderOutput(
+    JSON.stringify({ outcome: "revised", rationale: "changed", finding: { ...original, ...patch } }),
+    original,
+  )?.finding;
+
+  it("drops a replacement suggestion that fails validation, rather than restoring the old one", () => {
+    // Trailing whitespace is refused by the suggestion sanitizer (#43/#45).
+    expect(revise({ suggestion: "return fresh(ctx)\n" })?.suggestion).toBeUndefined();
+  });
+
+  it("drops an invalid endLine rather than pairing a new suggestion with a stale range", () => {
+    const result = revise({ suggestion: "return fresh(ctx)", endLine: 2.5 });
+
+    expect(result?.suggestion).toBe("return fresh(ctx)");
+    expect(result?.endLine).toBeUndefined();
+  });
+
+  it("still inherits when the field is genuinely absent", () => {
+    const { suggestion, ...withoutSuggestion } = original;
+    void suggestion;
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: withoutSuggestion }),
+      original,
+    );
+
+    expect(result?.finding?.suggestion).toBe("return stale(ctx)");
+  });
+});

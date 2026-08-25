@@ -256,10 +256,16 @@ export function parseReconsiderOutput(
     : {};
   const merged = { ...finding };
   for (const field of INHERITED_FINDING_FIELDS) {
-    // An explicit null CLEARS. Only an absent property inherits. Without that
-    // distinction, a revision that removed a suggestion the human clarification
-    // had just invalidated would silently republish it — as committable code.
-    if (field in raw && raw[field] === null) continue;
+    // Only an ABSENT property inherits. A property the response supplied —
+    // whatever became of it — stands as given, including when it was null
+    // (an explicit clear) or when validation refused it.
+    //
+    // The refused case is why this is presence and not null-ness: a replacement
+    // suggestion with trailing whitespace is rejected by the sanitizer, and
+    // inheriting there would discard the clarification's replacement and
+    // republish the superseded code as a one-click fix. For endLine it is worse
+    // — a NEW suggestion would be paired with the OLD range (PR #51 review).
+    if (field in raw) continue;
     if (merged[field] === undefined && original?.[field] !== undefined) {
       Object.assign(merged, { [field]: original[field] });
     }
