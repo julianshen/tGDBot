@@ -1027,7 +1027,7 @@ describe("parseReconsiderOutput — citations survive reassessment", () => {
   });
 
   it("adds no citation when the original had none", () => {
-    const { references: _dropped, ...uncited } = original;
+    const uncited = { ...original, references: undefined };
     const result = parseReconsiderOutput(
       response({ ...core, references: ["https://evil.example/x"] }),
       uncited,
