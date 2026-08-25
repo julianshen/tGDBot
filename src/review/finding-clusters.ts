@@ -123,14 +123,34 @@ const UBIQUITOUS_IDENTIFIERS = new Set([
 ]);
 
 /**
- * The distinct code symbols a finding names, as a set of identities.
+ * A symbol a finding names: its own name, plus the receiver it was named on.
  *
- * A reference's identity is its LAST component: `Cache.readL2` and a bare
- * `readL2` are one method, while `Cache.readL2` and `Cache.writeL2` are two
- * that merely share a receiver (PR #53 review). Taking the terminal component
- * also makes repetition free — a finding naming its symbol in both the title
- * and the message contributes one identity, not two, which matters because the
- * threshold means "two independently named symbols" and not "two mentions".
+ * Both halves matter, and they were learned one at a time (PR #53 review).
+ * Matching on the whole dotted string missed that `readL2` and `Cache.readL2`
+ * are one method. Matching on the terminal alone then missed that
+ * `UserCache.loadEntry` and `ConfigCache.loadEntry` are two.
+ */
+interface NamedSymbol {
+  readonly name: string;
+  /** The immediate receiver, or undefined when the finding named it bare. */
+  readonly receiver?: string;
+}
+
+/**
+ * True when two references could name the same thing.
+ *
+ * Deliberately asymmetric about missing information: a bare mention is
+ * compatible with any qualification, because the reviewer simply did not say
+ * which receiver — but two references that BOTH name a receiver have to agree.
+ */
+function sameSymbol(left: NamedSymbol, right: NamedSymbol): boolean {
+  if (left.name !== right.name) return false;
+  if (left.receiver === undefined || right.receiver === undefined) return true;
+  return left.receiver === right.receiver;
+}
+
+/**
+ * The distinct code symbols a finding names.
  *
  * Identifiers are a better signal than prose precisely because they are NOT the
  * rule's words: they come from the source, so two rules describing one defect
@@ -140,18 +160,30 @@ const UBIQUITOUS_IDENTIFIERS = new Set([
  * reviewer quotes a symbol) and bare words that LOOK like code — an internal
  * capital or an underscore. Plain English is never harvested from prose, or
  * every finding would "share" its whole sentence.
+ *
+ * References compatible with each other collapse into one entry, so repetition
+ * is free: a finding naming its symbol in the title and again in the message
+ * contributes one symbol, not two, which matters because the threshold means
+ * "two independently named symbols" and not "two mentions". A bare mention
+ * absorbs its qualified form; two different receivers stay separate.
  */
-function identifierSymbols(finding: Finding): Set<string> {
+function identifierSymbols(finding: Finding): NamedSymbol[] {
   const text = `${finding.title ?? ""} ${finding.message}`;
-  const symbols = new Set<string>();
+  const found: NamedSymbol[] = [];
   const add = (parts: readonly string[]): void => {
-    // The terminal component names the thing; earlier ones qualify it.
-    const terminal = parts.at(-1);
-    if (terminal === undefined) return;
-    const token = terminal.toLowerCase();
-    if (token.length < MIN_IDENTIFIER_LENGTH) return;
-    if (UBIQUITOUS_IDENTIFIERS.has(token)) return;
-    symbols.add(token);
+    const name = parts.at(-1)?.toLowerCase();
+    if (name === undefined || name.length < MIN_IDENTIFIER_LENGTH) return;
+    if (UBIQUITOUS_IDENTIFIERS.has(name)) return;
+    const receiver = parts.length > 1 ? parts.at(-2)?.toLowerCase() : undefined;
+    const candidate: NamedSymbol = receiver === undefined ? { name } : { name, receiver };
+    const existing = found.findIndex((symbol) => sameSymbol(symbol, candidate));
+    if (existing < 0) {
+      found.push(candidate);
+      return;
+    }
+    // A bare mention is the more general form, so it wins: once the finding has
+    // said the name unqualified, a receiver adds nothing to what it claims.
+    if (candidate.receiver === undefined) found[existing] = candidate;
   };
   for (const match of text.matchAll(/`([^`\n]{1,200})`/gu)) {
     add((match[1] ?? "").split(/[^A-Za-z0-9_]+/u).filter(Boolean));
@@ -162,16 +194,29 @@ function identifierSymbols(finding: Finding): Set<string> {
   for (const match of unquoted.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+\b/gu)) {
     add([match[0]]);
   }
-  return symbols;
+  return found;
 }
 
-/** How many distinct symbols the two findings both name. */
-function sharedIdentifierCount(left: Set<string>, right: Set<string>): number {
-  let shared = 0;
-  for (const symbol of left) if (right.has(symbol)) shared += 1;
-  return shared;
+/**
+ * How many distinct symbols the two findings both name.
+ *
+ * Counted on each side and reduced to the smaller, so one finding naming a
+ * method twice under different receivers cannot inflate the count on its own.
+ */
+function sharedIdentifierCount(left: readonly NamedSymbol[], right: readonly NamedSymbol[]): number {
+  const matched = (from: readonly NamedSymbol[], against: readonly NamedSymbol[]): number =>
+    from.filter((symbol) => against.some((other) => sameSymbol(symbol, other))).length;
+  return Math.min(matched(left, right), matched(right, left));
 }
 
+/**
+ * The text that identifies WHICH defect a finding is about.
+ *
+ * An authored `title` (ADR-008) is the rule's own one-line statement of the
+ * claim, so it is the better signal when present; otherwise the message's first
+ * sentence plays that role, since reviewers lead with the claim and follow with
+ * the evidence.
+ */
 /**
  * The text that identifies WHICH defect a finding is about.
  *
@@ -212,8 +257,8 @@ function sameRootCause(
   right: Finding,
   leftTokens: Set<string>,
   rightTokens: Set<string>,
-  leftIdentifiers: Set<string>,
-  rightIdentifiers: Set<string>,
+  leftIdentifiers: readonly NamedSymbol[],
+  rightIdentifiers: readonly NamedSymbol[],
 ): boolean {
   // The cross-file gate is deliberately NOT relaxed by the identifier signal.
   // Only a cluster's representative receives an inline comment (orchestrate.ts),

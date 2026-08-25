@@ -445,3 +445,42 @@ describe("clusterFindings — a receiver is not the symbol", () => {
     ])).toHaveLength(1);
   });
 });
+
+
+// PR #53 review, the mirror of the previous fix. Identifying a symbol by its
+// terminal alone lost the receiver, so two methods with a common name on
+// DIFFERENT receivers matched. Both corrections have to hold at once: a bare
+// mention still folds into its qualified form, and two qualified references
+// only match when their receivers agree.
+describe("clusterFindings — receivers separate look-alike methods", () => {
+  it("does not group look-alike methods on different receivers", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`UserCache.loadEntry` races `UserCache.storeEntry`." }),
+      finding({ file: "b.go", message: "`ConfigCache.loadEntry` races `ConfigCache.storeEntry`." }),
+    ])).toEqual([]);
+  });
+
+  it("groups them when the receiver does agree", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`UserCache.loadEntry` races `UserCache.storeEntry`." }),
+      finding({ file: "b.go", message: "`UserCache.storeEntry` runs before `UserCache.loadEntry`." }),
+    ])).toHaveLength(1);
+  });
+
+  // The earlier correction must survive: a bare mention is compatible with any
+  // qualification of the same name, because the reviewer simply did not say.
+  it("still lets a bare mention match its qualified form", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`loadEntry` skips `storeEntry`." }),
+      finding({ file: "b.go", message: "`UserCache.storeEntry` runs before `UserCache.loadEntry`." }),
+    ])).toHaveLength(1);
+  });
+
+  // Two different receivers named in ONE finding are two symbols, not one.
+  it("counts two receivers in one finding as two symbols", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`UserCache.loadEntry` disagrees with `ConfigCache.loadEntry`." }),
+      finding({ file: "b.go", message: "`ConfigCache.loadEntry` disagrees with `UserCache.loadEntry`." }),
+    ])).toHaveLength(1);
+  });
+});
