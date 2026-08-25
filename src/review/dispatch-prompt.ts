@@ -11,9 +11,12 @@ import type { ReviewConversationContext } from "./types.js";
 
 // Appended to every rule's task automatically — rule authors never write
 // this themselves (TASKS.md Task 5 technical design).
-export const FINDING_JSON_CONTRACT = `
-Respond with ONLY a JSON array matching this shape (no prose, no markdown fences):
-[{
+// The finding fields, and the notes explaining them, kept apart from any
+// envelope. The same fields are requested in two different containers — a
+// top-level array on the review paths, one nested object on the reconsider
+// path — and embedding the array contract inside the object contract gave the
+// model two contradictory instructions (PR #51 review).
+const FINDING_SHAPE = `{
   "file": string,
   "line": number | null,
   "endLine": number | null,
@@ -25,9 +28,9 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
   "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification",
   "question": string | null,
   "effort": "quick" | "heavy" | null
-}]
+}`;
 
-- "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
+const FINDING_FIELD_NOTES = `- "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
   e.g. "The loop uses <= n, so it sums one element too many." Write it as a
   statement of the problem, not a restatement of the file name.
 - "severity": how much this matters, on a bar you must be able to defend.
@@ -74,7 +77,18 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
   concern is fixed, "disputed" when discussion exists but the violation remains,
   and "needs-clarification" when correctness depends on one short question.
 - "question": required only for "needs-clarification" — one short, answerable
-  question. Must be null/omitted for every other decision.
+  question. Must be null/omitted for every other decision.`;
+
+/** The shape and its notes, with no envelope: safe to nest inside a contract. */
+export const FINDING_OBJECT_CONTRACT = `${FINDING_SHAPE}
+
+${FINDING_FIELD_NOTES}`;
+
+export const FINDING_JSON_CONTRACT = `
+Respond with ONLY a JSON array matching this shape (no prose, no markdown fences):
+[${FINDING_SHAPE}]
+
+${FINDING_FIELD_NOTES}
 
 If you find nothing, respond with [] exactly.
 `.trim();

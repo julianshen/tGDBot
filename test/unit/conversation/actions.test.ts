@@ -755,3 +755,98 @@ describe("a focus review refuses output it cannot use", () => {
     expect((result as { result: { findings: unknown[] } }).result.findings).toHaveLength(1);
   });
 });
+
+
+// PR #51 review. Embedding the ARRAY contract inside an OBJECT contract gave
+// the model two contradictory envelopes, omitted `ruleName` (which the parser
+// had no fallback for), and invited it to omit required fields that are
+// validated before any inheritance runs. All three turn a reconsider or
+// clarification into a transient error.
+describe("the reconsider contract is usable as written", () => {
+  const reconsiderPrompt = () => buildReconsiderPrompt({
+    finding,
+    historicalRuleSnapshot: ledger.ruleSnapshot,
+    currentTrustedRule: currentRule,
+    currentCodeHunk: currentHunk,
+    addressedThread: thread,
+    reason: "still wrong?",
+  });
+
+  it("does not tell the model to respond with a top-level array", () => {
+    const contract = section("OUTPUT_CONTRACT", reconsiderPrompt()).body;
+
+    expect(contract).toContain('"outcome"');
+    expect(contract).not.toMatch(/ONLY a JSON array/i);
+    expect(contract).not.toMatch(/respond with \[\] exactly/i);
+  });
+
+  it("names the fields that must always be present", () => {
+    const contract = section("OUTPUT_CONTRACT", reconsiderPrompt()).body;
+
+    for (const field of ["file", "severity", "category", "message"]) {
+      expect(contract, `${field} is required but not named as such`).toContain(`"${field}"`);
+    }
+    expect(contract).toMatch(/always|required/i);
+  });
+
+  // The rule that produced a finding still owns it after a reassessment, so
+  // the parser supplies the name rather than asking the model to echo it.
+  it("accepts a finding that carries no ruleName", () => {
+    const original = {
+      file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+      message: "unclear", ruleName: "rule-a",
+    };
+    const withoutRuleName = {
+      file: original.file, line: original.line, severity: original.severity,
+      category: original.category, message: original.message,
+    };
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: withoutRuleName }),
+      original,
+    );
+
+    expect(result?.finding?.ruleName).toBe("rule-a");
+  });
+});
+
+// PR #51 review, P1. A revision that explicitly clears a field must clear it.
+// Restoring the original would republish a suggestion the human clarification
+// had just established was wrong — as committable code.
+describe("an explicit null clears rather than inherits", () => {
+  const original = {
+    file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+    message: "unclear", ruleName: "rule-a",
+    suggestion: "return stale(ctx)", endLine: 6, effort: "heavy" as const,
+  };
+  const revise = (findingPatch: Record<string, unknown>) => parseReconsiderOutput(
+    JSON.stringify({
+      outcome: "revised",
+      rationale: "the answer changed things",
+      finding: { ...original, ...findingPatch },
+    }),
+    original,
+  );
+
+  it("drops a suggestion the revision set to null", () => {
+    expect(revise({ suggestion: null })?.finding?.suggestion).toBeUndefined();
+  });
+
+  it("drops endLine and effort set to null", () => {
+    const result = revise({ endLine: null, effort: null })?.finding;
+
+    expect(result?.endLine).toBeUndefined();
+    expect(result?.effort).toBeUndefined();
+  });
+
+  it("still inherits a field the revision simply did not mention", () => {
+    const { suggestion, ...withoutSuggestion } = original;
+    void suggestion;
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: withoutSuggestion }),
+      original,
+    );
+
+    expect(result?.finding?.suggestion).toBe("return stale(ctx)");
+  });
+});

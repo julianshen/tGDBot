@@ -12,7 +12,7 @@ import {
   parseFindingsFromFinalOutput,
 } from "../review/dispatch-results.js";
 import type { Finding } from "../review/types.js";
-import { FINDING_JSON_CONTRACT } from "../review/dispatch-prompt.js";
+import { FINDING_JSON_CONTRACT, FINDING_OBJECT_CONTRACT } from "../review/dispatch-prompt.js";
 import type { RuleDefinition } from "../rules/types.js";
 import type { CommandParseResult, ConversationCommand, DiffSide, RepositoryBinding } from "./types.js";
 import { parseChildMarker } from "./markers.js";
@@ -93,10 +93,17 @@ const RECONSIDER_CONTRACT = `Respond with ONLY a JSON object matching this shape
 - "withdrawn": the concern no longer holds against current code and the thread. Omit finding (null).
 "rationale" is a short justification grounded in the current code and trusted rule.
 
-The "finding" uses the shape below. Restate a field only if it has actually
-changed; anything you omit keeps its original value rather than being cleared.
+The "finding" is ONE object of the shape below — not an array, and not wrapped
+in anything. "file", "line", "severity", "category" and "message" are ALWAYS
+required, even when unchanged: the finding is validated before anything is
+carried over, so omitting one rejects the whole response. "ruleName" is
+supplied for you; you do not need to repeat it.
 
-${FINDING_JSON_CONTRACT}`;
+"title", "suggestion", "endLine" and "effort" may be omitted when unchanged and
+keep their original values. To CLEAR one — a suggestion the answer has made
+wrong, say — set it to null explicitly rather than leaving it out.
+
+${FINDING_OBJECT_CONTRACT}`;
 
 const FOCUS_CONTRACT = `${FINDING_JSON_CONTRACT}
 
@@ -230,7 +237,7 @@ const INHERITED_FINDING_FIELDS = ["title", "suggestion", "endLine", "effort"] as
 
 export function parseReconsiderOutput(
   text: string,
-  original?: Partial<Pick<Finding, (typeof INHERITED_FINDING_FIELDS)[number]>>,
+  original?: Partial<Finding>,
 ): ReconsiderResult | undefined {
   const parsed = parseJsonObject(text);
   if (!parsed) return undefined;
@@ -238,10 +245,20 @@ export function parseReconsiderOutput(
   const rationale = parsed.rationale;
   if (parsed.outcome === "withdrawn") return { outcome: "withdrawn", rationale };
   if (parsed.outcome !== "confirmed" && parsed.outcome !== "revised") return undefined;
-  const finding = normalizeUnknownFinding(parsed.finding);
+  // The rule that produced a finding still owns it after a reassessment, so the
+  // name is supplied here rather than asked of the model — which would have to
+  // echo it back correctly for the response to validate at all.
+  const finding = normalizeUnknownFinding(parsed.finding, original?.ruleName);
   if (finding === undefined) return undefined;
+  const raw = typeof parsed.finding === "object" && parsed.finding !== null
+    ? parsed.finding as Record<string, unknown>
+    : {};
   const merged = { ...finding };
   for (const field of INHERITED_FINDING_FIELDS) {
+    // An explicit null CLEARS. Only an absent property inherits. Without that
+    // distinction, a revision that removed a suggestion the human clarification
+    // had just invalidated would silently republish it — as committable code.
+    if (field in raw && raw[field] === null) continue;
     if (merged[field] === undefined && original?.[field] !== undefined) {
       Object.assign(merged, { [field]: original[field] });
     }
