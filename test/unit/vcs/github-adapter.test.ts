@@ -2622,6 +2622,34 @@ describe("GitHubAdapter large-diff fallback", () => {
     }
   });
 
+  // PR #52 review: a no-patch MOVE now lands in `contentless`, and the warning
+  // called every such entry "binary, empty, or mode-only" — none of which
+  // describes a rename.
+  it("describes a no-patch move without calling it binary", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const execGh = execGhServing([[
+      fileRow("src/a.ts"),
+      {
+        filename: "src/new-name.ts",
+        previous_filename: "src/old-name.ts",
+        status: "renamed",
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+      },
+    ]]);
+
+    try {
+      await new GitHubAdapter(execGh).getDiff(locator188);
+      const warned = warn.mock.calls.flat().join(" ");
+
+      expect(warned).toContain("src/new-name.ts");
+      expect(warned).toMatch(/move|rename/i);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("rejects a files page larger than the one it asked for", async () => {
     const execGh = execGhServing([Array.from({ length: 101 }, (_u, i) => fileRow(`src/f${i}.ts`))]);
     const adapter = new GitHubAdapter(execGh);
