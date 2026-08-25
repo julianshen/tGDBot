@@ -39,7 +39,7 @@ describe("dependencyChangesFromDiff", () => {
   });
 
   it("keeps a scoped package intact", () => {
-    const diff = diffOf("package.json", '@@ -3,2 +3,3 @@\n+    "@scope/pkg": "2.0.0",');
+    const diff = diffOf("package.json", '@@ -3,2 +3,3 @@\n   "dependencies": {\n+    "@scope/pkg": "2.0.0",');
 
     expect(dependencyChangesFromDiff(diff)[0]?.name).toBe("@scope/pkg");
   });
@@ -53,15 +53,15 @@ describe("dependencyChangesFromDiff", () => {
   });
 
   it("finds manifests in subdirectories", () => {
-    const diff = diffOf("packages/api/package.json", '@@ -1 +1,2 @@\n+    "lodash": "4.17.21",');
+    const diff = diffOf("packages/api/package.json", '@@ -1 +1,2 @@\n   "dependencies": {\n+    "lodash": "4.17.21",');
 
     expect(dependencyChangesFromDiff(diff)[0]?.manifest).toBe("packages/api/package.json");
   });
 
   it("deduplicates a package that appears in several manifests at one version", () => {
     const diff = [
-      diffOf("package.json", '@@ -1 +1,2 @@\n+    "lodash": "4.17.21",'),
-      diffOf("web/package.json", '@@ -1 +1,2 @@\n+    "lodash": "4.17.21",'),
+      diffOf("package.json", '@@ -1 +1,2 @@\n   "dependencies": {\n+    "lodash": "4.17.21",'),
+      diffOf("web/package.json", '@@ -1 +1,2 @@\n   "dependencies": {\n+    "lodash": "4.17.21",'),
     ].join("\n");
 
     expect(dependencyChangesFromDiff(diff)).toHaveLength(1);
@@ -70,7 +70,7 @@ describe("dependencyChangesFromDiff", () => {
   // Ranges are what a manifest usually carries; the caret is not part of the
   // version the registry knows.
   it("strips a range prefix from the version", () => {
-    const diff = diffOf("package.json", '@@ -1 +1,2 @@\n+    "lodash": "^4.17.21",');
+    const diff = diffOf("package.json", '@@ -1 +1,2 @@\n   "dependencies": {\n+    "lodash": "^4.17.21",');
 
     expect(dependencyChangesFromDiff(diff)[0]?.version).toBe("4.17.21");
   });
@@ -79,21 +79,21 @@ describe("dependencyChangesFromDiff", () => {
   // diff. Anything that could escape a URL path must never become a query.
   it("refuses a name that could escape the registry path", () => {
     for (const name of ["../../etc/passwd", "a/../b", "pkg?x=1", "pkg#frag", "pkg name", "PKG"]) {
-      const diff = diffOf("package.json", `@@ -1 +1,2 @@\n+    "${name}": "1.0.0",`);
+      const diff = diffOf("package.json", `@@ -1 +1,2 @@\n   "dependencies": {\n+    "${name}": "1.0.0",`);
 
       expect(dependencyChangesFromDiff(diff), `${name} was accepted`).toEqual([]);
     }
   });
 
   it("refuses a name longer than the registry allows", () => {
-    const diff = diffOf("package.json", `@@ -1 +1,2 @@\n+    "${"a".repeat(215)}": "1.0.0",`);
+    const diff = diffOf("package.json", `@@ -1 +1,2 @@\n   "dependencies": {\n+    "${"a".repeat(215)}": "1.0.0",`);
 
     expect(dependencyChangesFromDiff(diff)).toEqual([]);
   });
 
   it("refuses a version that is not a version", () => {
     for (const version of ["../x", "1.0.0 && curl evil", "latest?x=1"]) {
-      const diff = diffOf("package.json", `@@ -1 +1,2 @@\n+    "pkg": "${version}",`);
+      const diff = diffOf("package.json", `@@ -1 +1,2 @@\n   "dependencies": {\n+    "pkg": "${version}",`);
 
       expect(dependencyChangesFromDiff(diff), `${version} was accepted`).toEqual([]);
     }
@@ -102,8 +102,10 @@ describe("dependencyChangesFromDiff", () => {
   it("bounds how many packages one diff can ask about", () => {
     const body = Array.from({ length: 500 }, (_unused, index) => `+    "pkg-${index}": "1.0.0",`).join("\n");
 
-    expect(dependencyChangesFromDiff(diffOf("package.json", `@@ -1 +1,500 @@\n${body}`)).length)
-      .toBeLessThanOrEqual(200);
+    const diff = diffOf("package.json", `@@ -1 +1,500 @@\n   "dependencies": {\n${body}`);
+
+    // Exercises the ceiling rather than passing on an empty result.
+    expect(dependencyChangesFromDiff(diff)).toHaveLength(200);
   });
 });
 
@@ -128,5 +130,87 @@ describe("registryUrlFor", () => {
   // reached by a caller passing an unvalidated name.
   it("stays on the registry host whatever it is given", () => {
     expect(registryUrlFor("pkg").startsWith("https://registry.npmjs.org/")).toBe(true);
+  });
+});
+
+
+// PR #54 review, both P1.
+describe("dependencyChangesFromDiff — only real dependency sections", () => {
+  const manifest = (body: string): string =>
+    `diff --git a/package.json b/package.json\n--- a/package.json\n+++ b/package.json\n${body}`;
+
+  it("extracts from a dependencies block", () => {
+    const diff = manifest('@@ -1,3 +1,4 @@\n   "dependencies": {\n+    "lodash": "4.17.21",');
+
+    expect(dependencyChangesFromDiff(diff)).toEqual([
+      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+    ]);
+  });
+
+  it("extracts from devDependencies", () => {
+    const diff = manifest('@@ -1,3 +1,4 @@\n   "devDependencies": {\n+    "vitest": "4.1.10",');
+
+    expect(dependencyChangesFromDiff(diff)[0]?.name).toBe("vitest");
+  });
+
+  // The manifest's OWN version is not a package called "version".
+  it("ignores a top-level version bump", () => {
+    const diff = manifest('@@ -1,3 +1,3 @@\n {\n-  "version": "1.0.0",\n+  "version": "1.1.0",');
+
+    expect(dependencyChangesFromDiff(diff)).toEqual([]);
+  });
+
+  it("ignores an engines entry", () => {
+    const diff = manifest('@@ -1,3 +1,4 @@\n   "engines": {\n+    "node": "20.0.0"');
+
+    expect(dependencyChangesFromDiff(diff)).toEqual([]);
+  });
+
+  it("stops extracting once the dependency block closes", () => {
+    const diff = manifest(
+      '@@ -1,6 +1,8 @@\n   "dependencies": {\n+    "lodash": "4.17.21"\n   },\n   "engines": {\n+    "node": "20.0.0"',
+    );
+
+    expect(dependencyChangesFromDiff(diff).map((c) => c.name)).toEqual(["lodash"]);
+  });
+});
+
+// A forged file header is the sharpest case: it would bypass the closed
+// manifest allowlist the whole design rests on. An ADDED line whose CONTENT is
+// "++ b/package.json" renders as "+++ b/package.json" — byte-identical to a
+// real header.
+describe("dependencyChangesFromDiff — a forged header is not a manifest", () => {
+  it("ignores a header-shaped line inside another file's hunk", () => {
+    const diff = [
+      "diff --git a/src/evil.ts b/src/evil.ts",
+      "--- a/src/evil.ts",
+      "+++ b/src/evil.ts",
+      "@@ -1,2 +1,4 @@",
+      "+++ b/package.json",
+      '+    "dependencies": {',
+      '+    "lodash": "4.17.21",',
+    ].join("\n");
+
+    expect(dependencyChangesFromDiff(diff)).toEqual([]);
+  });
+
+  it("still reads a real manifest that follows a forged one", () => {
+    const diff = [
+      "diff --git a/src/evil.ts b/src/evil.ts",
+      "--- a/src/evil.ts",
+      "+++ b/src/evil.ts",
+      "@@ -1,2 +1,3 @@",
+      "+++ b/package.json",
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      "@@ -1,3 +1,4 @@",
+      '   "dependencies": {',
+      '+    "lodash": "4.17.21",',
+    ].join("\n");
+
+    expect(dependencyChangesFromDiff(diff)).toEqual([
+      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+    ]);
   });
 });

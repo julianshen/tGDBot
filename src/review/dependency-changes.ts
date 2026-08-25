@@ -84,19 +84,70 @@ function stripRange(raw: string): string {
   return raw.replace(/^[\^~><= ]+/u, "").trim();
 }
 
-function manifestPathsInDiff(diff: string): Map<number, string> {
+/**
+ * The dependency maps whose entries are packages. Anything else in a manifest
+ * — `version`, `engines`, `scripts` — is not, and treating every string pair as
+ * a dependency produced queries for packages called "version" and "node"
+ * (PR #54 review).
+ */
+const DEPENDENCY_SECTIONS = new Set([
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+]);
+
+/**
+ * Which manifest each line belongs to, and whether it sits in a dependency map.
+ *
+ * `+++ b/…` is a file header ONLY outside a hunk. Inside one it is content: an
+ * added line whose text is `++ b/package.json` renders as `+++ b/package.json`,
+ * byte for byte. Without hunk state a diff could forge a manifest header for
+ * any file and walk straight through the closed allowlist this module rests on
+ * (PR #54 review) — so headers are tied to real `diff --git` boundaries, the
+ * same discipline `review/diff-anchors` uses for the same reason.
+ */
+function manifestContextByLine(diff: string): Map<number, string> {
   const byLine = new Map<number, string>();
-  const lines = diff.split("\n");
-  let current: string | undefined;
-  for (const [index, line] of lines.entries()) {
-    const header = /^\+\+\+ b\/(.+)$/u.exec(line);
-    if (header) {
-      const path = header[1] ?? "";
-      const basename = path.slice(path.lastIndexOf("/") + 1);
-      current = MANIFEST_BASENAMES.has(basename) ? path : undefined;
+  let manifest: string | undefined;
+  let inHunk = false;
+  let inDependencySection = false;
+  for (const [index, line] of diff.split("\n").entries()) {
+    if (line.startsWith("diff --git ")) {
+      manifest = undefined;
+      inHunk = false;
+      inDependencySection = false;
       continue;
     }
-    if (current !== undefined) byLine.set(index, current);
+    if (!inHunk) {
+      const header = /^\+\+\+ b\/(.+)$/u.exec(line);
+      if (header) {
+        const path = header[1] ?? "";
+        const basename = path.slice(path.lastIndexOf("/") + 1);
+        manifest = MANIFEST_BASENAMES.has(basename) ? path : undefined;
+        continue;
+      }
+    }
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      // A hunk starts somewhere unknown in the file, so no section is assumed.
+      inDependencySection = false;
+      continue;
+    }
+    if (manifest === undefined || !inHunk) continue;
+    // Section tracking reads context lines as well as added ones: the opening
+    // `"dependencies": {` is usually unchanged context above the bump.
+    const content = line.slice(1);
+    const opening = /^\s*"([A-Za-z]+)"\s*:\s*\{/u.exec(content);
+    if (opening) {
+      inDependencySection = DEPENDENCY_SECTIONS.has(opening[1] ?? "");
+      continue;
+    }
+    if (/^\s*\}/u.test(content)) {
+      inDependencySection = false;
+      continue;
+    }
+    if (inDependencySection) byLine.set(index, manifest);
   }
   return byLine;
 }
@@ -111,7 +162,7 @@ function manifestPathsInDiff(diff: string): Map<number, string> {
  * a request.
  */
 export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
-  const manifests = manifestPathsInDiff(diff);
+  const manifests = manifestContextByLine(diff);
   const lines = diff.split("\n");
   const seen = new Set<string>();
   const changes: DependencyChange[] = [];
