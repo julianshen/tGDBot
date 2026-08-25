@@ -902,12 +902,21 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   ].filter((part): part is string => part !== undefined).join("\n\n");
 
   if (body.length <= maxLength) return body;
+  // The full section is gone by here, but the RELATIONSHIP is the thing this
+  // feature exists to surface, and dropping it wholesale would remove it
+  // exactly when a review is large enough to need it (PR #53 review). One line
+  // costs almost nothing and still tells a reader the findings are connected.
+  const groups = crossFileGroups(input.allFindings);
+  const crossFileSummary = groups.length === 0
+    ? undefined
+    : `${groups.length} group(s) of findings appear to share one root cause across files.`;
   const compactStatus = [
     header,
     notice,
     input.rulesFailed.length > 0
       ? `${input.rulesFailed.length} rule(s) failed to run.`
       : undefined,
+    crossFileSummary,
     `${relocated.length} finding(s) could not fit in the provider comment.`,
   ].filter((part): part is string => part !== undefined);
   const withRelatedWork = relatedWork

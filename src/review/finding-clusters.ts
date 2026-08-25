@@ -123,98 +123,63 @@ const UBIQUITOUS_IDENTIFIERS = new Set([
 ]);
 
 /**
- * Code identifiers named by a finding, lowercased.
+ * The distinct code symbols a finding names, as a set of identities.
  *
- * Two sources, because findings name code both ways: spans in backticks (which
- * is how a reviewer quotes a symbol) and bare words that LOOK like code — an
- * internal capital or an underscore. A plain lowercase English word is never
- * taken from prose, or every finding would "share" its whole sentence.
+ * A reference's identity is its LAST component: `Cache.readL2` and a bare
+ * `readL2` are one method, while `Cache.readL2` and `Cache.writeL2` are two
+ * that merely share a receiver (PR #53 review). Taking the terminal component
+ * also makes repetition free — a finding naming its symbol in both the title
+ * and the message contributes one identity, not two, which matters because the
+ * threshold means "two independently named symbols" and not "two mentions".
  *
- * Grouped BY SYMBOL, not flattened, because a single reference can yield
- * several tokens: `Cache.readL2` splits into two, and so does a compound key
- * like `sub:{roomID}:{account}`. Flattened, one shared symbol would satisfy a
- * threshold meant to require two independent ones (PR #42 review). Splitting is
- * still worth doing — it is what lets `readL2` match `Cache.readL2` — so the
- * parts stay together as one signal rather than being discarded.
+ * Identifiers are a better signal than prose precisely because they are NOT the
+ * rule's words: they come from the source, so two rules describing one defect
+ * name the same symbols however differently they phrase the claim.
+ *
+ * Two sources, because findings name code both ways: spans in backticks (how a
+ * reviewer quotes a symbol) and bare words that LOOK like code — an internal
+ * capital or an underscore. Plain English is never harvested from prose, or
+ * every finding would "share" its whole sentence.
  */
-function identifierSignals(finding: Finding): Set<string>[] {
+function identifierSymbols(finding: Finding): Set<string> {
   const text = `${finding.title ?? ""} ${finding.message}`;
-  const signals: Set<string>[] = [];
-  const collect = (parts: readonly string[]): void => {
-    const signal = new Set<string>();
-    for (const part of parts) {
-      const token = part.toLowerCase();
-      if (token.length < MIN_IDENTIFIER_LENGTH) continue;
-      if (UBIQUITOUS_IDENTIFIERS.has(token)) continue;
-      signal.add(token);
-    }
-    if (signal.size > 0) signals.push(signal);
+  const symbols = new Set<string>();
+  const add = (parts: readonly string[]): void => {
+    // The terminal component names the thing; earlier ones qualify it.
+    const terminal = parts.at(-1);
+    if (terminal === undefined) return;
+    const token = terminal.toLowerCase();
+    if (token.length < MIN_IDENTIFIER_LENGTH) return;
+    if (UBIQUITOUS_IDENTIFIERS.has(token)) return;
+    symbols.add(token);
   };
   for (const match of text.matchAll(/`([^`\n]{1,200})`/gu)) {
-    collect((match[1] ?? "").split(/[^A-Za-z0-9_]+/u).filter(Boolean));
+    add((match[1] ?? "").split(/[^A-Za-z0-9_]+/u).filter(Boolean));
   }
   // Quoted spans are removed before the bare scan, or a camelCase name INSIDE
-  // one would be counted a second time and a single `Cache.readL2` would look
-  // like two independent symbols.
+  // one would be counted a second time.
   const unquoted = text.replace(/`[^`\n]{1,200}`/gu, " ");
   for (const match of unquoted.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+\b/gu)) {
-    collect([match[0]]);
+    add([match[0]]);
   }
-  return mergeReferencesToOneSymbol(signals);
+  return symbols;
+}
+
+/** How many distinct symbols the two findings both name. */
+function sharedIdentifierCount(left: Set<string>, right: Set<string>): number {
+  let shared = 0;
+  for (const symbol of left) if (right.has(symbol)) shared += 1;
+  return shared;
 }
 
 /**
- * Collapses the references WITHIN one finding that name the same symbol.
+ * The text that identifies WHICH defect a finding is about.
  *
- * Signals are collected per occurrence, and a finding naturally names its
- * symbol more than once — typically in the title and again in the message. Left
- * as separate signals, two findings sharing ONE symbol would clear a threshold
- * that means "two independently named symbols" (PR #53 review).
- *
- * Two references in the same finding that share any token are taken to be the
- * same symbol, which also folds `readL2` into `Cache.readL2` — a qualified and
- * a bare mention of one function, not two.
+ * An authored `title` (ADR-008) is the rule's own one-line statement of the
+ * claim, so it is the better signal when present; otherwise the message's first
+ * sentence plays that role, since reviewers lead with the claim and follow with
+ * the evidence.
  */
-function mergeReferencesToOneSymbol(signals: readonly Set<string>[]): Set<string>[] {
-  const merged: Set<string>[] = [];
-  for (const signal of signals) {
-    const overlapping = merged.filter((existing) => {
-      for (const token of signal) if (existing.has(token)) return true;
-      return false;
-    });
-    if (overlapping.length === 0) {
-      merged.push(new Set(signal));
-      continue;
-    }
-    // Fold every overlapping group together with this reference: A~B and B~C
-    // means all three name one symbol.
-    const combined = new Set(signal);
-    for (const group of overlapping) {
-      for (const token of group) combined.add(token);
-      merged.splice(merged.indexOf(group), 1);
-    }
-    merged.push(combined);
-  }
-  return merged;
-}
-
-/**
- * How many DISTINCT symbols the two findings both name.
- *
- * Counted on each side and reduced to the smaller: one finding naming
- * `Cache.readL2` against another naming `readL2` and `FetchFromMongo` shares
- * one symbol, not two, however the tokens happen to line up.
- */
-function sharedIdentifierCount(left: Set<string>[], right: Set<string>[]): number {
-  const intersects = (a: Set<string>, b: Set<string>): boolean => {
-    for (const token of a) if (b.has(token)) return true;
-    return false;
-  };
-  const matched = (from: Set<string>[], against: Set<string>[]): number =>
-    from.filter((signal) => against.some((other) => intersects(signal, other))).length;
-  return Math.min(matched(left, right), matched(right, left));
-}
-
 function claimText(finding: Finding): string {
   if (finding.title?.trim()) return finding.title;
   const firstSentence = /^(.*?[.!?])(?:\s|$)/su.exec(finding.message.trim())?.[1];
@@ -247,8 +212,8 @@ function sameRootCause(
   right: Finding,
   leftTokens: Set<string>,
   rightTokens: Set<string>,
-  leftIdentifiers: Set<string>[],
-  rightIdentifiers: Set<string>[],
+  leftIdentifiers: Set<string>,
+  rightIdentifiers: Set<string>,
 ): boolean {
   // The cross-file gate is deliberately NOT relaxed by the identifier signal.
   // Only a cluster's representative receives an inline comment (orchestrate.ts),
@@ -324,7 +289,7 @@ function collapseExactDuplicates(
 export function clusterFindings(findings: readonly Finding[]): FindingCluster[] {
   const { unique, rulesByFinding } = collapseExactDuplicates(findings);
   const tokens = unique.map(claimTokens);
-  const identifiers = unique.map(identifierSignals);
+  const identifiers = unique.map(identifierSymbols);
 
   // Union-find over finding indices.
   const parent = unique.map((_, index) => index);
@@ -408,7 +373,7 @@ export function clusterFindings(findings: readonly Finding[]): FindingCluster[] 
  * single inline comment, and repeating it here would be noise.
  */
 export function crossFileGroups(findings: readonly Finding[]): FindingCluster[] {
-  const identifiers = findings.map(identifierSignals);
+  const identifiers = findings.map(identifierSymbols);
   const parent = findings.map((_, index) => index);
   const find = (index: number): number => {
     let root = index;

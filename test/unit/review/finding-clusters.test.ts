@@ -414,3 +414,34 @@ describe("clusterFindings — one symbol stays one signal however often it appea
     ])).toEqual([]);
   });
 });
+
+
+// PR #53 review. Folding any two references that share a token was too eager:
+// `Cache.readL2` and `Cache.writeL2` share only their RECEIVER and are two
+// different methods. Collapsing them lost a genuine two-symbol match.
+describe("clusterFindings — a receiver is not the symbol", () => {
+  it("treats two methods on one receiver as two symbols", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, message: "`Cache.readL2` and `Cache.writeL2` disagree about staleness." }),
+      finding({ line: 400, message: "`Cache.writeL2` races `Cache.readL2` during eviction." }),
+    ]);
+
+    expect(clusters).toHaveLength(1);
+  });
+
+  it("still folds a bare and a qualified mention of ONE method", () => {
+    const clusters = clusterFindings([
+      finding({ line: 120, title: "`Cache.readL2` is stale.", message: "`readL2` returns early." }),
+      finding({ line: 400, title: "`readL2` is slow.", message: "`Cache.readL2` blocks." }),
+    ]);
+
+    expect(clusters).toHaveLength(2);
+  });
+
+  it("groups across files on two sibling methods", () => {
+    expect(crossFileGroups([
+      finding({ file: "a.go", message: "`Cache.readL2` skips `Cache.writeL2`." }),
+      finding({ file: "b.go", message: "`Cache.writeL2` runs before `Cache.readL2`." }),
+    ])).toHaveLength(1);
+  });
+});

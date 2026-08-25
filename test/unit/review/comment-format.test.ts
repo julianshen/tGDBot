@@ -1179,12 +1179,27 @@ describe("renderSummaryComment — cross-file root causes", () => {
       .not.toMatch(/one root cause/i);
   });
 
-  it("survives the compact fallback without breaking the size budget", () => {
+  // Asserting only the length was vacuous: the section is dropped under
+  // pressure and a shorter body passes trivially. The relationship has to
+  // SURVIVE, in some bounded form, or the feature quietly disappears exactly
+  // when a review is large enough to need it (PR #53 review).
+  it("keeps the relationship visible in the compact fallback", () => {
     const body = renderSummaryComment(
       { ...base, allFindings: spread, unanchored: spread, inlineCount: 0 },
       500,
     );
 
     expect(body.length).toBeLessThanOrEqual(500);
+    expect(body).toMatch(/root cause/i);
+  });
+
+  it("keeps it visible even in the emergency representation", () => {
+    const body = renderSummaryComment(
+      { ...base, allFindings: spread, unanchored: spread, inlineCount: 0 },
+      260,
+    );
+
+    expect(body.length).toBeLessThanOrEqual(260);
+    expect(body).toMatch(/root cause/i);
   });
 });
