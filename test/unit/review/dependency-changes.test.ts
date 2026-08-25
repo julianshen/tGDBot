@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import {
   dependencyChangesFromDiff,
+  dependencyContextPack,
   registryUrlFor,
 } from "../../../src/review/dependency-changes.js";
 
@@ -212,5 +213,50 @@ describe("dependencyChangesFromDiff — a forged header is not a manifest", () =
     expect(dependencyChangesFromDiff(diff)).toEqual([
       { name: "lodash", version: "4.17.21", manifest: "package.json" },
     ]);
+  });
+});
+
+
+// Issue #50, integration. Host-derived facts reach a rule through the existing
+// context-pack seam, which renders them as TRUSTED_CONTEXT — deliberately
+// distinct from the UNTRUSTED_DIFF section, because the host derived them and
+// the diff did not.
+describe("dependencyContextPack", () => {
+  const change = (name: string, version: string) => ({ name, version, manifest: "package.json" });
+
+  it("is absent when the diff changes no dependencies", () => {
+    expect(dependencyContextPack([])).toBeUndefined();
+  });
+
+  it("lists each change with its manifest", () => {
+    const pack = dependencyContextPack([change("lodash", "4.17.21"), change("left-pad", "1.3.1")]);
+
+    expect(pack?.text).toContain("lodash@4.17.21");
+    expect(pack?.text).toContain("left-pad@1.3.1");
+    expect(pack?.text).toContain("package.json");
+  });
+
+  // The pack contract requires a lowercase SHA-256, and dispatch rejects a pack
+  // without one.
+  it("carries a content hash the dispatch contract accepts", () => {
+    const pack = dependencyContextPack([change("lodash", "4.17.21")]);
+
+    expect(pack?.manifestHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(pack?.truncated).toBe(false);
+  });
+
+  it("hashes the content, so different changes differ", () => {
+    const one = dependencyContextPack([change("lodash", "4.17.21")]);
+    const two = dependencyContextPack([change("lodash", "4.17.22")]);
+
+    expect(one?.manifestHash).not.toBe(two?.manifestHash);
+  });
+
+  // Says what it does NOT know. Until the fetch layer lands there is no
+  // currency or advisory data, and implying otherwise would invite a rule to
+  // claim a version is current when nothing checked.
+  it("states that no registry data was consulted", () => {
+    expect(dependencyContextPack([change("lodash", "4.17.21")])?.text)
+      .toMatch(/not been checked|no registry|unknown/i);
   });
 });

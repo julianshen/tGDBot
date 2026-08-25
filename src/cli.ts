@@ -33,6 +33,7 @@ import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
 import { isTransientGhFailure } from "./vcs/gh-retry.js";
 import { isDiffIncompleteError } from "./vcs/github-large-diff.js";
+import { dependencyChangesFromDiff, dependencyContextPack } from "./review/dependency-changes.js";
 import {
   buildConversationContext,
   MAX_REVIEW_CONTEXT_PAGES,
@@ -1104,11 +1105,20 @@ export async function review(
     return EXIT_FATAL;
   }
 
+  // Issue #50: dependency facts the HOST parsed out of the changed manifests,
+  // delivered as trusted context. Supplied for EVERY rule or for none — the
+  // dispatch contract rejects a partial map — and omitted entirely when nothing
+  // changed, so an ordinary review gains no empty section.
+  const dependencyPack = dependencyContextPack(dependencyChangesFromDiff(diff));
+  const contextPacks = dependencyPack === undefined
+    ? undefined
+    : Object.fromEntries(rules.map((rule) => [rule.name, dependencyPack]));
   const dispatchResult = await dispatchRulesFn({
     rules,
     diff,
     useAdvisor: config.advisor === "on",
     orchestratorModel: config.model,
+    ...(contextPacks === undefined ? {} : { contextPacks }),
     ...(loadedContext.conversationContext === undefined
       ? {}
       : { conversationContext: loadedContext.conversationContext }),

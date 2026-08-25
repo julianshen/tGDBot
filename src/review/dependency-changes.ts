@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import type { ContextPackResult } from "../context/context-pack.js";
+
 // Issue #50: reviewing a dependency bump needs facts the checkout does not
 // contain — whether a version is current, withdrawn, deprecated, or carries a
 // known advisory.
@@ -181,4 +184,47 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
     changes.push({ name, version, manifest });
   }
   return changes;
+}
+
+/**
+ * The dependency changes, rendered as trusted context for a rule.
+ *
+ * Delivered through the existing context-pack seam, which places the text in a
+ * TRUSTED_CONTEXT section — deliberately apart from UNTRUSTED_DIFF, because the
+ * HOST derived these facts by parsing the manifest, and the diff did not supply
+ * them. That distinction is the same one the whole design rests on.
+ *
+ * Undefined when nothing changed, so an ordinary review is untouched: a pack
+ * must be supplied for EVERY rule or for none, and adding an empty section to
+ * every rule's task on every pull request would be pure noise.
+ *
+ * States plainly that nothing has been checked against a registry. Until the
+ * fetch layer lands there is no currency or advisory data, and text that merely
+ * listed versions could invite a rule to claim one is current when nothing
+ * looked.
+ */
+export function dependencyContextPack(
+  changes: readonly DependencyChange[],
+): ContextPackResult | undefined {
+  if (changes.length === 0) return undefined;
+  const lines = changes.map(
+    (change) => `- ${change.name}@${change.version} (${change.manifest})`,
+  );
+  const text = [
+    "## Dependency changes in this pull request",
+    "",
+    "Parsed from the changed manifests by the review host, not by a rule.",
+    "",
+    ...lines,
+    "",
+    "These versions have NOT been checked against a registry or advisory",
+    "database: whether each is current, deprecated, withdrawn, or affected by a",
+    "known advisory is unknown here. Do not assert otherwise.",
+  ].join("\n");
+  return {
+    text,
+    manifestHash: createHash("sha256").update(text, "utf8").digest("hex"),
+    truncated: false,
+    sources: [],
+  };
 }

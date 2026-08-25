@@ -1349,6 +1349,50 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+
+
+  // Issue #50: dependency facts the HOST parsed reach every rule as trusted
+  // context. Supplied for all rules or none, because the dispatch contract
+  // requires a pack per rule and rejects a partial map.
+  it("issue #50: passes host-parsed dependency changes to the rules", async () => {
+    const h = makeHarness({ botComment: null });
+    h.vcsAdapter.getDiff.mockResolvedValue(
+      [
+        "diff --git a/package.json b/package.json",
+        "--- a/package.json",
+        "+++ b/package.json",
+        "@@ -1,3 +1,3 @@",
+        '   "dependencies": {',
+        '-    "left-pad": "1.2.0",',
+        '+    "left-pad": "1.3.1",',
+      ].join("\n"),
+    );
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const passed = h.dispatchRules.mock.calls[0]?.[0] as { contextPacks?: Record<string, { text: string }> };
+    expect(passed.contextPacks).toBeDefined();
+    expect(Object.keys(passed.contextPacks ?? {})).toEqual(["rule-a"]);
+    expect(passed.contextPacks?.["rule-a"]?.text).toContain("left-pad@1.3.1");
+
+    vi.restoreAllMocks();
+  });
+
+  // The common case must be untouched: no dependency change, no pack, no extra
+  // section in any rule's task.
+  it("issue #50: passes no context packs when no dependency changed", async () => {
+    const h = makeHarness({ botComment: null });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const passed = h.dispatchRules.mock.calls[0]?.[0] as { contextPacks?: unknown };
+    expect(passed.contextPacks).toBeUndefined();
+
+    vi.restoreAllMocks();
+  });
+
   // Review fix #1: rules LOADED fine (loadErrors is empty, rules.length >
   // 0), but every rule failed at DISPATCH time (e.g. a total LLM/provider
   // outage sends dispatchRules down its fallback path, which returns
