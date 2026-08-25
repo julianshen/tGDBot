@@ -625,3 +625,133 @@ describe("focus prompts carry the real finding contract", () => {
     expect(prompt).not.toMatch(/the normal review finding contract/i);
   });
 });
+
+
+// Issue #41: the audit this issue asks for. FOCUS_CONTRACT used to name a
+// contract it never carried; #39 fixed that one. RECONSIDER_CONTRACT still
+// says `"finding": object | null` and never says what a finding IS — so the
+// model is asked to restate a structured object it has never been shown.
+describe("conversation prompts carry the shape they ask for", () => {
+  it("gives the reconsider prompt the finding schema", () => {
+    const prompt = buildReconsiderPrompt({
+      finding,
+      historicalRuleSnapshot: ledger.ruleSnapshot,
+      currentTrustedRule: currentRule,
+      currentCodeHunk: currentHunk,
+      addressedThread: thread,
+      reason: "still wrong?",
+    });
+
+    expect(prompt).toContain('"severity"');
+    expect(prompt).toContain('"title"');
+    expect(prompt).toContain('"suggestion"');
+  });
+
+  // A finding the model was never shown the shape of comes back missing its
+  // optional fields. `effort` was given inheritance in #39; the others were
+  // not, so they were simply lost.
+  it("inherits every optional field the reassessment did not restate", () => {
+    const original = {
+      file: "src/a.ts",
+      line: 4,
+      severity: "warning" as const,
+      category: "correctness",
+      message: "unclear",
+      ruleName: "rule-a",
+      title: "The cache outlives its revocation.",
+      suggestion: "return revalidate(ctx)",
+      endLine: 6,
+      effort: "heavy" as const,
+    };
+    const bare = {
+      file: original.file,
+      line: original.line,
+      severity: original.severity,
+      category: original.category,
+      message: original.message,
+      ruleName: original.ruleName,
+    };
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "still holds", finding: bare }),
+      original,
+    );
+
+    expect(result?.finding).toMatchObject({
+      title: original.title,
+      suggestion: original.suggestion,
+      endLine: original.endLine,
+      effort: original.effort,
+    });
+  });
+
+  it("prefers what the reassessment did restate", () => {
+    const original = {
+      file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+      message: "unclear", ruleName: "rule-a", title: "Old title.", effort: "heavy" as const,
+    };
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({
+        outcome: "revised",
+        rationale: "narrower than thought",
+        finding: { ...original, title: "New title.", effort: "quick" },
+      }),
+      original,
+    );
+
+    expect(result?.finding?.title).toBe("New title.");
+    expect(result?.finding?.effort).toBe("quick");
+  });
+});
+
+
+// Issue #41: the coverage this issue asks for. The focus path had no test
+// exercising a model response end to end, which is how a prompt naming a
+// contract it never carried survived to be found by accident.
+describe("a focus review refuses output it cannot use", () => {
+  const focusWith = async (text: string) =>
+    focusReview({
+      rules: [currentRule],
+      diff: currentHunk,
+      direction: "auth only",
+      model: MODEL,
+      createSession: async () => ({
+        prompt: async () => undefined,
+        getLastAssistantText: () => text,
+      }) as never,
+    });
+
+  it("fails loudly on a finding missing a required field", async () => {
+    const shapeless = JSON.stringify([
+      { file: "a.ts", line: 1, category: "correctness", message: "No severity here." },
+    ]);
+
+    const result = await focusWith(shapeless);
+
+    // NOT { status: "success", findings: [] } — a review that reports nothing
+    // over unusable output is indistinguishable from a clean one.
+    expect(result).toMatchObject({ status: "transient-error" });
+  });
+
+  it("fails loudly on prose instead of JSON", async () => {
+    expect(await focusWith("I looked and everything seems fine!"))
+      .toMatchObject({ status: "transient-error" });
+  });
+
+  // An empty array is a genuine result: the rules ran and found nothing.
+  it("accepts an empty array as a real answer", async () => {
+    expect(await focusWith("[]")).toMatchObject({ status: "success", result: { findings: [] } });
+  });
+
+  it("returns the findings when the response matches the contract", async () => {
+    const valid = JSON.stringify([
+      { file: "a.ts", line: 1, severity: "warning", category: "correctness", message: "Real." },
+    ]);
+
+    const result = await focusWith(valid);
+
+    expect(result).toMatchObject({ status: "success" });
+    expect((result as { result: { findings: unknown[] } }).result.findings).toHaveLength(1);
+  });
+});

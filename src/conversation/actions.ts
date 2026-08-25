@@ -91,10 +91,12 @@ const RECONSIDER_CONTRACT = `Respond with ONLY a JSON object matching this shape
 - "confirmed": the finding still holds. Repeat the finding (updated only if needed) and say why.
 - "revised": the finding still holds but should change. Provide the revised finding.
 - "withdrawn": the concern no longer holds against current code and the thread. Omit finding (null).
-- The finding uses the same shape as a normal review finding, including "effort".
-  Restate it only if the work involved has actually changed; when omitted, the
-  original estimate is kept.
-"rationale" is a short justification grounded in the current code and trusted rule.`;
+"rationale" is a short justification grounded in the current code and trusted rule.
+
+The "finding" uses the shape below. Restate a field only if it has actually
+changed; anything you omit keeps its original value rather than being cleared.
+
+${FINDING_JSON_CONTRACT}`;
 
 const FOCUS_CONTRACT = `${FINDING_JSON_CONTRACT}
 
@@ -215,9 +217,20 @@ export function parseExplainOutput(text: string): ExplainResult | undefined {
   return { explanation };
 }
 
+/**
+ * Optional fields carried forward when a reassessment does not restate them.
+ *
+ * The response REPLACES the stored finding rather than merging into it, so an
+ * omitted field would otherwise be silently cleared — and the model is asked to
+ * restate a structured object, which it will do imperfectly. "Confirmed" means
+ * the finding still holds, so its unrestated parts still hold too. A restated
+ * value always wins, since a revision may legitimately change any of them.
+ */
+const INHERITED_FINDING_FIELDS = ["title", "suggestion", "endLine", "effort"] as const;
+
 export function parseReconsiderOutput(
   text: string,
-  original?: { readonly effort?: Finding["effort"] },
+  original?: Partial<Pick<Finding, (typeof INHERITED_FINDING_FIELDS)[number]>>,
 ): ReconsiderResult | undefined {
   const parsed = parseJsonObject(text);
   if (!parsed) return undefined;
@@ -227,13 +240,12 @@ export function parseReconsiderOutput(
   if (parsed.outcome !== "confirmed" && parsed.outcome !== "revised") return undefined;
   const finding = normalizeUnknownFinding(parsed.finding);
   if (finding === undefined) return undefined;
-  // The reassessment returns a WHOLE finding that REPLACES the stored one, so
-  // anything it does not restate would be dropped. An estimate the reviewer
-  // already made still holds unless this pass deliberately revised it, so it is
-  // inherited rather than lost (PR #39 review).
-  const merged = finding.effort === undefined && original?.effort !== undefined
-    ? { ...finding, effort: original.effort }
-    : finding;
+  const merged = { ...finding };
+  for (const field of INHERITED_FINDING_FIELDS) {
+    if (merged[field] === undefined && original?.[field] !== undefined) {
+      Object.assign(merged, { [field]: original[field] });
+    }
+  }
   return { outcome: parsed.outcome, finding: merged, rationale };
 }
 

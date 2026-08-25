@@ -119,6 +119,7 @@ import {
 import {
   MAX_FINDING_QUESTION_CHARS,
   parseDispatchResult,
+  extractFindingsArray,
   parseFindingsFromFinalOutput,
 } from "../../../src/review/dispatch-results.js";
 
@@ -2391,5 +2392,25 @@ describe("suggestions keep their indentation", () => {
 
   it("accepts leading indentation and trailing content together", () => {
     expect(withSuggestion("    const x = 1;")).toBe("    const x = 1;");
+  });
+});
+
+
+// Issue #41 asked whether shapeless model output could degrade into a clean
+// review. It cannot, and the reason is worth pinning: an array is accepted only
+// when EVERY entry parses, so one malformed finding rejects the whole response
+// rather than silently shortening it.
+describe("a findings array is all or nothing", () => {
+  it("rejects the whole array when a single entry is malformed", () => {
+    const raw = JSON.stringify([coreFinding, { ...coreFinding, severity: "urgent" }]);
+
+    expect(extractFindingsArray(raw)).toBeUndefined();
+    expect(parseFindingsFromFinalOutput(raw, "rule-a")).toEqual([]);
+  });
+
+  it("keeps every entry when they all parse", () => {
+    const raw = JSON.stringify([coreFinding, { ...coreFinding, line: 9 }]);
+
+    expect(parseFindingsFromFinalOutput(raw, "rule-a")).toHaveLength(2);
   });
 });

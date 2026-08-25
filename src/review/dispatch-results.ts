@@ -261,6 +261,11 @@ export function extractFindingsArray(text: string): unknown[] | undefined {
 export function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
   const parsed = extractFindingsArray(text);
   if (!parsed) return [];
+  // No entry can be dropped here: extractFindingsArray accepts an array only
+  // when EVERY entry passes isValidRawFinding, which is this same
+  // normalization. A single malformed finding rejects the whole array upstream,
+  // and the caller reports unusable output rather than a short list — checked
+  // in "an array is all or nothing" (issue #41).
   return parsed.flatMap((value) => {
     const finding = normalizeUnknownFinding(value, ruleName);
     return finding === undefined ? [] : [finding];

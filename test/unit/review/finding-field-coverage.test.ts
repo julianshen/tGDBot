@@ -311,3 +311,32 @@ describe("every Finding field reaches the reader", () => {
     }
   });
 });
+
+// Issue #41: the conversation prompts ask for findings too, and one of them
+// named a contract it never carried. The field walk now reaches them, so a new
+// field cannot be added to the review contract while these quietly keep asking
+// for the old shape.
+describe("conversation prompts describe the same finding", () => {
+  const contractsIn = (source: string): string => {
+    const text = sourceText(source);
+    const start = text.indexOf("FOCUS_CONTRACT");
+    return start < 0 ? text : text;
+  };
+
+  it("gives the focus and reconsider contracts the shared schema", () => {
+    const actions = contractsIn("conversation/actions.ts");
+
+    // Both embed FINDING_JSON_CONTRACT rather than restating the shape, which
+    // is what keeps them from drifting as fields are added.
+    const embeds = actions.split("${FINDING_JSON_CONTRACT}").length - 1;
+    expect(embeds, "a finding-producing contract stopped sharing the schema").toBeGreaterThanOrEqual(2);
+  });
+
+  it("never asks for a finding without saying what one is", () => {
+    const actions = sourceText("conversation/actions.ts");
+
+    // A contract mentioning "finding" as a JSON field must be one that carries
+    // the schema; `"finding": object` with no shape is the #41 defect.
+    expect(actions).not.toMatch(/"finding":\s*object\s*\|\s*null[\s\S]{0,400}?`;/);
+  });
+});
