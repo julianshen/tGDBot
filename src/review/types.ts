@@ -83,6 +83,18 @@ export interface Finding {
    * finding is worth posting whether or not its metadata parsed.
    */
   effort?: "quick" | "heavy";
+
+  /**
+   * Issue #49: documentation this finding rests on, so a reader can check the
+   * claim rather than take it.
+   *
+   * Only URLs that appear in the finding's OWN rule text survive parsing. A
+   * fabricated citation looks authoritative and is worse than none, and a model
+   * cannot invent a link it was never given — so the guarantee is structural
+   * rather than a matter of the model behaving. Where the rule text is not
+   * available, every citation is dropped: fail closed.
+   */
+  references?: readonly string[];
 }
 
 export interface DispatchResult {

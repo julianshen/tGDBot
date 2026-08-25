@@ -232,6 +232,8 @@ export function renderInlineComment(
     parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
   }
 
+  const citations = renderReferences(finding);
+  if (citations) parts.push("", citations);
   if (options.alsoReported && options.alsoReported.length > 0) {
     parts.push("", renderAlsoReported(options.alsoReported));
   }
@@ -510,6 +512,19 @@ function renderDiffExcerpt(snippet: HunkSnippet): string {
 }
 
 // Collapsed so one entry stays scannable, present so nothing is lost.
+/**
+ * Issue #49: the documentation a finding rests on, so a reader can check the
+ * claim rather than take it. Already validated against the rule's own text on
+ * parse, so nothing here can be a model invention.
+ */
+function renderReferences(finding: Finding): string | undefined {
+  if (!finding.references || finding.references.length === 0) return undefined;
+  const items = finding.references
+    .slice(0, 5)
+    .map((url) => `- ${sanitizeInline(url)}`);
+  return [`**Reference**`, "", ...items].join("\n");
+}
+
 function renderAlsoReported(members: readonly Finding[]): string {
   const items = members.flatMap((member) => {
     const rule = sanitizeInline(member.ruleName);
@@ -569,6 +584,8 @@ function renderUnanchoredFinding(
         : "> Proposed fix omitted because the summary size budget was exhausted.",
     );
   }
+  const references = renderReferences(finding);
+  if (references) parts.push("", references);
   if (context?.alsoReported && context.alsoReported.length > 0) {
     parts.push("", renderAlsoReported(context.alsoReported));
   }

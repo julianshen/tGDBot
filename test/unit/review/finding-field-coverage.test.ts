@@ -89,6 +89,7 @@ const COMPLETE: Required<Finding> = {
   // makes this file notice if that regresses.
   suggestion: "\tif stale(entry) {\n\t\treturn revalidate(ctx)\n\t}",
   effort: "heavy",
+  references: ["https://docs.example.com/ttl"],
 };
 
 const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
@@ -181,7 +182,14 @@ describe("every Finding field survives every representation", () => {
     });
 
     const parsed = parseDispatchResult(raw, [
-      { name: COMPLETE.ruleName, body: "rule body", sourcePath: "rules/x.md", dependsOn: [] },
+      {
+        name: COMPLETE.ruleName,
+        // The rule must DECLARE the citation, or the parser correctly discards
+        // it — a finding may only cite what its own rule text contains (#49).
+        body: `rule body — see ${COMPLETE.references[0]}`,
+        sourcePath: "rules/x.md",
+        dependsOn: [],
+      },
     ]);
     const finding = parsed.findings[0] as unknown as Record<string, unknown>;
 
@@ -258,6 +266,7 @@ describe("every Finding field reaches the reader", () => {
     title: COMPLETE.title,
     message: COMPLETE.message,
     suggestion: COMPLETE.suggestion,
+    references: COMPLETE.references[0],
   };
 
   /** Fields an inline comment deliberately does not print. */

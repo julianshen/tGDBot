@@ -112,7 +112,27 @@ export function readFindingDecision(
  * through this; the legacy orchestrator path uses it for the merged result.
  * Title/suggestion/endLine stay lenient optional enrichment.
  */
-export function normalizeUnknownFinding(value: unknown, ruleName?: string): Finding | undefined {
+/**
+ * The URLs a rule's own text cites (issue #49).
+ *
+ * Bounded and http(s) only. This is the set a finding may cite from, so it is
+ * the security boundary for the citation feature: anything outside it is a
+ * model invention.
+ */
+export function referencesDeclaredBy(ruleBody: string): Set<string> {
+  const declared = new Set<string>();
+  for (const match of ruleBody.matchAll(/https?:\/\/[^\s<>()\[\]"'`]+/gu)) {
+    const url = match[0].replace(/[.,;:]+$/u, "");
+    if (url.length <= 2_000) declared.add(url);
+  }
+  return declared;
+}
+
+export function normalizeUnknownFinding(
+  value: unknown,
+  ruleName?: string,
+  allowedReferences?: ReadonlySet<string>,
+): Finding | undefined {
   if (!value || typeof value !== "object") return undefined;
   const candidate = value as Record<string, unknown>;
   if (typeof candidate.file !== "string") return undefined;
@@ -147,6 +167,14 @@ export function normalizeUnknownFinding(value: unknown, ruleName?: string): Find
   if (candidate.effort === "quick" || candidate.effort === "heavy") {
     finding.effort = candidate.effort;
   }
+  // Fail closed: with no allowed set there is nothing to check a citation
+  // against, so none survives (issue #49).
+  if (Array.isArray(candidate.references) && allowedReferences !== undefined) {
+    const cited = candidate.references.filter(
+      (url): url is string => typeof url === "string" && allowedReferences.has(url),
+    );
+    if (cited.length > 0) finding.references = cited;
+  }
   const suggestion = stateSafeSuggestion(candidate.suggestion);
   if (suggestion !== undefined) finding.suggestion = suggestion;
   if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;
@@ -158,8 +186,30 @@ function isValidFinding(value: unknown): value is Finding {
   return normalizeUnknownFinding(value) !== undefined;
 }
 
-function normalizeFinding(finding: Finding): Finding {
-  return normalizeUnknownFinding(finding) ?? finding;
+function normalizeFinding(
+  finding: Finding,
+  declaredByRule: ReadonlyMap<string, ReadonlySet<string>>,
+): Finding {
+  const normalized = normalizeUnknownFinding(
+    finding,
+    undefined,
+    declaredByRule.get(finding.ruleName),
+  );
+  if (normalized !== undefined) return normalized;
+  // UNREACHABLE today, and deliberately kept. looksLikeDispatchResult has
+  // already validated every finding through this same normalization, and the
+  // allowed-reference set affects which citations survive rather than whether
+  // the finding is valid — so normalization cannot fail here, and no test can
+  // drive this branch (verified by removing it: nothing failed).
+  //
+  // It stays because the hazard it guards is a security one: should those two
+  // validations ever diverge, the raw finding would carry citations that never
+  // went through the declared-URL check, which is precisely what #49 exists to
+  // prevent. Cheap insurance at a boundary, not a tested path.
+  if (finding.references === undefined) return finding;
+  const { references, ...withoutReferences } = finding;
+  void references;
+  return withoutReferences;
 }
 
 function looksLikeDispatchResult(value: unknown): value is DispatchResult {
@@ -208,7 +258,13 @@ export function parseDispatchResult(text: string | undefined, rules: RuleDefinit
     return fallbackResult(rules);
   }
 
-  return { ...parsed, findings: parsed.findings.map(normalizeFinding) };
+  // A finding may cite only what ITS OWN rule declared, so the allowed set is
+  // keyed by rule name rather than pooled across the run (issue #49).
+  const declaredByRule = new Map(rules.map((rule) => [rule.name, referencesDeclaredBy(rule.body)]));
+  return {
+    ...parsed,
+    findings: parsed.findings.map((finding) => normalizeFinding(finding, declaredByRule)),
+  };
 }
 
 // Like isValidFinding but WITHOUT requiring ruleName — a dispatched task's raw

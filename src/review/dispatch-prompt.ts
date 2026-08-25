@@ -27,7 +27,8 @@ const FINDING_SHAPE = `{
   "suggestion": string | null,
   "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification",
   "question": string | null,
-  "effort": "quick" | "heavy" | null
+  "effort": "quick" | "heavy" | null,
+  "references": string[] | null
 }`;
 
 const FINDING_FIELD_NOTES = `- "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
@@ -58,6 +59,10 @@ const FINDING_FIELD_NOTES = `- "title": a SHORT one-line headline for the findin
   is still "blocking" — never soften severity because the fix is expensive, and
   never raise it because the fix is cheap. Effort only orders findings that are
   already equally severe.
+- "references": documentation this finding rests on, so a reader can check the
+  claim instead of taking it. You may ONLY cite a URL that appears in the rule
+  text above, copied exactly. A link the rule does not contain will be
+  discarded, and inventing one is worse than citing nothing.
 - "suggestion": the EXACT replacement text for lines "line".."endLine", or null.
   DO provide one whenever the fix is a concrete, local edit you are confident in
   — an off-by-one, a wrong operator or comparison, a missing nil/error check, a
@@ -283,7 +288,7 @@ export function buildDispatchPrompt(
 
   parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
-    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
+    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
     // ADR-007/ADR-008: the orchestrator MERGES the subagents' findings and re-emits
     // them, so every field it is not told to keep is silently dropped at this last
     // hop. That is exactly what happened on the first live run: the reviewers were
@@ -292,7 +297,7 @@ export function buildDispatchPrompt(
     // Copy them through VERBATIM; never rewrite a suggestion (it is literal code
     // destined for the file, and a paraphrase would commit something the reviewer
     // never proposed).
-    `Copy each finding's "title", "message", "suggestion", "endLine", "decision", "question" and "effort" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
+    `Copy each finding's "title", "message", "suggestion", "endLine", "decision", "question", "effort" and "references" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
     // Attribution fix (see order-mapping note above): the old wording defined
     // rulesFailed as tasks that "produced no usable output", which the
     // orchestrator wrongly applied to a task that RAN and returned an empty or

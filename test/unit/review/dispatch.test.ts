@@ -2414,3 +2414,67 @@ describe("a findings array is all or nothing", () => {
     expect(parseFindingsFromFinalOutput(raw, "rule-a")).toHaveLength(2);
   });
 });
+
+
+// Issue #49: a finding that cites the documentation it is based on is worth
+// more than one that asserts. The hazard is a HALLUCINATED citation — a
+// fabricated link looks authoritative and is worse than none — so a finding may
+// only cite a URL that appears in its own rule's text. The model cannot invent
+// a reference it was not given, which makes the guarantee structural rather
+// than a matter of the model behaving.
+describe("finding references are limited to what the rule declared", () => {
+  const ruleWithDocs = {
+    name: "rule-a",
+    body: "See https://docs.example.com/ttl and https://docs.example.com/caching for the contract.",
+    sourcePath: "rules/a.md",
+    dependsOn: [],
+  };
+  const parse = (references: unknown) => parseDispatchResult(
+    JSON.stringify({
+      findings: [{ ...coreFinding, references }],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    }),
+    [ruleWithDocs],
+  ).findings[0];
+
+  it("keeps a citation the rule itself contains", () => {
+    expect(parse(["https://docs.example.com/ttl"])?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("keeps several", () => {
+    expect(parse(["https://docs.example.com/ttl", "https://docs.example.com/caching"])?.references)
+      .toHaveLength(2);
+  });
+
+  // The whole point: a plausible-looking URL the rule never mentioned is
+  // dropped, and the finding still posts.
+  it("drops a citation the rule never made", () => {
+    const finding = parse(["https://docs.example.com/invented"]);
+
+    expect(finding?.references).toBeUndefined();
+    expect(finding?.message).toBe(coreFinding.message);
+  });
+
+  it("keeps the real ones when only some are invented", () => {
+    expect(parse(["https://docs.example.com/ttl", "https://evil.example/x"])?.references)
+      .toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("ignores a references field that is not a list of strings", () => {
+    for (const value of ["https://docs.example.com/ttl", 3, {}, [1, 2], null]) {
+      expect(parse(value)?.references, `${JSON.stringify(value)} was accepted`).toBeUndefined();
+    }
+  });
+
+  // Fail closed: without a rule body there is nothing to check a citation
+  // against, so none survives.
+  it("drops every citation when the rule text is unavailable", () => {
+    const recovered = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://docs.example.com/ttl"] }]),
+      "rule-a",
+    );
+
+    expect(recovered[0]?.references).toBeUndefined();
+  });
+});
