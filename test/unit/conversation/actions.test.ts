@@ -977,3 +977,62 @@ describe("a rejected replacement is not silently reverted", () => {
     expect(result?.finding?.suggestion).toBe("return stale(ctx)");
   });
 });
+
+// PR #54 review: a citation validated at parse time is persisted on the
+// finding, but a reassessment REPLACES the stored finding, and
+// parseReconsiderOutput has no rule text to validate a restated citation
+// against. So an echoing model's references were discarded and an omitting
+// model's were not restored — either way a confirmed finding lost its
+// documentation on republication.
+describe("parseReconsiderOutput — citations survive reassessment", () => {
+  const original = {
+    ruleName: "rule-a",
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking" as const,
+    message: "Original claim.",
+    references: ["https://docs.example.com/ttl"],
+  };
+  const response = (finding: Record<string, unknown>) => JSON.stringify({
+    outcome: "confirmed",
+    rationale: "Still stands.",
+    finding,
+  });
+  const core = {
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking",
+    message: "Original claim.",
+  };
+
+  it("restores the validated citation the response omitted", () => {
+    const result = parseReconsiderOutput(response(core), original);
+
+    expect(result?.outcome).toBe("confirmed");
+    expect(result?.finding?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  // The model cannot establish provenance here — there is no rule text to
+  // check against — so a citation it invents must not ride along, and the
+  // snapshot's own citation must not be lost to the attempt.
+  it("keeps the snapshot's citation rather than one the response invented", () => {
+    const result = parseReconsiderOutput(
+      response({ ...core, references: ["https://evil.example/x"] }),
+      original,
+    );
+
+    expect(result?.finding?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("adds no citation when the original had none", () => {
+    const { references: _dropped, ...uncited } = original;
+    const result = parseReconsiderOutput(
+      response({ ...core, references: ["https://evil.example/x"] }),
+      uncited,
+    );
+
+    expect(result?.finding?.references).toBeUndefined();
+  });
+});

@@ -119,8 +119,18 @@ export function readFindingDecision(
  * the security boundary for the citation feature: anything outside it is a
  * model invention.
  */
-/** The state schema refuses a longer array; parsing must not create one. */
-const MAX_PERSISTED_REFERENCES = 20;
+/**
+ * The ONE citation limit.
+ *
+ * Applied where the array is built, so it is also the number the reader sees.
+ * Parsing used to keep up to the state schema's twenty while the renderer
+ * printed five and discarded the rest in silence — a citation that survives
+ * provenance checking and persistence has earned its way into the comment
+ * (PR #54 review). A bound is still needed: an unbounded array parses and
+ * publishes, then fails validation on the next state read and leaves the
+ * finding ledger unusable.
+ */
+export const MAX_REFERENCES_PER_FINDING = 5;
 
 export function referencesDeclaredBy(ruleBody: string): Set<string> {
   const declared = new Set<string>();
@@ -173,14 +183,12 @@ export function normalizeUnknownFinding(
   // Fail closed: with no allowed set there is nothing to check a citation
   // against, so none survives (issue #49).
   if (Array.isArray(candidate.references) && allowedReferences !== undefined) {
-    // Deduplicated and capped at the state schema's own limit. An unbounded
-    // array parses and publishes, then fails validation on the next state read
-    // and leaves the finding ledger unusable (PR #54 review).
+    // Deduplicated and capped at the limit the renderer prints.
     const cited = [...new Set(
       candidate.references.filter(
         (url): url is string => typeof url === "string" && allowedReferences.has(url),
       ),
-    )].slice(0, MAX_PERSISTED_REFERENCES);
+    )].slice(0, MAX_REFERENCES_PER_FINDING);
     if (cited.length > 0) finding.references = cited;
   }
   const suggestion = stateSafeSuggestion(candidate.suggestion);

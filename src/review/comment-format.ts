@@ -517,12 +517,10 @@ function renderDiffExcerpt(snippet: HunkSnippet): string {
  * claim rather than take it. Already validated against the rule's own text on
  * parse, so nothing here can be a model invention.
  */
-const MAX_RENDERED_REFERENCES = 5;
-
 function renderReferences(finding: Finding): string | undefined {
   if (!finding.references || finding.references.length === 0) return undefined;
   const items = finding.references
-    .slice(0, MAX_RENDERED_REFERENCES)
+
     .map((url) => `- ${sanitizeInline(url)}`);
   return [`**Reference**`, "", ...items].join("\n");
 }
@@ -538,7 +536,6 @@ function renderReferences(finding: Finding): string | undefined {
 function referenceBullets(finding: Finding, indent: string): string[] {
   if (!finding.references || finding.references.length === 0) return [];
   return finding.references
-    .slice(0, MAX_RENDERED_REFERENCES)
     .map((url) => `${indent}- Reference: ${sanitizeInline(url)}`);
 }
 

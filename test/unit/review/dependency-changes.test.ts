@@ -408,3 +408,74 @@ describe("dependencyChangesFromDiff — full SemVer", () => {
     expect(dependencyChangesFromDiff(diff)[0]?.version).toBe("1.2.3-beta.1+build.5");
   });
 });
+
+// PR #54 review, round two. The indentation fallback that rescued far-from-
+// header bumps also accepts any 4-space string entry when git omits the
+// enclosing key. On a REAL git diff the 3-line context window carries
+// `"engines": {` in with it, so the section resolves to "other" and nothing
+// leaks — the first test pins that. But an engines block long enough to push
+// its own opening brace out of that window has no such rescue, and the runtime
+// keys that live there are a short, known list.
+describe("dependency extraction — entries that are not packages", () => {
+  it("keeps a real engines bump out, the way git actually emits it", () => {
+    const diff = [
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      "@@ -2,7 +2,7 @@",
+      '   "name": "x",',
+      '   "version": "1.0.0",',
+      '   "engines": {',
+      '-    "node": "22.0.0"',
+      '+    "node": "23.0.0"',
+      "   },",
+      '   "dependencies": {',
+      '     "pkg-00": "1.0.0",',
+      "@@ -25,7 +25,7 @@",
+      '     "pkg-19": "1.0.0",',
+      '-    "pkg-20": "1.0.0",',
+      '+    "pkg-20": "2.0.0",',
+      '     "pkg-21": "1.0.0",',
+    ].join("\n");
+
+    // The far-from-header bump survives, which is the whole point of the
+    // fallback, and the engines entry does not.
+    expect(dependencyChangesFromDiff(diff)).toEqual([
+      { name: "pkg-20", version: "2.0.0", manifest: "package.json" },
+    ]);
+  });
+
+  it("keeps a runtime key out even when its own section header is out of context", () => {
+    const diff = [
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      // No enclosing key anywhere in the hunk: this is the unknown-section
+      // case, where only indentation would otherwise decide.
+      "@@ -40,7 +40,7 @@",
+      '     "yarn": ">=4",',
+      '-    "node": ">=20",',
+      '+    "node": ">=22",',
+      '     "npm": ">=10",',
+    ].join("\n");
+
+    expect(dependencyChangesFromDiff(diff)).toEqual([]);
+  });
+
+  it("still admits a package that shares its name with nothing special", () => {
+    const diff = [
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      "@@ -40,7 +40,7 @@",
+      '     "left-pad": "1.0.0",',
+      '-    "lodash": "4.17.20",',
+      '+    "lodash": "4.17.21",',
+      '     "react": "18.0.0"',
+    ].join("\n");
+
+    expect(dependencyChangesFromDiff(diff)).toEqual([
+      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+    ]);
+  });
+});

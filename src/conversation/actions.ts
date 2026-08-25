@@ -270,6 +270,21 @@ export function parseReconsiderOutput(
       Object.assign(merged, { [field]: original[field] });
     }
   }
+
+  // Citations do not follow the rule above, in either direction. A restated one
+  // cannot be honoured — provenance is established against the RULE'S text, and
+  // no rule text reaches this parser, so `normalizeUnknownFinding` correctly
+  // refuses everything the response supplies. That left a confirmed finding
+  // publishing without the documentation it was published with the first time
+  // (PR #54 review). The snapshot's array was already validated on the way in,
+  // and a reassessment has no authority to add to it or take from it, so it
+  // simply carries over — including the response's attempt to replace it.
+  if (original?.references !== undefined) {
+    Object.assign(merged, { references: original.references });
+  } else {
+    delete (merged as { references?: unknown }).references;
+  }
+
   return { outcome: parsed.outcome, finding: merged, rationale };
 }
 

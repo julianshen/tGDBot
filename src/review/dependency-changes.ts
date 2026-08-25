@@ -67,6 +67,23 @@ const MANIFEST_BASENAMES = new Set(["package.json"]);
 const MANIFEST_PATH_RE = /^[A-Za-z0-9._\/-]{1,512}$/u;
 
 /**
+ * Keys that live in a manifest's RUNTIME sections, never in a dependency map.
+ *
+ * With the section unknown, indentation is the only signal, and an `engines`
+ * block long enough to push its own opening brace out of git's three-line
+ * context window would otherwise contribute `node` as a package (PR #54 review,
+ * round two). These are the keys that actually appear there — and every one of
+ * them is also a real name on the registry, so a lookup would come back
+ * plausible rather than obviously wrong.
+ *
+ * Narrow on purpose: it costs a genuine bump of a package by one of these names
+ * ONLY in the unknown-section case, where nothing was proven anyway. It is a
+ * heuristic backstop for a heuristic, not a boundary — the boundary is name
+ * validation and URL encoding, which every entry still passes through.
+ */
+const RUNTIME_KEYS = new Set(["node", "npm", "yarn", "pnpm", "bun", "deno", "vscode"]);
+
+/**
  * How many packages one diff may ask about.
  *
  * A lockfile churn can touch thousands. Without a ceiling, one pull request
@@ -175,7 +192,11 @@ function manifestContextByLine(diff: string): Map<number, string> {
     // inside a top-level object, so it is indented further than a top-level
     // field like "version". Not proof, but the alternative — dropping every
     // bump whose header git did not include — misses most real ones.
-    if (section === "unknown" && !/^\s{4,}"/u.test(content)) continue;
+    if (section === "unknown") {
+      if (!/^\s{4,}"/u.test(content)) continue;
+      const key = /^\s*"([^"]+)"\s*:/u.exec(content)?.[1];
+      if (key !== undefined && RUNTIME_KEYS.has(key)) continue;
+    }
     byLine.set(index, manifest);
   }
   return byLine;

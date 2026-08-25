@@ -118,11 +118,13 @@ import {
 } from "../../../src/review/extensions.js";
 import {
   MAX_FINDING_QUESTION_CHARS,
+  MAX_REFERENCES_PER_FINDING,
   parseDispatchResult,
   extractFindingsArray,
   referencesDeclaredBy,
   parseFindingsFromFinalOutput,
 } from "../../../src/review/dispatch-results.js";
+import { renderInlineComment } from "../../../src/review/comment-format.js";
 
 function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
   return {
@@ -2555,5 +2557,26 @@ describe("citations are not taken on an unverified rule name", () => {
     );
 
     expect(parsed.findings[0]?.references).toBeUndefined();
+  });
+});
+
+// PR #54 review: parsing kept up to 20 citations and the state schema accepted
+// them, but the renderer printed the first five and dropped the rest without
+// saying so. A citation that survives validation and persistence must reach the
+// reader, so there is now ONE limit, applied where the array is built.
+describe("the citation limit is the one the reader sees", () => {
+  it("keeps no more citations than a comment renders", () => {
+    const urls = Array.from({ length: 12 }, (_, i) => `https://docs.example.com/${i}`);
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: urls }]),
+      "rule-a",
+      referencesDeclaredBy(urls.join(" ")),
+    );
+
+    const kept = findings[0]?.references ?? [];
+    expect(kept.length).toBe(MAX_REFERENCES_PER_FINDING);
+    // Every kept citation is printed: nothing is dropped at the last step.
+    const body = renderInlineComment(findings[0]!, "abc1234", { suggestions: false });
+    for (const url of kept) expect(body).toContain(url);
   });
 });
