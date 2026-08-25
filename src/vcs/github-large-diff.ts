@@ -132,6 +132,51 @@ function fileCount(value: unknown, label: string): number {
   return value;
 }
 
+
+// `@@ -oldStart[,oldCount] +newStart[,newCount] @@`. A missing count means one,
+// not zero — git writes `@@ -3 +4 @@` for a single-line hunk.
+const HUNK_HEADER_RE = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/;
+
+/**
+ * True when every hunk in a patch delivers the number of lines it declares.
+ *
+ * Issue #35: counting changed lines against the entry's totals is a proxy, and
+ * it misses a patch cut short after its last `+`/`-` line but before the hunk's
+ * trailing context. The totals still match; the hunk is still incomplete, and
+ * `diff-anchors` discards an incomplete hunk — so the finding loses its anchor
+ * while the reconstruction reports itself whole.
+ *
+ * Only a SHORTFALL is a failure, matching the changed-line check: more lines
+ * than declared is a disagreement about counting, not evidence of loss.
+ */
+function hunksAreComplete(body: readonly string[]): boolean {
+  let oldRemaining = 0;
+  let newRemaining = 0;
+  let seenHeader = false;
+  for (const line of body) {
+    const header = HUNK_HEADER_RE.exec(line);
+    if (header) {
+      // A new hunk starting before the previous one finished is a short hunk.
+      if (seenHeader && (oldRemaining > 0 || newRemaining > 0)) return false;
+      oldRemaining = header[1] === undefined ? 1 : Number(header[1]);
+      newRemaining = header[2] === undefined ? 1 : Number(header[2]);
+      seenHeader = true;
+      continue;
+    }
+    if (!seenHeader) continue;
+    // "\ No newline at end of file" annotates the previous line; it belongs to
+    // neither side and must not be counted as content.
+    if (line.startsWith("\\")) continue;
+    if (line.startsWith("+")) newRemaining -= 1;
+    else if (line.startsWith("-")) oldRemaining -= 1;
+    else {
+      oldRemaining -= 1;
+      newRemaining -= 1;
+    }
+  }
+  return oldRemaining <= 0 && newRemaining <= 0;
+}
+
 /**
  * Rebuilds one unified diff from `/pulls/{number}/files` rows.
  *
@@ -197,7 +242,11 @@ export function reconstructDiffFromFiles(
       // not missing content, and must not fail an otherwise whole diff.
       const reportedAdditions = fileCount(row.additions, "addition count");
       const reportedDeletions = fileCount(row.deletions, "deletion count");
-      if (patchAdditions < reportedAdditions || patchDeletions < reportedDeletions) {
+      if (
+        patchAdditions < reportedAdditions ||
+        patchDeletions < reportedDeletions ||
+        !hunksAreComplete(body)
+      ) {
         truncatedPatches.push(newPath);
       }
       continue;
@@ -211,10 +260,11 @@ export function reconstructDiffFromFiles(
       continue;
     }
 
-    // No patch and nothing changed textually. A pure rename or copy is
-    // already fully described by the headers above. Anything else is either a
-    // binary file or a mode-only change, and this endpoint renders those
-    // IDENTICALLY — no patch, no additions, no deletions, and no mode field.
+    // No patch and nothing changed textually. Anything here is a binary file, a
+    // mode-only change, or a move — and this endpoint renders them IDENTICALLY:
+    // no patch, no additions, no deletions, and no mode field. A renamed binary
+    // whose CONTENT also changed looks exactly like a pure rename (issue #35),
+    // so the move headers alone are not proof the file is fully described.
     // Guessing would put a falsehood in the diff: "Binary files differ" on a
     // chmod hides the permission change behind a wrong label, and `old mode`/
     // `new mode` on a PNG is simply untrue. (Codex review, PR #34.)
@@ -226,8 +276,11 @@ export function reconstructDiffFromFiles(
     if (!moved) {
       if (added) lines.push("--- /dev/null", `+++ b/${newPath}`);
       else if (removed) lines.push(`--- a/${oldPath}`, "+++ /dev/null");
-      contentless.push(newPath);
     }
+    // Reported for a move as well. Nothing is MISSING that could have been
+    // shown — there is no patch to deliver — so this is not an omission, but it
+    // is no longer claimed as a complete description either.
+    contentless.push(newPath);
   }
 
   return {

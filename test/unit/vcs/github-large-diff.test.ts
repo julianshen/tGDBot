@@ -230,10 +230,13 @@ describe("reconstructDiffFromFiles", () => {
     expect(contentless).toEqual(["docs/logo.png"]);
   });
 
-  // A rename is fully described by its headers, so it is not "contentless" in
-  // the sense above — nothing about it is unknown.
-  it("does not count a pure rename as contentless", () => {
-    const { contentless } = reconstructDiffFromFiles([
+  // This once asserted the opposite — that a rename is fully described by its
+  // headers, so nothing about it is unknown. That was wrong (issue #35): a
+  // renamed BINARY whose content also changed reports identically to a pure
+  // rename, so the headers cannot prove the file is fully described. It is
+  // still not an omission, because there was never a patch to deliver.
+  it("counts a no-patch rename as contentless, not as an omission", () => {
+    const { contentless, omittedPatches } = reconstructDiffFromFiles([
       {
         filename: "src/new-name.ts",
         previous_filename: "src/old-name.ts",
@@ -244,7 +247,8 @@ describe("reconstructDiffFromFiles", () => {
       },
     ]);
 
-    expect(contentless).toEqual([]);
+    expect(contentless).toEqual(["src/new-name.ts"]);
+    expect(omittedPatches).toEqual([]);
   });
 
   // THE case that must never pass silently: GitHub reports the file changed
@@ -460,5 +464,117 @@ describe("isDiffIncompleteError", () => {
   it("does not swallow an unrelated failure", () => {
     expect(isDiffIncompleteError(new Error("error connecting to api.github.com"))).toBe(false);
     expect(isDiffIncompleteError({ code: "GITHUB_DIFF_INCOMPLETE" })).toBe(false);
+  });
+});
+
+
+// Issue #35, gap 1. Counting changed lines is a proxy: a patch truncated after
+// its last +/- line but before the hunk's declared trailing context still
+// satisfies the totals. diff-anchors then discards the incomplete hunk while
+// the reconstruction reports itself whole.
+describe("reconstructDiffFromFiles — hunk integrity", () => {
+  it("reports a hunk cut short of its declared context", () => {
+    const { truncatedPatches } = reconstructDiffFromFiles([
+      {
+        filename: "src/a.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        // Declares 4 old / 4 new lines, delivers 3 of each: the trailing
+        // context is missing even though every changed line arrived.
+        patch: "@@ -1,4 +1,4 @@\n one\n-two\n+TWO\n three",
+      },
+    ]);
+
+    expect(truncatedPatches).toEqual(["src/a.ts"]);
+  });
+
+  it("accepts a hunk whose line counts add up", () => {
+    const { truncatedPatches } = reconstructDiffFromFiles([
+      {
+        filename: "src/a.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        changes: 2,
+        patch: "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three",
+      },
+    ]);
+
+    expect(truncatedPatches).toEqual([]);
+  });
+
+  // `@@ -3 +4 @@` means one line on each side; a missing count is not zero.
+  it("treats an omitted count as one", () => {
+    const { truncatedPatches } = reconstructDiffFromFiles([
+      { filename: "src/a.ts", status: "modified", additions: 1, deletions: 1, changes: 2,
+        patch: "@@ -3 +3 @@\n-two\n+TWO" },
+    ]);
+
+    expect(truncatedPatches).toEqual([]);
+  });
+
+  it("counts across several hunks and flags only a short one", () => {
+    const whole = "@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three";
+    const short = "@@ -10,3 +10,3 @@\n ten\n-eleven\n+ELEVEN";
+
+    expect(reconstructDiffFromFiles([
+      { filename: "src/a.ts", status: "modified", additions: 2, deletions: 2, changes: 4,
+        patch: `${whole}\n${short}` },
+    ]).truncatedPatches).toEqual(["src/a.ts"]);
+  });
+
+  // "\ No newline at end of file" is a marker, not a line of either side.
+  it("does not count the no-newline marker as content", () => {
+    const { truncatedPatches } = reconstructDiffFromFiles([
+      { filename: "src/a.ts", status: "modified", additions: 1, deletions: 1, changes: 2,
+        patch: "@@ -1,1 +1,1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file" },
+    ]);
+
+    expect(truncatedPatches).toEqual([]);
+  });
+});
+
+// Issue #35, gap 2. A renamed binary that also changed content reports
+// `renamed`, no patch, and 0/0 — indistinguishable from a pure rename — so the
+// move headers alone were treated as a complete description.
+describe("reconstructDiffFromFiles — moved entries with no patch", () => {
+  it("reports a no-patch rename as carrying no line content", () => {
+    const { contentless, omittedPatches } = reconstructDiffFromFiles([
+      {
+        filename: "src/new-name.ts",
+        previous_filename: "src/old-name.ts",
+        status: "renamed",
+        additions: 0,
+        deletions: 0,
+        changes: 0,
+      },
+    ]);
+
+    // Not an omission — nothing is missing that could have been shown — but no
+    // longer claimed as fully described either.
+    expect(contentless).toEqual(["src/new-name.ts"]);
+    expect(omittedPatches).toEqual([]);
+  });
+
+  it("still renders the move itself", () => {
+    const { diff } = reconstructDiffFromFiles([
+      { filename: "src/new.ts", previous_filename: "src/old.ts", status: "renamed",
+        additions: 0, deletions: 0, changes: 0 },
+    ]);
+
+    expect(diff).toContain("rename from src/old.ts");
+    expect(diff).toContain("rename to src/new.ts");
+  });
+
+  // A rename that DID deliver its patch is fully described and must stay clean.
+  it("leaves a rename with a patch alone", () => {
+    const { contentless } = reconstructDiffFromFiles([
+      { filename: "src/new.ts", previous_filename: "src/old.ts", status: "renamed",
+        additions: 1, deletions: 1, changes: 2, patch: "@@ -1 +1 @@\n-a\n+b" },
+    ]);
+
+    expect(contentless).toEqual([]);
   });
 });
