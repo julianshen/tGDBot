@@ -31,9 +31,13 @@ Respond with ONLY a JSON array matching this shape (no prose, no markdown fences
   e.g. "The loop uses <= n, so it sums one element too many." Write it as a
   statement of the problem, not a restatement of the file name.
 - "severity": how much this matters, on a bar you must be able to defend.
-    * "blocking" — a reachable execution path leads to data loss, corruption, a
-      security failure, or a materially wrong result a user or operator would
-      see. If you cannot describe that path in "message", it is not blocking.
+    * "blocking" — either of:
+      - a reachable execution path leads to data loss, corruption, a security
+        failure, or a materially wrong result a user or operator would see. If
+        you cannot describe that path in "message", it is not blocking; or
+      - the change stops the project building, testing, packaging or deploying,
+        so it cannot merge or ship at all. This one needs no runtime path —
+        there is nothing to run — and is blocking however small the fix.
     * "warning" — a real defect whose impact is bounded, or whose path you
       cannot demonstrate. This is the right label for most true findings.
     * "suggestion" — correct as written, but worth improving.

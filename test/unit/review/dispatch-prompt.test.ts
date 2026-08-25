@@ -206,6 +206,20 @@ describe("the severity contract states a defensible bar", () => {
     expect(FINDING_JSON_CONTRACT).toMatch(/cannot describe that path.*not blocking/is);
   });
 
+  // PR #46 review: a change that will not compile, or breaks packaging, has no
+  // runtime path to describe — so a bar written purely in terms of runtime
+  // consequence forced it down to a warning, even though it cannot merge.
+  it("counts build, test, packaging and deploy breakage as blocking", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/building,\s+testing,\s+packaging\s+or\s+deploying/i);
+    expect(FINDING_JSON_CONTRACT).toMatch(/needs no runtime path/i);
+  });
+
+  // The runtime half keeps its discipline: widening the bar must not turn it
+  // back into "whatever feels serious".
+  it("still requires a described path for the runtime half", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/cannot describe that path.*not blocking/is);
+  });
+
   it("says plainly that most findings are not blocking", () => {
     expect(FINDING_JSON_CONTRACT).toMatch(/most findings.*are NOT blocking/is);
   });
@@ -218,5 +232,6 @@ describe("the severity contract states a defensible bar", () => {
 
     expect(agent).toMatch(/reachable execution path/i);
     expect(agent).toMatch(/most findings.*are NOT blocking/is);
+    expect(agent).toMatch(/building,\s+testing,\s+packaging\s+or\s+deploying/i);
   });
 });

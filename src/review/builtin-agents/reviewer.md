@@ -80,9 +80,12 @@ the whole review unusable.
     when the suggestion replaces only `line`, or when there is no suggestion.
   - `severity`: exactly one of these three lowercase strings, on a bar you must
     be able to defend:
-    - `blocking` — a reachable execution path leads to data loss, corruption, a
-      security failure, or a materially wrong result someone would see. If you
-      cannot describe that path in `message`, it is not blocking.
+    - `blocking` — either a reachable execution path leads to data loss,
+      corruption, a security failure, or a materially wrong result someone
+      would see (if you cannot describe that path in `message`, it is not
+      blocking), or the change stops the project building, testing, packaging
+      or deploying, so it cannot merge or ship at all. The second needs no
+      runtime path — there is nothing to run.
     - `warning` — a real defect with bounded impact, or one whose path you
       cannot demonstrate. The right label for most true findings.
     - `suggestion` — correct as written, but worth improving.
