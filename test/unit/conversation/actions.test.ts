@@ -625,3 +625,355 @@ describe("focus prompts carry the real finding contract", () => {
     expect(prompt).not.toMatch(/the normal review finding contract/i);
   });
 });
+
+
+// Issue #41: the audit this issue asks for. FOCUS_CONTRACT used to name a
+// contract it never carried; #39 fixed that one. RECONSIDER_CONTRACT still
+// says `"finding": object | null` and never says what a finding IS — so the
+// model is asked to restate a structured object it has never been shown.
+describe("conversation prompts carry the shape they ask for", () => {
+  it("gives the reconsider prompt the finding schema", () => {
+    const prompt = buildReconsiderPrompt({
+      finding,
+      historicalRuleSnapshot: ledger.ruleSnapshot,
+      currentTrustedRule: currentRule,
+      currentCodeHunk: currentHunk,
+      addressedThread: thread,
+      reason: "still wrong?",
+    });
+
+    expect(prompt).toContain('"severity"');
+    expect(prompt).toContain('"title"');
+    expect(prompt).toContain('"suggestion"');
+  });
+
+  // A finding the model was never shown the shape of comes back missing its
+  // optional fields. `effort` was given inheritance in #39; the others were
+  // not, so they were simply lost.
+  it("inherits every optional field the reassessment did not restate", () => {
+    const original = {
+      file: "src/a.ts",
+      line: 4,
+      severity: "warning" as const,
+      category: "correctness",
+      message: "unclear",
+      ruleName: "rule-a",
+      title: "The cache outlives its revocation.",
+      suggestion: "return revalidate(ctx)",
+      endLine: 6,
+      effort: "heavy" as const,
+    };
+    const bare = {
+      file: original.file,
+      line: original.line,
+      severity: original.severity,
+      category: original.category,
+      message: original.message,
+      ruleName: original.ruleName,
+    };
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "still holds", finding: bare }),
+      original,
+    );
+
+    expect(result?.finding).toMatchObject({
+      title: original.title,
+      suggestion: original.suggestion,
+      endLine: original.endLine,
+      effort: original.effort,
+    });
+  });
+
+  it("prefers what the reassessment did restate", () => {
+    const original = {
+      file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+      message: "unclear", ruleName: "rule-a", title: "Old title.", effort: "heavy" as const,
+    };
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({
+        outcome: "revised",
+        rationale: "narrower than thought",
+        finding: { ...original, title: "New title.", effort: "quick" },
+      }),
+      original,
+    );
+
+    expect(result?.finding?.title).toBe("New title.");
+    expect(result?.finding?.effort).toBe("quick");
+  });
+});
+
+
+// Issue #41: the coverage this issue asks for. The focus path had no test
+// exercising a model response end to end, which is how a prompt naming a
+// contract it never carried survived to be found by accident.
+describe("a focus review refuses output it cannot use", () => {
+  const focusWith = async (text: string) =>
+    focusReview({
+      rules: [currentRule],
+      diff: currentHunk,
+      direction: "auth only",
+      model: MODEL,
+      createSession: async () => ({
+        prompt: async () => undefined,
+        getLastAssistantText: () => text,
+      }) as never,
+    });
+
+  it("fails loudly on a finding missing a required field", async () => {
+    const shapeless = JSON.stringify([
+      { file: "a.ts", line: 1, category: "correctness", message: "No severity here." },
+    ]);
+
+    const result = await focusWith(shapeless);
+
+    // NOT { status: "success", findings: [] } — a review that reports nothing
+    // over unusable output is indistinguishable from a clean one.
+    expect(result).toMatchObject({ status: "transient-error" });
+  });
+
+  it("fails loudly on prose instead of JSON", async () => {
+    expect(await focusWith("I looked and everything seems fine!"))
+      .toMatchObject({ status: "transient-error" });
+  });
+
+  // An empty array is a genuine result: the rules ran and found nothing.
+  it("accepts an empty array as a real answer", async () => {
+    expect(await focusWith("[]")).toMatchObject({ status: "success", result: { findings: [] } });
+  });
+
+  it("returns the findings when the response matches the contract", async () => {
+    const valid = JSON.stringify([
+      { file: "a.ts", line: 1, severity: "warning", category: "correctness", message: "Real." },
+    ]);
+
+    const result = await focusWith(valid);
+
+    expect(result).toMatchObject({ status: "success" });
+    expect((result as { result: { findings: unknown[] } }).result.findings).toHaveLength(1);
+  });
+});
+
+
+// PR #51 review. Embedding the ARRAY contract inside an OBJECT contract gave
+// the model two contradictory envelopes, omitted `ruleName` (which the parser
+// had no fallback for), and invited it to omit required fields that are
+// validated before any inheritance runs. All three turn a reconsider or
+// clarification into a transient error.
+describe("the reconsider contract is usable as written", () => {
+  const reconsiderPrompt = () => buildReconsiderPrompt({
+    finding,
+    historicalRuleSnapshot: ledger.ruleSnapshot,
+    currentTrustedRule: currentRule,
+    currentCodeHunk: currentHunk,
+    addressedThread: thread,
+    reason: "still wrong?",
+  });
+
+  it("does not tell the model to respond with a top-level array", () => {
+    const contract = section("OUTPUT_CONTRACT", reconsiderPrompt()).body;
+
+    expect(contract).toContain('"outcome"');
+    expect(contract).not.toMatch(/ONLY a JSON array/i);
+    expect(contract).not.toMatch(/respond with \[\] exactly/i);
+  });
+
+  it("names the fields that must always be present", () => {
+    const contract = section("OUTPUT_CONTRACT", reconsiderPrompt()).body;
+
+    for (const field of ["file", "severity", "category", "message"]) {
+      expect(contract, `${field} is required but not named as such`).toContain(`"${field}"`);
+    }
+    expect(contract).toMatch(/always|required/i);
+  });
+
+  // The rule that produced a finding still owns it after a reassessment, so
+  // the parser supplies the name rather than asking the model to echo it.
+  it("accepts a finding that carries no ruleName", () => {
+    const original = {
+      file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+      message: "unclear", ruleName: "rule-a",
+    };
+    const withoutRuleName = {
+      file: original.file, line: original.line, severity: original.severity,
+      category: original.category, message: original.message,
+    };
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: withoutRuleName }),
+      original,
+    );
+
+    expect(result?.finding?.ruleName).toBe("rule-a");
+  });
+});
+
+// PR #51 review, P1. A revision that explicitly clears a field must clear it.
+// Restoring the original would republish a suggestion the human clarification
+// had just established was wrong — as committable code.
+describe("an explicit null clears rather than inherits", () => {
+  const original = {
+    file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+    message: "unclear", ruleName: "rule-a",
+    suggestion: "return stale(ctx)", endLine: 6, effort: "heavy" as const,
+  };
+  const revise = (findingPatch: Record<string, unknown>) => parseReconsiderOutput(
+    JSON.stringify({
+      outcome: "revised",
+      rationale: "the answer changed things",
+      finding: { ...original, ...findingPatch },
+    }),
+    original,
+  );
+
+  it("drops a suggestion the revision set to null", () => {
+    expect(revise({ suggestion: null })?.finding?.suggestion).toBeUndefined();
+  });
+
+  it("drops endLine and effort set to null", () => {
+    const result = revise({ endLine: null, effort: null })?.finding;
+
+    expect(result?.endLine).toBeUndefined();
+    expect(result?.effort).toBeUndefined();
+  });
+
+  it("still inherits a field the revision simply did not mention", () => {
+    const { suggestion, ...withoutSuggestion } = original;
+    void suggestion;
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: withoutSuggestion }),
+      original,
+    );
+
+    expect(result?.finding?.suggestion).toBe("return stale(ctx)");
+  });
+});
+
+
+// PR #51 review, P1. The clarification path was given the original finding to
+// inherit from; its twin was not. One of two call sites is exactly the class of
+// miss this contract change keeps producing, so the guard is end-to-end rather
+// than on the parser alone.
+describe("reconsider inherits from the finding it reassesses", () => {
+  const respond = (patch: Record<string, unknown>) => sessionFor(JSON.stringify({
+    outcome: "confirmed",
+    rationale: "still holds",
+    finding: {
+      file: finding.file,
+      line: finding.line,
+      severity: finding.severity,
+      category: finding.category,
+      message: finding.message,
+      ...patch,
+    },
+  }));
+
+  const reconsiderWith = (patch: Record<string, unknown>) => reconsiderFinding({
+    ledger,
+    currentRule,
+    currentCodeHunk: currentHunk,
+    addressedThread: thread,
+    reason: "please look again",
+    model: MODEL,
+    createSession: respond(patch),
+  });
+
+  // The contract now says ruleName is supplied rather than requested, so a
+  // response omitting it must be accepted — it was rejected before.
+  it("accepts a response that omits ruleName", async () => {
+    const result = await reconsiderWith({});
+
+    expect(result).toMatchObject({ status: "success" });
+    expect((result as { result: { finding: { ruleName: string } } }).result.finding.ruleName)
+      .toBe(finding.ruleName);
+  });
+
+  it("carries an omitted line over from the original", async () => {
+    const { line, ...noLine } = { line: undefined };
+    void line; void noLine;
+    const result = await reconsiderWith({ line: undefined });
+
+    expect((result as { result: { finding: { line?: number } } }).result.finding.line)
+      .toBe(finding.line);
+  });
+});
+
+// PR #51 review. The contract claimed "line" was always required, but the
+// parser accepts a finding without one — file-level findings are legitimate.
+// The contract was the wrong half.
+describe("line is inherited, not demanded", () => {
+  const original = {
+    file: "src/a.ts", line: 12, severity: "warning" as const, category: "correctness",
+    message: "unclear", ruleName: "rule-a",
+  };
+  const parse = (findingPatch: Record<string, unknown>) => parseReconsiderOutput(
+    JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: { ...original, ...findingPatch } }),
+    original,
+  );
+
+  it("keeps the original anchor when the reassessment omits it", () => {
+    expect(parse({ line: undefined })?.finding?.line).toBe(12);
+  });
+
+  it("lets an explicit null make the finding file-level", () => {
+    expect(parse({ line: null })?.finding?.line).toBeUndefined();
+  });
+
+  it("does not claim line is always required", () => {
+    const contract = section("OUTPUT_CONTRACT", buildReconsiderPrompt({
+      finding,
+      historicalRuleSnapshot: ledger.ruleSnapshot,
+      currentTrustedRule: currentRule,
+      currentCodeHunk: currentHunk,
+      addressedThread: thread,
+      reason: "again",
+    })).body;
+
+    expect(contract).not.toMatch(/"file", "line", "severity"/);
+  });
+});
+
+
+// PR #51 review, P1. Inheritance fired whenever the normalized field came back
+// undefined — including when the model DID supply a replacement that failed
+// validation. A new suggestion with trailing whitespace is rejected, and the
+// original was then restored: the clarification's replacement silently
+// discarded and the superseded code republished as a one-click fix. Worse for
+// endLine, which could pair a NEW suggestion with a STALE range.
+describe("a rejected replacement is not silently reverted", () => {
+  const original = {
+    file: "src/a.ts", line: 4, severity: "warning" as const, category: "correctness",
+    message: "unclear", ruleName: "rule-a",
+    suggestion: "return stale(ctx)", endLine: 6, effort: "heavy" as const,
+  };
+  const revise = (patch: Record<string, unknown>) => parseReconsiderOutput(
+    JSON.stringify({ outcome: "revised", rationale: "changed", finding: { ...original, ...patch } }),
+    original,
+  )?.finding;
+
+  it("drops a replacement suggestion that fails validation, rather than restoring the old one", () => {
+    // Trailing whitespace is refused by the suggestion sanitizer (#43/#45).
+    expect(revise({ suggestion: "return fresh(ctx)\n" })?.suggestion).toBeUndefined();
+  });
+
+  it("drops an invalid endLine rather than pairing a new suggestion with a stale range", () => {
+    const result = revise({ suggestion: "return fresh(ctx)", endLine: 2.5 });
+
+    expect(result?.suggestion).toBe("return fresh(ctx)");
+    expect(result?.endLine).toBeUndefined();
+  });
+
+  it("still inherits when the field is genuinely absent", () => {
+    const { suggestion, ...withoutSuggestion } = original;
+    void suggestion;
+
+    const result = parseReconsiderOutput(
+      JSON.stringify({ outcome: "confirmed", rationale: "holds", finding: withoutSuggestion }),
+      original,
+    );
+
+    expect(result?.finding?.suggestion).toBe("return stale(ctx)");
+  });
+});

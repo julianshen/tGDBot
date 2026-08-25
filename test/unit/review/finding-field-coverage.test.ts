@@ -21,7 +21,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { FINDING_JSON_CONTRACT } from "../../../src/review/dispatch-prompt.js";
+import { FINDING_JSON_CONTRACT, FINDING_OBJECT_CONTRACT } from "../../../src/review/dispatch-prompt.js";
 import { parseDispatchResult } from "../../../src/review/dispatch-results.js";
 import { renderInlineComment, renderSummaryComment } from "../../../src/review/comment-format.js";
 import { toFindingSnapshot } from "../../../src/review/review-publication.js";
@@ -309,5 +309,40 @@ describe("every Finding field reaches the reader", () => {
     for (const field of Object.keys(NOT_IN_INLINE_BODY)) {
       expect(FIELDS, `${field} is excepted but is not a Finding field`).toContain(field);
     }
+  });
+});
+
+// Issue #41: the conversation prompts ask for findings too, and one of them
+// named a contract it never carried. The field walk now reaches them, so a new
+// field cannot be added to the review contract while these quietly keep asking
+// for the old shape.
+describe("conversation prompts describe the same finding", () => {
+  it("gives the focus and reconsider contracts the shared schema", () => {
+    const actions = sourceText("conversation/actions.ts");
+
+    // Both interpolate a SHARED constant rather than restating the shape, which
+    // is what keeps them from drifting as fields are added. They use different
+    // ones on purpose: focus asks for a top-level array, reconsider for one
+    // nested object, and mixing the envelopes contradicts the model (PR #51).
+    expect(actions, "the focus contract stopped sharing the schema")
+      .toContain("${FINDING_JSON_CONTRACT}");
+    expect(actions, "the reconsider contract stopped sharing the schema")
+      .toContain("${FINDING_OBJECT_CONTRACT}");
+  });
+
+  // The shared object shape must not carry an envelope, or nesting it
+  // contradicts whatever contains it.
+  it("keeps the array envelope out of the nestable shape", () => {
+    expect(FINDING_OBJECT_CONTRACT).not.toMatch(/ONLY a JSON array/i);
+    expect(FINDING_OBJECT_CONTRACT).not.toMatch(/respond with \[\] exactly/i);
+    expect(FINDING_JSON_CONTRACT).toMatch(/ONLY a JSON array/i);
+  });
+
+  it("never asks for a finding without saying what one is", () => {
+    const actions = sourceText("conversation/actions.ts");
+
+    // A contract mentioning "finding" as a JSON field must be one that carries
+    // the schema; `"finding": object` with no shape is the #41 defect.
+    expect(actions).not.toMatch(/"finding":\s*object\s*\|\s*null[\s\S]{0,400}?`;/);
   });
 });
