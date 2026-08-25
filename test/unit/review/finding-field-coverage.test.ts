@@ -81,12 +81,13 @@ const COMPLETE: Required<Finding> = {
   decision: "needs-clarification",
   question: "Is the 90-minute window intentional?",
   title: "L2 hits bypass authorization revalidation.",
-  // Unindented deliberately, and NOT because that is representative: the
-  // parser and the state schema both reject any suggestion whose first line is
-  // indented, which is nearly all real ones (#43). This file guards field
-  // COVERAGE, so it uses a value both layers currently accept rather than
-  // failing on a defect it is not about.
-  suggestion: "return revalidate(ctx)",
+  // Indented, because that is what a real suggestion looks like: it replaces a
+  // whole line range, so it carries the file's existing indentation. This was
+  // an unindented placeholder while #43 was open — both the parser and the
+  // state schema rejected indented values back then, and this fixture is what
+  // exposed it. Now that they accept them, using a representative value also
+  // makes this file notice if that regresses.
+  suggestion: "\tif stale(entry) {\n\t\treturn revalidate(ctx)\n\t}",
   effort: "heavy",
 };
 
