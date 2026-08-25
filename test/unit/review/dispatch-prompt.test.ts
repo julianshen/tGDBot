@@ -4,6 +4,9 @@ import type { ContextPackResult } from "../../../src/context/context-pack.js";
 import { buildDispatchPrompt, buildTaskText } from "../../../src/review/dispatch-prompt.js";
 import type { ReviewConversationContext } from "../../../src/review/types.js";
 import type { EffectiveRule } from "../../../src/rules/types.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { FINDING_JSON_CONTRACT } from "../../../src/review/dispatch-prompt.js";
 
 const HASH = "a".repeat(64);
 
@@ -179,5 +182,56 @@ describe("finding decision contract", () => {
       expect(prompt).toContain("needs-clarification");
     }
     expect(orchestrator).toMatch(/copy each finding's.*"decision".*"question"/i);
+  });
+});
+
+
+// Issue #36: on hmchangw/newchat#188, 8 of 10 findings came back blocking and
+// none were suggestions. The per-rule contract explained what the field was
+// called and never what the levels MEANT, so a model reporting a real defect
+// naturally reached for the strongest label — and severity, which is the first
+// thing a reviewer reads, stopped ordering anything.
+describe("the severity contract states a defensible bar", () => {
+  it("defines all three levels, not just the enum", () => {
+    for (const level of ["blocking", "warning", "suggestion"]) {
+      expect(FINDING_JSON_CONTRACT, `no definition for ${level}`)
+        .toMatch(new RegExp(`"${level}" —`));
+    }
+  });
+
+  // The bar has to be checkable against something the finding itself contains,
+  // or it is just a stronger adjective.
+  it("ties blocking to a path the finding must actually describe", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/reachable execution path/i);
+    expect(FINDING_JSON_CONTRACT).toMatch(/cannot describe that path.*not blocking/is);
+  });
+
+  // PR #46 review: a change that will not compile, or breaks packaging, has no
+  // runtime path to describe — so a bar written purely in terms of runtime
+  // consequence forced it down to a warning, even though it cannot merge.
+  it("counts build, test, packaging and deploy breakage as blocking", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/building,\s+testing,\s+packaging\s+or\s+deploying/i);
+    expect(FINDING_JSON_CONTRACT).toMatch(/needs no runtime path/i);
+  });
+
+  // The runtime half keeps its discipline: widening the bar must not turn it
+  // back into "whatever feels serious".
+  it("still requires a described path for the runtime half", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/cannot describe that path.*not blocking/is);
+  });
+
+  it("says plainly that most findings are not blocking", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/most findings.*are NOT blocking/is);
+  });
+
+  it("gives the builtin reviewer agent the same bar", () => {
+    const agent = readFileSync(
+      fileURLToPath(new URL("../../../src/review/builtin-agents/reviewer.md", import.meta.url)),
+      "utf-8",
+    );
+
+    expect(agent).toMatch(/reachable execution path/i);
+    expect(agent).toMatch(/most findings.*are NOT blocking/is);
+    expect(agent).toMatch(/building,\s+testing,\s+packaging\s+or\s+deploying/i);
   });
 });

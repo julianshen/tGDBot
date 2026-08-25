@@ -78,8 +78,20 @@ the whole review unusable.
     specific line.
   - `endLine`: the LAST line a `suggestion` replaces (inclusive). Omit or `null`
     when the suggestion replaces only `line`, or when there is no suggestion.
-  - `severity`: `blocking` (must fix), `warning` (should fix), or `suggestion`
-    (optional). Use exactly one of these three lowercase strings.
+  - `severity`: exactly one of these three lowercase strings, on a bar you must
+    be able to defend:
+    - `blocking` — either a reachable execution path leads to data loss,
+      corruption, a security failure, or a materially wrong result someone
+      would see (if you cannot describe that path in `message`, it is not
+      blocking), or the change stops the project building, testing, packaging
+      or deploying, so it cannot merge or ship at all. The second needs no
+      runtime path — there is nothing to run.
+    - `warning` — a real defect with bounded impact, or one whose path you
+      cannot demonstrate. The right label for most true findings.
+    - `suggestion` — correct as written, but worth improving.
+
+    Most findings in a healthy review are NOT blocking. Severity is what a
+    reviewer reads first, so inflating it destroys the ordering they depend on.
   - `category`: a short free-form label, e.g. `"correctness"`, `"security"`,
     `"tests"`, `"readability"`.
   - `effort`: how much work YOUR suggested fix is — `quick` for a local edit (a
