@@ -227,6 +227,11 @@ async function publishMapping(
   artifactPaths: readonly string[],
   degradedReasons: readonly string[],
   createdAt: string,
+  /**
+   * Whether an abandoned claim may still be reclaimed. Cleared on the single
+   * retry below so a claim that keeps reappearing cannot loop.
+   */
+  mayReclaim = true,
 ): Promise<PublishedMapping | undefined> {
   try {
     const manifest = await cache.promoteContext(stagingPath, {
@@ -245,7 +250,28 @@ async function publishMapping(
       return manifest === undefined ? undefined : { manifest, ours: false };
     }
     if (error instanceof ContextCachePublicationInProgressError) {
-      // The winner holds the claim but may still be hashing or renaming, so a
+      // A claim can be held by a live publisher OR left behind by one that
+      // died. The dead case is checked FIRST, and deliberately before the wait:
+      // nothing will ever land, so polling for it burns the full wait on every
+      // review of that base commit and then fails anyway. `reclaimStaleClaim`
+      // only touches a claim old enough that no live publication could still be
+      // holding it, so the ordering costs the live case nothing.
+      //
+      // Our own staging is untouched here — the claim already existed, so
+      // `promoteContext` never moved it — which is what makes retrying with the
+      // same staging directory sound.
+      if (mayReclaim && await cache.reclaimStaleClaim(key)) {
+        return await publishMapping(
+          cache,
+          stagingPath,
+          key,
+          artifactPaths,
+          degradedReasons,
+          createdAt,
+          false,
+        );
+      }
+      // A live publisher, then. It may still be hashing or renaming, so a
       // single immediate lookup can miss an entry that appears moments later —
       // and treating that as final would review without context (or, under
       // `require`, fail) for no reason. Poll briefly for it to land.

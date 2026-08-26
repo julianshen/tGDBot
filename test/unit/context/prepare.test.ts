@@ -1,4 +1,4 @@
-import { chmod, chown, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -846,6 +846,41 @@ describe("prepareReviewContext", () => {
     expect((error as Error).message).not.toContain("cache lookup failed");
   });
 
+  // Left unhandled, one crashed publisher breaks a base commit forever: nothing
+  // else ever creates the entry, so every later review re-maps (the most
+  // expensive step there is), finds the claim still held, waits out the full
+  // publication timeout and returns unavailable — a non-zero exit under
+  // `--context require` — until an operator deletes the directory by hand.
+  it("publishes past a claim abandoned by a crashed publisher", async () => {
+    const { worktree, request } = await baseRequest();
+    const cache = new ContextCache(request.cacheRoot as string);
+    const key = contextCacheKey({ repository, baseSha: BASE_SHA });
+    // Exactly what a crash mid-`promoteContext` leaves behind: the claim, with
+    // the staged entry still inside it, and no process coming back for either.
+    const claim = `${cache.entryPath(key)}.publishing`;
+    await mkdir(path.join(claim, "entry"), { recursive: true });
+    await writeFile(path.join(claim, "entry", "CONTEXT.md"), "# abandoned\n", "utf8");
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(claim, twoHoursAgo, twoHoursAgo);
+
+    const started = Date.now();
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") throw new Error("unreachable");
+    expect(prepared.cacheHit).toBe(false);
+    // The abandoned claim is gone and a real entry stands in its place.
+    await expect(stat(claim)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await cache.lookupContext(key)).toBeDefined();
+    // Reclaimed BEFORE the publication wait, not after it: polling for an entry
+    // no process will ever write is the full timeout burned on every review of
+    // this base commit. Bounded well under the wait's own 30 seconds.
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
   it("waits for a concurrent publication rather than giving up on one miss", async () => {
     const { worktree, request } = await baseRequest();
     // First run publishes normally, so a real entry exists to be found.
@@ -871,6 +906,9 @@ describe("prepareReviewContext", () => {
         return lookups <= 2 ? undefined : cache.lookupContext(key);
       },
       promoteContext: () => Promise.reject(new ContextCachePublicationInProgressError("busy")),
+      // A LIVE publisher holds this claim, so there is nothing to reclaim and
+      // the wait below is the whole point of the test.
+      reclaimStaleClaim: () => Promise.resolve(false),
     } as unknown as ContextCache;
 
     const prepared = await prepareReviewContext(request, {
