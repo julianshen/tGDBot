@@ -53,7 +53,7 @@ import {
   formatMarker,
   stateRootDomainIdentifier,
 } from "./review/dedup.js";
-import { changedFiles, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
+import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
 import {
   formatPendingMarker,
   replacePendingMarker,
@@ -1156,7 +1156,9 @@ export async function review(
         repository,
         baseSha: pr.baseSha,
         headSha: pr.headSha,
-        changedFiles: changedFiles(diff),
+        // Both sides of the diff: the map is built from the base commit,
+        // where a renamed file still sits under its old path.
+        changedFiles: changedFilesWithRenameSources(diff),
         ruleNames: rules.map((rule) => rule.name),
         ...(config.contextMaxChars === undefined ? {} : { maxChars: config.contextMaxChars }),
         allowDegraded: config.allowDegradedContext,

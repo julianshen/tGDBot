@@ -96,6 +96,40 @@ export function changedFiles(diff: string): string[] {
   return files;
 }
 
+/**
+ * Every path the diff touches on BOTH sides: the head-side `b/` path first,
+ * then the base-side `a/` path when it differs — which it only does for a
+ * rename or a copy.
+ *
+ * `changedFiles` above is deliberately head-side only, because its callers
+ * (the summary's "files reviewed" list, and matching review threads to changed
+ * lines) are talking about the code as it is now. Trusted-base context is the
+ * one consumer that needs the other side: the repository map is built from the
+ * BASE commit, so a renamed file is still filed there under its OLD path, and
+ * matching only the new one finds nothing — a rename-only PR would get a pack
+ * reporting no matching graph nodes and none of the callers this is for.
+ *
+ * Added files legitimately match nothing: they do not exist at the base.
+ */
+export function changedFilesWithRenameSources(diff: string): string[] {
+  const files: string[] = [];
+  const seen = new Set<string>();
+  for (const line of diff.split("\n")) {
+    // Same greediness as `changedFiles`, so the b/ side is parsed identically;
+    // the a/ side is simply no longer discarded.
+    const match = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    if (!match) continue;
+    for (const candidate of [match[2], match[1]]) {
+      const file = candidate.trim();
+      if (file && !seen.has(file)) {
+        seen.add(file);
+        files.push(file);
+      }
+    }
+  }
+  return files;
+}
+
 /** One rendered line of a fallback excerpt, with its diff marker preserved. */
 export interface SnippetLine {
   /** `+` added, `-` removed, ` ` context — as it appears in the diff. */

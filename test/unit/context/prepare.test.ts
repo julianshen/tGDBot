@@ -295,6 +295,40 @@ describe("prepareReviewContext", () => {
       .toEqual(second.sources.map((source) => source.includedItems));
   });
 
+  it("finds a renamed file's nodes via its base-side path", async () => {
+    // The graph is mapped from the base commit, where the file is still
+    // `src/index.ts`. A PR that renames it to `src/entry.ts` sends BOTH paths
+    // (see changedFilesWithRenameSources); matching only the new one would
+    // return a ready pack with no graph nodes at all.
+    const { worktree, request } = await baseRequest({
+      changedFiles: ["src/entry.ts", "src/index.ts"],
+    });
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    const text = prepared.packs["tgd-review"]!.text;
+    expect(text).toContain("src/index.ts");
+    expect(text).not.toContain("No graph nodes matched the changed files.");
+  });
+
+  it("reports no match when only the head-side path of a rename is sent", async () => {
+    // The defect this guards: the new path does not exist at the base.
+    const { worktree, request } = await baseRequest({ changedFiles: ["src/entry.ts"] });
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(prepared.packs["tgd-review"]!.text)
+      .toContain("No graph nodes matched the changed files.");
+  });
+
   it("does nothing at all when context is off", async () => {
     const { worktree, request } = await baseRequest({ mode: "off" });
     const mapper = stubMapper();

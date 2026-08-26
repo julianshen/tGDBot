@@ -4079,6 +4079,34 @@ describe("repository context", () => {
     expect(request.headSha).toBe("cafef00d");
   });
 
+  it("sends a renamed file's BASE path to context preparation, not just its new one", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "auto" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(
+      [
+        "diff --git a/src/old-name.ts b/src/new-name.ts",
+        "rename from src/old-name.ts",
+        "rename to src/new-name.ts",
+        "--- a/src/old-name.ts",
+        "+++ b/src/new-name.ts",
+        "@@ -1,1 +1,1 @@",
+        "-const a = 1;",
+        "+const a = 2;",
+        "",
+      ].join("\n"),
+    );
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { changedFiles: string[] };
+    // The map is built from the base commit, where this file is still
+    // `src/old-name.ts`; sending only the new path finds no graph node.
+    expect(request.changedFiles).toContain("src/old-name.ts");
+    expect(request.changedFiles).toContain("src/new-name.ts");
+  });
+
   it("reviews without context, and says so, when preparation fails", async () => {
     const h = makeHarness({ args: makeArgs({ context: "auto" }) });
     h.prepareContext.mockResolvedValue({ status: "unavailable", reasons: ["mapping timed out"] });

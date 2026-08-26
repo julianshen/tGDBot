@@ -7,6 +7,8 @@
 // and cannot carry a RIGHT-side comment.
 import { describe, expect, it } from "vitest";
 import {
+  changedFiles,
+  changedFilesWithRenameSources,
   commentableLines,
   diffPositionRange,
   parseDiffPositions,
@@ -475,5 +477,78 @@ describe("hunkSnippet", () => {
 
   it("returns undefined when the finding has no line at all", () => {
     expect(hunkSnippet(SIMPLE, "src/a.go", undefined)).toBeUndefined();
+  });
+});
+
+const RENAME = `diff --git a/src/old-name.ts b/src/new-name.ts
+similarity index 94%
+rename from src/old-name.ts
+rename to src/new-name.ts
+--- a/src/old-name.ts
++++ b/src/new-name.ts
+@@ -1,3 +1,3 @@
+ const a = 1;
+-const b = 2;
++const b = 3;
+ const c = 4;
+`;
+
+const EDIT_AND_RENAME = `diff --git a/src/kept.ts b/src/kept.ts
+--- a/src/kept.ts
++++ b/src/kept.ts
+@@ -1,1 +1,1 @@
+-const x = 1;
++const x = 2;
+diff --git a/src/moved.ts b/src/relocated.ts
+rename from src/moved.ts
+rename to src/relocated.ts
+--- a/src/moved.ts
++++ b/src/relocated.ts
+@@ -1,1 +1,1 @@
+-const y = 1;
++const y = 2;
+`;
+
+describe("changedFilesWithRenameSources", () => {
+  it("keeps both sides of a rename, head-side first", () => {
+    // The whole point: trusted-base context is mapped from the BASE commit,
+    // where this file is still `src/old-name.ts`. Matching only the new path
+    // finds no graph node and the pack comes back empty.
+    expect(changedFilesWithRenameSources(RENAME)).toEqual([
+      "src/new-name.ts",
+      "src/old-name.ts",
+    ]);
+  });
+
+  it("adds nothing for an ordinary edit, where both sides are the same path", () => {
+    expect(changedFilesWithRenameSources(SIMPLE)).toEqual(changedFiles(SIMPLE));
+  });
+
+  it("handles a rename alongside an ordinary edit in one diff", () => {
+    expect(changedFilesWithRenameSources(EDIT_AND_RENAME)).toEqual([
+      "src/kept.ts",
+      "src/relocated.ts",
+      "src/moved.ts",
+    ]);
+  });
+
+  it("parses the head side exactly as changedFiles does", () => {
+    // The regex gained a capture group on the a/ side; its greediness, and so
+    // the b/ side it yields, must be unchanged.
+    for (const diff of [SIMPLE, RENAME, EDIT_AND_RENAME]) {
+      for (const file of changedFiles(diff)) {
+        expect(changedFilesWithRenameSources(diff)).toContain(file);
+      }
+    }
+    expect(changedFiles(RENAME)).toEqual(["src/new-name.ts"]);
+  });
+});
+
+describe("changedFiles stays head-side only", () => {
+  it("does not gain the base-side path of a rename", () => {
+    // Its callers — the summary's "files reviewed" list and changed-line
+    // matching against review threads — describe the code as it is now.
+    expect(changedFiles(RENAME)).not.toContain("src/old-name.ts");
+    expect(changedFiles(EDIT_AND_RENAME)).toEqual(["src/kept.ts", "src/relocated.ts"]);
   });
 });
