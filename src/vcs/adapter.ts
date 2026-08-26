@@ -158,6 +158,29 @@ export interface VcsAdapter {
     baseSha: string,
     rulesDir: string,
   ): Promise<RuleFileContent[]>;
+
+  /**
+   * One file's contents at one ref, or `undefined` if it is not there.
+   *
+   * Issue #56: dependency extraction was inferring a manifest's STRUCTURE from
+   * three lines of diff context — which key encloses which entry — because
+   * nothing could read the file. `JSON.parse` answers that exactly, and this is
+   * the missing seam.
+   *
+   * A missing path resolves to `undefined` rather than throwing, matching
+   * `getRuleFilesFromBase`'s treatment of a missing rules directory: absence is
+   * an answer. A genuine failure — auth, network, a malformed response — still
+   * rejects, because "could not read" and "not there" lead to different
+   * decisions and must not be collapsed.
+   *
+   * A path that names a DIRECTORY resolves to `undefined` too: the caller asked
+   * for a file, and a directory is not one.
+   */
+  getFileAtRef(
+    locator: ReviewLocator,
+    ref: string,
+    path: string,
+  ): Promise<string | undefined>;
 }
 
 export interface InlineReviewComment {

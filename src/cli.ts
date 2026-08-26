@@ -33,7 +33,11 @@ import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
 import { isTransientGhFailure } from "./vcs/gh-retry.js";
 import { isDiffIncompleteError } from "./vcs/github-large-diff.js";
-import { dependencyChangesFromDiff, dependencyContextPack } from "./review/dependency-changes.js";
+import {
+  changedManifestPaths,
+  dependencyChangesFromDiff,
+  dependencyContextPack,
+} from "./review/dependency-changes.js";
 import { fetchDependencyFacts } from "./review/dependency-facts.js";
 import type { FetchJson } from "./review/dependency-facts.js";
 import {
@@ -1144,21 +1148,51 @@ export async function review(
   // delivered as trusted context. Supplied for EVERY rule or for none — the
   // dispatch contract rejects a partial map — and omitted entirely when nothing
   // changed, so an ordinary review gains no empty section.
-  const dependencyChanges = dependencyChangesFromDiff(diff);
   // The legacy orchestrator has no context-pack concept: its prompt builder
   // never receives one, so the map below would be dropped on the floor while
   // the registry requests still went out — an operator paying for lookups and
   // getting a run that cannot produce a dependency finding (PR #54 review).
   // Say so instead of plumbing trusted-context surface into an engine that is
   // on its way out.
+  // Keyed on the diff touching a manifest, which is knowable before anything is
+  // fetched — and is the point at which the operator's request becomes
+  // unsatisfiable, whether or not a dependency actually changed inside it.
   const dependencyFactsUnavailable =
-    args.dependencyFacts === "on" && args.dispatch === "legacy" && dependencyChanges.length > 0;
+    args.dependencyFacts === "on"
+    && args.dispatch === "legacy"
+    && changedManifestPaths(diff).length > 0;
   if (dependencyFactsUnavailable) {
     console.warn(
       "tgd-review-agent: --dependency-facts needs --dispatch direct; the legacy engine cannot " +
         "carry host context, so no registry lookup was made and no dependency context was supplied",
     );
   }
+
+  // Issue #56: the manifests themselves, read at the HEAD ref — the version
+  // this pull request proposes, since a dependency it adds does not exist on
+  // the base branch at all. Fetched only when the feature is on, so an ordinary
+  // review makes no extra request.
+  //
+  // A manifest that cannot be read contributes no changes and is named in the
+  // pack instead, because "we did not look" and "we looked and it was fine"
+  // must not render the same.
+  const manifests = new Map<string, string | undefined>();
+  const unreadableManifests: string[] = [];
+  if (args.dependencyFacts === "on" && !dependencyFactsUnavailable) {
+    for (const path of changedManifestPaths(diff)) {
+      try {
+        const content = await config.vcsAdapter.getFileAtRef(config.locator, pr.headSha, path);
+        manifests.set(path, content);
+        if (content === undefined) unreadableManifests.push(path);
+      } catch (error) {
+        console.warn(
+          `tgd-review-agent: could not read ${path} at ${pr.headSha} (${redactedMessage(error)})`,
+        );
+        unreadableManifests.push(path);
+      }
+    }
+  }
+  const dependencyChanges = dependencyChangesFromDiff(diff, manifests);
   // Opt-in, and the only outbound request the tool makes. Without it the pack
   // still ships the parsed versions and says plainly that nothing was checked —
   // which is why leaving this unwired shipped a rule that could never see the
@@ -1177,7 +1211,7 @@ export async function review(
   // not. Without registry facts the pack was near-worthless anyway — a version
   // list plus a sentence saying nothing had been checked.
   const dependencyPack = args.dependencyFacts === "on"
-    ? dependencyContextPack(dependencyChanges, dependencyFacts)
+    ? dependencyContextPack(dependencyChanges, dependencyFacts, unreadableManifests)
     : undefined;
   const contextPacks = dependencyPack === undefined
     ? undefined

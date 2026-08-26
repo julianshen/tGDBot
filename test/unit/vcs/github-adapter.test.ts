@@ -884,6 +884,73 @@ describe("GitHubAdapter", () => {
     });
   });
 
+  // --- getFileAtRef (issue #56) ---
+  //
+  // The general form of the machinery getRuleFilesFromBase already used, so
+  // that a caller needing one file at one ref does not have to go through the
+  // rules-directory listing to get it.
+  describe("getFileAtRef", () => {
+    const b64 = (s: string): string => Buffer.from(s, "utf-8").toString("base64");
+
+    it("reads a file at the given ref and decodes it", async () => {
+      const execGh = vi.fn(async (args: string[]) => {
+        if (args[1] === "repos/{owner}/{repo}/contents/package.json?ref=headsha") {
+          return JSON.stringify({ content: b64('{"name":"x"}'), encoding: "base64" });
+        }
+        throw new Error(`unexpected execGh call: ${JSON.stringify(args)}`);
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "package.json")).toBe('{"name":"x"}');
+    });
+
+    it("encodes a path that needs it, without encoding the separators", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({ content: b64("{}"), encoding: "base64" }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await adapter.getFileAtRef(locator42, "headsha", "packages/@acme/w/package.json");
+
+      expect(execGh).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          "repos/{owner}/{repo}/contents/packages/%40acme/w/package.json?ref=headsha",
+        ]),
+      );
+    });
+
+    // A path that is not there is an answer, not a failure — the same
+    // semantics getRuleFilesFromBase already has for a missing directory.
+    it("returns undefined for a path that does not exist at that ref", async () => {
+      const execGh = vi.fn(async () => {
+        throw new Error("Command failed: gh api ...\ngh: Not Found (HTTP 404)");
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "nope.json")).toBeUndefined();
+    });
+
+    // An auth failure or an outage is NOT "the file is absent", and must not
+    // be quietly turned into one.
+    it("propagates a genuine error", async () => {
+      const execGh = vi.fn(async () => {
+        throw new Error("gh: Bad credentials (HTTP 401)");
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json")).rejects.toThrow(/401/);
+    });
+
+    // The Contents API answers a DIRECTORY with an array. Two guards catch it —
+    // the explicit array check and the missing `content` field — so this pins
+    // the OUTCOME, not either branch; neither can be isolated, because an array
+    // never carries a `content` property of its own.
+    it("refuses a directory, which the Contents API answers with an array", async () => {
+      const execGh = vi.fn(async () => JSON.stringify([{ name: "a", type: "file" }]));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "src")).toBeUndefined();
+    });
+  });
+
   // --- getRuleFilesFromBase (ADR-002 CLI-native fix) ---
   //
   // Uses GitHub's Contents API via `gh api repos/{owner}/{repo}/contents/{path}?ref={sha}`,

@@ -46,18 +46,13 @@ export interface DependencyChange {
    */
   readonly spec: string;
   /**
-   * Whether the host ESTABLISHED that this line sits in a dependency map,
-   * rather than inferring it from indentation.
+   * Which dependency map it lives in, read from the parsed manifest.
    *
-   * git emits only nearby context, so an ordinary bump in a long list has no
-   * `"dependencies": {` in its hunk and the section is genuinely unknown.
-   * Dropping those loses most real changes; presenting them as parsed facts
-   * asserts something unproven, and a denylist of non-dependency keys was the
-   * wrong shape — a custom object full of package-shaped entries walks past any
-   * such list (PR #54 review, round five). So the uncertainty is RECORDED: it
-   * orders the budget and it is stated in the pack.
+   * Not inferred. Issue #56 replaced six rounds of guessing — hunk headers,
+   * indentation depth, a runtime-key denylist, a separate budget for guesses —
+   * with the answer the file gives directly.
    */
-  readonly inDependencySection: boolean;
+  readonly section: string;
 }
 
 /** The one host queried. Not configurable: an allowlist of exactly one. */
@@ -119,23 +114,6 @@ const MANIFEST_BASENAMES = new Set(["package.json"]);
 const MANIFEST_PATH_RE = /^[A-Za-z0-9._@\/-]{1,512}$/u;
 
 /**
- * Keys that live in a manifest's RUNTIME sections, never in a dependency map.
- *
- * With the section unknown, indentation is the only signal, and an `engines`
- * block long enough to push its own opening brace out of git's three-line
- * context window would otherwise contribute `node` as a package (PR #54 review,
- * round two). These are the keys that actually appear there — and every one of
- * them is also a real name on the registry, so a lookup would come back
- * plausible rather than obviously wrong.
- *
- * Narrow on purpose: it costs a genuine bump of a package by one of these names
- * ONLY in the unknown-section case, where nothing was proven anyway. It is a
- * heuristic backstop for a heuristic, not a boundary — the boundary is name
- * validation and URL encoding, which every entry still passes through.
- */
-const RUNTIME_KEYS = new Set(["node", "npm", "yarn", "pnpm", "bun", "deno", "vscode"]);
-
-/**
  * How many packages one diff may ask about.
  *
  * A lockfile churn can touch thousands. Without a ceiling, one pull request
@@ -143,17 +121,6 @@ const RUNTIME_KEYS = new Set(["node", "npm", "yarn", "pnpm", "bun", "deno", "vsc
  * matters more than perfect coverage of an enormous bump.
  */
 const MAX_PACKAGES_PER_DIFF = 200;
-
-/**
- * How many UNESTABLISHED entries are kept while scanning.
- *
- * A single cap on everything only moved the cutoff: a guessed block large
- * enough to reach it stopped the scan before any later confirmed hunk was read,
- * and the ordering fix cannot order what was never seen (PR #54 review, round
- * six). Guesses are bounded on their own so they can never end the scan, while
- * confirmed entries keep being collected to the ceiling.
- */
-const MAX_GUESSED_PACKAGES = 200;
 
 /** True for a name the registry itself would accept. */
 export function isValidPackageName(name: string): boolean {
@@ -181,29 +148,6 @@ function stripRange(raw: string): string {
 }
 
 /**
- * How many nesting levels a line's indentation represents.
- *
- * A dependency entry sits at depth 2 — inside a top-level object — while a
- * field like `version` sits at depth 1, and that difference is the only signal
- * left when git's hunk omits the enclosing key. Testing for four SPACES encoded
- * one house style: a tab-indented manifest matched nothing and every dependency
- * change in it was dropped silently (PR #54 review, final round).
- *
- * A tab is one level; two spaces are one level. Under the 4-space style a
- * top-level field reads as depth 2 and still gets through, exactly as it did
- * before — that is what the unconfirmed label, the separate budget and the
- * runtime-key list are for. A 1-space manifest still reads its entries as depth
- * 1 and is missed, which is the pre-existing behaviour and the reason #56
- * proposes parsing the file instead of guessing from it.
- */
-function indentDepth(line: string): number {
-  const indent = /^[\t ]*/u.exec(line)?.[0] ?? "";
-  const tabs = (indent.match(/\t/gu) ?? []).length;
-  const spaces = indent.length - tabs;
-  return tabs + Math.floor(spaces / 2);
-}
-
-/**
  * True when the spec names one release outright.
  *
  * `=1.2.3` counts: `=` is npm's EXACT comparator, so it resolves to exactly one
@@ -215,39 +159,29 @@ function isPinnedSpec(raw: string): boolean {
   return isExactVersion(raw.trim().replace(/^=/u, ""));
 }
 
-/**
- * The dependency maps whose entries are packages. Anything else in a manifest
- * — `version`, `engines`, `scripts` — is not, and treating every string pair as
- * a dependency produced queries for packages called "version" and "node"
- * (PR #54 review).
- */
-const DEPENDENCY_SECTIONS = new Set([
-  "dependencies",
-  "devDependencies",
-  "peerDependencies",
-  "optionalDependencies",
-]);
 
 /**
- * Which manifest each line belongs to, and whether it sits in a dependency map.
+ * Which manifest each added line belongs to.
  *
  * `+++ b/…` is a file header ONLY outside a hunk. Inside one it is content: an
  * added line whose text is `++ b/package.json` renders as `+++ b/package.json`,
  * byte for byte. Without hunk state a diff could forge a manifest header for
  * any file and walk straight through the closed allowlist this module rests on
  * (PR #54 review) — so headers are tied to real `diff --git` boundaries, the
- * same discipline `review/diff-anchors` uses for the same reason.
+ * same discipline `review/diff-anchors` uses for the same reason. That matters
+ * more since #56, not less: the path chosen here is the path fetched.
+ *
+ * This is all the diff is asked for now. It says WHICH file and WHICH lines
+ * changed; the manifest itself says what those lines mean.
  */
-function manifestContextByLine(diff: string): Map<number, { manifest: string; confirmed: boolean }> {
-  const byLine = new Map<number, { manifest: string; confirmed: boolean }>();
+function manifestByLine(diff: string): Map<number, string> {
+  const byLine = new Map<number, string>();
   let manifest: string | undefined;
   let inHunk = false;
-  let section: "dependency" | "other" | "unknown" = "unknown";
   for (const [index, line] of diff.split("\n").entries()) {
     if (line.startsWith("diff --git ")) {
       manifest = undefined;
       inHunk = false;
-      section = "unknown";
       continue;
     }
     if (!inHunk) {
@@ -263,107 +197,122 @@ function manifestContextByLine(diff: string): Map<number, { manifest: string; co
     }
     if (line.startsWith("@@")) {
       inHunk = true;
-      // Git's own hunk context often names the enclosing key — use it when it
-      // is there. Otherwise the section is UNKNOWN rather than absent: git
-      // emits only nearby lines, so an ordinary bump in a long dependency list
-      // has no header in its hunk at all, and requiring one omitted most real
-      // changes (PR #54 review).
-      const context = /@@[^@]*@@\s*"?([A-Za-z]+)"?\s*:/u.exec(line);
-      section = context ? (DEPENDENCY_SECTIONS.has(context[1] ?? "") ? "dependency" : "other") : "unknown";
       continue;
     }
     if (manifest === undefined || !inHunk) continue;
-    // Section tracking reads context lines as well as added ones: the opening
-    // `"dependencies": {` is usually unchanged context above the bump.
-    const content = line.slice(1);
-    const opening = /^\s*"([A-Za-z]+)"\s*:\s*\{/u.exec(content);
-    if (opening) {
-      section = DEPENDENCY_SECTIONS.has(opening[1] ?? "") ? "dependency" : "other";
-      continue;
-    }
-    if (/^\s*\}/u.test(content)) {
-      section = "unknown";
-      continue;
-    }
-    if (section === "other") continue;
-    // With the section unknown, depth decides: a dependency entry is nested
-    // inside a top-level object, so it is indented further than a top-level
-    // field like "version". Not proof, but the alternative — dropping every
-    // bump whose header git did not include — misses most real ones.
-    if (section === "unknown") {
-      if (indentDepth(content) < 2) continue;
-      const key = /^\s*"([^"]+)"\s*:/u.exec(content)?.[1];
-      if (key !== undefined && RUNTIME_KEYS.has(key)) continue;
-    }
-    byLine.set(index, { manifest, confirmed: section === "dependency" });
+    byLine.set(index, manifest);
   }
   return byLine;
 }
 
+/** The manifest files this diff touches, for the host to fetch and parse. */
+export function changedManifestPaths(diff: string): string[] {
+  return [...new Set(manifestByLine(diff).values())];
+}
+
+/** One manifest's contents at the head ref, or undefined if it could not be read. */
+export type ManifestSource = ReadonlyMap<string, string | undefined>;
+
+/** The dependency maps whose entries are packages. */
+const DEPENDENCY_SECTIONS = [
+  "dependencies",
+  "devDependencies",
+  "peerDependencies",
+  "optionalDependencies",
+] as const;
+
 /**
- * The dependency changes a diff introduces.
+ * Every dependency a manifest declares, by name, with its section and spec.
  *
- * Only ADDED lines are read: a removal leaves nothing to ask about, and the
- * new version is what a reviewer needs facts for. Anything whose name or
- * version does not validate is dropped silently rather than rejected — a
- * malformed entry is not worth failing a review over, and it must never become
- * a request.
+ * Returns undefined when the text is not a usable manifest — unparseable, not
+ * an object, an array. That is distinct from "declares nothing", because one is
+ * an answer and the other is a failure, and the pack says different things
+ * about them.
  */
-export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
-  const manifests = manifestContextByLine(diff);
+function declaredDependencies(
+  text: string,
+): Map<string, { section: string; spec: string }> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const manifest = parsed as Record<string, unknown>;
+  const declared = new Map<string, { section: string; spec: string }>();
+  for (const section of DEPENDENCY_SECTIONS) {
+    const entries = manifest[section];
+    if (typeof entries !== "object" || entries === null || Array.isArray(entries)) continue;
+    for (const [name, spec] of Object.entries(entries as Record<string, unknown>)) {
+      // First section wins, matching npm's own precedence closely enough for a
+      // review: a package in both `dependencies` and `devDependencies` is a
+      // runtime dependency.
+      if (typeof spec === "string" && !declared.has(name)) declared.set(name, { section, spec });
+    }
+  }
+  return declared;
+}
+
+/**
+ * The dependency changes a diff introduces, confirmed against the manifests.
+ *
+ * The diff supplies WHICH lines changed; the parsed manifest supplies what they
+ * mean. An added line is a dependency change only when its key is a package the
+ * manifest actually declares in a dependency map — so `engines.node`, a
+ * `scripts` entry, a custom metadata block and a top-level `version` are all
+ * excluded because the file says they are not dependencies, not because a
+ * heuristic guessed (issue #56).
+ *
+ * A manifest that could not be read contributes nothing. The pack says so
+ * rather than implying those dependencies were checked and found fine.
+ */
+export function dependencyChangesFromDiff(
+  diff: string,
+  manifests: ManifestSource = new Map(),
+): DependencyChange[] {
+  const lineManifest = manifestByLine(diff);
   const lines = diff.split("\n");
+  const declaredByManifest = new Map<string, Map<string, { section: string; spec: string }>>();
+  for (const [path, text] of manifests) {
+    if (text === undefined) continue;
+    const declared = declaredDependencies(text);
+    if (declared !== undefined) declaredByManifest.set(path, declared);
+  }
+
   const seen = new Set<string>();
   const changes: DependencyChange[] = [];
-  const guessed: DependencyChange[] = [];
-  const guessedKeys = new Set<string>();
   for (const [index, line] of lines.entries()) {
-    // The scan ends only when the CONFIRMED entries fill the ceiling. Guesses
-    // are collected separately and capped separately, so no amount of them can
-    // stop a real dependency hunk further down from being read.
     if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
-    const context = manifests.get(index);
-    if (context === undefined || !line.startsWith("+")) continue;
-    const manifest = context.manifest;
+    const manifest = lineManifest.get(index);
+    if (manifest === undefined || !line.startsWith("+")) continue;
+    const declared = declaredByManifest.get(manifest);
+    if (declared === undefined) continue;
     const entry = /^\+\s*"([^"]+)"\s*:\s*"([^"]+)"/u.exec(line);
     if (!entry) continue;
     const name = entry[1] ?? "";
-    const spec = entry[2] ?? "";
-    const version = stripRange(spec);
+    const found = declared.get(name);
+    // The manifest decides. A key the file does not declare as a dependency is
+    // not one, whatever it looks like in the diff.
+    if (found === undefined) continue;
+    // And the spec must be the one the manifest ends up with: an added line
+    // that was later superseded within the same diff is not the current state.
+    if (found.spec !== (entry[2] ?? "")) continue;
+    const version = stripRange(found.spec);
     if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
-    // Keyed by the SPEC, not the stripped version: `^1.2.3` and `1.2.3` ask
-    // different questions of the registry, and collapsing them dropped the pin
-    // — the only one of the two that can be checked (round six).
-    const key = `${name}@${spec}`;
-    const change: DependencyChange = {
+    const key = `${name}@${found.spec}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    changes.push({
       name,
       version,
-      spec,
+      spec: found.spec,
       manifest,
-      pinned: isPinnedSpec(spec),
-      inDependencySection: context.confirmed,
-    };
-    // Deduplicated WITHIN each class, not across them. A single seen-set let a
-    // guess claim the key first, so the confirmed occurrence of the same
-    // package was dropped and the entry kept the wrong manifest and the "may
-    // not be a dependency" label (PR #54 review, final round).
-    if (change.inDependencySection) {
-      if (seen.has(key)) continue;
-      seen.add(key);
-      changes.push(change);
-    } else if (guessed.length < MAX_GUESSED_PACKAGES && !guessedKeys.has(key)) {
-      guessedKeys.add(key);
-      guessed.push(change);
-    }
+      pinned: isPinnedSpec(found.spec),
+      section: found.section,
+    });
   }
-  // A guess is dropped entirely once a confirmed entry describes the same
-  // change: the confirmed one carries the real manifest and no caveat.
-  const confirmedKeys = new Set(changes.map((change) => `${change.name}@${change.spec}`));
-  // Established entries first, order otherwise preserved, then the ceiling.
-  // A guess must never displace something the host actually parsed.
-  return [
-    ...changes,
-    ...guessed.filter((change) => !confirmedKeys.has(`${change.name}@${change.spec}`)),
-  ].slice(0, MAX_PACKAGES_PER_DIFF);
+  return changes;
 }
 
 /**
@@ -386,20 +335,14 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
 export function dependencyContextPack(
   changes: readonly DependencyChange[],
   facts: readonly DependencyFact[] = [],
+  unreadableManifests: readonly string[] = [],
 ): ContextPackResult | undefined {
-  if (changes.length === 0) return undefined;
+  if (changes.length === 0 && unreadableManifests.length === 0) return undefined;
   // Keyed by SPEC: a pin and a range share a stripped version, so name@version
   // handed both changes whichever fact was written last (round six).
   const factFor = new Map(facts.map((fact) => [`${fact.name}@${fact.spec}`, fact]));
   const lines = changes.map((change) => {
-    // An unestablished entry is labelled as one. git's context often omits the
-    // enclosing key, so indentation was the only signal — that is a guess, and
-    // presenting a guess as a parsed fact is the thing this pack must not do
-    // (PR #54 review, round five).
-    const provenance = change.inDependencySection
-      ? ""
-      : " — the host could not confirm this line sits in a dependency map; it may not be a dependency at all";
-    const head = `- ${change.name}@${change.spec} (${change.manifest})${provenance}`;
+    const head = `- ${change.name}@${change.spec} (${change.manifest}, ${change.section})`;
     const fact = factFor.get(`${change.name}@${change.spec}`);
     if (fact === undefined) return head;
     const notes: string[] = [];
@@ -456,12 +399,25 @@ export function dependencyContextPack(
         "database: whether each is current, deprecated, withdrawn, or affected by",
         "a known advisory is unknown here. Do not assert otherwise.",
       ];
+  // A manifest the host could not read is stated, never omitted. Its
+  // dependencies were not examined, and an absent section would read as an
+  // examined one that found nothing — the silent-degradation failure this
+  // project rejects everywhere else (#33/#35, and issue #56).
+  const unreadable = unreadableManifests.length === 0
+    ? []
+    : [
+        "",
+        "These manifests changed but could NOT be read, so no dependency change",
+        "in them was examined at all:",
+        ...unreadableManifests.map((path) => `- ${path}`),
+      ];
   const text = [
     "## Dependency changes in this pull request",
     "",
     "Parsed from the changed manifests by the review host, not by a rule.",
     "",
     ...lines,
+    ...unreadable,
     "",
     ...closing,
   ].join("\n");

@@ -327,6 +327,15 @@ function makeHarness(options: {
       },
     ),
     getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
+    // Issue #56: dependency extraction reads the manifest at head rather than
+    // inferring its structure from diff context, so the double has to supply
+    // one. Covers the packages the dependency tests below bump.
+    getFileAtRef: vi.fn().mockResolvedValue(JSON.stringify({
+      name: "app",
+      version: "1.0.0",
+      engines: { node: "22.0.0" },
+      dependencies: { "left-pad": "1.3.1", lodash: "4.17.21", react: "18.0.0" },
+    })),
     createInlineReview: vi.fn().mockImplementation(
       (_locator, _headSha, comments: Array<{ clientId: string }>) =>
         Promise.resolve(comments.map(({ clientId }) => postedInline(clientId))),
@@ -4239,5 +4248,93 @@ describe("review — the dependency pack is part of the opt-in", () => {
     });
 
     expect(packFor(h)).toContain("lodash");
+  });
+});
+
+// Issue #56: the host reads the changed manifests at the HEAD ref and parses
+// them, instead of inferring their structure from three lines of diff context.
+describe("review — manifests are read at the head ref", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    // No section header in the hunk: under the old heuristic this was the case
+    // that had to be guessed at.
+    "@@ -40,7 +40,7 @@",
+    '+    "lodash": "4.17.21",',
+    '+    "node": "22.0.0",',
+  ].join("\n");
+
+  const packFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  it("asks for each changed manifest at the head sha", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "cafef00d" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(),
+      "cafef00d",
+      "package.json",
+    );
+  });
+
+  // The engines entry rides in on the same hunk and is excluded because the
+  // FILE says it is not a dependency — no denylist involved.
+  it("takes what the manifest declares and leaves the rest", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(packFor(h)).toContain("lodash");
+    expect(packFor(h)).not.toMatch(/(^|\W)node@/);
+  });
+
+  it("makes no manifest request when the feature is off", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalled();
+  });
+
+  // "We could not look" must not render as "we looked and it was fine".
+  it("says so when a manifest could not be read", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getFileAtRef.mockResolvedValue(undefined);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(packFor(h)).toMatch(/could NOT be read/i);
+    expect(packFor(h)).toContain("package.json");
+  });
+
+  it("survives a manifest read that fails outright", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getFileAtRef.mockRejectedValue(new Error("HTTP 500"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(exitCode).toBe(0);
+    expect(packFor(h)).toMatch(/could NOT be read/i);
+    warn.mockRestore();
   });
 });

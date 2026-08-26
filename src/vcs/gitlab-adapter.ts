@@ -1228,6 +1228,32 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     return resolved;
   }
 
+  async getFileAtRef(
+    locator: ReviewLocator,
+    ref: string,
+    path: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolveMergeRequestLocator(locator);
+    try {
+      // GitLab's files endpoint takes the path fully URL-encoded, separators
+      // included — unlike GitHub's, which keeps them as path structure.
+      return await this.execGlab([
+        "api",
+        "--method",
+        "GET",
+        "--hostname",
+        repo.host,
+        projectEndpoint(repo, `repository/files/${encodeURIComponent(path)}/raw`),
+        "--raw-field",
+        `ref=${ref}`,
+      ]);
+    } catch (error) {
+      // Absent is an answer; anything else is a failure the caller must see.
+      if (error instanceof GlabCommandError && error.httpStatus === 404) return undefined;
+      throw error;
+    }
+  }
+
   async getRuleFilesFromBase(
     locator: ReviewLocator,
     baseSha: string,

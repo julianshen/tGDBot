@@ -428,6 +428,18 @@ interface GhContentsFileResponse {
 // getRuleFilesFromBase to distinguish "rulesDir doesn't exist on the base
 // branch" (return [], per ADR-002's existing "no rules dir = zero user
 // rules" semantics) from a genuine error, which must still propagate.
+/**
+ * Percent-encodes each path SEGMENT, leaving the separators alone.
+ *
+ * `encodeURIComponent` on the whole path would escape the slashes and ask for
+ * one oddly-named file; leaving it raw would let a segment like `@acme` or a
+ * space through unencoded. Scoped workspaces make this a real case rather than
+ * a theoretical one (issue #56).
+ */
+function encodePath(path: string): string {
+  return path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
 function isNotFoundError(err: unknown): boolean {
   return err instanceof Error && /HTTP 404/.test(err.message);
 }
@@ -1963,6 +1975,34 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
    * one extra `gh api` round trip per nested directory; neither is
    * necessary for v1's flat `.tgd-review/rules/*.md` layout.
    */
+  async getFileAtRef(
+    locator: ReviewLocator,
+    ref: string,
+    path: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolvePullLocator(locator);
+    let parsed: unknown;
+    try {
+      const out = await this.execGh([
+        "api", `${apiRepo(repo)}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`,
+        ...apiHost(repo),
+      ]);
+      parsed = JSON.parse(out) as unknown;
+    } catch (err) {
+      // Absent is an answer; anything else is a failure the caller must see.
+      if (isNotFoundError(err)) return undefined;
+      throw err;
+    }
+    // The Contents API answers a directory with an ARRAY. The caller asked for
+    // a file, so that is a "no", not a shape to guess at. The `content` check
+    // below would also reject it — this states the intent rather than relying
+    // on that coincidence.
+    if (Array.isArray(parsed) || parsed === null || typeof parsed !== "object") return undefined;
+    const file = parsed as GhContentsFileResponse;
+    if (typeof file.content !== "string") return undefined;
+    return Buffer.from(file.content, "base64").toString("utf-8");
+  }
+
   async getRuleFilesFromBase(
     locator: ReviewLocator,
     baseSha: string,

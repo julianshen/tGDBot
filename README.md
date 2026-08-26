@@ -385,7 +385,11 @@ tgd-review-agent review \
                                   # for it rather than paraphrase what they were not given.
                                   # The context section is part of this opt-in: with the flag off
                                   # no dependency context is supplied at all, because the package
-                                  # names and manifest paths in it come from the diff.
+                                  # names and manifest paths in it come from the diff. With it on,
+                                  # the host also reads each changed manifest at the PR's head ref
+                                  # and parses it, so which entries are dependencies comes from the
+                                  # file rather than from guessing at diff context; a manifest that
+                                  # cannot be read is named in the context as unexamined.
                                   # Off by default because it reveals a private
                                   # repository's dependencies to a third party. With it off the
                                   # context still lists the changed versions and says plainly that
