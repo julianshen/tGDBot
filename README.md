@@ -509,6 +509,12 @@ pre-create the deterministic entry with a perfectly self-consistent manifest,
 and its text would go straight into `[TRUSTED_CONTEXT]`. Hash integrity is not
 provenance. Point `--context-dir` somewhere only you can write.
 
+The same rule covers the managed worktree, and there it guards code execution
+rather than context: `git worktree add` runs the mirror's
+`hooks/post-checkout`, so a previously-shared workspace root could hold a
+pre-created mirror with the expected origin and an attacker's hook in it.
+Mapping refuses such a root instead of adopting it.
+
 **On Windows this check does nothing.** It is built on POSIX ownership and
 mode bits, and Node has no portable API for the ACLs that would replace them,
 so the cache root is unverified there and a directory another local user can

@@ -276,6 +276,22 @@ describe("prepareWorkspace", () => {
     expect((await stat(root)).mode & 0o777).toBe(0o700);
   });
 
+  it.skipIf(process.platform === "win32")("refuses a previously shared root when the caller asks it to", async () => {
+    // A caller that RUNS something out of the workspace opts in: `git worktree
+    // add` executes the mirror's hooks/post-checkout, and a root another user
+    // could previously write may already hold a mirror carrying one. chmod
+    // 0700 would lock that in rather than shut it out.
+    const root = await tempRoot();
+    await chmod(root, 0o777);
+    const exec = vi.fn(async () => "");
+
+    await expect(
+      prepareWorkspace({ root, repo, baseSha, rejectPreviouslySharedRoot: true }, { exec }),
+    ).rejects.toThrow(/writable by other users/);
+    // Refused before any git command ran, so no clone and no worktree add.
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it.skipIf(process.platform === "win32")("rejects a root whose parent can be replaced by another user", async () => {
     const parent = await tempRoot();
     const root = path.join(parent, "workspace");

@@ -313,6 +313,12 @@ export async function prepareReviewContext(
       root: request.workspaceRoot,
       repo: request.repository,
       baseSha: request.baseSha,
+      // Mapping RUNS out of this worktree, and `git worktree add` executes the
+      // mirror's `hooks/post-checkout`. A root another user could previously
+      // write may already hold a bare mirror with the expected origin and an
+      // attacker's hook in it, which chmod 0700 would lock in rather than shut
+      // out — so refuse such a root instead of adopting it.
+      rejectPreviouslySharedRoot: true,
     });
     // Invariant 1, checked rather than assumed. `prepareWorkspace` already
     // refuses a worktree whose HEAD is not the requested base SHA; this is the

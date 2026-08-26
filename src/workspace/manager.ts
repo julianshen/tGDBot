@@ -356,7 +356,9 @@ export async function prepareWorkspace(
   const paths = deriveWorkspacePaths({ ...request, root: await physicalWorkspaceRoot(request.root) });
   const normalizedRequest = { ...request, root: paths.root };
   await mkdir(paths.root, { recursive: true });
-  await protectManagedRoot(paths.root);
+  await protectManagedRoot(paths.root, "Managed workspace", {
+    ...(request.rejectPreviouslySharedRoot === true ? { rejectPreviouslyShared: true } : {}),
+  });
   const lockPath = request.repo.provider === "github"
     ? path.join(paths.root, ".locks", request.repo.host, request.repo.owner, `${request.repo.repo}.lock`)
     : path.join(
