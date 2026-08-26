@@ -373,6 +373,25 @@ tgd-review-agent review \
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
+  --dependency-facts on|off      # default: OFF. The only outbound request this tool makes: when a
+                                  # pull request changes a package.json, the host asks
+                                  # registry.npmjs.org about each changed package and puts the
+                                  # answer in front of every rule as trusted context: the newest
+                                  # release, whether an exact PIN is published (a range is not a
+                                  # question the registry can answer), and whether the version is
+                                  # deprecated. Only the deprecation FLAG — never the publisher's
+                                  # notice, which is text the package owner writes and is not
+                                  # trusted input; rules are told to send the reader to the registry
+                                  # for it rather than paraphrase what they were not given.
+                                  # The context section is part of this opt-in: with the flag off
+                                  # no dependency context is supplied at all, because the package
+                                  # names and manifest paths in it come from the diff.
+                                  # Off by default because it reveals a private
+                                  # repository's dependencies to a third party. With it off the
+                                  # context still lists the changed versions and says plainly that
+                                  # none of them were checked. Needs --dispatch direct (the default):
+                                  # the legacy engine cannot carry host context and will say so.
+                                  # See examples/rules/dependency-currency.md
   --model <provider>/<model>     # optional: the DEFAULT model. Runs the review's orchestrating
                                   # session AND any rule that doesn't pin its own provider/model
                                   # (pinned rules always keep their pin). Default when absent:

@@ -1058,6 +1058,48 @@ describe("renderSummaryComment — merged members keep their proposed fix", () =
   });
 });
 
+// PR #54 review: a citation reaches the reader only through the representative
+// finding's own block. A merged member and a disputed finding each carry
+// `references` that survived the parser's provenance check and were then
+// silently dropped at the last step — the reader is asked to accept a claim
+// while the evidence for it sits one layer up, unrendered.
+describe("citations reach the reader wherever a finding is rendered", () => {
+  const cited = "https://docs.example.com/leases";
+
+  it("renders a merged member's references", () => {
+    const representative = makeFinding({ file: "a.go", line: 10, message: "Primary claim." });
+    const member = makeFinding({
+      file: "a.go",
+      line: 10,
+      ruleName: "nats",
+      message: "Secondary claim.",
+      references: [cited],
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [representative],
+      inlineCount: 0,
+      unanchored: [representative],
+      context: new Map([[representative, { alsoReported: [member] }]]),
+    }));
+
+    expect(body).toContain(cited);
+  });
+
+  it("renders a disputed finding's references", () => {
+    const finding = makeFinding({ file: "a.go", line: 10, message: "Still argued.", references: [cited] });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [],
+      inlineCount: 0,
+      disputed: [finding],
+    }));
+
+    expect(body).toContain("### Disputed");
+    expect(body).toContain(cited);
+  });
+});
+
 // Codex round 5 on PR #23: with per-client reasons the shared field is
 // undefined, so compact mode kept the publication-failure label but dropped
 // every provider diagnosis.
@@ -1275,5 +1317,192 @@ describe("renderSummaryComment — cross-file root causes", () => {
 
     expect(body.length).toBeLessThanOrEqual(260);
     expect(body).toMatch(/root cause/i);
+  });
+});
+
+// PR #54 review: compact mode builds its entries from location, rule, effort
+// and message alone, so citations disappeared exactly on the large reviews —
+// where a reader has the least context and needs the evidence most.
+describe("renderSummaryComment — compact mode keeps the evidence", () => {
+  const cited = (references: string[]) => makeFinding({
+    file: "a.go",
+    line: 10,
+    message: "m".repeat(2000),
+    references,
+  });
+
+  it("renders a citation on a relocated finding", () => {
+    const finding = cited(["https://docs.example.com/leases"]);
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 700);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("https://docs.example.com/leases");
+  });
+
+  // Compact mode is a size fallback, so it may show fewer — but it must not
+  // pretend that is all there was.
+  it("says so when it could not show every citation", () => {
+    const finding = cited([
+      "https://docs.example.com/one",
+      "https://docs.example.com/two",
+      "https://docs.example.com/three",
+    ]);
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 700);
+
+    expect(body).toContain("https://docs.example.com/one");
+    expect(body).toMatch(/further reference|additional reference|reference.*omitted/i);
+  });
+
+  it("adds no such note when everything fits", () => {
+    const finding = cited(["https://docs.example.com/only"]);
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 700);
+
+    expect(body).not.toMatch(/further reference|additional reference/i);
+  });
+});
+
+// PR #54 review, round four: compact mode truncated the URL itself at 200
+// characters and appended an ellipsis, so the reader got a link that does not
+// resolve AND was counted as shown. A destroyed citation is worse than an
+// absent one: it looks like evidence and leads nowhere.
+describe("renderSummaryComment — compact mode never truncates a citation", () => {
+  const longUrl = `https://docs.example.com/${"p".repeat(400)}`;
+
+  it("omits a citation it cannot show whole, and counts it as omitted", () => {
+    const finding = makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "m".repeat(2000),
+      references: [longUrl],
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 900);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    // The message is still truncated — that is compact mode working. What must
+    // not appear is a half of the URL.
+    expect(body).not.toContain("Reference:");
+    expect(body).not.toContain("p".repeat(50));
+    expect(body).toMatch(/further reference|reference.*omitted/i);
+  });
+
+  it("still shows one that fits", () => {
+    const finding = makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "m".repeat(2000),
+      references: ["https://docs.example.com/short"],
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 900);
+
+    expect(body).toContain("https://docs.example.com/short");
+  });
+});
+
+// PR #54 review, round six: compact mode reuses renderDisputedSection, which
+// renders every citation on every disputed finding at full length. Enough of
+// them and the compact body is still oversized, falls through to the
+// emergency status-only form, and the whole disputed section disappears —
+// silently, and for a disputes-only review the headline then claims nothing
+// failed to fit.
+describe("renderSummaryComment — disputed citations respect the compact budget", () => {
+  const disputed = Array.from({ length: 40 }, (_, i) => makeFinding({
+    file: `f${i}.go`,
+    line: 10,
+    message: `Disputed claim ${i}.`,
+    decision: "disputed",
+    references: [
+      `https://docs.example.com/${"a".repeat(300)}/${i}`,
+      `https://docs.example.com/${"b".repeat(300)}/${i}`,
+    ],
+  }));
+
+  it("keeps the disputed section rather than overflowing into the status-only form", () => {
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [],
+      inlineCount: 0,
+      disputed,
+    }), 4000);
+
+    expect(body.length).toBeLessThanOrEqual(4000);
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("Disputed claim 0.");
+  });
+});
+
+// Found while auditing round six's own change: applying the compact citation
+// budget to disputed entries made them drop citations too, but the notice's
+// omission counter still only reduced over the relocated findings. So the
+// shortfall was real and the number denying it was wrong — the same "reader is
+// never told" failure the budget was added to fix.
+describe("renderSummaryComment — the compact omission count includes disputed findings", () => {
+  it("counts citations dropped from the disputed section", () => {
+    const disputed = [makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "Disputed claim.",
+      decision: "disputed",
+      references: [
+        "https://docs.example.com/one",
+        "https://docs.example.com/two",
+        "https://docs.example.com/three",
+      ],
+    })];
+    const relocated = makeFinding({ file: "b.go", line: 1, message: "r".repeat(2000) });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [relocated],
+      inlineCount: 0,
+      unanchored: [relocated],
+      disputed,
+    }), 900);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    // One shown, two dropped — and the notice must say two, not nothing.
+    expect(body).toMatch(/2 further reference/);
+  });
+
+  it("says nothing when the disputed section loses none", () => {
+    const disputed = [makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "Disputed claim.",
+      decision: "disputed",
+      references: ["https://docs.example.com/only"],
+    })];
+    const relocated = makeFinding({ file: "b.go", line: 1, message: "r".repeat(2000) });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [relocated],
+      inlineCount: 0,
+      unanchored: [relocated],
+      disputed,
+    }), 900);
+
+    expect(body).not.toMatch(/further reference/);
   });
 });

@@ -143,16 +143,26 @@ export function composeFrozenSummary(
  * older manifest, or a renderer that did not sign.
  */
 export function stripSignature(body: string): string {
-  if (!body.includes(BOT_SIGNATURE_BLOCK)) return body.trimEnd();
+  // The renderer's own footer is the LAST occurrence, and nothing but machine
+  // markers follows it. Anchoring on that is what makes this safe to run over a
+  // relocated finding: a `suggestion` is emitted verbatim by design (ADR-007),
+  // so it can legitimately contain the exact block — a proposed edit to a
+  // Markdown footer, say, including this repository's own README. Removing
+  // every occurrence would silently delete that from the proposed fix (Codex
+  // review). A body whose only copy sits inside a suggestion is left alone.
+  const index = body.lastIndexOf(BOT_SIGNATURE_BLOCK);
+  if (index === -1) return body.trimEnd();
+  const after = body.slice(index + BOT_SIGNATURE_BLOCK.length);
+  if (!ONLY_MARKERS_RE.test(after)) return body.trimEnd();
   // Newlines are normalized only where the block was, so nothing else in the
   // body — a fenced block's own blank lines, say — is reflowed.
-  return body
-    .split(BOT_SIGNATURE_BLOCK)
-    .map((part, index) => (index === 0 ? part.replace(/\n+$/u, "") : part.replace(/^\n+/u, "")))
-    .filter((part) => part.length > 0)
-    .join("\n\n")
-    .trimEnd();
+  const before = body.slice(0, index).replace(/\n+$/u, "");
+  const tail = after.replace(/^\n+/u, "");
+  return (tail.length === 0 ? before : `${before}\n\n${tail}`).trimEnd();
 }
+
+/** Whitespace and whole-line HTML comments only — the tool's trailing markers. */
+const ONLY_MARKERS_RE = /^\s*(?:<!--[^\n]*-->\s*)*$/u;
 
 function sameTerminalResult(
   actual: TerminalReviewResult | undefined,
@@ -185,6 +195,7 @@ export function toFindingSnapshot(finding: Finding): FindingSnapshot {
     ...(finding.title === undefined ? {} : { title: finding.title }),
     ...(finding.suggestion === undefined ? {} : { suggestion: finding.suggestion }),
     ...(finding.effort === undefined ? {} : { effort: finding.effort }),
+    ...(finding.references === undefined ? {} : { references: [...finding.references] }),
   };
 }
 

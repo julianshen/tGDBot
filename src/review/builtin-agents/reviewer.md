@@ -70,7 +70,7 @@ the whole review unusable.
   be `]`.
 - Each element is one finding, in exactly this shape:
 
-  `{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "effort": "quick" | "heavy" | null }`
+  `{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null }`
 
   - `file`: the repo-relative path the finding is about (must be a real path
     from the diff/files you inspected — never null, never a placeholder).
@@ -92,6 +92,8 @@ the whole review unusable.
 
     Most findings in a healthy review are NOT blocking. Severity is what a
     reviewer reads first, so inflating it destroys the ordering they depend on.
+  - `references`: documentation this finding rests on. Only URLs that appear in
+    the rule text above, copied exactly — an invented link is worse than none.
   - `category`: a short free-form label, e.g. `"correctness"`, `"security"`,
     `"tests"`, `"readability"`.
   - `effort`: how much work YOUR suggested fix is — `quick` for a local edit (a

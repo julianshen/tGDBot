@@ -868,3 +868,33 @@ export async function buildContextPacks(
   }
   return packs;
 }
+
+/**
+ * Folds several trusted-context packs for one rule into the single pack the
+ * dispatch contract allows.
+ *
+ * `validateDispatchContext` requires exactly one pack per rule and one shared
+ * manifest hash across them all, so two independent producers — the
+ * repository map and the host's dependency facts — cannot each hand dispatch
+ * their own. Concatenating keeps both, in a fixed order so the same inputs
+ * always render the same prompt.
+ *
+ * The combined hash is taken over the component hashes rather than the joined
+ * text: each component already hashes its own content, and hashing the hashes
+ * keeps the result stable and changes it whenever any component does.
+ */
+export function combineContextPacks(
+  packs: readonly (ContextPackResult | undefined)[],
+): ContextPackResult | undefined {
+  const present = packs.filter((pack): pack is ContextPackResult => pack !== undefined);
+  if (present.length === 0) return undefined;
+  if (present.length === 1) return present[0]!;
+  const hash = createHash("sha256").update("tgd:combined-context:v1\0", "utf8");
+  for (const pack of present) hash.update(`${pack.manifestHash}\0`);
+  return {
+    text: present.map((pack) => pack.text).join("\n\n"),
+    manifestHash: hash.digest("hex"),
+    truncated: present.some((pack) => pack.truncated),
+    sources: present.flatMap((pack) => pack.sources),
+  };
+}

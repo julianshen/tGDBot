@@ -977,3 +977,144 @@ describe("a rejected replacement is not silently reverted", () => {
     expect(result?.finding?.suggestion).toBe("return stale(ctx)");
   });
 });
+
+// PR #54 review: a citation validated at parse time is persisted on the
+// finding, but a reassessment REPLACES the stored finding, and
+// parseReconsiderOutput has no rule text to validate a restated citation
+// against. So an echoing model's references were discarded and an omitting
+// model's were not restored — either way a confirmed finding lost its
+// documentation on republication.
+describe("parseReconsiderOutput — citations survive reassessment", () => {
+  const original = {
+    ruleName: "rule-a",
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking" as const,
+    message: "Original claim.",
+    references: ["https://docs.example.com/ttl"],
+  };
+  const response = (finding: Record<string, unknown>) => JSON.stringify({
+    outcome: "confirmed",
+    rationale: "Still stands.",
+    finding,
+  });
+  const core = {
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking",
+    message: "Original claim.",
+  };
+
+  it("restores the validated citation the response omitted", () => {
+    const result = parseReconsiderOutput(response(core), original);
+
+    expect(result?.outcome).toBe("confirmed");
+    expect(result?.finding?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  // The model cannot establish provenance here — there is no rule text to
+  // check against — so a citation it invents must not ride along, and the
+  // snapshot's own citation must not be lost to the attempt.
+  it("keeps the snapshot's citation rather than one the response invented", () => {
+    const result = parseReconsiderOutput(
+      response({ ...core, references: ["https://evil.example/x"] }),
+      original,
+    );
+
+    expect(result?.finding?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("adds no citation when the original had none", () => {
+    const uncited = { ...original, references: undefined };
+    const result = parseReconsiderOutput(
+      response({ ...core, references: ["https://evil.example/x"] }),
+      uncited,
+    );
+
+    expect(result?.finding?.references).toBeUndefined();
+  });
+});
+
+// PR #54 review, round five: carrying the snapshot's citations onto a REVISED
+// finding attaches evidence to a claim it may no longer support. "Confirmed"
+// means the finding still holds, so its documentation still holds; "revised"
+// means the claim changed, and this parser cannot revalidate a citation
+// against the rule.
+describe("parseReconsiderOutput — a revised claim does not inherit evidence", () => {
+  const original = {
+    ruleName: "rule-a",
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking" as const,
+    message: "Original claim.",
+    references: ["https://docs.example.com/ttl"],
+  };
+  const core = {
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking",
+  };
+  const result = (outcome: string, message: string) => parseReconsiderOutput(
+    JSON.stringify({ outcome, rationale: "Because.", finding: { ...core, message } }),
+    original,
+  );
+
+  it("drops the citations when the claim was revised", () => {
+    expect(result("revised", "A materially different claim.")?.finding?.references)
+      .toBeUndefined();
+  });
+
+  it("keeps them when the claim was confirmed", () => {
+    expect(result("confirmed", "Original claim.")?.finding?.references)
+      .toEqual(["https://docs.example.com/ttl"]);
+  });
+});
+
+// PR #54 review, final round: focusReview parsed without an allowed set, so the
+// fail-closed branch stripped every citation — even though the shared contract
+// asks the model for `references` and the rules it ran are right there.
+describe("focusReview — citations from the rules it ran", () => {
+  const rules = [
+    { name: "rule-a", body: "See https://docs.example.com/a", sourcePath: "a.md", dependsOn: [] },
+    { name: "rule-b", body: "See https://docs.example.com/b", sourcePath: "b.md", dependsOn: [] },
+  ];
+  const finding = (references: string[]) => JSON.stringify([{
+    file: "a.ts",
+    line: 1,
+    severity: "warning",
+    category: "correctness",
+    title: "T",
+    message: "M",
+    decision: "new",
+    references,
+  }]);
+
+  const run = async (text: string) => focusReview({
+    rules,
+    diff: "diff",
+    direction: "look at locking",
+    model: MODEL,
+    createSession: async () => ({
+      prompt: async () => text,
+      getLastAssistantText: () => text,
+    }),
+  } as never);
+
+  it("keeps a URL one of the focus rules declared", async () => {
+    const result = await run(finding(["https://docs.example.com/b"]));
+
+    expect((result as { result?: { findings?: Finding[] } }).result?.findings?.[0]?.references)
+      .toEqual(["https://docs.example.com/b"]);
+  });
+
+  it("drops one no rule in the focus set declared", async () => {
+    const result = await run(finding(["https://evil.example/x"]));
+
+    expect((result as { result?: { findings?: Finding[] } }).result?.findings?.[0]?.references)
+      .toBeUndefined();
+  });
+});

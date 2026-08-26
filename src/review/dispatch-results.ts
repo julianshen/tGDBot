@@ -112,7 +112,78 @@ export function readFindingDecision(
  * through this; the legacy orchestrator path uses it for the merged result.
  * Title/suggestion/endLine stay lenient optional enrichment.
  */
-export function normalizeUnknownFinding(value: unknown, ruleName?: string): Finding | undefined {
+/**
+ * The URLs a rule's own text cites (issue #49).
+ *
+ * Bounded and http(s) only. This is the set a finding may cite from, so it is
+ * the security boundary for the citation feature: anything outside it is a
+ * model invention.
+ */
+/**
+ * The ONE citation limit.
+ *
+ * Applied where the array is built, so it is also the number the reader sees.
+ * Parsing used to keep up to the state schema's twenty while the renderer
+ * printed five and discarded the rest in silence — a citation that survives
+ * provenance checking and persistence has earned its way into the comment
+ * (PR #54 review). A bound is still needed: an unbounded array parses and
+ * publishes, then fails validation on the next state read and leaves the
+ * finding ledger unusable.
+ */
+export const MAX_REFERENCES_PER_FINDING = 5;
+
+/**
+ * The end of a URL that started at `start`.
+ *
+ * Delimiters are admitted, because legitimate targets contain them —
+ * `/Function_(computing)` was being truncated to its prefix, and a reviewer
+ * citing the real URL then failed the exact-match check and lost its citation
+ * without a word (PR #54 review, round five).
+ *
+ * They cannot simply be admitted and trimmed afterwards, though. Prose writes
+ * `(see https://example.com/docs)`, where the closing paren is punctuation, and
+ * markdown writes `[a](…)[b](…)`, where a greedy match runs through BOTH links
+ * and no amount of tail-trimming recovers the second one. So the scan stops at
+ * the first delimiter that closes something the URL never opened.
+ */
+function urlEndFrom(text: string, start: number): number {
+  let parens = 0;
+  let brackets = 0;
+  let index = start;
+  for (; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (/[\s<>"'`]/u.test(char)) break;
+    if (char === "(") parens += 1;
+    else if (char === "[") brackets += 1;
+    else if (char === ")") {
+      if (parens === 0) break;
+      parens -= 1;
+    } else if (char === "]") {
+      if (brackets === 0) break;
+      brackets -= 1;
+    }
+  }
+  return index;
+}
+
+export function referencesDeclaredBy(ruleBody: string): Set<string> {
+  const declared = new Set<string>();
+  // Only the scheme is matched here; `urlEndFrom` decides where each one ends,
+  // because that decision needs delimiter state a regex cannot carry.
+  for (const match of ruleBody.matchAll(/https?:\/\//gu)) {
+    const start = match.index;
+    const raw = ruleBody.slice(start, urlEndFrom(ruleBody, start));
+    const url = raw.replace(/[.,;:]+$/u, "");
+    if (url.length > "https://".length && url.length <= 2_000) declared.add(url);
+  }
+  return declared;
+}
+
+export function normalizeUnknownFinding(
+  value: unknown,
+  ruleName?: string,
+  allowedReferences?: ReadonlySet<string>,
+): Finding | undefined {
   if (!value || typeof value !== "object") return undefined;
   const candidate = value as Record<string, unknown>;
   if (typeof candidate.file !== "string") return undefined;
@@ -147,6 +218,17 @@ export function normalizeUnknownFinding(value: unknown, ruleName?: string): Find
   if (candidate.effort === "quick" || candidate.effort === "heavy") {
     finding.effort = candidate.effort;
   }
+  // Fail closed: with no allowed set there is nothing to check a citation
+  // against, so none survives (issue #49).
+  if (Array.isArray(candidate.references) && allowedReferences !== undefined) {
+    // Deduplicated and capped at the limit the renderer prints.
+    const cited = [...new Set(
+      candidate.references.filter(
+        (url): url is string => typeof url === "string" && allowedReferences.has(url),
+      ),
+    )].slice(0, MAX_REFERENCES_PER_FINDING);
+    if (cited.length > 0) finding.references = cited;
+  }
   const suggestion = stateSafeSuggestion(candidate.suggestion);
   if (suggestion !== undefined) finding.suggestion = suggestion;
   if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;
@@ -159,7 +241,22 @@ function isValidFinding(value: unknown): value is Finding {
 }
 
 function normalizeFinding(finding: Finding): Finding {
-  return normalizeUnknownFinding(finding) ?? finding;
+  const normalized = normalizeUnknownFinding(finding);
+  if (normalized !== undefined) return normalized;
+  // UNREACHABLE today, and deliberately kept. looksLikeDispatchResult has
+  // already validated every finding through this same normalization, and the
+  // allowed-reference set affects which citations survive rather than whether
+  // the finding is valid — so normalization cannot fail here, and no test can
+  // drive this branch (verified by removing it: nothing failed).
+  //
+  // It stays because the hazard it guards is a security one: should those two
+  // validations ever diverge, the raw finding would carry citations that never
+  // went through the declared-URL check, which is precisely what #49 exists to
+  // prevent. Cheap insurance at a boundary, not a tested path.
+  if (finding.references === undefined) return finding;
+  const { references, ...withoutReferences } = finding;
+  void references;
+  return withoutReferences;
 }
 
 function looksLikeDispatchResult(value: unknown): value is DispatchResult {
@@ -208,7 +305,17 @@ export function parseDispatchResult(text: string | undefined, rules: RuleDefinit
     return fallbackResult(rules);
   }
 
-  return { ...parsed, findings: parsed.findings.map(normalizeFinding) };
+  // No citations survive here. This is the legacy orchestrator's MERGED output,
+  // where `ruleName` is supplied by the model and reconcileWithCapturedResults
+  // explicitly does not detect misattribution — so selecting an allowlist from
+  // that name would let a finding attributed to rule B cite rule B's URLs even
+  // though rule A produced it, defeating the per-rule provenance the feature
+  // rests on (PR #54 review). Citations come from paths that know the true
+  // rule: direct dispatch, and recovered task output.
+  return {
+    ...parsed,
+    findings: parsed.findings.map((finding) => normalizeFinding(finding)),
+  };
 }
 
 // Like isValidFinding but WITHOUT requiring ruleName — a dispatched task's raw
@@ -258,7 +365,11 @@ export function extractFindingsArray(text: string): unknown[] | undefined {
 
 // Parses one task's raw finalOutput into Finding[] stamped with ruleName.
 // Best-effort — returns [] on any parse/shape problem, never throws.
-export function parseFindingsFromFinalOutput(text: string, ruleName: string): Finding[] {
+export function parseFindingsFromFinalOutput(
+  text: string,
+  ruleName: string,
+  allowedReferences?: ReadonlySet<string>,
+): Finding[] {
   const parsed = extractFindingsArray(text);
   if (!parsed) return [];
   // No entry can be dropped here: extractFindingsArray accepts an array only
@@ -267,8 +378,14 @@ export function parseFindingsFromFinalOutput(text: string, ruleName: string): Fi
   // and the caller reports unusable output rather than a short list — checked
   // in "an array is all or nothing" (issue #41).
   return parsed.flatMap((value) => {
-    const finding = normalizeUnknownFinding(value, ruleName);
-    return finding === undefined ? [] : [finding];
+    const finding = normalizeUnknownFinding(value, ruleName, allowedReferences);
+    // The task's rule is a FACT — this parser was handed one rule's output.
+    // The name inside the payload is a claim, and normalizeUnknownFinding
+    // prefers it, which let a finding be validated against the rule that ran
+    // and then stamped with a different one (PR #54 review, round four). The
+    // name and the citations must describe the same rule or neither means
+    // anything.
+    return finding === undefined ? [] : [{ ...finding, ruleName }];
   });
 }
 
@@ -296,7 +413,13 @@ export function suggestionProvenanceKeys(
   captured.forEach((c, i) => {
     const rule = rules[i];
     if (!rule || !c.finalOutput) return;
-    for (const finding of parseFindingsFromFinalOutput(c.finalOutput, rule.name)) {
+    // Recovered from the captured task output, so the producing rule is known
+    // and its declared citations can be honoured (PR #54 review).
+    for (const finding of parseFindingsFromFinalOutput(
+      c.finalOutput,
+      rule.name,
+      referencesDeclaredBy(rule.body),
+    )) {
       if (typeof finding.suggestion === "string") {
         keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
       }
@@ -465,7 +588,11 @@ export function reconcileWithCapturedResults(
     if (!recoverFindings) return;
     const orchestratorHasFindings = orchestrator.findings.some((f) => f.ruleName === rule.name);
     if (!orchestratorHasFindings && c.finalOutput) {
-      recovered.push(...parseFindingsFromFinalOutput(c.finalOutput, rule.name));
+      recovered.push(...parseFindingsFromFinalOutput(
+        c.finalOutput,
+        rule.name,
+        referencesDeclaredBy(rule.body),
+      ));
     }
   });
 

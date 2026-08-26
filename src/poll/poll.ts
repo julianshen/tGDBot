@@ -617,6 +617,9 @@ function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): Review
     rulesDir: config.rulesDir,
     disableBuiltinRule: config.disableBuiltinRule,
     advisor: config.advisor,
+    // A polled review must run under the poll's own network setting, not a
+    // different one (PR #54 review).
+    dependencyFacts: config.dependencyFacts,
     suggestions: config.suggestions,
     dryRun: config.dryRun,
     trustLocalRules: config.trustLocalRules,
