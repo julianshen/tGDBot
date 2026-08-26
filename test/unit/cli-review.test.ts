@@ -1356,6 +1356,52 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+
+
+  // Issue #50: dependency facts the HOST parsed reach every rule as trusted
+  // context. Supplied for all rules or none, because the dispatch contract
+  // requires a pack per rule and rejects a partial map.
+  it("issue #50: passes host-parsed dependency changes to the rules", async () => {
+    // Final round: the pack is part of the --dependency-facts opt-in, because
+    // its package names and manifest paths are diff-controlled.
+    const h = makeHarness({ botComment: null, args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(
+      [
+        "diff --git a/package.json b/package.json",
+        "--- a/package.json",
+        "+++ b/package.json",
+        "@@ -1,3 +1,3 @@",
+        '   "dependencies": {',
+        '-    "left-pad": "1.2.0",',
+        '+    "left-pad": "1.3.1",',
+      ].join("\n"),
+    );
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const passed = h.dispatchRules.mock.calls[0]?.[0] as { contextPacks?: Record<string, { text: string }> };
+    expect(passed.contextPacks).toBeDefined();
+    expect(Object.keys(passed.contextPacks ?? {})).toEqual(["rule-a"]);
+    expect(passed.contextPacks?.["rule-a"]?.text).toContain("left-pad@1.3.1");
+
+    vi.restoreAllMocks();
+  });
+
+  // The common case must be untouched: no dependency change, no pack, no extra
+  // section in any rule's task.
+  it("issue #50: passes no context packs when no dependency changed", async () => {
+    const h = makeHarness({ botComment: null });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const passed = h.dispatchRules.mock.calls[0]?.[0] as { contextPacks?: unknown };
+    expect(passed.contextPacks).toBeUndefined();
+
+    vi.restoreAllMocks();
+  });
+
   // Review fix #1: rules LOADED fine (loadErrors is empty, rules.length >
   // 0), but every rule failed at DISPATCH time (e.g. a total LLM/provider
   // outage sends dispatchRules down its fallback path, which returns
@@ -4013,5 +4059,185 @@ describe("review: discussion context failures are diagnosable and non-blocking",
     // with no way to tell pagination from malformed data from an outage.
     expect(error!.message).toMatch(/refusing to publish/u);
     expect(error!.message).toMatch(/HTTP 502 upstream unavailable/u);
+  });
+});
+
+// PR #54 review: the fetch layer built for #50 was invoked only by its own
+// tests. Every real review called dependencyContextPack with no facts, so the
+// dependency-currency rule could never see a latest version, a deprecation, or
+// a withdrawn release — the facts it exists to check.
+//
+// Wiring it means outbound network from a tool that otherwise makes none, so it
+// is opt-in and OFF by default. The pack's wording already tells the truth in
+// both states: "have NOT been checked" without facts, "do not read silence as
+// approval" with them.
+describe("review — dependency facts", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    '     "left-pad": "1.0.0",',
+    '-    "lodash": "4.17.20",',
+    '+    "lodash": "4.17.21",',
+    '     "react": "18.0.0"',
+  ].join("\n");
+
+  const packFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  // Final round: with the feature off there is no pack at all, because its
+  // identifiers are diff-controlled — see "the dependency pack is part of the
+  // opt-in" below.
+  it("makes no request, and supplies no context, unless asked", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn();
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(packFor(h)).toBeUndefined();
+  });
+
+  it("puts the registry's answer in front of the rule when enabled", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.30" },
+      versions: { "4.17.21": { deprecated: "use lodash-es" } },
+    });
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).toHaveBeenCalledWith("https://registry.npmjs.org/lodash");
+    expect(packFor(h)).toContain("latest is 4.17.30");
+    // Round four: the deprecation FLAG reaches the rule, the publisher's
+    // wording does not.
+    expect(packFor(h)).toMatch(/deprecated/i);
+    expect(packFor(h)).not.toContain("use lodash-es");
+    expect(packFor(h)).not.toMatch(/NOT been checked/);
+  });
+
+  // An outage must not read as a clean bill of health, and must not fail the
+  // review either.
+  it("reports a failed lookup as unchecked rather than as nothing to report", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn().mockRejectedValue(new Error("ECONNRESET"));
+
+    const exitCode = await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(exitCode).toBe(0);
+    expect(packFor(h)).toMatch(/lookup failed/);
+    // Final round: the reason is host-authored; the transport's own message is
+    // logged rather than carried into trusted context.
+    expect(packFor(h)).toMatch(/could not be reached/);
+    expect(packFor(h)).not.toMatch(/ECONNRESET/);
+  });
+
+  it("asks nothing when the diff changes no manifest", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    const fetchJson = vi.fn();
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(packFor(h)).toBeUndefined();
+  });
+});
+
+// PR #54 review: the legacy orchestrator has no context-pack concept — its
+// prompt builder never receives one — so the map was silently dropped there
+// while the registry requests still went out. Silent is the problem: the
+// operator asked for a dependency review, paid for the lookups, and got a run
+// that could not produce a single dependency finding.
+describe("review — dependency facts under legacy dispatch", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    '-    "lodash": "4.17.20",',
+    '+    "lodash": "4.17.21",',
+  ].join("\n");
+
+  it("asks the registry nothing, and says why, when the engine cannot carry it", async () => {
+    const h = makeHarness({
+      args: makeArgs({ dependencyFacts: "on", dispatch: "legacy" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(warn.mock.calls.flat().join(" ")).toMatch(/dependency.facts.*legacy|legacy.*dependency/i);
+    warn.mockRestore();
+  });
+
+  it("still reaches the rules on the default engine", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" },
+      versions: { "4.17.21": {} },
+    });
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).toHaveBeenCalled();
+  });
+});
+
+// PR #54 review, final round, P1: the context pack was built on EVERY review
+// whose diff touches a package.json, flag or no flag. Package names and
+// manifest paths are diff-controlled, and while the allowlists stop a path
+// forming a sentence with spaces, `ignore-all-previous-instructions` needs no
+// spaces. Those strings are already in UNTRUSTED_DIFF; copying them into
+// TRUSTED_CONTEXT is what elevates them, and it was happening by default.
+describe("review — the dependency pack is part of the opt-in", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    '+    "lodash": "4.17.21",',
+  ].join("\n");
+
+  const packFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  it("supplies no pack at all when the feature is off", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(packFor(h)).toBeUndefined();
+  });
+
+  it("supplies one when the feature is on", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, {
+      ...depsFrom(h),
+      fetchJson: vi.fn().mockResolvedValue({
+        "dist-tags": { latest: "4.17.21" },
+        versions: { "4.17.21": {} },
+      }),
+    });
+
+    expect(packFor(h)).toContain("lodash");
   });
 });

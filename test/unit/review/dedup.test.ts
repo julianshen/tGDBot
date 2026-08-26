@@ -39,6 +39,7 @@ function makeConfig(overrides: Partial<ReviewConfigForDedup> = {}): ReviewConfig
     rulesDir: ".tgd-review/rules",
     model: undefined,
     dispatch: "direct",
+    dependencyFacts: "off",
     ...overrides,
   };
 }
@@ -220,5 +221,27 @@ describe("formatMarker", () => {
     expect(formatMarker("abc123", "1a2b3c4d5e6f")).toBe(
       "<!-- tgd-review-agent:sha=abc123 cfg=1a2b3c4d5e6f -->",
     );
+  });
+});
+
+// PR #54 review: --dependency-facts changes what a review can find, so flipping
+// it on an unchanged head must re-trigger. Without it in the identity, turning
+// the feature on did nothing until someone pushed a commit.
+describe("computeReviewConfigHash — dependency facts", () => {
+  it("re-triggers a review when the flag is turned on", () => {
+    expect(computeReviewConfigHash(makeConfig({ dependencyFacts: "on" })))
+      .not.toBe(computeReviewConfigHash(makeConfig({ dependencyFacts: "off" })));
+  });
+
+  // The default contributes nothing, so adding this field did NOT invalidate
+  // every marker in the wild — no repository gets a spurious re-review of every
+  // open pull request just for upgrading.
+  it("leaves the hash of a default configuration untouched", () => {
+    // Captured from the build BEFORE --dependency-facts existed. Adding a
+    // field to the canonical array normally invalidates every marker in the
+    // wild and costs one re-review of every open pull request; the default
+    // contributes nothing to the array, so this stayed free.
+    expect(computeReviewConfigHash(makeConfig({ dependencyFacts: "off" })))
+      .toBe("157353dcae62");
   });
 });

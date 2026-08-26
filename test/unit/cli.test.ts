@@ -37,6 +37,9 @@ describe("parseCommandArgs", () => {
       rulesDir: ".review/rules",
       disableBuiltinRule: false,
       advisor: "on",
+      // Outbound network is opt-in. If this default ever flips, a review of a
+      // private repository starts telling npm what it depends on (PR #54).
+      dependencyFacts: "off",
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
@@ -79,6 +82,9 @@ describe("parseArgs", () => {
       rulesDir: ".review/rules",
       disableBuiltinRule: false,
       advisor: "on",
+      // Outbound network is opt-in. If this default ever flips, a review of a
+      // private repository starts telling npm what it depends on (PR #54).
+      dependencyFacts: "off",
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
@@ -101,6 +107,8 @@ describe("parseArgs", () => {
       "--disable-builtin-rule",
       "--advisor",
       "off",
+      "--dependency-facts",
+      "on",
       "--dry-run",
       "--trust-local-rules",
       "--dispatch",
@@ -113,6 +121,7 @@ describe("parseArgs", () => {
       rulesDir: "custom/rules",
       disableBuiltinRule: true,
       advisor: "off",
+      dependencyFacts: "on",
       suggestions: "on",
       dryRun: true,
       trustLocalRules: true,

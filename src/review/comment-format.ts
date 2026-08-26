@@ -283,6 +283,8 @@ export function renderInlineComment(
     parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
   }
 
+  const citations = renderReferences(finding);
+  if (citations) parts.push("", citations);
   if (options.alsoReported && options.alsoReported.length > 0) {
     parts.push("", renderAlsoReported(options.alsoReported));
   }
@@ -566,6 +568,65 @@ function renderDiffExcerpt(snippet: HunkSnippet): string {
 }
 
 // Collapsed so one entry stays scannable, present so nothing is lost.
+/**
+ * Issue #49: the documentation a finding rests on, so a reader can check the
+ * claim rather than take it. Already validated against the rule's own text on
+ * parse, so nothing here can be a model invention.
+ */
+function renderReferences(finding: Finding): string | undefined {
+  if (!finding.references || finding.references.length === 0) return undefined;
+  const items = finding.references
+
+    .map((url) => `- ${sanitizeInline(url)}`);
+  return [`**Reference**`, "", ...items].join("\n");
+}
+
+/**
+ * The same citations, as sub-bullets, for a finding rendered as a LIST ENTRY.
+ *
+ * A merged member and a disputed finding are one line each, so the standalone
+ * `**Reference**` block would break the list. Dropping them instead — which is
+ * what happened until PR #54's review — asks the reader to weigh a claim while
+ * the evidence for it sits one layer up, unrendered.
+ */
+/**
+ * The longest citation compact mode will print.
+ *
+ * Well under the 2,000 characters parsing accepts: this is a size fallback, and
+ * a URL long enough to matter against the budget is omitted and declared rather
+ * than cut down into something that no longer resolves.
+ */
+const MAX_COMPACT_REFERENCE_CHARS = 200;
+
+/**
+ * The compact budget: the first citation, and only if it fits WHOLE.
+ *
+ * The single definition on purpose. It was briefly stated twice — once for
+ * rendering and once for the omission counter — and a rule expressed in two
+ * places is a rule that will eventually disagree with itself, which here means
+ * the notice denying a shortfall that happened.
+ */
+function compactShownReference(finding: Finding): string | undefined {
+  const first = finding.references?.[0];
+  return first !== undefined && first.length <= MAX_COMPACT_REFERENCE_CHARS ? first : undefined;
+}
+
+/** How many of a finding's citations compact mode cannot show. */
+function compactUnshownCount(finding: Finding): number {
+  return (finding.references?.length ?? 0) - (compactShownReference(finding) === undefined ? 0 : 1);
+}
+
+function compactReferenceBullets(finding: Finding, indent: string): string[] {
+  const shown = compactShownReference(finding);
+  return shown === undefined ? [] : [`${indent}- Reference: ${sanitizeInline(shown)}`];
+}
+
+function referenceBullets(finding: Finding, indent: string): string[] {
+  if (!finding.references || finding.references.length === 0) return [];
+  return finding.references
+    .map((url) => `${indent}- Reference: ${sanitizeInline(url)}`);
+}
+
 function renderAlsoReported(members: readonly Finding[]): string {
   const items = members.flatMap((member) => {
     const rule = sanitizeInline(member.ruleName);
@@ -576,9 +637,10 @@ function renderAlsoReported(members: readonly Finding[]): string {
     // shown, always NON-committable: a merged member is a similarity judgement,
     // and a one-click commit should never rest on one.
     const suggestion = member.suggestion?.trim() ? capSuggestion(member.suggestion) : undefined;
+    const cited = referenceBullets(member, "  ");
     return suggestion === undefined
-      ? [line]
-      : [line, "", renderSuggestionBlock(suggestion, false), ""];
+      ? [line, ...cited]
+      : [line, ...cited, "", renderSuggestionBlock(suggestion, false), ""];
   });
   return detailsBlock(
     `Also reported by ${members.length} other rule${members.length === 1 ? "" : "s"}`,
@@ -625,6 +687,8 @@ function renderUnanchoredFinding(
         : "> Proposed fix omitted because the summary size budget was exhausted.",
     );
   }
+  const references = renderReferences(finding);
+  if (references) parts.push("", references);
   if (context?.alsoReported && context.alsoReported.length > 0) {
     parts.push("", renderAlsoReported(context.alsoReported));
   }
@@ -768,14 +832,27 @@ function renderClarificationSection(input: SummaryInput): string | undefined {
   ].join("\n");
 }
 
-function renderDisputedSection(input: SummaryInput): string | undefined {
+/**
+ * @param compact - apply the compact citation budget: one per finding, only if
+ * it fits whole. Compact mode reused this renderer at full length, so enough
+ * disputed citations kept the compact body oversized, dropped it into the
+ * emergency status-only form, and took the whole disputed section with it —
+ * silently (PR #54 review, round six).
+ */
+function renderDisputedSection(input: SummaryInput, compact = false): string | undefined {
   const disputed = input.disputed ?? [];
   if (disputed.length === 0) return undefined;
-  const items = disputed.map((finding) => {
+  const items = disputed.flatMap((finding) => {
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const message = sanitizeText(finding.message);
-    return `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`;
+    // A disputed finding is precisely the one whose evidence a reader needs.
+    return [
+      `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`,
+      ...(compact
+        ? compactReferenceBullets(finding, "  ")
+        : referenceBullets(finding, "  ")),
+    ];
   });
   return `### Disputed\n\n${items.join("\n")}`;
 }
@@ -888,6 +965,11 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
   const publishFailedSet = new Set(input.publishFailed ?? []);
+  // Every finding compact mode renders, not just the relocated ones. Disputed
+  // entries take the same budget, so leaving them out of the count made the
+  // notice deny a shortfall that had actually happened.
+  const unshownReferences = [...relocated, ...(input.disputed ?? [])]
+    .reduce((total, finding) => total + compactUnshownCount(finding), 0);
   const notice =
     "> [!WARNING]\n" +
     "> Review details were compacted to fit the provider limit; proposed fixes were omitted." +
@@ -897,10 +979,13 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     (publishFailedSet.size > 0
       ? `\n> ${publishFailedSet.size} inline comment(s) had valid anchors but publication failed` +
         compactFailureReasons(input, publishFailedSet)
+      : "") +
+    (unshownReferences > 0
+      ? `\n> ${unshownReferences} further reference(s) omitted; one is shown per finding`
       : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);
-  const disputed = renderDisputedSection(input);
+  const disputed = renderDisputedSection(input, true);
   const failedRules = input.rulesFailed.length > 0
     ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
         .map((name) => {
@@ -932,9 +1017,21 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     // The badge is charged against the same budget as everything else below,
     // so it costs message characters rather than overflowing the limit.
     const effort = finding.effort === undefined ? "" : ` ${EFFORT_BADGE[finding.effort]}`;
-    return { prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `, message };
+    // The FIRST citation only. A citation is the evidence a claim rests on, and
+    // dropping it silently on the large reviews — where the reader has least
+    // context — was the worst place to drop it (PR #54 review). It rides in the
+    // prefix so it is charged against the fixed budget and shrinks the message
+    // allowance rather than overflowing the provider limit; the rest are
+    // declared missing in the notice above rather than quietly discarded.
+    const citation = compactShownReference(finding);
+    const reference = citation === undefined ? "" : `\n  - Reference: ${sanitizeInline(citation)}`;
+    return {
+      prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `,
+      message,
+      reference,
+    };
   });
-  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix }) => prefix)]
+  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -953,7 +1050,8 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     relatedWork,
     crossFile,
     ...findings.map(
-      ({ prefix, message }, index) => `${prefix}${truncate(message, messageBudgets[index] ?? 0)}`,
+      ({ prefix, message, reference }, index) =>
+        `${prefix}${truncate(message, messageBudgets[index] ?? 0)}${reference}`,
     ),
   ].filter((part): part is string => part !== undefined).join("\n\n");
 

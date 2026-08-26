@@ -118,10 +118,13 @@ import {
 } from "../../../src/review/extensions.js";
 import {
   MAX_FINDING_QUESTION_CHARS,
+  MAX_REFERENCES_PER_FINDING,
   parseDispatchResult,
   extractFindingsArray,
+  referencesDeclaredBy,
   parseFindingsFromFinalOutput,
 } from "../../../src/review/dispatch-results.js";
+import { renderInlineComment } from "../../../src/review/comment-format.js";
 
 function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
   return {
@@ -2412,5 +2415,267 @@ describe("a findings array is all or nothing", () => {
     const raw = JSON.stringify([coreFinding, { ...coreFinding, line: 9 }]);
 
     expect(parseFindingsFromFinalOutput(raw, "rule-a")).toHaveLength(2);
+  });
+});
+
+
+// Issue #49: a finding that cites the documentation it is based on is worth
+// more than one that asserts. The hazard is a HALLUCINATED citation — a
+// fabricated link looks authoritative and is worse than none — so a finding may
+// only cite a URL that appears in its own rule's text. The model cannot invent
+// a reference it was not given, which makes the guarantee structural rather
+// than a matter of the model behaving.
+describe("finding references are limited to what the rule declared", () => {
+  // Exercised through the path that KNOWS which rule produced the finding.
+  // parseDispatchResult deliberately does not: see "citations are not taken on
+  // an unverified rule name" below.
+  const declared = referencesDeclaredBy(
+    "See https://docs.example.com/ttl and https://docs.example.com/caching for the contract.",
+  );
+  const parse = (references: unknown) => parseFindingsFromFinalOutput(
+    JSON.stringify([{ ...coreFinding, references }]),
+    "rule-a",
+    declared,
+  )[0];
+
+  it("keeps a citation the rule itself contains", () => {
+    expect(parse(["https://docs.example.com/ttl"])?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("keeps several", () => {
+    expect(parse(["https://docs.example.com/ttl", "https://docs.example.com/caching"])?.references)
+      .toHaveLength(2);
+  });
+
+  // The whole point: a plausible-looking URL the rule never mentioned is
+  // dropped, and the finding still posts.
+  it("drops a citation the rule never made", () => {
+    const finding = parse(["https://docs.example.com/invented"]);
+
+    expect(finding?.references).toBeUndefined();
+    expect(finding?.message).toBe(coreFinding.message);
+  });
+
+  it("keeps the real ones when only some are invented", () => {
+    expect(parse(["https://docs.example.com/ttl", "https://evil.example/x"])?.references)
+      .toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("ignores a references field that is not a list of strings", () => {
+    for (const value of ["https://docs.example.com/ttl", 3, {}, [1, 2], null]) {
+      expect(parse(value)?.references, `${JSON.stringify(value)} was accepted`).toBeUndefined();
+    }
+  });
+
+  it("drops every citation when the rule text is unavailable", () => {
+    const recovered = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://docs.example.com/ttl"] }]),
+      "rule-a",
+    );
+
+    expect(recovered[0]?.references).toBeUndefined();
+  });
+});
+
+describe("citations survive the default dispatch path", () => {
+  const ruleBody = "See https://docs.example.com/ttl for the contract.";
+
+  it("keeps a declared citation when the parser is given the rule text", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://docs.example.com/ttl"] }]),
+      "rule-a",
+      referencesDeclaredBy(ruleBody),
+    );
+
+    expect(findings[0]?.references).toEqual(["https://docs.example.com/ttl"]);
+  });
+
+  it("still drops an invented one", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://evil.example/x"] }]),
+      "rule-a",
+      referencesDeclaredBy(ruleBody),
+    );
+
+    expect(findings[0]?.references).toBeUndefined();
+  });
+
+  it("fails closed when no rule text is supplied", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: ["https://docs.example.com/ttl"] }]),
+      "rule-a",
+    );
+
+    expect(findings[0]?.references).toBeUndefined();
+  });
+});
+
+// The state schema rejects a persisted array longer than 20, so an unbounded
+// one would parse, publish, and then make the ledger unreadable on the next
+// state read.
+describe("citations are bounded before they can be persisted", () => {
+  it("caps and deduplicates repeated citations", () => {
+    const url = "https://docs.example.com/ttl";
+    const declared = referencesDeclaredBy(`see ${url}`);
+
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: Array.from({ length: 40 }, () => url) }]),
+      "rule-a",
+      declared,
+    );
+
+    expect(findings[0]?.references).toEqual([url]);
+  });
+
+  it("caps distinct citations at the state schema's limit", () => {
+    const urls = Array.from({ length: 30 }, (_unused, index) => `https://docs.example.com/p${index}`);
+    const declared = referencesDeclaredBy(urls.join(" "));
+
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: urls }]),
+      "rule-a",
+      declared,
+    );
+
+    expect(findings[0]?.references?.length).toBeLessThanOrEqual(20);
+  });
+});
+
+// Under legacy dispatch the orchestrating model supplies ruleName, and
+// reconcileWithCapturedResults explicitly does not detect misattribution.
+// Selecting the allowlist from that unverified name would let a finding
+// attributed to rule B cite rule B's URLs even though rule A produced it.
+describe("citations are not taken on an unverified rule name", () => {
+  it("drops citations from the orchestrator's merged output", () => {
+    const parsed = parseDispatchResult(
+      JSON.stringify({
+        findings: [{ ...coreFinding, references: ["https://docs.example.com/ttl"] }],
+        rulesRun: ["rule-a"],
+        rulesFailed: [],
+      }),
+      [{ name: "rule-a", body: "See https://docs.example.com/ttl", sourcePath: "r.md", dependsOn: [] }],
+    );
+
+    expect(parsed.findings[0]?.references).toBeUndefined();
+  });
+});
+
+// PR #54 review: parsing kept up to 20 citations and the state schema accepted
+// them, but the renderer printed the first five and dropped the rest without
+// saying so. A citation that survives validation and persistence must reach the
+// reader, so there is now ONE limit, applied where the array is built.
+describe("the citation limit is the one the reader sees", () => {
+  it("keeps no more citations than a comment renders", () => {
+    const urls = Array.from({ length: 12 }, (_, i) => `https://docs.example.com/${i}`);
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, references: urls }]),
+      "rule-a",
+      referencesDeclaredBy(urls.join(" ")),
+    );
+
+    const kept = findings[0]?.references ?? [];
+    expect(kept.length).toBe(MAX_REFERENCES_PER_FINDING);
+    // Every kept citation is printed: nothing is dropped at the last step.
+    const body = renderInlineComment(findings[0]!, "abc1234", { suggestions: false });
+    for (const url of kept) expect(body).toContain(url);
+  });
+});
+
+// PR #54 review, round four: normalizeUnknownFinding prefers a model-supplied
+// ruleName over the argument. On the direct path that meant references were
+// validated against the rule that ACTUALLY ran while the finding was stamped
+// with whatever name the model claimed — so rule A could publish under rule B's
+// name carrying rule A's citations. The task's own rule is a fact; the name in
+// the payload is a claim.
+describe("a task's findings are stamped with the rule that ran", () => {
+  it("overrides a model-supplied rule name", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, ruleName: "rule-b" }]),
+      "rule-a",
+    );
+
+    expect(findings[0]?.ruleName).toBe("rule-a");
+  });
+
+  it("keeps citations bound to the rule that actually declared them", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{
+        ...coreFinding,
+        ruleName: "rule-b",
+        references: ["https://docs.example.com/a"],
+      }]),
+      "rule-a",
+      referencesDeclaredBy("see https://docs.example.com/a"),
+    );
+
+    // Both halves must agree: the name and the citation describe one rule.
+    expect(findings[0]?.ruleName).toBe("rule-a");
+    expect(findings[0]?.references).toEqual(["https://docs.example.com/a"]);
+  });
+});
+
+// PR #54 review, round five: the extractor excluded parentheses and brackets
+// outright, so a rule declaring `.../Function_(computing)` registered only the
+// prefix. A reviewer citing the real URL then failed the exact-match check and
+// lost its citation silently; one citing the extracted prefix published a link
+// to somewhere other than the documentation the rule named.
+describe("referencesDeclaredBy — URLs with delimiters", () => {
+  it("keeps a parenthesised path whole", () => {
+    const url = "https://example.com/wiki/Function_(computing)";
+
+    expect(referencesDeclaredBy(`See ${url} for the contract.`).has(url)).toBe(true);
+  });
+
+  it("keeps a bracketed path whole", () => {
+    const url = "https://example.com/docs/array[0]";
+
+    expect(referencesDeclaredBy(`See ${url}.`).has(url)).toBe(true);
+  });
+
+  it("keeps nested parentheses whole", () => {
+    const url = "https://example.com/a_(b_(c))";
+
+    expect(referencesDeclaredBy(`See ${url}.`).has(url)).toBe(true);
+  });
+
+  // The reason the delimiters were excluded in the first place: prose wraps
+  // URLs in parentheses, and the closing one is punctuation, not path.
+  it("does not swallow a closing parenthesis that belongs to the sentence", () => {
+    const declared = referencesDeclaredBy("the contract (see https://example.com/docs) is clear");
+
+    expect(declared.has("https://example.com/docs")).toBe(true);
+    expect(declared.has("https://example.com/docs)")).toBe(false);
+  });
+
+  it("still strips trailing sentence punctuation", () => {
+    const declared = referencesDeclaredBy("See https://example.com/docs.");
+
+    expect(declared.has("https://example.com/docs")).toBe(true);
+  });
+
+  it("keeps a markdown link target out of the trailing bracket", () => {
+    const declared = referencesDeclaredBy("[the docs](https://example.com/docs)");
+
+    expect(declared.has("https://example.com/docs")).toBe(true);
+  });
+
+  // Admitting delimiters and trimming AFTERWARDS is not enough: with no space
+  // between two links the greedy match runs through both, and balancing the
+  // tail leaves one unusable string while the second URL is never registered
+  // at all. The scan has to stop at the delimiter that closes nothing.
+  it("separates two markdown links written back to back", () => {
+    const declared = referencesDeclaredBy("[a](https://x.example.com/a)[b](https://y.example.com/b)");
+
+    expect([...declared].sort()).toEqual([
+      "https://x.example.com/a",
+      "https://y.example.com/b",
+    ]);
+  });
+
+  it("separates a parenthesised URL followed immediately by another", () => {
+    const declared = referencesDeclaredBy("(https://x.example.com/a)(https://y.example.com/b)");
+
+    expect(declared.has("https://x.example.com/a")).toBe(true);
+    expect(declared.has("https://y.example.com/b")).toBe(true);
   });
 });

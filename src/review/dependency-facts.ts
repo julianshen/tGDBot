@@ -1,0 +1,219 @@
+// Issue #50: the facts a reviewer needs about a dependency bump and cannot get
+// from the checkout — whether a version is current, published, or deprecated.
+//
+// The fetcher is INJECTED. No HTTP lives here, which keeps the whole suite off
+// the network and leaves timeouts, proxies and retries to the caller that owns
+// them. It also means this module cannot be talked into reaching somewhere
+// unexpected: it only ever asks for a URL that `registryUrlFor` built.
+//
+// Every failure becomes an explicit `unknown` rather than an absence. A review
+// that could not check something must say so — implying it checked and found
+// nothing is the silent-degradation failure this project rejects elsewhere
+// (see the large-diff completeness work, #33/#35).
+import { isExactVersion, isValidPackageName, registryUrlFor } from "./dependency-changes.js";
+import type { DependencyChange } from "./dependency-changes.js";
+
+/** What the host could establish about one changed dependency. */
+export interface DependencyFact {
+  readonly name: string;
+  /** The version the pull request moves to. */
+  readonly version: string;
+  /**
+   * The spec that produced this fact, verbatim.
+   *
+   * A pin and a range share a `version` once the operator is stripped, so it
+   * cannot identify which change a fact belongs to — the pack looked them up by
+   * `name@version` and handed both changes the same fact (PR #54 review, round
+   * six).
+   */
+  readonly spec: string;
+  /** The registry's current `latest`, when it could be read. */
+  readonly latest?: string;
+  /**
+   * Whether the registry publishes this exact version.
+   *
+   * ABSENT for a range like `^1.2`: the registry keys its versions by exact
+   * release, so a partial pin is simply not a question it can answer, and
+   * answering `false` claimed the build would not install for a dependency npm
+   * resolves fine (PR #54 review).
+   */
+  readonly published?: boolean;
+  /** The registry's deprecation notice for this version, if any. */
+  readonly deprecated?: string;
+  /** Why nothing could be established. Present iff the lookup failed. */
+  readonly unknown?: string;
+}
+
+/**
+ * A rejection value rendered as text, whatever it is.
+ *
+ * `String()` is not total: it throws for a null-prototype object and for one
+ * whose primitive conversion throws. That exception escaped the catch below and
+ * rejected the whole lookup phase, losing the unknown fact the catch exists to
+ * produce (PR #54 review, round six).
+ */
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  try {
+    return String(error);
+  } catch {
+    return "an error that could not be rendered";
+  }
+}
+
+/** Parsed JSON, or a throw. Anything network-shaped belongs to the caller. */
+export type FetchJson = (url: string) => Promise<unknown>;
+
+/**
+ * How many lookups run at once.
+ *
+ * Matches the related-work resolver's bound. A pull request can change many
+ * dependencies, and a review is not entitled to open an unbounded number of
+ * connections on the operator's behalf.
+ */
+const CONCURRENCY = 3;
+
+/**
+ * How long the whole lookup phase may take.
+ *
+ * Per-request timeouts do not bound this: three workers draining the 200-package
+ * ceiling against a registry that hangs is `ceil(200 / 3)` timeouts deep — over
+ * eleven minutes before dispatch even starts (PR #54 review). A review must not
+ * be consumable by someone else's outage, so the phase gives up as a whole and
+ * every package it never reached says so.
+ */
+const DEFAULT_DEADLINE_MS = 60_000;
+
+/** Injectable so the suite can exercise the deadline without waiting on it. */
+export interface DependencyFactOptions {
+  readonly deadlineMs?: number;
+  readonly now?: () => number;
+}
+
+function readRegistryDocument(
+  change: DependencyChange,
+  body: unknown,
+): DependencyFact {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { name: change.name, version: change.version, spec: change.spec, unknown: "the registry returned no usable document" };
+  }
+  const document = body as Record<string, unknown>;
+  const versions = document.versions;
+  if (typeof versions !== "object" || versions === null || Array.isArray(versions)) {
+    return { name: change.name, version: change.version, spec: change.spec, unknown: "the registry document listed no versions" };
+  }
+  const distTags = document["dist-tags"];
+  const latest =
+    typeof distTags === "object" && distTags !== null && !Array.isArray(distTags)
+      ? (distTags as Record<string, unknown>).latest
+      : undefined;
+  // Only a PIN earns a per-version fact. `^1.2.3` installs whatever 1.x the
+  // resolver picks, so the registry's answer about 1.2.3 specifically says
+  // nothing about what the build gets — and reporting a deprecated or absent
+  // lower bound as the installed version was a confidently false claim
+  // (PR #54 review, round five). `isExactVersion` still guards the lookup key
+  // itself, since a range's stripped remainder need not be a valid key.
+  const exact = change.pinned && isExactVersion(change.version);
+  const entry = exact ? (versions as Record<string, unknown>)[change.version] : undefined;
+  const published = exact
+    ? Object.hasOwn(versions as Record<string, unknown>, change.version)
+    : undefined;
+  const deprecated =
+    typeof entry === "object" && entry !== null && !Array.isArray(entry)
+      ? (entry as Record<string, unknown>).deprecated
+      : undefined;
+  return {
+    name: change.name,
+    version: change.version,
+    spec: change.spec,
+    ...(published === undefined ? {} : { published }),
+    ...(typeof latest === "string" ? { latest } : {}),
+    ...(typeof deprecated === "string" ? { deprecated } : {}),
+  };
+}
+
+/**
+ * Looks up each changed dependency, once per package.
+ *
+ * Deduplicated by name and version: a monorepo names the same dependency in
+ * several manifests, and that is one question, not several.
+ */
+export async function fetchDependencyFacts(
+  changes: readonly DependencyChange[],
+  fetchJson: FetchJson,
+  options: DependencyFactOptions = {},
+): Promise<DependencyFact[]> {
+  const now = options.now ?? (() => Date.now());
+  const deadline = now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
+  // Grouped by NAME, not by name@version: one packument carries every version,
+  // so asking again per version spent the lookup budget re-fetching the same
+  // document — and a monorepo pinning several versions of one package is
+  // exactly where that budget matters (PR #54 review, round five).
+  const byName = new Map<string, DependencyChange[]>();
+  for (const change of changes) {
+    const group = byName.get(change.name);
+    if (group === undefined) byName.set(change.name, [change]);
+    // Deduplicated by SPEC, not version: `^1.2.3` and `1.2.3` are different
+    // questions of the same document, and collapsing them dropped the pin —
+    // the only one of the two the registry can answer (PR #54 review, round
+    // six). Both still ride on one request.
+    else if (!group.some((seen) => seen.spec === change.spec)) group.push(change);
+  }
+  const queue = [...byName.values()];
+  const facts: DependencyFact[][] = new Array(queue.length);
+
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < queue.length) {
+      const index = next++;
+      const group = queue[index]!;
+      const first = group[0]!;
+      const asUnknown = (unknown: string): DependencyFact[] =>
+        group.map((change) => ({
+          name: change.name,
+          version: change.version,
+          spec: change.spec,
+          unknown,
+        }));
+      // Never silence: a package nobody got to is UNKNOWN, not clean.
+      if (now() >= deadline) {
+        facts[index] = asUnknown(
+          "the lookup budget for this review ran out before this package was checked",
+        );
+        continue;
+      }
+      // Defence in depth: the parser cannot emit an invalid name, so this is
+      // reachable only by a caller that skipped it. Never let one through to a
+      // request.
+      if (!isValidPackageName(first.name)) {
+        facts[index] = asUnknown("the package name is not one the registry would accept");
+        continue;
+      }
+      try {
+        const document = await fetchJson(registryUrlFor(first.name));
+        facts[index] = group.map((change) => readRegistryDocument(change, document));
+      } catch (error) {
+        // One dead lookup must not cost the others, and must not read as "we
+        // checked and it was fine".
+        //
+        // A cast is not a check: a fetcher can reject with a string or a
+        // plain object, and `(error as Error).message` then rendered
+        // "reached (undefined)" — nothing, at the moment an operator most
+        // needs something (PR #54 review, round four).
+        // HOST-AUTHORED, with no remote text in it. `fetchJsonReal` puts the
+        // response's own `statusText` into the error it throws, so
+        // interpolating the message here piped an intermediary's prose into
+        // TRUSTED_CONTEXT — the same channel the publisher's deprecation notice
+        // was removed to close, and flattening does not close it (PR #54
+        // review, final round). The detail is still worth having, so it goes
+        // where diagnostics belong.
+        console.warn(
+          `tgd-review-agent: registry lookup for ${first.name} failed (${errorText(error)})`,
+        );
+        facts[index] = asUnknown("the registry could not be reached");
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
+  return facts.flat();
+}

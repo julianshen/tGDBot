@@ -28,6 +28,12 @@ export interface ReviewConfigForDedup {
    * re-review per open PR after upgrading, then hashes are stable again.
    */
   dispatch: "direct" | "legacy";
+  /**
+   * PR #54 review: this decides whether a review can see registry facts at
+   * all, so flipping it must re-trigger on an unchanged head. Optional so the
+   * older two-field callers and their pinned hashes still typecheck.
+   */
+  dependencyFacts?: "on" | "off";
 }
 
 /**
@@ -93,6 +99,12 @@ export function computeReviewConfigHash(
     config.rulesDir.replace(/\\/g, "/"),
     config.model ?? null,
     config.dispatch,
+    // Contributes NOTHING when off, which is the default. Appending an
+    // unconditional field would have changed every hash in the wild and cost a
+    // spurious re-review of every open pull request on upgrade — the price the
+    // `dispatch` field above had to pay. Turning the flag on still changes the
+    // hash, which is the whole point.
+    ...(config.dependencyFacts === "on" ? ["dependency-facts"] : []),
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,

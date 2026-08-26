@@ -22,7 +22,10 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { FINDING_JSON_CONTRACT, FINDING_OBJECT_CONTRACT } from "../../../src/review/dispatch-prompt.js";
-import { parseDispatchResult } from "../../../src/review/dispatch-results.js";
+import {
+  parseFindingsFromFinalOutput,
+  referencesDeclaredBy,
+} from "../../../src/review/dispatch-results.js";
 import { renderInlineComment, renderSummaryComment } from "../../../src/review/comment-format.js";
 import { stripReviewMarker, stripSignature, toFindingSnapshot } from "../../../src/review/review-publication.js";
 import { BOT_SIGNATURE, BOT_SIGNATURE_BLOCK, INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
@@ -92,6 +95,7 @@ const COMPLETE: Required<Finding> = {
   // makes this file notice if that regresses.
   suggestion: "\tif stale(entry) {\n\t\treturn revalidate(ctx)\n\t}",
   effort: "heavy",
+  references: ["https://docs.example.com/ttl"],
 };
 
 const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
@@ -177,16 +181,18 @@ describe("every Finding field survives every representation", () => {
   });
 
   it("round-trips through the reviewer-output parser", () => {
-    const raw = JSON.stringify({
-      findings: [COMPLETE],
-      rulesRun: [COMPLETE.ruleName],
-      rulesFailed: [],
-    });
-
-    const parsed = parseDispatchResult(raw, [
-      { name: COMPLETE.ruleName, body: "rule body", sourcePath: "rules/x.md", dependsOn: [] },
-    ]);
-    const finding = parsed.findings[0] as unknown as Record<string, unknown>;
+    // The per-rule dispatch path, which is what the CLI runs. The legacy
+    // orchestrator's merged output is checked separately in dispatch.test.ts:
+    // it drops citations on purpose, because it cannot prove which rule
+    // produced a finding (PR #54 review).
+    const parsed = parseFindingsFromFinalOutput(
+      JSON.stringify([COMPLETE]),
+      COMPLETE.ruleName,
+      // The rule must DECLARE the citation, or the parser correctly discards
+      // it — a finding may only cite what its own rule text contains (#49).
+      referencesDeclaredBy(`rule body — see ${COMPLETE.references[0]}`),
+    );
+    const finding = parsed[0] as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
       expect(finding[field], `the parser drops ${field}`).toEqual(COMPLETE[field]);
@@ -261,6 +267,7 @@ describe("every Finding field reaches the reader", () => {
     title: COMPLETE.title,
     message: COMPLETE.message,
     suggestion: COMPLETE.suggestion,
+    references: COMPLETE.references[0],
   };
 
   /** Fields an inline comment deliberately does not print. */

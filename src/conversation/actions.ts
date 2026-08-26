@@ -10,6 +10,7 @@ import {
   extractFindingsArray,
   normalizeUnknownFinding,
   parseFindingsFromFinalOutput,
+  referencesDeclaredBy,
 } from "../review/dispatch-results.js";
 import type { Finding } from "../review/types.js";
 import { FINDING_JSON_CONTRACT, FINDING_OBJECT_CONTRACT } from "../review/dispatch-prompt.js";
@@ -270,6 +271,27 @@ export function parseReconsiderOutput(
       Object.assign(merged, { [field]: original[field] });
     }
   }
+
+  // Citations do not follow the rule above, in either direction. A restated one
+  // cannot be honoured — provenance is established against the RULE'S text, and
+  // no rule text reaches this parser, so `normalizeUnknownFinding` correctly
+  // refuses everything the response supplies. That left a confirmed finding
+  // publishing without the documentation it was published with the first time
+  // (PR #54 review). The snapshot's array was already validated on the way in,
+  // and a reassessment has no authority to add to it or take from it, so it
+  // simply carries over — including the response's attempt to replace it.
+  //
+  // CONFIRMED only. "Confirmed" means the finding still holds, so the evidence
+  // for it still holds. "Revised" means the claim itself changed, and attaching
+  // the old documentation to a new claim asserts support this parser cannot
+  // check (PR #54 review, round five) — a citation that no longer backs what it
+  // sits under is worse than none.
+  if (parsed.outcome === "confirmed" && original?.references !== undefined) {
+    Object.assign(merged, { references: original.references });
+  } else {
+    delete (merged as { references?: unknown }).references;
+  }
+
   return { outcome: parsed.outcome, finding: merged, rationale };
 }
 
@@ -475,7 +497,31 @@ export async function focusReview(
     input,
     (text) => {
       if (extractFindingsArray(text) === undefined) return undefined;
-      return { findings: parseFindingsFromFinalOutput(text, input.rules[0]?.name ?? "focus") };
+      // The UNION of the focus set's declarations, not one rule's.
+      //
+      // A focus review runs every trusted rule in ONE session against one
+      // merged output, and the contract has no `ruleName` field — which is why
+      // the attribution below is already the first rule's name rather than the
+      // producing rule's. So per-rule provenance is not available on this path
+      // and pretending otherwise would be the misattribution the merged
+      // orchestrator output was stopped for.
+      //
+      // What the union still guarantees is the property that matters: every URL
+      // was declared by a rule that actually ran in THIS review, so the model
+      // cannot invent one. Parsing with no set at all fails closed and stripped
+      // every citation, including ones the contract asks the model to emit
+      // (PR #54 review, final round).
+      const declared = new Set<string>();
+      for (const rule of input.rules) {
+        for (const url of referencesDeclaredBy(rule.body)) declared.add(url);
+      }
+      return {
+        findings: parseFindingsFromFinalOutput(
+          text,
+          input.rules[0]?.name ?? "focus",
+          declared,
+        ),
+      };
     },
   );
 }

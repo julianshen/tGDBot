@@ -219,6 +219,8 @@ export interface FindingSnapshot {
    * so a field the snapshot cannot hold is a field the reader never sees.
    */
   readonly effort?: "quick" | "heavy";
+  /** Issue #49: documentation the finding cites, already validated on parse. */
+  readonly references?: readonly string[];
 }
 
 export interface FindingReviewOptions {
@@ -1063,7 +1065,7 @@ export function materializeMemories(entries: readonly MemoryEntry[]): readonly M
 
 function findingSnapshot(value: unknown, name: string): FindingSnapshot {
   const object = exact(value, name, ["file", "severity", "category", "message", "ruleName"],
-    ["line", "decision", "question", "title", "suggestion", "endLine", "effort"]);
+    ["line", "decision", "question", "title", "suggestion", "endLine", "effort", "references"]);
   if (object.severity !== "blocking" && object.severity !== "warning" && object.severity !== "suggestion") {
     throw new Error(`${name}.severity is invalid`);
   }
@@ -1089,6 +1091,13 @@ function findingSnapshot(value: unknown, name: string): FindingSnapshot {
   if (object.effort !== undefined) {
     if (object.effort !== "quick" && object.effort !== "heavy") throw new Error(`${name}.effort is invalid`);
     result.effort = object.effort;
+  }
+  if (object.references !== undefined) {
+    if (!Array.isArray(object.references) || object.references.length > 20) {
+      throw new Error(`${name}.references must be a bounded array`);
+    }
+    result.references = object.references.map((url, index) =>
+      text(url, `${name}.references[${index}]`, 2_000));
   }
   return result;
 }
