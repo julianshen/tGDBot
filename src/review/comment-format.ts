@@ -533,12 +533,36 @@ function renderReferences(finding: Finding): string | undefined {
  * what happened until PR #54's review — asks the reader to weigh a claim while
  * the evidence for it sits one layer up, unrendered.
  */
-/** The compact budget: the first citation, and only if it fits whole. */
-function compactReferenceBullets(finding: Finding, indent: string): string[] {
+/**
+ * The longest citation compact mode will print.
+ *
+ * Well under the 2,000 characters parsing accepts: this is a size fallback, and
+ * a URL long enough to matter against the budget is omitted and declared rather
+ * than cut down into something that no longer resolves.
+ */
+const MAX_COMPACT_REFERENCE_CHARS = 200;
+
+/**
+ * The compact budget: the first citation, and only if it fits WHOLE.
+ *
+ * The single definition on purpose. It was briefly stated twice — once for
+ * rendering and once for the omission counter — and a rule expressed in two
+ * places is a rule that will eventually disagree with itself, which here means
+ * the notice denying a shortfall that happened.
+ */
+function compactShownReference(finding: Finding): string | undefined {
   const first = finding.references?.[0];
-  return first !== undefined && first.length <= MAX_COMPACT_REFERENCE_CHARS
-    ? [`${indent}- Reference: ${sanitizeInline(first)}`]
-    : [];
+  return first !== undefined && first.length <= MAX_COMPACT_REFERENCE_CHARS ? first : undefined;
+}
+
+/** How many of a finding's citations compact mode cannot show. */
+function compactUnshownCount(finding: Finding): number {
+  return (finding.references?.length ?? 0) - (compactShownReference(finding) === undefined ? 0 : 1);
+}
+
+function compactReferenceBullets(finding: Finding, indent: string): string[] {
+  const shown = compactShownReference(finding);
+  return shown === undefined ? [] : [`${indent}- Reference: ${sanitizeInline(shown)}`];
 }
 
 function referenceBullets(finding: Finding, indent: string): string[] {
@@ -872,15 +896,6 @@ function compactFailureReasons(input: SummaryInput, failed: ReadonlySet<Finding>
   return `:\n> ${shown.map((reason) => `- ${reason}`).join("\n> ")}${more}`;
 }
 
-/**
- * The longest citation compact mode will print.
- *
- * Well under the 2,000 characters parsing accepts: this is a size fallback, and
- * a URL long enough to matter against the budget is omitted and declared rather
- * than cut down into something that no longer resolves.
- */
-const MAX_COMPACT_REFERENCE_CHARS = 200;
-
 function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // Compact mode must carry the SAME finding set as the full renderer — it is a
   // size fallback, not a scope fallback. Publication failures were previously
@@ -894,18 +909,11 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
   const publishFailedSet = new Set(input.publishFailed ?? []);
-  // A citation is shown only if it fits WHOLE. Truncating a URL produces a link
-  // that does not resolve while still reading as evidence, and it was being
-  // counted as shown, so the reader was never told (PR #54 review, round four).
-  const shownReference = (finding: Finding): string | undefined => {
-    const first = finding.references?.[0];
-    return first !== undefined && first.length <= MAX_COMPACT_REFERENCE_CHARS ? first : undefined;
-  };
-  const unshownReferences = relocated.reduce(
-    (total, finding) =>
-      total + (finding.references?.length ?? 0) - (shownReference(finding) === undefined ? 0 : 1),
-    0,
-  );
+  // Every finding compact mode renders, not just the relocated ones. Disputed
+  // entries take the same budget, so leaving them out of the count made the
+  // notice deny a shortfall that had actually happened.
+  const unshownReferences = [...relocated, ...(input.disputed ?? [])]
+    .reduce((total, finding) => total + compactUnshownCount(finding), 0);
   const notice =
     "> [!WARNING]\n" +
     "> Review details were compacted to fit the provider limit; proposed fixes were omitted." +
@@ -959,7 +967,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     // prefix so it is charged against the fixed budget and shrinks the message
     // allowance rather than overflowing the provider limit; the rest are
     // declared missing in the notice above rather than quietly discarded.
-    const citation = shownReference(finding);
+    const citation = compactShownReference(finding);
     const reference = citation === undefined ? "" : `\n  - Reference: ${sanitizeInline(citation)}`;
     return {
       prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `,

@@ -1379,3 +1379,56 @@ describe("renderSummaryComment — disputed citations respect the compact budget
     expect(body).toContain("Disputed claim 0.");
   });
 });
+
+// Found while auditing round six's own change: applying the compact citation
+// budget to disputed entries made them drop citations too, but the notice's
+// omission counter still only reduced over the relocated findings. So the
+// shortfall was real and the number denying it was wrong — the same "reader is
+// never told" failure the budget was added to fix.
+describe("renderSummaryComment — the compact omission count includes disputed findings", () => {
+  it("counts citations dropped from the disputed section", () => {
+    const disputed = [makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "Disputed claim.",
+      decision: "disputed",
+      references: [
+        "https://docs.example.com/one",
+        "https://docs.example.com/two",
+        "https://docs.example.com/three",
+      ],
+    })];
+    const relocated = makeFinding({ file: "b.go", line: 1, message: "r".repeat(2000) });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [relocated],
+      inlineCount: 0,
+      unanchored: [relocated],
+      disputed,
+    }), 900);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    // One shown, two dropped — and the notice must say two, not nothing.
+    expect(body).toMatch(/2 further reference/);
+  });
+
+  it("says nothing when the disputed section loses none", () => {
+    const disputed = [makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "Disputed claim.",
+      decision: "disputed",
+      references: ["https://docs.example.com/only"],
+    })];
+    const relocated = makeFinding({ file: "b.go", line: 1, message: "r".repeat(2000) });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [relocated],
+      inlineCount: 0,
+      unanchored: [relocated],
+      disputed,
+    }), 900);
+
+    expect(body).not.toMatch(/further reference/);
+  });
+});
