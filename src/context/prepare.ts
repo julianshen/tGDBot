@@ -247,7 +247,7 @@ export async function prepareReviewContext(
     // handed to the reviewing model inside `[TRUSTED_CONTEXT]`. Hash integrity
     // is not provenance; ownership of the directory is what supplies it. Same
     // guard the managed git workspace already applies to its own root.
-    await mkdir(request.cacheRoot, { recursive: true });
+    await mkdir(request.cacheRoot, { recursive: true, mode: 0o700 });
     // Resolve to the PHYSICAL path first. `protectManagedRoot` walks ancestors
     // with `stat`, which follows symlinks, so it inspects a link target's mode
     // rather than noticing the link — leaving room to point an ancestor at a
@@ -257,7 +257,7 @@ export async function prepareReviewContext(
     // cannot redirect it. Same reason `prepareWorkspace` resolves its own root
     // (`physicalWorkspaceRoot`) before protecting it.
     const physicalCacheRoot = await realpath(request.cacheRoot);
-    await protectManagedRoot(physicalCacheRoot, "Context cache");
+    await protectManagedRoot(physicalCacheRoot, "Context cache", { rejectPreviouslyShared: true });
     cache = createCache(physicalCacheRoot);
     key = contextCacheKey(request);
   } catch (error) {

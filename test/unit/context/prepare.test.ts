@@ -1,4 +1,4 @@
-import { chown, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -651,6 +651,40 @@ describe("prepareReviewContext", () => {
     // The entry must live under the resolved directory, not be reachable only
     // through the link.
     await expect(readdir(path.join(real, "cache", "contexts"))).resolves.not.toEqual([]);
+  });
+
+  it("refuses a cache root that other users could previously write", async () => {
+    if (process.platform === "win32") return;
+    const { worktree, request } = await baseRequest();
+    const mapper = stubMapper();
+    // Owned by us now, but it was world-writable, so another user may already
+    // have put an entry inside. chmod 0700 would lock the door on their files
+    // and `lookupContext` would then read one as trusted-base context.
+    await mkdir(request.cacheRoot as string, { recursive: true });
+    await chmod(request.cacheRoot as string, 0o777);
+
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => mapper,
+    });
+
+    expect(prepared.status).toBe("unavailable");
+    if (prepared.status !== "unavailable") return;
+    expect(prepared.reasons.join(" ")).toContain("writable by other users");
+    expect(mapper.calls).toHaveLength(0);
+  });
+
+  it("creates its own cache root 0700, so a fresh one is never refused", async () => {
+    if (process.platform === "win32") return;
+    // Guards the umask-0 false positive: the root is created mode 0700 rather
+    // than inheriting a permissive umask and then failing its own check.
+    const { worktree, request } = await baseRequest();
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("ready");
   });
 
   it("waits for a concurrent publication rather than giving up on one miss", async () => {

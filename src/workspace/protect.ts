@@ -53,7 +53,25 @@ export async function assertNoSymlinkedAncestors(
  *
  * A no-op on Windows, whose permission model this does not describe.
  */
-export async function protectManagedRoot(root: string, label = "Managed workspace"): Promise<void> {
+export interface ProtectManagedRootOptions {
+  /**
+   * Refuse a pre-existing root that other users could write, instead of
+   * adopting it and locking it down.
+   *
+   * Off by default because the managed git workspace has always adopted such a
+   * root (and a test asserts it): reversing that is a separate decision from
+   * this one. The context cache turns it ON, because its contents are read
+   * back as `[TRUSTED_CONTEXT]` — ownership NOW is not evidence about the past,
+   * and chmodding to 0700 locks the door on whatever is already inside.
+   */
+  readonly rejectPreviouslyShared?: boolean;
+}
+
+export async function protectManagedRoot(
+  root: string,
+  label = "Managed workspace",
+  options: ProtectManagedRootOptions = {},
+): Promise<void> {
   if (process.platform === "win32") return;
   const initial = await lstat(root);
   if (!initial.isDirectory() || initial.isSymbolicLink()) {
@@ -62,6 +80,15 @@ export async function protectManagedRoot(root: string, label = "Managed workspac
   const currentUid = process.getuid?.();
   if (currentUid !== undefined && initial.uid !== currentUid) {
     throw new Error(`${label} root must be owned by the current user: ${root}`);
+  }
+  // Callers that opt in create their root mode 0700, so a freshly-made one
+  // never trips this whatever the umask; only a root that already existed and
+  // was shared does.
+  if (options.rejectPreviouslyShared === true && (initial.mode & 0o022) !== 0) {
+    throw new Error(
+      `${label} root was writable by other users and may already hold their files; ` +
+        `remove it or choose another location: ${root}`,
+    );
   }
 
   let ancestor = path.dirname(root);
