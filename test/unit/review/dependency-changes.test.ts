@@ -5,7 +5,7 @@
 import { describe, expect, it } from "vitest";
 import {
   changedManifestPaths,
-  dependencyChangesFromDiff,
+  dependencyChanges,
   dependencyContextPack,
   registryUrlFor,
 } from "../../../src/review/dependency-changes.js";
@@ -33,9 +33,13 @@ function agreeingManifests(diff: string): Map<string, string> {
   return new Map(changedManifestPaths(diff).map((path) => [path, text]));
 }
 
-/** Extraction against a manifest that agrees with the diff. */
+/**
+ * Extraction against a head manifest that agrees with the diff, with no base
+ * manifest — i.e. everything the head declares is new. That is what these cases
+ * were always about: the diff adds these entries and they are dependencies.
+ */
 function changesFrom(diff: string) {
-  return dependencyChangesFromDiff(diff, agreeingManifests(diff));
+  return dependencyChanges(changedManifestPaths(diff), agreeingManifests(diff)).changes;
 }
 
 describe("dependencyChangesFromDiff", () => {
@@ -512,27 +516,15 @@ describe("dependencyContextPack — a range is shown as a range", () => {
 // Round six: `^1.2.3` in one workspace and `1.2.3` in another collapsed to one
 // entry keyed by name@version, and the surviving one was the unpinned spec — so
 // a deprecated or withdrawn EXACT pin in the second manifest got no finding.
-describe("dependencyChangesFromDiff — a pin and a range are different changes", () => {
+describe("dependencyChanges — a pin and a range are different changes", () => {
   it("keeps both specs", () => {
-    const diff = [
-      "diff --git a/package.json b/package.json",
-      "--- a/package.json",
-      "+++ b/package.json",
-      '@@ -3,7 +3,7 @@ "dependencies": {',
-      '+    "pkg": "^1.2.3",',
-      "diff --git a/web/package.json b/web/package.json",
-      "--- a/web/package.json",
-      "+++ b/web/package.json",
-      '@@ -3,7 +3,7 @@ "dependencies": {',
-      '+    "pkg": "1.2.3",',
-    ].join("\n");
     // Each workspace declares its own spec — the point of the case.
-    const manifests = new Map([
+    const head = new Map([
       ["package.json", JSON.stringify({ dependencies: { pkg: "^1.2.3" } })],
       ["web/package.json", JSON.stringify({ dependencies: { pkg: "1.2.3" } })],
     ]);
 
-    const changes = dependencyChangesFromDiff(diff, manifests);
+    const changes = dependencyChanges([...head.keys()], head).changes;
 
     expect(changes).toHaveLength(2);
     expect(changes.some((c) => c.pinned)).toBe(true);
@@ -629,99 +621,88 @@ describe("dependencyChangesFromDiff — the exact comparator is a pin", () => {
   });
 });
 
-// Issue #56: the whole point. Six rounds of review on PR #54 went into guessing
-// which lines of a package.json diff sit in a dependency map — hunk headers,
-// indentation depth, a runtime-key denylist, a separate budget for guesses.
-// The file answers all of it directly.
-describe("dependencyChangesFromDiff — the manifest decides, not the diff", () => {
-  const manifest = JSON.stringify({
+// Issue #56 and PR #67: the whole point. Six rounds of review on PR #54 went
+// into guessing which lines of a package.json diff sit in a dependency map —
+// hunk headers, indentation depth, a runtime-key denylist, a separate budget
+// for guesses. Comparing the two manifests answers it outright, and answers a
+// question the diff cannot: what actually CHANGED.
+describe("dependencyChanges — the manifests decide, not the diff", () => {
+  const manifest = (over: Record<string, unknown>) => JSON.stringify({
     name: "app",
     version: "1.0.0",
-    engines: { node: "22.0.0" },
+    engines: { node: "20.0.0" },
     scripts: { build: "tsc" },
     customBlock: { lodash: "9.9.9" },
-    dependencies: { lodash: "4.17.21" },
-    devDependencies: { vitest: "4.1.10" },
+    dependencies: { lodash: "4.17.20" },
+    devDependencies: { vitest: "4.1.9" },
+    ...over,
   });
-  const at = (...lines: string[]) => [
-    "diff --git a/package.json b/package.json",
-    "--- a/package.json",
-    "+++ b/package.json",
-    ...lines,
-  ].join("\n");
-  const run = (diff: string) =>
-    dependencyChangesFromDiff(diff, new Map([["package.json", manifest]]));
+  const run = (head: Record<string, unknown>, base: Record<string, unknown> = {}) =>
+    dependencyChanges(
+      ["package.json"],
+      new Map([["package.json", manifest(head)]]),
+      new Map([["package.json", manifest(base)]]),
+    ).changes;
 
-  // The case that took four rounds to get wrong-then-right by inference: a bump
-  // with no section header anywhere in its hunk.
-  it("finds a bump whose hunk has no section header at all", () => {
-    const changes = run(at("@@ -40,7 +40,7 @@", '+    "lodash": "4.17.21",'));
+  it("reports a bumped dependency, with the section the file names", () => {
+    const changes = run({ dependencies: { lodash: "4.17.21" } });
 
     expect(changes).toHaveLength(1);
-    expect(changes[0]?.section).toBe("dependencies");
+    expect(changes[0]).toMatchObject({ name: "lodash", spec: "4.17.21", section: "dependencies" });
   });
 
-  it("names the section rather than asserting one", () => {
-    const changes = run(at("@@ -40,7 +40,7 @@", '+    "vitest": "4.1.10",'));
+  it("names devDependencies as devDependencies", () => {
+    const changes = run({ devDependencies: { vitest: "4.1.10" } });
 
     expect(changes[0]?.section).toBe("devDependencies");
   });
 
-  // engines.node was accepted as a package called "node" in round three, and
-  // needed a denylist to stop it. The file says it is not a dependency.
-  it("excludes a runtime key without needing a denylist", () => {
-    expect(run(at("@@ -2,7 +2,7 @@", '+    "node": "22.0.0"'))).toEqual([]);
+  it("reports a newly added dependency", () => {
+    const changes = run({ dependencies: { lodash: "4.17.20", "left-pad": "1.3.1" } });
+
+    expect(changes.map((c) => c.name)).toEqual(["left-pad"]);
   });
 
-  // The round-five P1: a custom top-level object full of package-shaped entries
-  // walks past any denylist. It does not walk past the file.
-  it("excludes a package-shaped entry in a custom block", () => {
-    expect(run(at("@@ -9,7 +9,7 @@", '+    "lodash": "9.9.9",'))).toEqual([]);
+  // The comparison IS the feature: an unchanged dependency is not a change,
+  // however the diff happens to mention it.
+  it("says nothing about a dependency that did not move", () => {
+    expect(run({})).toEqual([]);
   });
 
-  it("excludes a script, whatever it looks like", () => {
-    expect(run(at("@@ -6,7 +6,7 @@", '+    "build": "tsc"'))).toEqual([]);
+  // engines.node needed a denylist to exclude in round three. The file says it
+  // is not a dependency, so it never arises.
+  it("ignores a runtime key that changed", () => {
+    expect(run({ engines: { node: "22.0.0" } })).toEqual([]);
   });
 
-  // Indentation is no longer a signal at all, so no house style can hide a
-  // dependency — the tab case that was silently dropping whole manifests.
-  it("does not care how the file is indented", () => {
-    for (const indent of ["\t\t", "    ", "  ", " ", ""]) {
-      const changes = run(at("@@ -40,7 +40,7 @@", `+${indent}"lodash": "4.17.21",`));
-
-      expect(changes, `indent ${JSON.stringify(indent)} was missed`).toHaveLength(1);
-    }
+  // The round-five P1: a custom object full of package-shaped entries walks
+  // past any denylist. It does not walk past the file's structure.
+  it("ignores a package-shaped entry in a custom block", () => {
+    expect(run({ customBlock: { lodash: "9.9.10" } })).toEqual([]);
   });
 
-  // A line the diff added but the manifest does not end up with is not the
-  // current state of the file.
-  it("ignores an added line the manifest contradicts", () => {
-    expect(run(at("@@ -40,7 +40,7 @@", '+    "lodash": "4.17.20",'))).toEqual([]);
-  });
-});
-
-describe("dependencyChangesFromDiff — a manifest that could not be read", () => {
-  const diff = [
-    "diff --git a/package.json b/package.json",
-    "--- a/package.json",
-    "+++ b/package.json",
-    '@@ -3,7 +3,7 @@ "dependencies": {',
-    '+    "lodash": "4.17.21",',
-  ].join("\n");
-
-  // Never guess in its place: that is what #56 removed.
-  it("contributes nothing when the file is absent", () => {
-    expect(dependencyChangesFromDiff(diff, new Map([["package.json", undefined]]))).toEqual([]);
+  it("ignores a script, whatever it looks like", () => {
+    expect(run({ scripts: { build: "tsc --noEmit" } })).toEqual([]);
   });
 
-  it("contributes nothing when the file is not valid JSON", () => {
-    expect(dependencyChangesFromDiff(diff, new Map([["package.json", "{ not json"]]))).toEqual([]);
+  // PR #67: the case that made line-matching untenable. `overrides` is not a
+  // dependency map here, and an entry in it that matches an existing
+  // dependency was reported as a change to that dependency.
+  it("does not read an overrides entry as a change to the dependency it names", () => {
+    expect(run({ overrides: { lodash: "4.17.20" } })).toEqual([]);
   });
 
-  it("contributes nothing when no manifest was supplied", () => {
-    expect(dependencyChangesFromDiff(diff)).toEqual([]);
+  it("treats a manifest that is new at head as all-new", () => {
+    const changes = dependencyChanges(
+      ["package.json"],
+      new Map([["package.json", manifest({})]]),
+      new Map(),
+    ).changes;
+
+    expect(changes.map((c) => c.name).sort()).toEqual(["lodash", "vitest"]);
   });
 });
+
 
 describe("changedManifestPaths", () => {
   it("lists each manifest the diff touches, once", () => {
@@ -767,5 +748,68 @@ describe("changedManifestPaths", () => {
     ].join("\n");
 
     expect(changedManifestPaths(diff)).toEqual([]);
+  });
+});
+
+// PR #67 review, found by both bots: a manifest the provider returned but that
+// parsed as rubbish was dropped in silence. It produced no entries and no
+// notice, so the pack either vanished or implied every fetched manifest had
+// been examined — the exact degradation this feature is written against.
+describe("dependencyChanges — what could not be examined is reported", () => {
+  const good = JSON.stringify({ dependencies: { lodash: "4.17.21" } });
+
+  it("reports a head manifest that is not valid JSON", () => {
+    const result = dependencyChanges(["package.json"], new Map([["package.json", "{ not json"]]));
+
+    expect(result.changes).toEqual([]);
+    expect(result.unreadable).toEqual(["package.json"]);
+  });
+
+  it("reports a head manifest whose root is not an object", () => {
+    const result = dependencyChanges(["package.json"], new Map([["package.json", "[1,2,3]"]]));
+
+    expect(result.unreadable).toEqual(["package.json"]);
+  });
+
+  it("reports a head manifest that could not be fetched", () => {
+    const result = dependencyChanges(["package.json"], new Map([["package.json", undefined]]));
+
+    expect(result.unreadable).toEqual(["package.json"]);
+  });
+
+  // A corrupt BASE is just as disqualifying: there is no honest diff against
+  // it, and calling every head entry "changed" would flood the review with
+  // dependencies nobody touched.
+  it("reports a base manifest that is not valid JSON", () => {
+    const result = dependencyChanges(
+      ["package.json"],
+      new Map([["package.json", good]]),
+      new Map([["package.json", "{ not json"]]),
+    );
+
+    expect(result.changes).toEqual([]);
+    expect(result.unreadable).toEqual(["package.json"]);
+  });
+
+  // Absent at base is NOT a failure — it is a manifest this pull request adds.
+  it("treats an absent base manifest as new, not unreadable", () => {
+    const result = dependencyChanges(
+      ["package.json"],
+      new Map([["package.json", good]]),
+      new Map([["package.json", undefined]]),
+    );
+
+    expect(result.unreadable).toEqual([]);
+    expect(result.changes).toHaveLength(1);
+  });
+
+  it("keeps examining the manifests it can read", () => {
+    const result = dependencyChanges(
+      ["a/package.json", "b/package.json"],
+      new Map([["a/package.json", "{ not json"], ["b/package.json", good]]),
+    );
+
+    expect(result.unreadable).toEqual(["a/package.json"]);
+    expect(result.changes.map((c) => c.manifest)).toEqual(["b/package.json"]);
   });
 });

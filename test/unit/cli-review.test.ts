@@ -327,15 +327,25 @@ function makeHarness(options: {
       },
     ),
     getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
-    // Issue #56: dependency extraction reads the manifest at head rather than
-    // inferring its structure from diff context, so the double has to supply
-    // one. Covers the packages the dependency tests below bump.
-    getFileAtRef: vi.fn().mockResolvedValue(JSON.stringify({
-      name: "app",
-      version: "1.0.0",
-      engines: { node: "22.0.0" },
-      dependencies: { "left-pad": "1.3.1", lodash: "4.17.21", react: "18.0.0" },
-    })),
+    // Issue #56 / PR #67: extraction compares the manifest at BASE against the
+    // one at HEAD, so the double answers per ref. At base the packages the
+    // dependency tests bump are older or absent; at head they are what those
+    // tests expect to see reported.
+    getFileAtRef: vi.fn(async (_locator: unknown, ref: string) => JSON.stringify(
+      ref === pr.baseSha
+        ? {
+            name: "app",
+            version: "1.0.0",
+            engines: { node: "20.0.0" },
+            dependencies: { "left-pad": "1.2.0", lodash: "4.17.20", react: "18.0.0" },
+          }
+        : {
+            name: "app",
+            version: "1.0.0",
+            engines: { node: "22.0.0" },
+            dependencies: { "left-pad": "1.3.1", lodash: "4.17.21", react: "18.0.0" },
+          },
+    )),
     createInlineReview: vi.fn().mockImplementation(
       (_locator, _headSha, comments: Array<{ clientId: string }>) =>
         Promise.resolve(comments.map(({ clientId }) => postedInline(clientId))),
@@ -4302,6 +4312,29 @@ describe("review — manifests are read at the head ref", () => {
 
     expect(packFor(h)).toContain("lodash");
     expect(packFor(h)).not.toMatch(/(^|\W)node@/);
+  });
+
+  // PR #67: extraction compares BASE against HEAD, so a dependency that did not
+  // move must not be reported. Without the base read every dependency in the
+  // manifest reads as new, which is how the old line-matching behaved and why
+  // nothing caught it.
+  it("reads the base ref too, and leaves unchanged dependencies out", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "cafef00d", baseSha: "deadbeef" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "deadbeef", "package.json",
+    );
+    // lodash moved 4.17.20 -> 4.17.21; react is 18.0.0 at both ends.
+    expect(packFor(h)).toContain("lodash");
+    expect(packFor(h)).not.toContain("react");
   });
 
   it("makes no manifest request when the feature is off", async () => {

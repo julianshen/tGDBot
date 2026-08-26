@@ -943,6 +943,51 @@ describe("GitHubAdapter", () => {
     // the explicit array check and the missing `content` field — so this pins
     // the OUTCOME, not either branch; neither can be isolated, because an array
     // never carries a `content` property of its own.
+    // `undefined` MEANS absent-or-directory. A response that is neither — an
+    // object claiming to be a file but carrying no usable content — is a
+    // malformed answer, and returning `undefined` for it would tell the caller
+    // "this manifest is not in the repository", which is a different and wrong
+    // fact (PR #67 review).
+    it("throws on a file response with no string content", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({ type: "file", encoding: "base64" }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json"))
+        .rejects.toThrow(/unexpected|malformed|contents/i);
+    });
+
+    it("throws on an encoding it cannot decode", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({
+        type: "file", encoding: "none", content: "",
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json"))
+        .rejects.toThrow(/encoding/i);
+    });
+
+    // Buffer.from(..., "base64") silently accepts rubbish, so a corrupt payload
+    // would decode to something plausible rather than failing.
+    it("throws on content that is not base64", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({
+        type: "file", encoding: "base64", content: "not base64 $$$",
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json"))
+        .rejects.toThrow(/base64/i);
+    });
+
+    it("accepts base64 split across lines, as the API returns it", async () => {
+      const wrapped = `${b64('{"name":"x"}').slice(0, 4)}\n${b64('{"name":"x"}').slice(4)}`;
+      const execGh = vi.fn(async () => JSON.stringify({
+        type: "file", encoding: "base64", content: wrapped,
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "package.json")).toBe('{"name":"x"}');
+    });
+
     it("refuses a directory, which the Contents API answers with an array", async () => {
       const execGh = vi.fn(async () => JSON.stringify([{ name: "a", type: "file" }]));
       const adapter = new GitHubAdapter(execGh);

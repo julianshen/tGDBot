@@ -1998,9 +1998,24 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     // below would also reject it — this states the intent rather than relying
     // on that coincidence.
     if (Array.isArray(parsed) || parsed === null || typeof parsed !== "object") return undefined;
-    const file = parsed as GhContentsFileResponse;
-    if (typeof file.content !== "string") return undefined;
-    return Buffer.from(file.content, "base64").toString("utf-8");
+    // `undefined` MEANS absent-or-directory. Anything else that cannot be
+    // decoded is a MALFORMED answer, and returning `undefined` for it would
+    // tell the caller "not in the repository" — a different and wrong fact
+    // that would then be rendered as an unexamined manifest (PR #67 review).
+    const file = parsed as GhContentsFileResponse & { type?: unknown; encoding?: unknown };
+    if (typeof file.content !== "string") {
+      throw new Error(`Contents API returned a file response with no content for ${path}`);
+    }
+    if (file.encoding !== "base64") {
+      throw new Error(`Contents API returned unsupported encoding ${String(file.encoding)} for ${path}`);
+    }
+    // `Buffer.from(…, "base64")` discards anything it does not recognise rather
+    // than failing, so a corrupt payload would decode to something plausible.
+    const packed = file.content.replace(/\s+/gu, "");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(packed) || packed.length % 4 !== 0) {
+      throw new Error(`Contents API returned content that is not base64 for ${path}`);
+    }
+    return Buffer.from(packed, "base64").toString("utf-8");
   }
 
   async getRuleFilesFromBase(

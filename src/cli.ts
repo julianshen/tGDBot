@@ -35,7 +35,7 @@ import { isTransientGhFailure } from "./vcs/gh-retry.js";
 import { isDiffIncompleteError } from "./vcs/github-large-diff.js";
 import {
   changedManifestPaths,
-  dependencyChangesFromDiff,
+  dependencyChanges as extractDependencyChanges,
   dependencyContextPack,
 } from "./review/dependency-changes.js";
 import { fetchDependencyFacts } from "./review/dependency-facts.js";
@@ -1176,23 +1176,49 @@ export async function review(
   // A manifest that cannot be read contributes no changes and is named in the
   // pack instead, because "we did not look" and "we looked and it was fine"
   // must not render the same.
-  const manifests = new Map<string, string | undefined>();
-  const unreadableManifests: string[] = [];
-  if (args.dependencyFacts === "on" && !dependencyFactsUnavailable) {
-    for (const path of changedManifestPaths(diff)) {
-      try {
-        const content = await config.vcsAdapter.getFileAtRef(config.locator, pr.headSha, path);
-        manifests.set(path, content);
-        if (content === undefined) unreadableManifests.push(path);
-      } catch (error) {
-        console.warn(
-          `tgd-review-agent: could not read ${path} at ${pr.headSha} (${redactedMessage(error)})`,
-        );
-        unreadableManifests.push(path);
-      }
+  const manifestPaths = args.dependencyFacts === "on" && !dependencyFactsUnavailable
+    ? changedManifestPaths(diff)
+    : [];
+  // Read at BOTH ends. What a pull request CHANGED is the difference between
+  // the two dependency maps — an added diff line carries no structural
+  // location, so an entry added under `overrides` that happens to match an
+  // existing dependency read as a change to that dependency (PR #67 review).
+  //
+  // A read that fails is recorded, never treated as "the file declares
+  // nothing": that is the difference between "we did not look" and "we looked
+  // and it was fine".
+  const headManifests = new Map<string, string | undefined>();
+  const baseManifests = new Map<string, string | undefined>();
+  const unreachableManifests: string[] = [];
+  for (const path of manifestPaths) {
+    const read = async (ref: string): Promise<string | undefined> =>
+      config.vcsAdapter.getFileAtRef(config.locator, ref, path);
+    try {
+      headManifests.set(path, await read(pr.headSha));
+    } catch (error) {
+      console.warn(
+        `tgd-review-agent: could not read ${path} at ${pr.headSha} (${redactedMessage(error)})`,
+      );
+      unreachableManifests.push(path);
+      continue;
+    }
+    try {
+      // Absent at base is a NEW manifest, which the extractor reads as such.
+      baseManifests.set(path, await read(pr.baseSha));
+    } catch (error) {
+      console.warn(
+        `tgd-review-agent: could not read ${path} at ${pr.baseSha} (${redactedMessage(error)})`,
+      );
+      unreachableManifests.push(path);
     }
   }
-  const dependencyChanges = dependencyChangesFromDiff(diff, manifests);
+  const extraction = extractDependencyChanges(
+    manifestPaths.filter((path) => !unreachableManifests.includes(path)),
+    headManifests,
+    baseManifests,
+  );
+  const dependencyChanges = extraction.changes;
+  const unreadableManifests = [...unreachableManifests, ...extraction.unreadable];
   // Opt-in, and the only outbound request the tool makes. Without it the pack
   // still ships the parsed versions and says plainly that nothing was checked —
   // which is why leaving this unwired shipped a rule that could never see the

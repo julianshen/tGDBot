@@ -224,10 +224,9 @@ const DEPENDENCY_SECTIONS = [
 /**
  * Every dependency a manifest declares, by name, with its section and spec.
  *
- * Returns undefined when the text is not a usable manifest — unparseable, not
- * an object, an array. That is distinct from "declares nothing", because one is
- * an answer and the other is a failure, and the pack says different things
- * about them.
+ * `undefined` means the text is not a usable manifest — unparseable, not an
+ * object, an array. Distinct from "declares nothing": one is an answer and the
+ * other is a failure, and the pack says different things about them.
  */
 function declaredDependencies(
   text: string,
@@ -254,65 +253,77 @@ function declaredDependencies(
   return declared;
 }
 
-/**
- * The dependency changes a diff introduces, confirmed against the manifests.
- *
- * The diff supplies WHICH lines changed; the parsed manifest supplies what they
- * mean. An added line is a dependency change only when its key is a package the
- * manifest actually declares in a dependency map — so `engines.node`, a
- * `scripts` entry, a custom metadata block and a top-level `version` are all
- * excluded because the file says they are not dependencies, not because a
- * heuristic guessed (issue #56).
- *
- * A manifest that could not be read contributes nothing. The pack says so
- * rather than implying those dependencies were checked and found fine.
- */
-export function dependencyChangesFromDiff(
-  diff: string,
-  manifests: ManifestSource = new Map(),
-): DependencyChange[] {
-  const lineManifest = manifestByLine(diff);
-  const lines = diff.split("\n");
-  const declaredByManifest = new Map<string, Map<string, { section: string; spec: string }>>();
-  for (const [path, text] of manifests) {
-    if (text === undefined) continue;
-    const declared = declaredDependencies(text);
-    if (declared !== undefined) declaredByManifest.set(path, declared);
-  }
+/** What extraction established, and what it could not. */
+export interface DependencyExtraction {
+  readonly changes: DependencyChange[];
+  /**
+   * Manifests that changed but could not be examined.
+   *
+   * Reported rather than dropped. A manifest that parsed as rubbish produced no
+   * entries and no notice, so the pack either vanished or implied every fetched
+   * manifest had been examined — the silent degradation the whole feature is
+   * written against (PR #67 review).
+   */
+  readonly unreadable: string[];
+}
 
-  const seen = new Set<string>();
+/**
+ * The dependency changes a pull request introduces.
+ *
+ * Established by comparing the dependency maps of each changed manifest at BASE
+ * and at HEAD. Not by reading the diff's added lines: an added line carries no
+ * structural location, so an entry added under `overrides` whose name and spec
+ * happen to match an existing `dependencies` entry was reported as a change to
+ * that dependency (PR #67 review). Two maps answer "what actually changed"
+ * exactly, and the added-line matching is gone rather than patched.
+ *
+ * A manifest absent at base is NEW, so everything it declares is a change. A
+ * manifest that cannot be parsed at either end is unreadable: with a corrupt
+ * base there is no way to say what changed, and guessing "all of it" would
+ * flood the review with dependencies nobody touched.
+ */
+export function dependencyChanges(
+  paths: readonly string[],
+  head: ManifestSource,
+  base: ManifestSource = new Map(),
+): DependencyExtraction {
   const changes: DependencyChange[] = [];
-  for (const [index, line] of lines.entries()) {
-    if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
-    const manifest = lineManifest.get(index);
-    if (manifest === undefined || !line.startsWith("+")) continue;
-    const declared = declaredByManifest.get(manifest);
-    if (declared === undefined) continue;
-    const entry = /^\+\s*"([^"]+)"\s*:\s*"([^"]+)"/u.exec(line);
-    if (!entry) continue;
-    const name = entry[1] ?? "";
-    const found = declared.get(name);
-    // The manifest decides. A key the file does not declare as a dependency is
-    // not one, whatever it looks like in the diff.
-    if (found === undefined) continue;
-    // And the spec must be the one the manifest ends up with: an added line
-    // that was later superseded within the same diff is not the current state.
-    if (found.spec !== (entry[2] ?? "")) continue;
-    const version = stripRange(found.spec);
-    if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
-    const key = `${name}@${found.spec}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    changes.push({
-      name,
-      version,
-      spec: found.spec,
-      manifest,
-      pinned: isPinnedSpec(found.spec),
-      section: found.section,
-    });
+  const unreadable: string[] = [];
+  const seen = new Set<string>();
+
+  for (const path of paths) {
+    const headText = head.get(path);
+    if (headText === undefined) {
+      unreadable.push(path);
+      continue;
+    }
+    const headDeps = declaredDependencies(headText);
+    if (headDeps === undefined) {
+      unreadable.push(path);
+      continue;
+    }
+    // Absent at base is a NEW manifest, which is an answer. Present but
+    // unparseable is a failure, and there is no honest diff against it.
+    const baseText = base.get(path);
+    const baseDeps = baseText === undefined ? new Map() : declaredDependencies(baseText);
+    if (baseDeps === undefined) {
+      unreadable.push(path);
+      continue;
+    }
+
+    for (const [name, { section, spec }] of headDeps) {
+      if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
+      // Unchanged is not a change. This is the whole comparison.
+      if (baseDeps.get(name)?.spec === spec) continue;
+      const version = stripRange(spec);
+      if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
+      const key = `${name}@${spec}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      changes.push({ name, version, spec, manifest: path, pinned: isPinnedSpec(spec), section });
+    }
   }
-  return changes;
+  return { changes, unreadable };
 }
 
 /**
