@@ -51,7 +51,20 @@ export async function assertNoSymlinkedAncestors(
  * under ancestors no other user can replace, then makes it mode 0700 and
  * re-checks that the directory it just secured is the one it inspected.
  *
- * A no-op on Windows, whose permission model this does not describe.
+ * **This control is POSIX-only, and that is a real gap, not a footnote.** On
+ * Windows it returns immediately and establishes nothing: uid ownership and
+ * mode bits do not describe that platform, and Node exposes no portable API
+ * for the ACLs that do. A caller relying on this for provenance — as the
+ * context cache does, since its contents are read back as `[TRUSTED_CONTEXT]`
+ * — therefore has NO provenance guarantee on Windows, and a directory another
+ * local user can write could be pre-populated with a self-consistent entry.
+ *
+ * Closing it means either validating ACLs (no portable API; would mean
+ * shelling out to `icacls` or a native dependency) or declining to trust a
+ * cache on that platform at all — which would mean the feature does not work
+ * on Windows. That is a product decision, so it is stated here rather than
+ * silently chosen. Until it is made, prefer `--context off` on Windows for a
+ * cache root that is not exclusively yours.
  */
 export interface ProtectManagedRootOptions {
   /**

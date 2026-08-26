@@ -490,6 +490,13 @@ pre-create the deterministic entry with a perfectly self-consistent manifest,
 and its text would go straight into `[TRUSTED_CONTEXT]`. Hash integrity is not
 provenance. Point `--context-dir` somewhere only you can write.
 
+**On Windows this check does nothing.** It is built on POSIX ownership and
+mode bits, and Node has no portable API for the ACLs that would replace them,
+so the cache root is unverified there and a directory another local user can
+write could be pre-populated with an entry that is then read as trusted
+context. Until that is resolved, on Windows either keep the cache root
+somewhere exclusively yours or run with `--context off`.
+
 `--dry-run` prepares context exactly as a real run would, so the preview it
 prints is the review you would actually get. That means a dry run on a cold
 cache pays for the first map; pair it with `--context off` if you only wanted
