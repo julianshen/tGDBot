@@ -603,3 +603,41 @@ describe("git-quoted paths in the diff header", () => {
     expect(changedFiles("diff --git nota/x b/y")).toEqual([]);
   });
 });
+
+describe("mixed and pathological diff headers", () => {
+  it("parses a quoted head path after an unquoted base path", () => {
+    // Git quotes each operand independently, so renaming an ASCII name to one
+    // it must quote produces a mixed header. Requiring the FIRST path to be
+    // quoted before using the quoted parser dropped these entirely.
+    const mixed = 'diff --git a/old.ts "b/caf\\303\\251.ts"';
+    expect(changedFiles(mixed)).toEqual(["café.ts"]);
+    expect(changedFilesWithRenameSources(mixed)).toEqual(["café.ts", "old.ts"]);
+  });
+
+  it("parses an unquoted head path after a quoted base path", () => {
+    const mixed = 'diff --git "a/caf\\303\\251.ts" b/plain.ts';
+    expect(changedFiles(mixed)).toEqual(["plain.ts"]);
+    expect(changedFilesWithRenameSources(mixed)).toEqual(["plain.ts", "café.ts"]);
+  });
+
+  it("omits a path carrying a control character rather than passing it on", () => {
+    // `normalizeChangedFile` rejects controls, so letting one through would
+    // fail the whole context build — and under `--context require` abort the
+    // review — over a single filename. The summary also renders each path in a
+    // backtick span, which a newline would break out of.
+    expect(changedFiles('diff --git "a/we\\012ird.ts" "b/we\\012ird.ts"')).toEqual([]);
+    expect(changedFilesWithRenameSources('diff --git "a/tab\\011.ts" "b/tab\\011.ts"')).toEqual([]);
+  });
+
+  it("keeps a control-free file in the same diff as a rejected one", () => {
+    const diff = [
+      'diff --git "a/we\\012ird.ts" "b/we\\012ird.ts"',
+      "diff --git a/fine.ts b/fine.ts",
+    ].join("\n");
+    expect(changedFiles(diff)).toEqual(["fine.ts"]);
+  });
+
+  it("rejects a header whose quote does not follow the separating space", () => {
+    expect(changedFiles('diff --git a/x"b/y.ts"')).toEqual([]);
+  });
+});

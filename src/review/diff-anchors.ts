@@ -96,7 +96,14 @@ export function parseDiffGitHeader(line: string): { readonly a: string; readonly
   const rest = line.startsWith("diff --git ") ? line.slice("diff --git ".length) : undefined;
   if (rest === undefined) return undefined;
 
-  if (rest.startsWith('"')) {
+  // Each operand is quoted independently, so a rename from an ASCII name to
+  // one git must quote yields a MIXED header: `a/old.ts "b/caf\303\251.ts"`.
+  // Git quotes any path containing a double quote, so an unquoted operand can
+  // never contain one — which makes the first `"` in the line, wherever it
+  // falls, the unambiguous start of a quoted operand.
+  const quote = rest.indexOf('"');
+
+  if (quote === 0) {
     const first = readQuotedPath(rest);
     if (first === undefined || !rest.startsWith(" ", first.end)) return undefined;
     const secondRaw = rest.slice(first.end + 1);
@@ -107,17 +114,39 @@ export function parseDiffGitHeader(line: string): { readonly a: string; readonly
     return stripSides(first.value, second.value);
   }
 
-  // Unquoted. Kept greedy on the a/ side exactly as before: a path may contain
-  // a space, which git does NOT quote, so there is no unambiguous split.
+  if (quote > 0) {
+    // Unquoted first operand, quoted second. The quote must open right after
+    // the separating space.
+    if (rest[quote - 1] !== " ") return undefined;
+    const second = readQuotedPath(rest.slice(quote));
+    if (second === undefined || second.end !== rest.length - quote) return undefined;
+    return stripSides(rest.slice(0, quote - 1).trim(), second.value);
+  }
+
+  // Both unquoted. Kept greedy on the a/ side exactly as before: a path may
+  // contain a space, which git does NOT quote, so there is no unambiguous split.
   const match = /^a\/(.+) b\/(.+)$/.exec(rest);
   if (!match) return undefined;
-  return { a: match[1]!.trim(), b: match[2]!.trim() };
+  return stripSides(`a/${match[1]!.trim()}`, `b/${match[2]!.trim()}`);
 }
 
 function stripSides(first: string, second: string): { a: string; b: string } | undefined {
   if (!first.startsWith("a/") || !second.startsWith("b/")) return undefined;
-  return { a: first.slice(2), b: second.slice(2) };
+  const a = first.slice(2);
+  const b = second.slice(2);
+  // A decoded `\n` or `\t` escape is a real control BYTE. Two consumers cannot
+  // take one: `normalizeChangedFile` rejects control characters, so a single
+  // such file would take the whole context down with it (and abort the review
+  // outright under `--context require`); and the summary renders each path
+  // inside a backtick span, where a newline breaks out of it. Git permits
+  // these names, but the honest handling here is to omit the file — exactly
+  // what the unquoted-only regex did before quoted parsing existed — rather
+  // than to let one pathological filename cost the review its context.
+  if (CONTROL_CHARACTERS.test(a) || CONTROL_CHARACTERS.test(b)) return undefined;
+  return { a, b };
 }
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/u;
 
 const ESCAPES: Readonly<Record<string, string>> = {
   a: "\u0007", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", '"': '"', "\\": "\\",
