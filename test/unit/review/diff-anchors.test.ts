@@ -640,4 +640,14 @@ describe("mixed and pathological diff headers", () => {
   it("rejects a header whose quote does not follow the separating space", () => {
     expect(changedFiles('diff --git a/x"b/y.ts"')).toEqual([]);
   });
+
+  it("keeps a literal quote in an unquoted path from the oversized-diff fallback", () => {
+    // `reconstructDiffFromFiles` writes paths into the header without
+    // C-quoting them, so a name containing a quote arrives unquoted. Treating
+    // that quote as opening an operand dropped the file from context
+    // selection, thread matching and the reviewed-files list alike.
+    const reconstructed = 'diff --git a/foo"bar.ts b/foo"bar.ts';
+    expect(changedFiles(reconstructed)).toEqual(['foo"bar.ts']);
+    expect(changedFilesWithRenameSources(reconstructed)).toEqual(['foo"bar.ts']);
+  });
 });

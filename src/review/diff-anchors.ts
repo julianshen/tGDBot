@@ -114,17 +114,22 @@ export function parseDiffGitHeader(line: string): { readonly a: string; readonly
     return stripSides(first.value, second.value);
   }
 
-  if (quote > 0) {
-    // Unquoted first operand, quoted second. The quote must open right after
-    // the separating space.
-    if (rest[quote - 1] !== " ") return undefined;
+  // Unquoted first operand, quoted second — but only when the quote opens
+  // right after the separating space. A quote anywhere else is a LITERAL one
+  // inside an unquoted path, which the oversized-diff fallback really does
+  // emit: `reconstructDiffFromFiles` (github-large-diff.ts) writes paths into
+  // the header without C-quoting them, so `foo"bar.ts` arrives as
+  // `a/foo"bar.ts b/foo"bar.ts`. Those fall through to the unquoted branch
+  // rather than being rejected.
+  if (quote > 0 && rest[quote - 1] === " ") {
     const second = readQuotedPath(rest.slice(quote));
     if (second === undefined || second.end !== rest.length - quote) return undefined;
     return stripSides(rest.slice(0, quote - 1).trim(), second.value);
   }
 
-  // Both unquoted. Kept greedy on the a/ side exactly as before: a path may
-  // contain a space, which git does NOT quote, so there is no unambiguous split.
+  // Both unquoted (or carrying a literal quote, per above). Kept greedy on the
+  // a/ side exactly as before: a path may contain a space, which git does NOT
+  // quote, so there is no unambiguous split.
   const match = /^a\/(.+) b\/(.+)$/.exec(rest);
   if (!match) return undefined;
   return stripSides(`a/${match[1]!.trim()}`, `b/${match[2]!.trim()}`);
