@@ -18,7 +18,7 @@
 //     unavailable context into an error, for callers who would rather not
 //     review at all than review blind.
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { buildContextPacks, type ContextPackResult } from "./context-pack.js";
 import { declareMappedArtifacts } from "./artifact-paths.js";
@@ -29,7 +29,7 @@ import {
 } from "./cache.js";
 import { contextCacheKeyForRepository, type ContextCacheKey, type ContextManifest } from "./types.js";
 import { prepareWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
-import { assertNoSymlinkedAncestors, protectManagedRoot } from "../workspace/protect.js";
+import { protectManagedRoot } from "../workspace/protect.js";
 import type { ContextMapper } from "./mapper.js";
 import type { RepositoryRef } from "../target/types.js";
 
@@ -248,9 +248,17 @@ export async function prepareReviewContext(
     // is not provenance; ownership of the directory is what supplies it. Same
     // guard the managed git workspace already applies to its own root.
     await mkdir(request.cacheRoot, { recursive: true });
-    await assertNoSymlinkedAncestors(request.cacheRoot, [], "Context cache");
-    await protectManagedRoot(request.cacheRoot, "Context cache");
-    cache = createCache(request.cacheRoot);
+    // Resolve to the PHYSICAL path first. `protectManagedRoot` walks ancestors
+    // with `stat`, which follows symlinks, so it inspects a link target's mode
+    // rather than noticing the link — leaving room to point an ancestor at a
+    // victim-owned directory until the checks pass and retarget it afterwards.
+    // `realpath` removes every symlink component by construction, and
+    // everything below then operates on the resolved path, so a later retarget
+    // cannot redirect it. Same reason `prepareWorkspace` resolves its own root
+    // (`physicalWorkspaceRoot`) before protecting it.
+    const physicalCacheRoot = await realpath(request.cacheRoot);
+    await protectManagedRoot(physicalCacheRoot, "Context cache");
+    cache = createCache(physicalCacheRoot);
     key = contextCacheKey(request);
   } catch (error) {
     return unavailable([`context cache is unusable: ${errorMessage(error)}`]);

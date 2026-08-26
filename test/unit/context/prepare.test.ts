@@ -1,4 +1,4 @@
-import { chown, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chown, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -615,6 +615,42 @@ describe("prepareReviewContext", () => {
 
     const info = await stat(request.cacheRoot as string);
     expect(info.mode & 0o077).toBe(0);
+  });
+
+  it("resolves a symlinked ancestor of the cache root before trusting it", async () => {
+    if (process.platform === "win32") return;
+    const root = await tempRoot();
+    const worktree = path.join(root, "worktree");
+    const real = path.join(root, "real-cache-parent");
+    const link = path.join(root, "linked-parent");
+    await mkdir(worktree, { recursive: true });
+    await mkdir(real, { recursive: true });
+    await symlink(real, link);
+
+    // The configured root reaches its directory THROUGH a symlink. The
+    // ancestor walk in protectManagedRoot uses stat, which follows links and
+    // so inspects the target's mode rather than noticing the link at all;
+    // resolving first is what removes the retarget window.
+    const request = {
+      mode: "auto" as const,
+      repository,
+      baseSha: BASE_SHA,
+      headSha: HEAD_SHA,
+      changedFiles: ["src/index.ts"],
+      ruleNames: ["tgd-review"],
+      allowDegraded: false,
+      workspaceRoot: path.join(root, "workspaces"),
+      cacheRoot: path.join(link, "cache"),
+    };
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("ready");
+    // The entry must live under the resolved directory, not be reachable only
+    // through the link.
+    await expect(readdir(path.join(real, "cache", "contexts"))).resolves.not.toEqual([]);
   });
 
   it("waits for a concurrent publication rather than giving up on one miss", async () => {
