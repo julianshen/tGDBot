@@ -203,9 +203,16 @@ function indentDepth(line: string): number {
   return tabs + Math.floor(spaces / 2);
 }
 
-/** True when the spec names one release outright, with no range operator. */
+/**
+ * True when the spec names one release outright.
+ *
+ * `=1.2.3` counts: `=` is npm's EXACT comparator, so it resolves to exactly one
+ * version, and treating it as a range suppressed the publication and
+ * deprecation checks it can perfectly well answer (PR #54 review, final round).
+ * Every other operator — `^ ~ > < >=` — genuinely admits more than one release.
+ */
 function isPinnedSpec(raw: string): boolean {
-  return isExactVersion(raw.trim());
+  return isExactVersion(raw.trim().replace(/^=/u, ""));
 }
 
 /**

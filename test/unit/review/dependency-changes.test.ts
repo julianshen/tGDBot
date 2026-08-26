@@ -915,3 +915,33 @@ describe("dependency extraction — indentation styles", () => {
     expect(dependencyChangesFromDiff(diffWith("  ", "version"))).toEqual([]);
   });
 });
+
+// PR #54 review, final round: `=1.2.3` is npm's EXACT comparator. stripRange
+// removes the `=`, but isPinnedSpec saw an operator and called it a range, so
+// publication and deprecation were suppressed and the pack said the resolver
+// might already be installing something newer — for a spec that can resolve to
+// exactly one release.
+describe("dependencyChangesFromDiff — the exact comparator is a pin", () => {
+  const diffFor = (spec: string) => [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    `+    "pkg": "${spec}",`,
+  ].join("\n");
+
+  it("treats =1.2.3 as a pin", () => {
+    const [change] = dependencyChangesFromDiff(diffFor("=1.2.3"));
+
+    expect(change?.pinned).toBe(true);
+    expect(change?.version).toBe("1.2.3");
+  });
+
+  it("still treats the real ranges as ranges", () => {
+    for (const spec of ["^1.2.3", "~1.2.3", ">=1.2.3", ">1.2.3", "<=1.2.3"]) {
+      const [change] = dependencyChangesFromDiff(diffFor(spec));
+
+      expect(change?.pinned, `${spec} was read as a pin`).toBe(false);
+    }
+  });
+});

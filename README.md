@@ -383,6 +383,9 @@ tgd-review-agent review \
                                   # notice, which is text the package owner writes and is not
                                   # trusted input; rules are told to send the reader to the registry
                                   # for it rather than paraphrase what they were not given.
+                                  # The context section is part of this opt-in: with the flag off
+                                  # no dependency context is supplied at all, because the package
+                                  # names and manifest paths in it come from the diff.
                                   # Off by default because it reveals a private
                                   # repository's dependencies to a third party. With it off the
                                   # context still lists the changed versions and says plainly that

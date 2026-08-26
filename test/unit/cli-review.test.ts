@@ -1355,7 +1355,9 @@ describe("review", () => {
   // context. Supplied for all rules or none, because the dispatch contract
   // requires a pack per rule and rejects a partial map.
   it("issue #50: passes host-parsed dependency changes to the rules", async () => {
-    const h = makeHarness({ botComment: null });
+    // Final round: the pack is part of the --dependency-facts opt-in, because
+    // its package names and manifest paths are diff-controlled.
+    const h = makeHarness({ botComment: null, args: makeArgs({ dependencyFacts: "on" }) });
     h.vcsAdapter.getDiff.mockResolvedValue(
       [
         "diff --git a/package.json b/package.json",
@@ -4062,7 +4064,10 @@ describe("review — dependency facts", () => {
     return input?.contextPacks?.["rule-a"]?.text;
   };
 
-  it("makes no request, and says nothing was checked, unless asked", async () => {
+  // Final round: with the feature off there is no pack at all, because its
+  // identifiers are diff-controlled — see "the dependency pack is part of the
+  // opt-in" below.
+  it("makes no request, and supplies no context, unless asked", async () => {
     const h = makeHarness();
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
     const fetchJson = vi.fn();
@@ -4070,8 +4075,7 @@ describe("review — dependency facts", () => {
     await review(h.args, { ...depsFrom(h), fetchJson });
 
     expect(fetchJson).not.toHaveBeenCalled();
-    expect(packFor(h)).toContain("lodash@4.17.21");
-    expect(packFor(h)).toMatch(/NOT been checked/);
+    expect(packFor(h)).toBeUndefined();
   });
 
   it("puts the registry's answer in front of the rule when enabled", async () => {
@@ -4162,5 +4166,52 @@ describe("review — dependency facts under legacy dispatch", () => {
     await review(h.args, { ...depsFrom(h), fetchJson });
 
     expect(fetchJson).toHaveBeenCalled();
+  });
+});
+
+// PR #54 review, final round, P1: the context pack was built on EVERY review
+// whose diff touches a package.json, flag or no flag. Package names and
+// manifest paths are diff-controlled, and while the allowlists stop a path
+// forming a sentence with spaces, `ignore-all-previous-instructions` needs no
+// spaces. Those strings are already in UNTRUSTED_DIFF; copying them into
+// TRUSTED_CONTEXT is what elevates them, and it was happening by default.
+describe("review — the dependency pack is part of the opt-in", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    '+    "lodash": "4.17.21",',
+  ].join("\n");
+
+  const packFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  it("supplies no pack at all when the feature is off", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(packFor(h)).toBeUndefined();
+  });
+
+  it("supplies one when the feature is on", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, {
+      ...depsFrom(h),
+      fetchJson: vi.fn().mockResolvedValue({
+        "dist-tags": { latest: "4.17.21" },
+        versions: { "4.17.21": {} },
+      }),
+    });
+
+    expect(packFor(h)).toContain("lodash");
   });
 });
