@@ -37,6 +37,15 @@ export interface DependencyChange {
    */
   readonly pinned: boolean;
   /**
+   * The spec as the manifest writes it: `^1.2.3`, not `1.2.3`.
+   *
+   * `version` is the stripped lower bound, which is the right key for a
+   * registry lookup and the WRONG thing to show a reader — rendering `^1.2.3`
+   * as `pkg@1.2.3` invited exactly the currency claim the `pinned` flag was
+   * added to prevent (PR #54 review, round six).
+   */
+  readonly spec: string;
+  /**
    * Whether the host ESTABLISHED that this line sits in a dependency map,
    * rather than inferring it from indentation.
    *
@@ -130,13 +139,15 @@ const RUNTIME_KEYS = new Set(["node", "npm", "yarn", "pnpm", "bun", "deno", "vsc
 const MAX_PACKAGES_PER_DIFF = 200;
 
 /**
- * How much of a diff is read before ordering.
+ * How many UNESTABLISHED entries are kept while scanning.
  *
- * Larger than the ceiling so that a real dependency hunk late in a big diff can
- * still outrank guesses found earlier, and bounded so a pathological diff does
- * not turn into unbounded work.
+ * A single cap on everything only moved the cutoff: a guessed block large
+ * enough to reach it stopped the scan before any later confirmed hunk was read,
+ * and the ordering fix cannot order what was never seen (PR #54 review, round
+ * six). Guesses are bounded on their own so they can never end the scan, while
+ * confirmed entries keep being collected to the ceiling.
  */
-const MAX_SCANNED_PACKAGES = 2_000;
+const MAX_GUESSED_PACKAGES = 200;
 
 /** True for a name the registry itself would accept. */
 export function isValidPackageName(name: string): boolean {
@@ -267,12 +278,12 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
   const lines = diff.split("\n");
   const seen = new Set<string>();
   const changes: DependencyChange[] = [];
+  const guessed: DependencyChange[] = [];
   for (const [index, line] of lines.entries()) {
-    // No early break on the ceiling: stopping mid-scan let whatever appeared
-    // FIRST take the whole budget, so a long guessed block could exhaust it
-    // before a real dependency hunk further down was reached. The cap is
-    // applied after ordering instead (PR #54 review, round five).
-    if (changes.length >= MAX_SCANNED_PACKAGES) break;
+    // The scan ends only when the CONFIRMED entries fill the ceiling. Guesses
+    // are collected separately and capped separately, so no amount of them can
+    // stop a real dependency hunk further down from being read.
+    if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
     const context = manifests.get(index);
     if (context === undefined || !line.startsWith("+")) continue;
     const manifest = context.manifest;
@@ -282,23 +293,26 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
     const spec = entry[2] ?? "";
     const version = stripRange(spec);
     if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
-    const key = `${name}@${version}`;
+    // Keyed by the SPEC, not the stripped version: `^1.2.3` and `1.2.3` ask
+    // different questions of the registry, and collapsing them dropped the pin
+    // — the only one of the two that can be checked (round six).
+    const key = `${name}@${spec}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    changes.push({
+    const change: DependencyChange = {
       name,
       version,
+      spec,
       manifest,
       pinned: isPinnedSpec(spec),
       inDependencySection: context.confirmed,
-    });
+    };
+    if (change.inDependencySection) changes.push(change);
+    else if (guessed.length < MAX_GUESSED_PACKAGES) guessed.push(change);
   }
   // Established entries first, order otherwise preserved, then the ceiling.
   // A guess must never displace something the host actually parsed.
-  return [
-    ...changes.filter((change) => change.inDependencySection),
-    ...changes.filter((change) => !change.inDependencySection),
-  ].slice(0, MAX_PACKAGES_PER_DIFF);
+  return [...changes, ...guessed].slice(0, MAX_PACKAGES_PER_DIFF);
 }
 
 /**
@@ -348,7 +362,9 @@ export function dependencyContextPack(
   facts: readonly DependencyFact[] = [],
 ): ContextPackResult | undefined {
   if (changes.length === 0) return undefined;
-  const factFor = new Map(facts.map((fact) => [`${fact.name}@${fact.version}`, fact]));
+  // Keyed by SPEC: a pin and a range share a stripped version, so name@version
+  // handed both changes whichever fact was written last (round six).
+  const factFor = new Map(facts.map((fact) => [`${fact.name}@${fact.spec}`, fact]));
   const lines = changes.map((change) => {
     // An unestablished entry is labelled as one. git's context often omits the
     // enclosing key, so indentation was the only signal — that is a guess, and
@@ -357,8 +373,8 @@ export function dependencyContextPack(
     const provenance = change.inDependencySection
       ? ""
       : " — the host could not confirm this line sits in a dependency map; it may not be a dependency at all";
-    const head = `- ${change.name}@${change.version} (${change.manifest})${provenance}`;
-    const fact = factFor.get(`${change.name}@${change.version}`);
+    const head = `- ${change.name}@${change.spec} (${change.manifest})${provenance}`;
+    const fact = factFor.get(`${change.name}@${change.spec}`);
     if (fact === undefined) return head;
     const notes: string[] = [];
     // An unchecked package must read as unchecked, never as clean.
@@ -389,8 +405,20 @@ export function dependencyContextPack(
     // it is rendered only when it IS a version. Anything else is not a latest
     // tag worth repeating, and validating beats escaping (round four).
     const latest = fact.latest !== undefined && isExactVersion(fact.latest) ? fact.latest : undefined;
-    if (latest !== undefined && latest !== change.version) notes.push(`latest is ${latest}`);
-    if (latest !== undefined && latest === change.version) notes.push("this is the latest");
+    if (latest !== undefined) {
+      if (!change.pinned) {
+        // A range may ALREADY resolve to the latest release, so stating a gap
+        // would invent one. The tag is still worth having; the comparison is
+        // not ours to make without resolving the range (round six).
+        notes.push(
+          `the registry's newest release is ${latest}, but this is a range — the resolver may already be installing it, so nothing here says the dependency is behind`,
+        );
+      } else if (latest !== change.version) {
+        notes.push(`latest is ${latest}`);
+      } else {
+        notes.push("this is the latest");
+      }
+    }
     return notes.length === 0 ? head : `${head}\n${notes.map((note) => `  - ${note}`).join("\n")}`;
   });
   const checked = facts.some((fact) => fact.unknown === undefined);

@@ -7,8 +7,10 @@ import type { DependencyChange } from "../../../src/review/dependency-changes.js
 const change = (name: string, version: string, pinned = true): DependencyChange => ({
   name,
   version,
+  spec: pinned ? version : `^${version}`,
   manifest: "package.json",
   pinned,
+  inDependencySection: true,
 });
 
 const registry = (body: Record<string, unknown>) => vi.fn(async () => body);
@@ -315,5 +317,56 @@ describe("fetchDependencyFacts — one request per package", () => {
     expect(fetchJson).toHaveBeenCalledTimes(1);
     expect(facts).toHaveLength(2);
     for (const fact of facts) expect(fact.unknown).toMatch(/ECONNRESET/);
+  });
+});
+
+// PR #54 review, round six: the per-name grouping deduplicated by VERSION, so a
+// workspace pinning `1.2.3` and another allowing `^1.2.3` collapsed to one
+// entry — and the survivor was whichever came first. When that was the range,
+// the exact pin lost its publication and deprecation check entirely.
+describe("fetchDependencyFacts — a pin and a range are separate questions", () => {
+  it("answers both, from one request", async () => {
+    const fetchJson = registry({
+      "dist-tags": { latest: "1.9.0" },
+      versions: { "1.2.3": { deprecated: "old" }, "1.9.0": {} },
+    });
+
+    const facts = await fetchDependencyFacts(
+      [change("pkg", "1.2.3", false), change("pkg", "1.2.3", true)],
+      fetchJson,
+    );
+
+    expect(fetchJson).toHaveBeenCalledTimes(1);
+    expect(facts).toHaveLength(2);
+    // The pin is checkable and must be checked; the range is not.
+    expect(facts.some((f) => f.deprecated === "old")).toBe(true);
+    expect(facts.some((f) => f.deprecated === undefined)).toBe(true);
+  });
+});
+
+// Round six: String() itself throws for a null-prototype object or one with a
+// hostile primitive conversion, and that escapes the catch — rejecting the
+// whole lookup phase and losing the unknown fact it exists to produce.
+describe("fetchDependencyFacts — a rejection value need not be coercible", () => {
+  it("survives a value String() cannot render", async () => {
+    const hostile = Object.create(null) as object;
+
+    const [fact] = await fetchDependencyFacts(
+      [change("pkg", "1.0.0")],
+      vi.fn(async () => { throw hostile; }),
+    );
+
+    expect(fact?.unknown).toBeDefined();
+  });
+
+  it("survives a throwing toString", async () => {
+    const hostile = { toString() { throw new Error("nope"); } };
+
+    const [fact] = await fetchDependencyFacts(
+      [change("pkg", "1.0.0")],
+      vi.fn(async () => { throw hostile; }),
+    );
+
+    expect(fact?.unknown).toBeDefined();
   });
 });

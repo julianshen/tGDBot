@@ -1348,3 +1348,34 @@ describe("renderSummaryComment — compact mode never truncates a citation", () 
     expect(body).toContain("https://docs.example.com/short");
   });
 });
+
+// PR #54 review, round six: compact mode reuses renderDisputedSection, which
+// renders every citation on every disputed finding at full length. Enough of
+// them and the compact body is still oversized, falls through to the
+// emergency status-only form, and the whole disputed section disappears —
+// silently, and for a disputes-only review the headline then claims nothing
+// failed to fit.
+describe("renderSummaryComment — disputed citations respect the compact budget", () => {
+  const disputed = Array.from({ length: 40 }, (_, i) => makeFinding({
+    file: `f${i}.go`,
+    line: 10,
+    message: `Disputed claim ${i}.`,
+    decision: "disputed",
+    references: [
+      `https://docs.example.com/${"a".repeat(300)}/${i}`,
+      `https://docs.example.com/${"b".repeat(300)}/${i}`,
+    ],
+  }));
+
+  it("keeps the disputed section rather than overflowing into the status-only form", () => {
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [],
+      inlineCount: 0,
+      disputed,
+    }), 4000);
+
+    expect(body.length).toBeLessThanOrEqual(4000);
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("Disputed claim 0.");
+  });
+});

@@ -533,6 +533,14 @@ function renderReferences(finding: Finding): string | undefined {
  * what happened until PR #54's review — asks the reader to weigh a claim while
  * the evidence for it sits one layer up, unrendered.
  */
+/** The compact budget: the first citation, and only if it fits whole. */
+function compactReferenceBullets(finding: Finding, indent: string): string[] {
+  const first = finding.references?.[0];
+  return first !== undefined && first.length <= MAX_COMPACT_REFERENCE_CHARS
+    ? [`${indent}- Reference: ${sanitizeInline(first)}`]
+    : [];
+}
+
 function referenceBullets(finding: Finding, indent: string): string[] {
   if (!finding.references || finding.references.length === 0) return [];
   return finding.references
@@ -744,7 +752,14 @@ function renderClarificationSection(input: SummaryInput): string | undefined {
   ].join("\n");
 }
 
-function renderDisputedSection(input: SummaryInput): string | undefined {
+/**
+ * @param compact - apply the compact citation budget: one per finding, only if
+ * it fits whole. Compact mode reused this renderer at full length, so enough
+ * disputed citations kept the compact body oversized, dropped it into the
+ * emergency status-only form, and took the whole disputed section with it —
+ * silently (PR #54 review, round six).
+ */
+function renderDisputedSection(input: SummaryInput, compact = false): string | undefined {
   const disputed = input.disputed ?? [];
   if (disputed.length === 0) return undefined;
   const items = disputed.flatMap((finding) => {
@@ -754,7 +769,9 @@ function renderDisputedSection(input: SummaryInput): string | undefined {
     // A disputed finding is precisely the one whose evidence a reader needs.
     return [
       `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`,
-      ...referenceBullets(finding, "  "),
+      ...(compact
+        ? compactReferenceBullets(finding, "  ")
+        : referenceBullets(finding, "  ")),
     ];
   });
   return `### Disputed\n\n${items.join("\n")}`;
@@ -904,7 +921,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
       : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);
-  const disputed = renderDisputedSection(input);
+  const disputed = renderDisputedSection(input, true);
   const failedRules = input.rulesFailed.length > 0
     ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
         .map((name) => {

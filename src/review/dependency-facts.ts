@@ -18,6 +18,15 @@ export interface DependencyFact {
   readonly name: string;
   /** The version the pull request moves to. */
   readonly version: string;
+  /**
+   * The spec that produced this fact, verbatim.
+   *
+   * A pin and a range share a `version` once the operator is stripped, so it
+   * cannot identify which change a fact belongs to — the pack looked them up by
+   * `name@version` and handed both changes the same fact (PR #54 review, round
+   * six).
+   */
+  readonly spec: string;
   /** The registry's current `latest`, when it could be read. */
   readonly latest?: string;
   /**
@@ -33,6 +42,23 @@ export interface DependencyFact {
   readonly deprecated?: string;
   /** Why nothing could be established. Present iff the lookup failed. */
   readonly unknown?: string;
+}
+
+/**
+ * A rejection value rendered as text, whatever it is.
+ *
+ * `String()` is not total: it throws for a null-prototype object and for one
+ * whose primitive conversion throws. That exception escaped the catch below and
+ * rejected the whole lookup phase, losing the unknown fact the catch exists to
+ * produce (PR #54 review, round six).
+ */
+function errorText(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  try {
+    return String(error);
+  } catch {
+    return "an error that could not be rendered";
+  }
 }
 
 /** Parsed JSON, or a throw. Anything network-shaped belongs to the caller. */
@@ -69,12 +95,12 @@ function readRegistryDocument(
   body: unknown,
 ): DependencyFact {
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    return { name: change.name, version: change.version, unknown: "the registry returned no usable document" };
+    return { name: change.name, version: change.version, spec: change.spec, unknown: "the registry returned no usable document" };
   }
   const document = body as Record<string, unknown>;
   const versions = document.versions;
   if (typeof versions !== "object" || versions === null || Array.isArray(versions)) {
-    return { name: change.name, version: change.version, unknown: "the registry document listed no versions" };
+    return { name: change.name, version: change.version, spec: change.spec, unknown: "the registry document listed no versions" };
   }
   const distTags = document["dist-tags"];
   const latest =
@@ -99,6 +125,7 @@ function readRegistryDocument(
   return {
     name: change.name,
     version: change.version,
+    spec: change.spec,
     ...(published === undefined ? {} : { published }),
     ...(typeof latest === "string" ? { latest } : {}),
     ...(typeof deprecated === "string" ? { deprecated } : {}),
@@ -126,7 +153,11 @@ export async function fetchDependencyFacts(
   for (const change of changes) {
     const group = byName.get(change.name);
     if (group === undefined) byName.set(change.name, [change]);
-    else if (!group.some((seen) => seen.version === change.version)) group.push(change);
+    // Deduplicated by SPEC, not version: `^1.2.3` and `1.2.3` are different
+    // questions of the same document, and collapsing them dropped the pin —
+    // the only one of the two the registry can answer (PR #54 review, round
+    // six). Both still ride on one request.
+    else if (!group.some((seen) => seen.spec === change.spec)) group.push(change);
   }
   const queue = [...byName.values()];
   const facts: DependencyFact[][] = new Array(queue.length);
@@ -138,7 +169,12 @@ export async function fetchDependencyFacts(
       const group = queue[index]!;
       const first = group[0]!;
       const asUnknown = (unknown: string): DependencyFact[] =>
-        group.map((change) => ({ name: change.name, version: change.version, unknown }));
+        group.map((change) => ({
+          name: change.name,
+          version: change.version,
+          spec: change.spec,
+          unknown,
+        }));
       // Never silence: a package nobody got to is UNKNOWN, not clean.
       if (now() >= deadline) {
         facts[index] = asUnknown(
@@ -164,11 +200,7 @@ export async function fetchDependencyFacts(
         // plain object, and `(error as Error).message` then rendered
         // "reached (undefined)" — nothing, at the moment an operator most
         // needs something (PR #54 review, round four).
-        facts[index] = asUnknown(
-          `the registry could not be reached (${
-            error instanceof Error ? error.message : String(error)
-          })`,
-        );
+        facts[index] = asUnknown(`the registry could not be reached (${errorText(error)})`);
       }
     }
   };
