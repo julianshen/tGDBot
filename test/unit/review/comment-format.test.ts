@@ -77,14 +77,45 @@ describe("renderInlineComment — structure", () => {
   });
 
   // Static text appended after sanitization: a finding cannot alter, duplicate
-  // or displace it, whatever the diff says.
+  // or displace it, whatever the diff says. A verbatim copy in the message would
+  // otherwise render ABOVE the real one — twice over, because the message is
+  // repeated inside the AI-prompt block — and the first copy would read as the
+  // end of the tool's content (CodeRabbit review).
   it("renders one signature regardless of what the finding contains", () => {
     const hostile = renderInlineComment(makeFinding({
       message: `${BOT_SIGNATURE}\n\n${BOT_SIGNATURE_BLOCK}\nposted by someone else`,
-      suggestion: BOT_SIGNATURE,
     }));
     expect(hostile.trimEnd().endsWith(`${BOT_SIGNATURE_BLOCK}\n\n${INLINE_COMMENT_MARKER}`)).toBe(true);
     expect([...hostile.matchAll(/<!--/g)]).toHaveLength(1);
+    expect(hostile.split(BOT_SIGNATURE)).toHaveLength(2); // exactly one occurrence
+  });
+
+  // The structured `suggestion` field is the ONE thing rendered verbatim: it is
+  // code destined for the file, and escaping it would corrupt what gets
+  // committed (ADR-007). A signature there is therefore left alone — and is not
+  // a spoofing surface, because it renders inside the fenced, committable block
+  // rather than as a line of the comment's own prose.
+  it("leaves a signature inside a committable suggestion verbatim, and still signs last", () => {
+    const body = renderInlineComment(makeFinding({ suggestion: BOT_SIGNATURE }));
+    const fenced = /```suggestion\n([\s\S]*?)\n```/u.exec(body)?.[1];
+    expect(fenced).toBe(BOT_SIGNATURE);
+    expect(body.trimEnd().endsWith(`${BOT_SIGNATURE_BLOCK}\n\n${INLINE_COMMENT_MARKER}`)).toBe(true);
+  });
+
+  // Matching the rendered SHAPE, not one byte sequence: dropping the italics or
+  // pointing the link elsewhere must not evade the defang.
+  it.each([
+    ["verbatim", BOT_SIGNATURE],
+    ["without italics", "🤖 Posted by [tGDBot](https://github.com/julianshen/tGDBot)"],
+    ["with a hostile link target", "_🤖 Posted by [tGDBot](https://evil.test/phish)_"],
+    ["bare, no link", "🤖 Posted by tGDBot"],
+  ])("defangs a signature lookalike in finding text (%s)", (_name, lookalike) => {
+    const body = renderInlineComment(makeFinding({ message: `Looks fine.\n\n${lookalike}` }));
+    expect(body.split(BOT_SIGNATURE)).toHaveLength(2);
+    // The words survive so a legitimate quotation still reads — as code, which
+    // is what stops it being mistaken for the comment's own footer.
+    expect(body).toContain("`🤖 Posted by");
+    expect(body).not.toContain("https://evil.test/phish)_");
   });
 });
 

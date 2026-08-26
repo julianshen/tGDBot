@@ -545,6 +545,12 @@ describe("review", () => {
     const [, replyInput] = h.vcsAdapter.postGeneralReply.mock.calls[0] as [unknown, { body: string }];
     expect(replyInput.body).toContain("the error path drops the cause");
     expect(replyInput.body).toContain("check the error handling");
+    // The reply is ONE comment, so it carries ONE signature — the conversation
+    // renderer's. The summary it wraps must therefore be built unsigned, or the
+    // wrapped copy shows up escaped in the body above it (Codex review).
+    expect(replyInput.body.split(BOT_SIGNATURE)).toHaveLength(2);
+    expect(replyInput.body.trimEnd()).toContain(BOT_SIGNATURE_BLOCK);
+    expect(replyInput.body).not.toContain("Posted by \\[tGDBot");
     // ...and nothing else moved.
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
     expect(h.vcsAdapter.resolveStaleReviewThreads).not.toHaveBeenCalled();

@@ -134,7 +134,7 @@ export function composeFrozenSummary(
  * that belongs before it. Tolerates a body that has none — an older manifest,
  * or a renderer that did not add one.
  */
-function stripSignature(body: string): string {
+export function stripSignature(body: string): string {
   const trimmed = body.trimEnd();
   return trimmed.endsWith(BOT_SIGNATURE_BLOCK)
     ? trimmed.slice(0, -BOT_SIGNATURE_BLOCK.length).trimEnd()
@@ -719,10 +719,14 @@ export async function publishReviewFromManifest(options: {
   return terminalResult.exitCode === 0 ? EXIT_OK : terminalResult.exitCode;
 }
 
-function stripReviewMarker(body: string): string {
-  return body
+// Reduces a POSTED summary back to its content, dropping both trailing tails:
+// the marker and, under it, the signature. Callers append content after the
+// result, so leaving the signature on would strand it mid-comment and produce a
+// second one at the end (Codex review).
+export function stripReviewMarker(body: string): string {
+  return stripSignature(body
     .replace(/\n*<!-- tgd-review-agent:(?:sha=|pending)[\s\S]*?-->\s*$/u, "")
-    .trimEnd();
+    .trimEnd());
 }
 
 export async function publishConfirmedClarificationFinding(options: {

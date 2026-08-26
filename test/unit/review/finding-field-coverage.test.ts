@@ -24,7 +24,8 @@ import { describe, expect, it } from "vitest";
 import { FINDING_JSON_CONTRACT, FINDING_OBJECT_CONTRACT } from "../../../src/review/dispatch-prompt.js";
 import { parseDispatchResult } from "../../../src/review/dispatch-results.js";
 import { renderInlineComment, renderSummaryComment } from "../../../src/review/comment-format.js";
-import { toFindingSnapshot } from "../../../src/review/review-publication.js";
+import { stripReviewMarker, stripSignature, toFindingSnapshot } from "../../../src/review/review-publication.js";
+import { BOT_SIGNATURE, BOT_SIGNATURE_BLOCK } from "../../../src/review/comment-format.js";
 import {
   createPreparedClarification,
   toClarificationFindingSnapshot,
@@ -344,5 +345,41 @@ describe("conversation prompts describe the same finding", () => {
     // A contract mentioning "finding" as a JSON field must be one that carries
     // the schema; `"finding": object` with no shape is the #41 defect.
     expect(actions).not.toMatch(/"finding":\s*object\s*\|\s*null[\s\S]{0,400}?`;/);
+  });
+});
+
+// Both tails of a POSTED summary have to come off before anything is appended
+// to it. `publishConfirmedClarificationFinding` appends clarification content to
+// the existing summary body; leaving the signature on would strand it in the
+// middle of the comment and produce a second one at the end (Codex review).
+describe("stripping a posted summary back to its content", () => {
+  const posted = [
+    "## Review summary",
+    "",
+    "- src/a.ts:1 — something",
+    "",
+    BOT_SIGNATURE_BLOCK,
+    "",
+    "<!-- tgd-review-agent:sha=cafef00d cfg=abc123 -->",
+  ].join("\n");
+
+  it("removes the marker and the signature under it", () => {
+    const stripped = stripReviewMarker(posted);
+    expect(stripped).not.toContain(BOT_SIGNATURE);
+    expect(stripped).not.toContain("tgd-review-agent:sha=");
+    expect(stripped.endsWith("- src/a.ts:1 — something")).toBe(true);
+  });
+
+  it("appending content after the stripped body leaves exactly one signature to add", () => {
+    const composed = `${stripReviewMarker(posted)}\n\n- src/b.ts:9 — clarified\n\n${BOT_SIGNATURE_BLOCK}`;
+    expect(composed.split(BOT_SIGNATURE)).toHaveLength(2);
+    expect(composed.trimEnd().endsWith(BOT_SIGNATURE_BLOCK)).toBe(true);
+    expect(composed.indexOf(BOT_SIGNATURE)).toBeGreaterThan(composed.indexOf("clarified"));
+  });
+
+  it("tolerates a body with no signature — an older manifest, or a pending checkpoint", () => {
+    const unsigned = "## Review summary\n\n<!-- tgd-review-agent:pending -->";
+    expect(stripReviewMarker(unsigned)).toBe("## Review summary");
+    expect(stripSignature("plain text")).toBe("plain text");
   });
 });

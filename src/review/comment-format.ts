@@ -142,7 +142,32 @@ function sanitizeText(text: string): string {
     .replace(/<\/?(?:details|summary|script|style|iframe|img|a)\b/gi, (m) => `&lt;${m.slice(1)}`)
     // A committable suggestion must never originate from finding text.
     .replace(SUGGESTION_FENCE_RE, "$1text")
+    .replace(SIGNATURE_LOOKALIKE_RE, quoteSignatureLookalike)
     .trim();
+}
+
+// A finding whose text contains the signature renders it verbatim ABOVE the real
+// one, so the comment appears to carry two — and the first one appears to end the
+// tool's content, with attacker text below it reading as something else.
+//
+// Matches the rendered shape rather than one exact string, so dropping the
+// italics or pointing the link elsewhere does not evade it. What it CANNOT do is
+// stop an approximation ("🤖 Posted by tGDBot" as plain prose); free text can
+// always be made to resemble a line of free text. That is why the signature is a
+// courtesy label and never an authentication signal: what proves authorship is
+// the verified account plus INLINE_COMMENT_MARKER, neither of which finding text
+// can reach.
+const SIGNATURE_LOOKALIKE_RE = /_?\s*🤖\s*Posted by\s*\[?tGDBot\]?(?:\([^)\n]*\))?\s*_?/giu;
+
+// Rendered as an inline code span: the words survive, so a finding that
+// legitimately quotes a signature still reads, but it can no longer be mistaken
+// for the comment's own footer. The italic markers are dropped rather than
+// escaped so the signature's exact byte sequence does not survive anywhere in
+// the body — "how many signatures does this comment contain" then has one
+// answer, countable by a test.
+function quoteSignatureLookalike(match: string): string {
+  const inner = match.replace(/[`\r\n]+/g, " ").replace(/^[\s_]+|[\s_]+$/gu, "");
+  return `\`${inner}\``;
 }
 
 // Single-line fields (file, category, ruleName) are interpolated into a code span
