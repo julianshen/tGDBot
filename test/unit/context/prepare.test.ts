@@ -687,6 +687,39 @@ describe("prepareReviewContext", () => {
     expect(prepared.status).toBe("ready");
   });
 
+  it("refuses a cache root whose ancestor another user owns", async () => {
+    if (process.platform === "win32" || process.getuid?.() === undefined) return;
+    const root = await tempRoot();
+    const worktree = path.join(root, "worktree");
+    const parent = path.join(root, "someone-elses");
+    await mkdir(worktree, { recursive: true });
+    await mkdir(path.join(parent, "cache"), { recursive: true });
+    // Mode 0755 and owned by another user passes every write-bit test —
+    // owner-write is not in 0o022 — yet that owner can rename the protected
+    // root after the last check and drop their own directory in its place.
+    const chowned = await chown(parent, 65534, 65534).then(() => true, () => false);
+    if (!chowned) return;
+
+    const prepared = await prepareReviewContext({
+      mode: "auto" as const,
+      repository,
+      baseSha: BASE_SHA,
+      headSha: HEAD_SHA,
+      changedFiles: ["src/index.ts"],
+      ruleNames: ["tgd-review"],
+      allowDegraded: false,
+      workspaceRoot: path.join(root, "workspaces"),
+      cacheRoot: path.join(parent, "cache"),
+    }, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("unavailable");
+    if (prepared.status !== "unavailable") return;
+    expect(prepared.reasons.join(" ")).toContain("owned by another user");
+  });
+
   it("waits for a concurrent publication rather than giving up on one miss", async () => {
     const { worktree, request } = await baseRequest();
     // First run publishes normally, so a real entry exists to be found.

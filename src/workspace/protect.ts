@@ -107,6 +107,16 @@ export async function protectManagedRoot(
   let ancestor = path.dirname(root);
   while (true) {
     const info = await stat(ancestor);
+    // Ownership, not just write bits. An ancestor owned by another local user
+    // at an ordinary mode 0755 passes every permission test here — owner-write
+    // is not in 0o022 — yet its owner can rename the protected root after the
+    // last check and put their own directory in its place. A sticky writable
+    // ancestor is the same story: it stops others replacing entries they do
+    // not own, and says nothing about the owner. Root is trusted because a
+    // uid 0 that wanted this could take it far more directly.
+    if (currentUid !== undefined && info.uid !== currentUid && info.uid !== 0) {
+      throw new Error(`${label} parent is owned by another user: ${ancestor}`);
+    }
     const writableByOthers = (info.mode & 0o022) !== 0;
     const sticky = (info.mode & 0o1000) !== 0;
     if (writableByOthers && !sticky) {

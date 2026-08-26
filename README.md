@@ -522,6 +522,15 @@ write could be pre-populated with an entry that is then read as trusted
 context. Until that is resolved, on Windows either keep the cache root
 somewhere exclusively yours or run with `--context off`.
 
+`--context-max-chars` is a ceiling on the whole trusted-context section a rule
+receives, not on the repository map alone. When `--dependency-facts` also
+produces a section, its size is reserved first and the repository map is
+rendered against what is left — reserving rather than truncating, because the
+map can drop whole evidence entries and report the omission counts while a list
+of dependency facts cannot be cut mid-claim. The repository map keeps a floor of
+4000 characters, so a very large dependency section is the one case where the
+combined text exceeds the ceiling.
+
 `--dry-run` prepares context exactly as a real run would, so the preview it
 prints is the review you would actually get. That means a dry run on a cold
 cache pays for the first map; pair it with `--context off` if you only wanted

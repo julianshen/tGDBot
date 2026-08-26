@@ -4321,6 +4321,78 @@ describe("repository context", () => {
     expect(pack.manifestHash).toBe("b".repeat(64));
   });
 
+  it("reserves the dependency section's share of the size ceiling", async () => {
+    // --context-max-chars is a per-rule cost control, and the two producers
+    // share one rule's pack — so the repository map must be rendered against
+    // what is LEFT, not against the whole ceiling.
+    const h = makeHarness({
+      args: makeArgs({ context: "auto", dependencyFacts: "on", contextMaxChars: 12_000 }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue([
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      '@@ -3,7 +3,7 @@ "dependencies": {',
+      '-    "lodash": "4.17.20",',
+      '+    "lodash": "4.17.21",',
+      "",
+    ].join("\n"));
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { maxChars?: number };
+    expect(request.maxChars).toBeLessThan(12_000);
+    expect(request.maxChars).toBeGreaterThanOrEqual(4_000);
+  });
+
+  it("spends the whole ceiling on the repository map when no manifest changed", async () => {
+    const h = makeHarness({
+      args: makeArgs({ context: "auto", dependencyFacts: "on", contextMaxChars: 12_000 }),
+    });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { maxChars?: number };
+    expect(request.maxChars).toBe(12_000);
+  });
+
+  it("carries dependency facts on the legacy engine too, now that it takes packs", async () => {
+    // The suppression this replaces was correct when written: the legacy
+    // prompt builder never received a pack. Wiring context removed that
+    // premise, and leaving the guard would deny an operator facts they asked
+    // for on a reason that no longer holds.
+    const h = makeHarness({
+      args: makeArgs({ context: "off", dependencyFacts: "on", dispatch: "legacy" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue([
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      '@@ -3,7 +3,7 @@ "dependencies": {',
+      '-    "lodash": "4.17.20",',
+      '+    "lodash": "4.17.21",',
+      "",
+    ].join("\n"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as {
+      contextPacks?: Record<string, { text: string }>;
+    };
+    expect(dispatched.contextPacks?.["rule-a"]?.text).toContain("Dependency changes in this pull request");
+    expect(warnSpy.mock.calls.flat().join(" ")).not.toContain("needs --dispatch direct");
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   it("re-reviews when the context mode changes, because the config hash moves", async () => {
     const pr = makePr({ headSha: "cafef00d" });
     const offArgs = makeArgs({ context: "off" });
@@ -4439,6 +4511,13 @@ describe("review — dependency facts", () => {
 // while the registry requests still went out. Silent is the problem: the
 // operator asked for a dependency review, paid for the lookups, and got a run
 // that could not produce a single dependency finding.
+// PR #65: this suite asserted that legacy dispatch SUPPRESSED dependency facts,
+// which was correct while the legacy prompt builder could not receive a context
+// pack. Wiring repository context gave `buildDispatchPrompt` a `packsByRule`
+// parameter and `dispatchRules` the same validation the direct engine has, so
+// the premise is gone and the suppression would now deny an operator facts they
+// asked for on a reason that no longer holds. The suite now pins the opposite
+// contract, deliberately, rather than being deleted.
 describe("review — dependency facts under legacy dispatch", () => {
   const MANIFEST_DIFF = [
     "diff --git a/package.json b/package.json",
@@ -4449,18 +4528,28 @@ describe("review — dependency facts under legacy dispatch", () => {
     '+    "lodash": "4.17.21",',
   ].join("\n");
 
-  it("asks the registry nothing, and says why, when the engine cannot carry it", async () => {
+  it("asks the registry and reaches the rules, now that the engine carries packs", async () => {
     const h = makeHarness({
       args: makeArgs({ dependencyFacts: "on", dispatch: "legacy" }),
     });
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
-    const fetchJson = vi.fn();
+    const fetchJson = vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" },
+      versions: { "4.17.21": {} },
+    });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await review(h.args, { ...depsFrom(h), fetchJson });
 
-    expect(fetchJson).not.toHaveBeenCalled();
-    expect(warn.mock.calls.flat().join(" ")).toMatch(/dependency.facts.*legacy|legacy.*dependency/i);
+    expect(fetchJson).toHaveBeenCalled();
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as {
+      contextPacks?: Record<string, { text: string }>;
+    };
+    expect(dispatched.contextPacks?.["rule-a"]?.text)
+      .toContain("Dependency changes in this pull request");
+    // The old warning must be gone, not merely unreachable: a lookup that
+    // happened while the operator was told it had not is worse than either.
+    expect(warn.mock.calls.flat().join(" ")).not.toMatch(/needs --dispatch direct/i);
     warn.mockRestore();
   });
 
