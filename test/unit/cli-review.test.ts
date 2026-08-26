@@ -4086,7 +4086,10 @@ describe("review — dependency facts", () => {
 
     expect(fetchJson).toHaveBeenCalledWith("https://registry.npmjs.org/lodash");
     expect(packFor(h)).toContain("latest is 4.17.30");
-    expect(packFor(h)).toContain("use lodash-es");
+    // Round four: the deprecation FLAG reaches the rule, the publisher's
+    // wording does not.
+    expect(packFor(h)).toMatch(/deprecated/i);
+    expect(packFor(h)).not.toContain("use lodash-es");
     expect(packFor(h)).not.toMatch(/NOT been checked/);
   });
 

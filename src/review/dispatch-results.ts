@@ -341,7 +341,13 @@ export function parseFindingsFromFinalOutput(
   // in "an array is all or nothing" (issue #41).
   return parsed.flatMap((value) => {
     const finding = normalizeUnknownFinding(value, ruleName, allowedReferences);
-    return finding === undefined ? [] : [finding];
+    // The task's rule is a FACT — this parser was handed one rule's output.
+    // The name inside the payload is a claim, and normalizeUnknownFinding
+    // prefers it, which let a finding be validated against the rule that ran
+    // and then stamped with a different one (PR #54 review, round four). The
+    // name and the citations must describe the same rule or neither means
+    // anything.
+    return finding === undefined ? [] : [{ ...finding, ruleName }];
   });
 }
 

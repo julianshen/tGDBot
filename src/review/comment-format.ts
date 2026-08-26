@@ -855,6 +855,15 @@ function compactFailureReasons(input: SummaryInput, failed: ReadonlySet<Finding>
   return `:\n> ${shown.map((reason) => `- ${reason}`).join("\n> ")}${more}`;
 }
 
+/**
+ * The longest citation compact mode will print.
+ *
+ * Well under the 2,000 characters parsing accepts: this is a size fallback, and
+ * a URL long enough to matter against the budget is omitted and declared rather
+ * than cut down into something that no longer resolves.
+ */
+const MAX_COMPACT_REFERENCE_CHARS = 200;
+
 function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // Compact mode must carry the SAME finding set as the full renderer — it is a
   // size fallback, not a scope fallback. Publication failures were previously
@@ -868,8 +877,16 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     `**${summaryHeadline(input, input.inlineCount + relocated.length)}**` +
     `${severityCounts(input)}`;
   const publishFailedSet = new Set(input.publishFailed ?? []);
+  // A citation is shown only if it fits WHOLE. Truncating a URL produces a link
+  // that does not resolve while still reading as evidence, and it was being
+  // counted as shown, so the reader was never told (PR #54 review, round four).
+  const shownReference = (finding: Finding): string | undefined => {
+    const first = finding.references?.[0];
+    return first !== undefined && first.length <= MAX_COMPACT_REFERENCE_CHARS ? first : undefined;
+  };
   const unshownReferences = relocated.reduce(
-    (total, finding) => total + Math.max(0, (finding.references?.length ?? 0) - 1),
+    (total, finding) =>
+      total + (finding.references?.length ?? 0) - (shownReference(finding) === undefined ? 0 : 1),
     0,
   );
   const notice =
@@ -925,10 +942,8 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     // prefix so it is charged against the fixed budget and shrinks the message
     // allowance rather than overflowing the provider limit; the rest are
     // declared missing in the notice above rather than quietly discarded.
-    const citation = finding.references?.[0];
-    const reference = citation === undefined
-      ? ""
-      : `\n  - Reference: ${truncate(sanitizeInline(citation), 200)}`;
+    const citation = shownReference(finding);
+    const reference = citation === undefined ? "" : `\n  - Reference: ${sanitizeInline(citation)}`;
     return {
       prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `,
       message,

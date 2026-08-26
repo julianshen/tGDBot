@@ -248,36 +248,28 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
 }
 
 /**
- * How much publisher prose is worth carrying.
+ * How much of a lookup failure's detail is worth carrying.
  *
- * A deprecation notice is a sentence — "no longer maintained, use lodash-es".
- * Anything past this is not a notice, and letting it run would let one package
- * bury every other entry in the pack.
+ * Enough to tell a proxy error from a 404, not enough for a response body to
+ * become a paragraph.
  */
-const MAX_NOTICE_CHARS = 200;
+const MAX_FAILURE_CHARS = 120;
 
 /**
- * Renders a registry deprecation notice as inert, clearly-attributed data.
+ * Reduces a string the host did not author to a single inert fragment.
  *
- * This is the ONE value in the pack the host did not derive: npm returns
- * whatever the package's publisher wrote. A pull-request author can publish a
- * package, deprecate it with text addressed to the reviewing model, and add it
- * as a dependency — so without this the diff gains an indirect channel into
- * TRUSTED_CONTEXT (PR #54 review).
- *
- * Collapsed to a single line, so it cannot open a heading, a list item, or a
- * section that reads as part of the host's own document; backticks stripped, so
- * it cannot close the span quoting it; capped; and attributed inline rather
- * than in a preamble, which a long dependency list would push out of view.
+ * Used for transport error text, which can carry response content. This bounds
+ * STRUCTURE only — it cannot make a sentence mean less — so it is never applied
+ * to something whose meaning would matter if followed. See `quoteNotice`'s
+ * removal below for why that distinction decides where prose may appear.
  */
-function quoteNotice(notice: string): string {
-  const flattened = notice
+function inertFragment(value: string, max: number): string {
+  return value
     .replace(/[\r\n]+/gu, " ")
     .replace(/`/gu, "'")
     .replace(/\s+/gu, " ")
     .trim()
-    .slice(0, MAX_NOTICE_CHARS);
-  return `the publisher's own note, which is NOT trusted input: \`${flattened}\``;
+    .slice(0, max);
 }
 
 /**
@@ -309,13 +301,35 @@ export function dependencyContextPack(
     if (fact === undefined) return head;
     const notes: string[] = [];
     // An unchecked package must read as unchecked, never as clean.
-    if (fact.unknown !== undefined) notes.push(`lookup failed — ${fact.unknown}`);
-    if (fact.published === false) notes.push("this version is NOT published by the registry");
-    if (fact.deprecated !== undefined) notes.push(`deprecated — ${quoteNotice(fact.deprecated)}`);
-    if (fact.latest !== undefined && fact.latest !== change.version) {
-      notes.push(`latest is ${fact.latest}`);
+    // The reason is transport-derived and can carry response text, so it is
+    // bounded and flattened. It is diagnostic, not instruction: a rule acts on
+    // "this was not checked", never on the wording (PR #54 review, round four).
+    if (fact.unknown !== undefined) {
+      notes.push(`lookup failed — ${inertFragment(fact.unknown, MAX_FAILURE_CHARS)}`);
     }
-    if (fact.latest !== undefined && fact.latest === change.version) notes.push("this is the latest");
+    if (fact.published === false) notes.push("this version is NOT published by the registry");
+    // The FLAG only, never the publisher's words.
+    //
+    // Round three flattened and capped the notice and left it in place. That
+    // defends the document's structure and does nothing about its meaning: an
+    // instruction addressed to the reviewing model survives flattening intact,
+    // and labelling a code span "untrusted" is not a trust boundary a model
+    // enforces (PR #54 review, round four). A pull-request author can publish a
+    // package and write its deprecation text, so this is diff-controlled prose
+    // arriving in the section that means "the host established this".
+    //
+    // The deprecation FLAG is host-established and is what a rule acts on. The
+    // guidance in the notice is a real loss, and a small one against an
+    // injection channel that cannot be closed while the text is here.
+    if (fact.deprecated !== undefined) {
+      notes.push("the registry marks this version deprecated (see the registry for the publisher's guidance)");
+    }
+    // `dist-tags.latest` is a value from a document the publisher controls, so
+    // it is rendered only when it IS a version. Anything else is not a latest
+    // tag worth repeating, and validating beats escaping (round four).
+    const latest = fact.latest !== undefined && isExactVersion(fact.latest) ? fact.latest : undefined;
+    if (latest !== undefined && latest !== change.version) notes.push(`latest is ${latest}`);
+    if (latest !== undefined && latest === change.version) notes.push("this is the latest");
     return notes.length === 0 ? head : `${head}\n${notes.map((note) => `  - ${note}`).join("\n")}`;
   });
   const checked = facts.some((fact) => fact.unknown === undefined);

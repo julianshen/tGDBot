@@ -2580,3 +2580,36 @@ describe("the citation limit is the one the reader sees", () => {
     for (const url of kept) expect(body).toContain(url);
   });
 });
+
+// PR #54 review, round four: normalizeUnknownFinding prefers a model-supplied
+// ruleName over the argument. On the direct path that meant references were
+// validated against the rule that ACTUALLY ran while the finding was stamped
+// with whatever name the model claimed — so rule A could publish under rule B's
+// name carrying rule A's citations. The task's own rule is a fact; the name in
+// the payload is a claim.
+describe("a task's findings are stamped with the rule that ran", () => {
+  it("overrides a model-supplied rule name", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{ ...coreFinding, ruleName: "rule-b" }]),
+      "rule-a",
+    );
+
+    expect(findings[0]?.ruleName).toBe("rule-a");
+  });
+
+  it("keeps citations bound to the rule that actually declared them", () => {
+    const findings = parseFindingsFromFinalOutput(
+      JSON.stringify([{
+        ...coreFinding,
+        ruleName: "rule-b",
+        references: ["https://docs.example.com/a"],
+      }]),
+      "rule-a",
+      referencesDeclaredBy("see https://docs.example.com/a"),
+    );
+
+    // Both halves must agree: the name and the citation describe one rule.
+    expect(findings[0]?.ruleName).toBe("rule-a");
+    expect(findings[0]?.references).toEqual(["https://docs.example.com/a"]);
+  });
+});

@@ -1301,3 +1301,50 @@ describe("renderSummaryComment — compact mode keeps the evidence", () => {
     expect(body).not.toMatch(/further reference|additional reference/i);
   });
 });
+
+// PR #54 review, round four: compact mode truncated the URL itself at 200
+// characters and appended an ellipsis, so the reader got a link that does not
+// resolve AND was counted as shown. A destroyed citation is worse than an
+// absent one: it looks like evidence and leads nowhere.
+describe("renderSummaryComment — compact mode never truncates a citation", () => {
+  const longUrl = `https://docs.example.com/${"p".repeat(400)}`;
+
+  it("omits a citation it cannot show whole, and counts it as omitted", () => {
+    const finding = makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "m".repeat(2000),
+      references: [longUrl],
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 900);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    // The message is still truncated — that is compact mode working. What must
+    // not appear is a half of the URL.
+    expect(body).not.toContain("Reference:");
+    expect(body).not.toContain("p".repeat(50));
+    expect(body).toMatch(/further reference|reference.*omitted/i);
+  });
+
+  it("still shows one that fits", () => {
+    const finding = makeFinding({
+      file: "a.go",
+      line: 10,
+      message: "m".repeat(2000),
+      references: ["https://docs.example.com/short"],
+    });
+
+    const body = renderSummaryComment(summaryInput({
+      allFindings: [finding],
+      inlineCount: 0,
+      unanchored: [finding],
+    }), 900);
+
+    expect(body).toContain("https://docs.example.com/short");
+  });
+});

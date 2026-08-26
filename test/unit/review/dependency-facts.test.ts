@@ -216,3 +216,29 @@ describe("fetchDependencyFacts — the lookup phase is bounded overall", () => {
     expect(fetchJson).toHaveBeenCalledTimes(changes.length);
   });
 });
+
+// PR #54 review, round four: `(error as Error).message` is a cast, not a check.
+// A fetcher that rejects with a string or a plain object produced "the registry
+// could not be reached (undefined)" — a diagnostic that tells an operator
+// nothing at the moment they most need it.
+describe("fetchDependencyFacts — a thrown value need not be an Error", () => {
+  it("reports a string rejection", async () => {
+    const [fact] = await fetchDependencyFacts(
+      [change("pkg", "1.0.0")],
+      vi.fn(async () => { throw "ECONNREFUSED"; }),
+    );
+
+    expect(fact?.unknown).toContain("ECONNREFUSED");
+    expect(fact?.unknown).not.toContain("undefined");
+  });
+
+  it("reports a non-Error object rejection", async () => {
+    const [fact] = await fetchDependencyFacts(
+      [change("pkg", "1.0.0")],
+      vi.fn(async () => { throw { code: 502 }; }),
+    );
+
+    expect(fact?.unknown).toBeDefined();
+    expect(fact?.unknown).not.toContain("undefined");
+  });
+});

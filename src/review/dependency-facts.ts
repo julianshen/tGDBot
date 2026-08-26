@@ -153,7 +153,13 @@ export async function fetchDependencyFacts(
         facts[index] = {
           name: change.name,
           version: change.version,
-          unknown: `the registry could not be reached (${(error as Error).message})`,
+          // A cast is not a check: a fetcher can reject with a string or a
+          // plain object, and `(error as Error).message` then rendered
+          // "reached (undefined)" — nothing, at the moment an operator most
+          // needs something (PR #54 review, round four).
+          unknown: `the registry could not be reached (${
+            error instanceof Error ? error.message : String(error)
+          })`,
         };
       }
     }
