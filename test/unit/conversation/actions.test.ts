@@ -1073,3 +1073,48 @@ describe("parseReconsiderOutput — a revised claim does not inherit evidence", 
       .toEqual(["https://docs.example.com/ttl"]);
   });
 });
+
+// PR #54 review, final round: focusReview parsed without an allowed set, so the
+// fail-closed branch stripped every citation — even though the shared contract
+// asks the model for `references` and the rules it ran are right there.
+describe("focusReview — citations from the rules it ran", () => {
+  const rules = [
+    { name: "rule-a", body: "See https://docs.example.com/a", sourcePath: "a.md", dependsOn: [] },
+    { name: "rule-b", body: "See https://docs.example.com/b", sourcePath: "b.md", dependsOn: [] },
+  ];
+  const finding = (references: string[]) => JSON.stringify([{
+    file: "a.ts",
+    line: 1,
+    severity: "warning",
+    category: "correctness",
+    title: "T",
+    message: "M",
+    decision: "new",
+    references,
+  }]);
+
+  const run = async (text: string) => focusReview({
+    rules,
+    diff: "diff",
+    direction: "look at locking",
+    model: MODEL,
+    createSession: async () => ({
+      prompt: async () => text,
+      getLastAssistantText: () => text,
+    }),
+  } as never);
+
+  it("keeps a URL one of the focus rules declared", async () => {
+    const result = await run(finding(["https://docs.example.com/b"]));
+
+    expect((result as { result?: { findings?: Finding[] } }).result?.findings?.[0]?.references)
+      .toEqual(["https://docs.example.com/b"]);
+  });
+
+  it("drops one no rule in the focus set declared", async () => {
+    const result = await run(finding(["https://evil.example/x"]));
+
+    expect((result as { result?: { findings?: Finding[] } }).result?.findings?.[0]?.references)
+      .toBeUndefined();
+  });
+});

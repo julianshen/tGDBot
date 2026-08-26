@@ -10,6 +10,7 @@ import {
   extractFindingsArray,
   normalizeUnknownFinding,
   parseFindingsFromFinalOutput,
+  referencesDeclaredBy,
 } from "../review/dispatch-results.js";
 import type { Finding } from "../review/types.js";
 import { FINDING_JSON_CONTRACT, FINDING_OBJECT_CONTRACT } from "../review/dispatch-prompt.js";
@@ -496,7 +497,31 @@ export async function focusReview(
     input,
     (text) => {
       if (extractFindingsArray(text) === undefined) return undefined;
-      return { findings: parseFindingsFromFinalOutput(text, input.rules[0]?.name ?? "focus") };
+      // The UNION of the focus set's declarations, not one rule's.
+      //
+      // A focus review runs every trusted rule in ONE session against one
+      // merged output, and the contract has no `ruleName` field — which is why
+      // the attribution below is already the first rule's name rather than the
+      // producing rule's. So per-rule provenance is not available on this path
+      // and pretending otherwise would be the misattribution the merged
+      // orchestrator output was stopped for.
+      //
+      // What the union still guarantees is the property that matters: every URL
+      // was declared by a rule that actually ran in THIS review, so the model
+      // cannot invent one. Parsing with no set at all fails closed and stripped
+      // every citation, including ones the contract asks the model to emit
+      // (PR #54 review, final round).
+      const declared = new Set<string>();
+      for (const rule of input.rules) {
+        for (const url of referencesDeclaredBy(rule.body)) declared.add(url);
+      }
+      return {
+        findings: parseFindingsFromFinalOutput(
+          text,
+          input.rules[0]?.name ?? "focus",
+          declared,
+        ),
+      };
     },
   );
 }

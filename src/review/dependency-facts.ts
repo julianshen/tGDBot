@@ -200,7 +200,17 @@ export async function fetchDependencyFacts(
         // plain object, and `(error as Error).message` then rendered
         // "reached (undefined)" — nothing, at the moment an operator most
         // needs something (PR #54 review, round four).
-        facts[index] = asUnknown(`the registry could not be reached (${errorText(error)})`);
+        // HOST-AUTHORED, with no remote text in it. `fetchJsonReal` puts the
+        // response's own `statusText` into the error it throws, so
+        // interpolating the message here piped an intermediary's prose into
+        // TRUSTED_CONTEXT — the same channel the publisher's deprecation notice
+        // was removed to close, and flattening does not close it (PR #54
+        // review, final round). The detail is still worth having, so it goes
+        // where diagnostics belong.
+        console.warn(
+          `tgd-review-agent: registry lookup for ${first.name} failed (${errorText(error)})`,
+        );
+        facts[index] = asUnknown("the registry could not be reached");
       }
     }
   };

@@ -4104,7 +4104,10 @@ describe("review — dependency facts", () => {
 
     expect(exitCode).toBe(0);
     expect(packFor(h)).toMatch(/lookup failed/);
-    expect(packFor(h)).toMatch(/ECONNRESET/);
+    // Final round: the reason is host-authored; the transport's own message is
+    // logged rather than carried into trusted context.
+    expect(packFor(h)).toMatch(/could not be reached/);
+    expect(packFor(h)).not.toMatch(/ECONNRESET/);
   });
 
   it("asks nothing when the diff changes no manifest", async () => {

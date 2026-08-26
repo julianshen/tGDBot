@@ -109,8 +109,14 @@ const MANIFEST_BASENAMES = new Set(["package.json"]);
  * carry prose across that boundary: `IGNORE ALL PREVIOUS INSTRUCTIONS/…` has a
  * perfectly ordinary basename. Restricting the whole path to an inert charset
  * means no interpolated value can form a sentence.
+ *
+ * `@` is admitted: scoped workspaces live at `packages/@acme/widget/package.json`
+ * and every dependency change in one was being dropped silently (PR #54 review,
+ * final round). It is a path character, not a word character, so it cannot make
+ * the path read as prose — which is the whole point of the allowlist. What the
+ * allowlist excludes is SPACE.
  */
-const MANIFEST_PATH_RE = /^[A-Za-z0-9._\/-]{1,512}$/u;
+const MANIFEST_PATH_RE = /^[A-Za-z0-9._@\/-]{1,512}$/u;
 
 /**
  * Keys that live in a manifest's RUNTIME sections, never in a dependency map.
@@ -279,6 +285,7 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
   const seen = new Set<string>();
   const changes: DependencyChange[] = [];
   const guessed: DependencyChange[] = [];
+  const guessedKeys = new Set<string>();
   for (const [index, line] of lines.entries()) {
     // The scan ends only when the CONFIRMED entries fill the ceiling. Guesses
     // are collected separately and capped separately, so no amount of them can
@@ -297,8 +304,6 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
     // different questions of the registry, and collapsing them dropped the pin
     // — the only one of the two that can be checked (round six).
     const key = `${name}@${spec}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
     const change: DependencyChange = {
       name,
       version,
@@ -307,37 +312,28 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
       pinned: isPinnedSpec(spec),
       inDependencySection: context.confirmed,
     };
-    if (change.inDependencySection) changes.push(change);
-    else if (guessed.length < MAX_GUESSED_PACKAGES) guessed.push(change);
+    // Deduplicated WITHIN each class, not across them. A single seen-set let a
+    // guess claim the key first, so the confirmed occurrence of the same
+    // package was dropped and the entry kept the wrong manifest and the "may
+    // not be a dependency" label (PR #54 review, final round).
+    if (change.inDependencySection) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      changes.push(change);
+    } else if (guessed.length < MAX_GUESSED_PACKAGES && !guessedKeys.has(key)) {
+      guessedKeys.add(key);
+      guessed.push(change);
+    }
   }
+  // A guess is dropped entirely once a confirmed entry describes the same
+  // change: the confirmed one carries the real manifest and no caveat.
+  const confirmedKeys = new Set(changes.map((change) => `${change.name}@${change.spec}`));
   // Established entries first, order otherwise preserved, then the ceiling.
   // A guess must never displace something the host actually parsed.
-  return [...changes, ...guessed].slice(0, MAX_PACKAGES_PER_DIFF);
-}
-
-/**
- * How much of a lookup failure's detail is worth carrying.
- *
- * Enough to tell a proxy error from a 404, not enough for a response body to
- * become a paragraph.
- */
-const MAX_FAILURE_CHARS = 120;
-
-/**
- * Reduces a string the host did not author to a single inert fragment.
- *
- * Used for transport error text, which can carry response content. This bounds
- * STRUCTURE only — it cannot make a sentence mean less — so it is never applied
- * to something whose meaning would matter if followed. See `quoteNotice`'s
- * removal below for why that distinction decides where prose may appear.
- */
-function inertFragment(value: string, max: number): string {
-  return value
-    .replace(/[\r\n]+/gu, " ")
-    .replace(/`/gu, "'")
-    .replace(/\s+/gu, " ")
-    .trim()
-    .slice(0, max);
+  return [
+    ...changes,
+    ...guessed.filter((change) => !confirmedKeys.has(`${change.name}@${change.spec}`)),
+  ].slice(0, MAX_PACKAGES_PER_DIFF);
 }
 
 /**
@@ -378,12 +374,9 @@ export function dependencyContextPack(
     if (fact === undefined) return head;
     const notes: string[] = [];
     // An unchecked package must read as unchecked, never as clean.
-    // The reason is transport-derived and can carry response text, so it is
-    // bounded and flattened. It is diagnostic, not instruction: a rule acts on
-    // "this was not checked", never on the wording (PR #54 review, round four).
-    if (fact.unknown !== undefined) {
-      notes.push(`lookup failed — ${inertFragment(fact.unknown, MAX_FAILURE_CHARS)}`);
-    }
+    // `unknown` is host-authored by construction — see fetchDependencyFacts,
+    // which logs the remote detail rather than putting it here.
+    if (fact.unknown !== undefined) notes.push(`lookup failed — ${fact.unknown}`);
     if (fact.published === false) notes.push("this version is NOT published by the registry");
     // The FLAG only, never the publisher's words.
     //
