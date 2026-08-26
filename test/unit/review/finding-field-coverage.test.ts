@@ -24,7 +24,10 @@ import { describe, expect, it } from "vitest";
 import { FINDING_JSON_CONTRACT, FINDING_OBJECT_CONTRACT } from "../../../src/review/dispatch-prompt.js";
 import { parseDispatchResult } from "../../../src/review/dispatch-results.js";
 import { renderInlineComment, renderSummaryComment } from "../../../src/review/comment-format.js";
-import { toFindingSnapshot } from "../../../src/review/review-publication.js";
+import { stripReviewMarker, stripSignature, toFindingSnapshot } from "../../../src/review/review-publication.js";
+import { BOT_SIGNATURE, BOT_SIGNATURE_BLOCK, INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
+import { composeFrozenSummary } from "../../../src/review/review-publication.js";
+import type { PublicationAction, PublicationChild } from "../../../src/conversation/publication-manifest.js";
 import {
   createPreparedClarification,
   toClarificationFindingSnapshot,
@@ -344,5 +347,102 @@ describe("conversation prompts describe the same finding", () => {
     // A contract mentioning "finding" as a JSON field must be one that carries
     // the schema; `"finding": object` with no shape is the #41 defect.
     expect(actions).not.toMatch(/"finding":\s*object\s*\|\s*null[\s\S]{0,400}?`;/);
+  });
+});
+
+// Both tails of a POSTED summary have to come off before anything is appended
+// to it. `publishConfirmedClarificationFinding` appends clarification content to
+// the existing summary body; leaving the signature on would strand it in the
+// middle of the comment and produce a second one at the end (Codex review).
+describe("stripping a posted summary back to its content", () => {
+  const posted = [
+    "## Review summary",
+    "",
+    "- src/a.ts:1 — something",
+    "",
+    BOT_SIGNATURE_BLOCK,
+    "",
+    "<!-- tgd-review-agent:sha=cafef00d cfg=abc123 -->",
+  ].join("\n");
+
+  it("removes the marker and the signature under it", () => {
+    const stripped = stripReviewMarker(posted);
+    expect(stripped).not.toContain(BOT_SIGNATURE);
+    expect(stripped).not.toContain("tgd-review-agent:sha=");
+    expect(stripped.endsWith("- src/a.ts:1 — something")).toBe(true);
+  });
+
+  it("appending content after the stripped body leaves exactly one signature to add", () => {
+    const composed = `${stripReviewMarker(posted)}\n\n- src/b.ts:9 — clarified\n\n${BOT_SIGNATURE_BLOCK}`;
+    expect(composed.split(BOT_SIGNATURE)).toHaveLength(2);
+    expect(composed.trimEnd().endsWith(BOT_SIGNATURE_BLOCK)).toBe(true);
+    expect(composed.indexOf(BOT_SIGNATURE)).toBeGreaterThan(composed.indexOf("clarified"));
+  });
+
+  it("tolerates a body with no signature — an older manifest, or a pending checkpoint", () => {
+    const unsigned = "## Review summary\n\n<!-- tgd-review-agent:pending -->";
+    expect(stripReviewMarker(unsigned)).toBe("## Review summary");
+    expect(stripSignature("plain text")).toBe("plain text");
+  });
+});
+
+// The replayed-manifest path composes the summary from FROZEN child bodies, and
+// a fallback child's body is the rendered inline comment verbatim — which now
+// carries its own signature. Spreading those between the summary and the footer
+// put one apparent footer in the middle of the comment per relocated finding
+// (Codex review). Only this path is affected: on a live run `bodyFor` prefers
+// cli.ts's buildBody, which re-renders relocated findings as summary entries.
+describe("composeFrozenSummary with relocated findings", () => {
+  const marker = "<!-- tgd-review-agent:sha=cafef00d cfg=abc123 -->";
+
+  function child(over: Partial<PublicationChild> & { id: string; kind: PublicationChild["kind"]; body: string }): PublicationChild {
+    return {
+      status: "posted",
+      placement: { kind: "summary", headSha: "c".repeat(40), configHash: "abc123" },
+      bodyDigest: "0".repeat(64),
+      marker: "",
+      ...over,
+    } as PublicationChild;
+  }
+
+  it("carries exactly one signature, last, however many findings were relocated", () => {
+    const relocated = (n: number) => renderInlineComment({
+      file: `src/${n}.ts`,
+      line: n,
+      severity: "warning",
+      category: "correctness",
+      message: `finding ${n}`,
+      ruleName: "rule-a",
+    });
+    const action = {
+      children: [
+        child({ id: "summary", kind: "summary", body: `## Review summary\n\n${BOT_SIGNATURE_BLOCK}` }),
+        child({
+          id: "fb-1",
+          kind: "fallback",
+          status: "fallback-selected",
+          body: relocated(1),
+          placement: { kind: "fallback" },
+        }),
+        child({
+          id: "fb-2",
+          kind: "fallback",
+          status: "fallback-selected",
+          body: relocated(2),
+          placement: { kind: "fallback" },
+        }),
+      ],
+    } as unknown as PublicationAction;
+
+    const composed = composeFrozenSummary(action, new Set(), marker);
+
+    expect(composed).toContain("finding 1");
+    expect(composed).toContain("finding 2");
+    expect(composed.split(BOT_SIGNATURE)).toHaveLength(2);
+    expect(composed.trimEnd().endsWith(marker)).toBe(true);
+    expect(composed.indexOf(BOT_SIGNATURE)).toBeGreaterThan(composed.indexOf("finding 2"));
+    // The relocated bodies keep their own machine markers — only the visible
+    // signature is removed, so stale-thread cleanup is unaffected.
+    expect(composed).toContain(INLINE_COMMENT_MARKER);
   });
 });

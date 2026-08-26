@@ -3,6 +3,7 @@
 import { computeContentDigest } from "./markers.js";
 import type { PublicationChild } from "./publication-manifest.js";
 import type { PublicationChildKind, PublicationPlacement } from "./state-schema.js";
+import { BOT_SIGNATURE_BLOCK } from "../review/comment-format.js";
 import type { Finding } from "../review/types.js";
 import type { RepositoryRef } from "../target/types.js";
 
@@ -111,9 +112,12 @@ export function childMarkerSuffix(marker: string): string {
 
 function capToLimit(content: string, marker: string): string {
   const suffix = childMarkerSuffix(marker);
-  const budget = Math.max(0, MAX_PUBLIC_CONVERSATION_BODY_CHARS - suffix.length);
+  // The signature is part of the body the provider stores, so it is charged
+  // against the same budget as the marker — never appended after the cap.
+  const signature = `\n\n${BOT_SIGNATURE_BLOCK}`;
+  const budget = Math.max(0, MAX_PUBLIC_CONVERSATION_BODY_CHARS - suffix.length - signature.length);
   const trimmed = content.length <= budget ? content : content.slice(0, budget);
-  return `${trimmed}${suffix}`;
+  return `${trimmed}${signature}${suffix}`;
 }
 
 function attributionLines(

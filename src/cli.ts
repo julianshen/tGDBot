@@ -27,7 +27,7 @@ import {
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
-import type { ClarificationPresentation } from "./review/comment-format.js";
+import { BOT_SIGNATURE_BLOCK, type ClarificationPresentation } from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
@@ -1302,10 +1302,18 @@ export async function review(
     marker = formatMarker(pr.headSha, configHash),
     providerLimit = true,
     publishFailureReason?: string | ReadonlyMap<string, string>,
+    // Off for a summary that becomes the CONTENT of another comment rather than
+    // a comment of its own: the conversational renderer signs what it wraps, so
+    // signing here would embed a second (escaped) attribution in its body.
+    sign = true,
   ): string => {
     const suffixParts: string[] = [];
     if (loadErrors.length > 0) suffixParts.push(renderLoadErrorsSection(loadErrors));
-    suffixParts.push(marker);
+    // Visible "written by the tool" line, last before the dedup marker on every
+    // summary this path composes. composeFrozenSummary re-places it when a
+    // replayed manifest appends relocated findings after the frozen body.
+    if (sign) suffixParts.push(BOT_SIGNATURE_BLOCK);
+    if (marker.length > 0) suffixParts.push(marker);
     const suffix = `\n\n${suffixParts.join("\n\n")}`;
     const maxSummaryLength = providerLimit ? 65_536 - suffix.length : Number.MAX_SAFE_INTEGER;
     if (providerLimit && maxSummaryLength <= 0) {
@@ -1349,7 +1357,9 @@ export async function review(
         identityDigest: publicationIdentity.identityDigest,
       },
       direction: invocation.direction,
-      summary: buildBody(orchestration, noFallbackIds, undefined, false),
+      // Unsigned: renderFocusReply wraps this in a conversation reply, and that
+      // renderer appends the one signature the posted comment carries.
+      summary: buildBody(orchestration, noFallbackIds, undefined, false, undefined, false),
       orchestration,
       rules,
       reviewOptions: reviewOptionsSnapshot(config),
