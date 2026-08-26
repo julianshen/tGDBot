@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { computeContentDigest, formatChildMarker, parseChildMarker } from "../../../src/conversation/markers.js";
 import {
+  BOT_SIGNATURE,
+  BOT_SIGNATURE_BLOCK,
+} from "../../../src/review/comment-format.js";
+import {
   MAX_PUBLIC_CONVERSATION_BODY_CHARS,
   createConversationPublicationChild,
   flattenAuthor,
@@ -243,6 +247,34 @@ describe("conversation reply rendering", () => {
     expect(text.endsWith(marker)).toBe(true);
     expect(text).toContain("Z".repeat(100));
     expect(text.length).toBeLessThan(40_000 + marker.length);
+  });
+
+  // Same reason as the inline surface: the marker is invisible, so a reader
+  // cannot otherwise tell a tool reply from one a colleague typed.
+  it("signs every reply visibly, immediately before the marker", () => {
+    const replies = [
+      renderExplainReply({ explanation: "because" }, marker, githubBinding),
+      renderUsageReply(marker),
+      renderScopeErrorReply(marker),
+      renderUnsupportedHistoryReply(marker),
+    ];
+    for (const reply of replies) {
+      const text = publicationBody(reply);
+      expect(text).toContain(BOT_SIGNATURE);
+      expect(text.endsWith(`${BOT_SIGNATURE_BLOCK}\n${marker}`)).toBe(true);
+    }
+  });
+
+  // The signature is part of the stored body, so it is charged against the
+  // public-body budget — a maximal reply must not overflow the limit by
+  // exactly the length of the line we append.
+  it("keeps the signature inside the public-body limit on a maximal reply", () => {
+    const text = publicationBody(renderExplainReply({
+      explanation: "Z".repeat(40_000),
+    }, marker, githubBinding));
+
+    expect(text.length).toBeLessThanOrEqual(MAX_PUBLIC_CONVERSATION_BODY_CHARS);
+    expect(text.endsWith(`${BOT_SIGNATURE_BLOCK}\n${marker}`)).toBe(true);
   });
 
   it("rejects a raw string as a publication body and accepts only the branded renderer type", () => {

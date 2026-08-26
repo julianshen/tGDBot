@@ -37,6 +37,7 @@ import {
   type InlineRecoveryState,
   type TerminalReviewResult,
 } from "./comment-marker.js";
+import { BOT_SIGNATURE_BLOCK } from "./comment-format.js";
 import { formatMarker } from "./dedup.js";
 import { orchestrate, type OrchestrationResult } from "./orchestrate.js";
 import type { Finding } from "./types.js";
@@ -116,9 +117,28 @@ export function composeFrozenSummary(
       return key !== undefined && fallbackIds.has(key);
     })
     .map((child) => child.body);
-  const suffix = extras.length === 0 ? marker : `${extras.join("\n\n")}\n\n${marker}`;
-  return extras.length === 0 ? `${summary.body}${summary.body.endsWith("\n") ? "" : "\n\n"}${marker}` :
-    `${summary.body.trimEnd()}\n\n${suffix}`;
+  // The frozen summary body was rendered with a signature already (buildBody
+  // appends one), but relocated findings are appended AFTER it here — so a
+  // replayed manifest would show the signature mid-comment. Strip and re-append
+  // instead of rendering around it: the signature marks the end of the comment,
+  // whatever else this path adds, and the dedup marker stays last.
+  const base = stripSignature(summary.body);
+  const signed = marker.length === 0
+    ? BOT_SIGNATURE_BLOCK
+    : `${BOT_SIGNATURE_BLOCK}\n\n${marker}`;
+  return [base, ...extras, signed].join("\n\n");
+}
+
+/**
+ * Removes a trailing signature block so it can be re-appended after content
+ * that belongs before it. Tolerates a body that has none — an older manifest,
+ * or a renderer that did not add one.
+ */
+function stripSignature(body: string): string {
+  const trimmed = body.trimEnd();
+  return trimmed.endsWith(BOT_SIGNATURE_BLOCK)
+    ? trimmed.slice(0, -BOT_SIGNATURE_BLOCK.length).trimEnd()
+    : trimmed;
 }
 
 function sameTerminalResult(

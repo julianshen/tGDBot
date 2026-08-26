@@ -27,7 +27,7 @@ import {
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
-import type { ClarificationPresentation } from "./review/comment-format.js";
+import { BOT_SIGNATURE_BLOCK, type ClarificationPresentation } from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
@@ -1204,7 +1204,11 @@ export async function review(
   ): string => {
     const suffixParts: string[] = [];
     if (loadErrors.length > 0) suffixParts.push(renderLoadErrorsSection(loadErrors));
-    suffixParts.push(marker);
+    // Visible "written by the tool" line, last before the dedup marker on every
+    // summary this path composes. composeFrozenSummary re-places it when a
+    // replayed manifest appends relocated findings after the frozen body.
+    suffixParts.push(BOT_SIGNATURE_BLOCK);
+    if (marker.length > 0) suffixParts.push(marker);
     const suffix = `\n\n${suffixParts.join("\n\n")}`;
     const maxSummaryLength = providerLimit ? 65_536 - suffix.length : Number.MAX_SAFE_INTEGER;
     if (providerLimit && maxSummaryLength <= 0) {

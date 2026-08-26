@@ -33,6 +33,32 @@ import {
  */
 export const INLINE_COMMENT_MARKER = "<!-- tgd-review-agent:inline -->";
 
+/**
+ * HUMAN-visible counterpart to the machine markers: the last rendered line of
+ * every comment this tool writes, on every surface (inline findings, the
+ * managed summary, and conversation replies).
+ *
+ * The marker above is an HTML comment — invisible in the rendered page, which
+ * is the point for stale-thread cleanup and exactly the problem for a reader.
+ * On a provider account named for the bot the avatar carries that signal, but
+ * the common local case is a developer running the CLI under their OWN login
+ * (the same case that forces resolveStaleReviewThreads to check the marker and
+ * not just the author): their teammates then see review comments apparently
+ * hand-written by a colleague. The signature says which ones the tool wrote.
+ *
+ * Static text, appended AFTER all sanitized content and never interpolated
+ * with finding-derived values, so nothing a diff can say reaches this line.
+ * It is decoration, not a machine signal: nothing parses it, and stale-thread
+ * cleanup still keys on INLINE_COMMENT_MARKER alone. Content-addressed
+ * publication digests cover the rendered body, so this line participates in
+ * them like any other rendered text and must stay byte-stable per release.
+ */
+export const BOT_SIGNATURE =
+  "_🤖 Posted by [tGDBot](https://github.com/julianshen/tGDBot)_";
+
+/** The signature as its own block: a rule, then the line. */
+export const BOT_SIGNATURE_BLOCK = `---\n\n${BOT_SIGNATURE}`;
+
 export interface InlineComment {
   clientId: string;
   /** Repo-relative path, as it appears on the NEW side of the diff. */
@@ -249,6 +275,11 @@ export function renderInlineComment(
     fence,
     "",
     "</details>",
+    "",
+    // The visible half of "this was written by the tool". Before the machine
+    // marker, because the marker (and any finding marker after it) must stay
+    // the last line: recovery reads exactly that line back.
+    BOT_SIGNATURE_BLOCK,
     "",
     // Appended AFTER all sanitized content, like the summary's dedup marker —
     // this is what lets resolveStaleReviewThreads recognize the tool's own

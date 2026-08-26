@@ -3,6 +3,8 @@
 // orchestrate() — which is how the security holes below survived to review.
 import { describe, expect, it } from "vitest";
 import {
+  BOT_SIGNATURE,
+  BOT_SIGNATURE_BLOCK,
   INLINE_COMMENT_MARKER,
   renderInlineComment,
   renderSummaryComment,
@@ -12,12 +14,16 @@ import type { Finding } from "../../../src/review/types.js";
 import type { SummaryInput } from "../../../src/review/comment-format.js";
 import type { RelatedWorkItem } from "../../../src/review/related-work.js";
 
-// Every inline body ends with the tool's trailing marker (what stale-thread
-// resolution keys on); assertions about "the body proper" strip it first.
+// Every inline body ends with two static tails appended after sanitization:
+// the visible "posted by tGDBot" signature, then the trailing marker that
+// stale-thread resolution keys on. Assertions about "the body proper" — that
+// content-derived text cannot escape a block, for instance — strip both first.
 function bodyBeforeMarker(body: string): string {
   const trimmed = body.trimEnd();
   expect(trimmed.endsWith(INLINE_COMMENT_MARKER)).toBe(true);
-  return trimmed.slice(0, -INLINE_COMMENT_MARKER.length).trimEnd();
+  const beforeMarker = trimmed.slice(0, -INLINE_COMMENT_MARKER.length).trimEnd();
+  expect(beforeMarker.endsWith(BOT_SIGNATURE_BLOCK)).toBe(true);
+  return beforeMarker.slice(0, -BOT_SIGNATURE_BLOCK.length).trimEnd();
 }
 
 function makeFinding(overrides: Partial<Finding> = {}): Finding {
@@ -42,6 +48,43 @@ describe("renderInlineComment — structure", () => {
     const body = renderInlineComment(makeFinding());
     expect(body).toContain("🤖 Prompt for AI Agents");
     expect(body).toContain("In `src/a.ts` around line 12:");
+  });
+
+  // The machine marker is an HTML comment and therefore invisible in the
+  // rendered page. A reader — especially on a repo where the CLI runs under a
+  // human's own login — needs a visible way to tell a tool comment from a
+  // hand-written one.
+  it("signs the comment visibly, immediately before the machine marker", () => {
+    const body = renderInlineComment(makeFinding()).trimEnd();
+    expect(body).toContain(BOT_SIGNATURE);
+    expect(body.endsWith(`${BOT_SIGNATURE_BLOCK}\n\n${INLINE_COMMENT_MARKER}`)).toBe(true);
+  });
+
+  // The marker must remain the LAST line: inline recovery reads exactly that
+  // line back to match a published comment to its publication manifest.
+  it("keeps the finding marker last when one is supplied", () => {
+    const findingMarker = formatChildMarker({
+      kind: "finding",
+      parentId: `act_${"1".repeat(32)}`,
+      childId: `finding_${"2".repeat(32)}`,
+      repositoryDigest: "a".repeat(64),
+      reviewNumber: 42,
+      contentDigest: "b".repeat(64),
+    });
+    const body = renderInlineComment(makeFinding(), { findingMarker }).trimEnd();
+    expect(body.endsWith(findingMarker)).toBe(true);
+    expect(body).toContain(`${BOT_SIGNATURE_BLOCK}\n\n${INLINE_COMMENT_MARKER}`);
+  });
+
+  // Static text appended after sanitization: a finding cannot alter, duplicate
+  // or displace it, whatever the diff says.
+  it("renders one signature regardless of what the finding contains", () => {
+    const hostile = renderInlineComment(makeFinding({
+      message: `${BOT_SIGNATURE}\n\n${BOT_SIGNATURE_BLOCK}\nposted by someone else`,
+      suggestion: BOT_SIGNATURE,
+    }));
+    expect(hostile.trimEnd().endsWith(`${BOT_SIGNATURE_BLOCK}\n\n${INLINE_COMMENT_MARKER}`)).toBe(true);
+    expect([...hostile.matchAll(/<!--/g)]).toHaveLength(1);
   });
 });
 
