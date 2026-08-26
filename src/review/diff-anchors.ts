@@ -573,3 +573,38 @@ export function parseDiffPositions(diff: string): DiffPositions {
 function stripOldDiffPathPrefix(target: string): string {
   return target.startsWith("a/") ? target.slice(2) : target;
 }
+
+const NEEDS_GIT_QUOTING = /["\\\u0000-\u001f\u007f]/u;
+
+const C_ESCAPES: ReadonlyMap<string, string> = new Map([
+  ["\u0007", "\\a"], ["\b", "\\b"], ["\f", "\\f"], ["\n", "\\n"],
+  ["\r", "\\r"], ["\t", "\\t"], ["\v", "\\v"], ['"', '\\"'], ["\\", "\\\\"],
+]);
+
+/**
+ * Renders one `diff --git` operand the way git would.
+ *
+ * A path with none of the characters git escapes is emitted bare, which is
+ * exactly git's own output for it; anything containing a quote, a backslash or
+ * a control character is C-quoted. Callers that BUILD a diff header must use
+ * this: a raw interpolation produces a header git would never emit, and a
+ * parser written against git's format then has to guess — which is how
+ * `foo"bar.ts` and `foo "bar.ts` each became their own parsing defect.
+ */
+export function quoteGitPathOperand(prefix: "a" | "b", filePath: string): string {
+  const full = `${prefix}/${filePath}`;
+  if (!NEEDS_GIT_QUOTING.test(full)) return full;
+  let quoted = '"';
+  for (const character of full) {
+    const escape = C_ESCAPES.get(character);
+    if (escape !== undefined) {
+      quoted += escape;
+      continue;
+    }
+    const code = character.codePointAt(0)!;
+    quoted += code < 0x20 || code === 0x7f
+      ? `\\${code.toString(8).padStart(3, "0")}`
+      : character;
+  }
+  return `${quoted}"`;
+}

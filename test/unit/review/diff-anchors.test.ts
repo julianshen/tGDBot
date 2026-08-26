@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   changedFiles,
   changedFilesWithRenameSources,
+  quoteGitPathOperand,
   commentableLines,
   diffPositionRange,
   parseDiffPositions,
@@ -649,5 +650,31 @@ describe("mixed and pathological diff headers", () => {
     const reconstructed = 'diff --git a/foo"bar.ts b/foo"bar.ts';
     expect(changedFiles(reconstructed)).toEqual(['foo"bar.ts']);
     expect(changedFilesWithRenameSources(reconstructed)).toEqual(['foo"bar.ts']);
+  });
+});
+
+describe("quoteGitPathOperand", () => {
+  it("leaves an ordinary path bare, exactly as git would", () => {
+    expect(quoteGitPathOperand("a", "src/index.ts")).toBe("a/src/index.ts");
+    expect(quoteGitPathOperand("b", "dir/with space.ts")).toBe("b/dir/with space.ts");
+  });
+
+  it("quotes the two shapes that broke the parser", () => {
+    expect(quoteGitPathOperand("a", 'foo"bar.ts')).toBe('"a/foo\\"bar.ts"');
+    expect(quoteGitPathOperand("b", 'foo "bar.ts')).toBe('"b/foo \\"bar.ts"');
+  });
+
+  it("escapes backslashes and control characters octally", () => {
+    expect(quoteGitPathOperand("a", "back\\slash.ts")).toBe('"a/back\\\\slash.ts"');
+    expect(quoteGitPathOperand("a", "line\nbreak.ts")).toBe('"a/line\\nbreak.ts"');
+  });
+
+  it("round-trips through the header parser", () => {
+    // The point of fixing the producer: whatever it emits, the parser reads
+    // back unchanged — so no path shape needs its own parser special case.
+    for (const name of ['foo"bar.ts', 'foo "bar.ts', "plain.ts", "with space.ts", "caf\u00e9.ts"]) {
+      const header = `diff --git ${quoteGitPathOperand("a", name)} ${quoteGitPathOperand("b", name)}`;
+      expect(changedFiles(header)).toEqual([name]);
+    }
   });
 });
