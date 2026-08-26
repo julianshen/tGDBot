@@ -320,4 +320,42 @@ describe("buildDispatchPrompt trusted-base context", () => {
     expect(warnings[0]).toContain("of which");
     expect(warnings[0]).not.toContain("plus ~");
   });
+
+  // The warning used to require more than one rule, on the reasoning that it is
+  // about per-rule duplication. But what it tells the operator is what this
+  // dispatch will COST, and a single rule carrying a large diff and a full
+  // context pack costs that whether anything is duplicated or not — so exactly
+  // that run was the one warned about nowhere.
+  it("warns on a single rule whose diff and pack cross the threshold", () => {
+    const rules = [makeRule()];
+    const diff = "d".repeat(100);
+    const pack = makePack("c".repeat(600_000));
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (message: string) => void warnings.push(message);
+    try {
+      buildDispatchPrompt(rules, diff, false, undefined, new Map([[rules[0]!.name, pack]]));
+    } finally {
+      console.warn = original;
+    }
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("1 rule,");
+    expect(warnings[0]).toContain("trusted-base context");
+    // The scaling half of the message describes a multiplier, and on one rule
+    // that multiplier is one — saying it would be describing nothing.
+    expect(warnings[0]).not.toContain("scales with rule count");
+  });
+
+  it("stays quiet on a single small rule", () => {
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (message: string) => void warnings.push(message);
+    try {
+      buildDispatchPrompt([makeRule()], "d".repeat(100), false, undefined, new Map());
+    } finally {
+      console.warn = original;
+    }
+    expect(warnings).toHaveLength(0);
+  });
 });

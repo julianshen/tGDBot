@@ -2,7 +2,7 @@ import { chmod, chown, mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } f
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ContextCache, ContextCachePublicationInProgressError } from "../../../src/context/cache.js";
+import { ContextCache, ContextCacheConflictError, ContextCachePublicationInProgressError } from "../../../src/context/cache.js";
 import {
   CONTEXT_MAPPER_VERSION,
   CONTEXT_POLICY_VERSION,
@@ -718,6 +718,132 @@ describe("prepareReviewContext", () => {
     expect(prepared.status).toBe("unavailable");
     if (prepared.status !== "unavailable") return;
     expect(prepared.reasons.join(" ")).toContain("owned by another user");
+  });
+
+  // The cache key covers the base commit, the schema, the mapper and the policy
+  // — nothing about the pack renderer. So an entry that promotes cleanly and
+  // then cannot be rendered is NOT self-correcting: every later run at that base
+  // finds it, re-pays the same failing build and degrades, until
+  // CONTEXT_SCHEMA_VERSION moves. The run that created it is the one that knows,
+  // so it is the one that throws it away.
+  it("discards its own freshly published entry when the entry cannot render", async () => {
+    const { worktree, request } = await baseRequest();
+    const cache = new ContextCache(request.cacheRoot as string);
+    const key = contextCacheKey({ repository, baseSha: BASE_SHA });
+
+    // Publication validates the artifacts against the same schema the renderer
+    // parses, so a malformed graph never gets this far. What CAN get here is an
+    // entry that promotes intact and is then unreadable at render time — a lost
+    // artifact, a resource limit, a renderer that grew stricter than the
+    // publisher. Reproduced by promoting for real and then removing an artifact
+    // the pack build needs.
+    const breaking = new ContextCache(request.cacheRoot as string);
+    const breakingProxy = Object.assign(Object.create(ContextCache.prototype) as ContextCache, {
+      root: breaking.root,
+      entryPath: (k: Parameters<ContextCache["entryPath"]>[0]) => breaking.entryPath(k),
+      lookupContext: (k: Parameters<ContextCache["lookupContext"]>[0]) => breaking.lookupContext(k),
+      promoteContext: async (
+        staging: string,
+        input: Parameters<ContextCache["promoteContext"]>[1],
+      ) => {
+        const manifest = await breaking.promoteContext(staging, input);
+        await rm(path.join(breaking.entryPath(input.key), ".understand-anything"), {
+          recursive: true,
+          force: true,
+        });
+        return manifest;
+      },
+    }) as ContextCache;
+
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+      createCache: () => breakingProxy,
+    });
+
+    expect(prepared.status).toBe("unavailable");
+    if (prepared.status !== "unavailable") throw new Error("unreachable");
+    expect(prepared.reasons.join(" ")).toContain("context pack could not be built");
+    expect(prepared.reasons.join(" ")).toContain("discarded");
+    // Gone from disk, not merely unreadable: the next run re-maps.
+    await expect(stat(cache.entryPath(key))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await cache.lookupContext(key)).toBeUndefined();
+  });
+
+  // The mirror image. An entry a CONCURRENT run published is not this run's to
+  // throw away — the pack failure may be local to this process, and deleting it
+  // would destroy work this run did not do and cannot redo any better.
+  it("leaves a concurrently published entry alone when the pack build fails", async () => {
+    const { worktree, request } = await baseRequest();
+    const key = contextCacheKey({ repository, baseSha: BASE_SHA });
+    // A real, complete entry, published by "another run".
+    await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+    const cache = new ContextCache(request.cacheRoot as string);
+    const winner = await cache.lookupContext(key);
+    expect(winner).toBeDefined();
+
+    // This run loses the race, and then cannot render what the winner published.
+    const losing = {
+      root: cache.root,
+      entryPath: () => path.join(request.cacheRoot as string, "empty-entry"),
+      lookupContext: vi.fn()
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValue(winner),
+      promoteContext: () => Promise.reject(new ContextCacheConflictError("taken")),
+    } as unknown as ContextCache;
+
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+      createCache: () => losing,
+    });
+
+    expect(prepared.status).toBe("unavailable");
+    if (prepared.status !== "unavailable") throw new Error("unreachable");
+    expect(prepared.reasons.join(" ")).toContain("context pack could not be built");
+    expect(prepared.reasons.join(" ")).not.toContain("discarded");
+    // The winner's entry survives untouched.
+    expect(await cache.lookupContext(key)).toBeDefined();
+  });
+
+  // Under `require`, `unavailable()` THROWS. A `pack()` call made inside the
+  // lookup's own try was therefore caught by that lookup's catch and re-wrapped
+  // as "context cache lookup failed: … context pack could not be built: …" —
+  // the wrong stage, with the real reason demoted to a nested string. The
+  // operator was sent to the wrong half of the pipeline.
+  it("reports a cache-hit pack failure as a pack failure, not a lookup failure", async () => {
+    const { worktree, request } = await baseRequest({ mode: "require" });
+    // Publish a real entry so a genuine manifest exists to hand back.
+    await prepareReviewContext({ ...request, mode: "auto" }, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+    const cache = new ContextCache(request.cacheRoot as string);
+    const manifest = await cache.lookupContext(contextCacheKey({ repository, baseSha: BASE_SHA }));
+    expect(manifest).toBeDefined();
+
+    // A hit whose artifacts are not where the renderer will look for them.
+    const hitting = {
+      root: cache.root,
+      entryPath: () => path.join(request.cacheRoot as string, "not-an-entry"),
+      lookupContext: async () => manifest,
+      promoteContext: () => {
+        throw new Error("must not be reached: this run took the cache hit");
+      },
+    } as unknown as ContextCache;
+
+    const error = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+      createCache: () => hitting,
+    }).then(() => undefined, (thrown: unknown) => thrown);
+
+    expect(error).toBeInstanceOf(ContextRequiredError);
+    expect((error as Error).message).toContain("context pack could not be built");
+    expect((error as Error).message).not.toContain("cache lookup failed");
   });
 
   it("waits for a concurrent publication rather than giving up on one miss", async () => {

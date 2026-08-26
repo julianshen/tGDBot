@@ -27,7 +27,7 @@ import {
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
-import { BOT_SIGNATURE_BLOCK, type ClarificationPresentation } from "./review/comment-format.js";
+import { BOT_SIGNATURE_BLOCK, type ClarificationPresentation, type ContextUnavailableLabel } from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
@@ -186,7 +186,7 @@ export interface ReviewDependencies {
       inline?: boolean;
       suggestions?: boolean;
       relatedWork?: readonly RelatedWorkItem[];
-      contextUnavailable?: readonly string[];
+      contextUnavailable?: readonly ContextUnavailableLabel[];
       reviewBinding?: { repositoryDigest: string; reviewNumber: number; headSha: string };
       clarification?: ClarificationPresentation;
       deferredClarificationCount?: number;
@@ -413,10 +413,10 @@ async function loadOptionalReviewContext(options: {
   fingerprint?: string;
   existingIssues: readonly ExistingReviewIssue[];
   discussionMemories: readonly DiscussionMemory[];
-  unavailable: string[];
+  unavailable: ContextUnavailableLabel[];
   unavailableReason?: string;
 }> {
-  const unavailable: string[] = [];
+  const unavailable: ContextUnavailableLabel[] = [];
   let unavailableReason: string | undefined;
   const resolved = options.identity !== undefined || options.identityUnavailable !== undefined
     ? { identity: options.identity, unavailable: options.identityUnavailable, reason: options.identityUnavailableReason }
@@ -1364,9 +1364,9 @@ export async function review(
   // "repository" joins the existing discussion/memory labels rather than
   // carrying the mapper's message: the summary is published, and a raw mapper
   // diagnostic can name local filesystem paths.
-  const reviewContextLabels = [
+  const reviewContextLabels: ContextUnavailableLabel[] = [
     ...loadedContext.unavailable,
-    ...(contextPreparation.status === "unavailable" ? ["repository"] : []),
+    ...(contextPreparation.status === "unavailable" ? ["repository" as const] : []),
   ];
   const orchestration = orchestrateFn(dispatchResult, diff, {
     inline: true,

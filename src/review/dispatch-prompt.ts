@@ -161,16 +161,25 @@ function warnIfDiffCostRisk(
     0,
   );
   const totalChars = diff.length * rules.length + packChars;
-  if (rules.length > 1 && totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
+  // Gated on the SIZE alone. It used to also require more than one rule, on the
+  // reasoning that the warning is about per-rule duplication — but the operator
+  // is being told what this dispatch will cost, and a single rule carrying a
+  // huge diff and a full context pack costs that whether or not anything is
+  // duplicated. Under the old gate exactly that run warned nowhere.
+  if (totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
     // A breakdown of the total, not an addition to it: `totalChars` already
     // includes `packChars`, and "plus ~N" read as though it did not.
     const packNote = packChars === 0 ? "" : `, of which ~${packChars} is trusted-base context`;
+    // The scaling half of the message is only true when there is something to
+    // scale; on a single rule it would be describing a multiplier of one.
+    const scalingNote = rules.length > 1
+      ? ` — this is required because each dispatched "reviewer" subagent runs in a fresh, isolated ` +
+        `child session with no access to the orchestrator's own context, but it does mean ` +
+        `cost/context-window usage scales with rule count on large diffs or rule sets.`
+      : `.`;
     console.warn(
       `dispatchRules: dispatch prompt embeds the ${diff.length}-char diff once per rule ` +
-        `(${rules.length} rules, ~${totalChars} chars total${packNote}) — this is required because each ` +
-        `dispatched "reviewer" subagent runs in a fresh, isolated child session with no access ` +
-        `to the orchestrator's own context, but it does mean cost/context-window usage scales ` +
-        `with rule count on large diffs or rule sets.`,
+        `(${rules.length} rule${rules.length === 1 ? "" : "s"}, ~${totalChars} chars total${packNote})${scalingNote}`,
     );
   }
 }

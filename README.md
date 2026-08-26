@@ -389,8 +389,9 @@ tgd-review-agent review \
                                   # Off by default because it reveals a private
                                   # repository's dependencies to a third party. With it off the
                                   # context still lists the changed versions and says plainly that
-                                  # none of them were checked. Needs --dispatch direct (the default):
-                                  # the legacy engine cannot carry host context and will say so.
+                                  # none of them were checked. Carried by BOTH dispatch
+                                  # engines: the registry lookup and the context section it
+                                  # produces do not depend on which engine runs the rules.
                                   # See examples/rules/dependency-currency.md
   --model <provider>/<model>     # optional: the DEFAULT model. Runs the review's orchestrating
                                   # session AND any rule that doesn't pin its own provider/model

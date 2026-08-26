@@ -29,7 +29,7 @@ import {
 } from "./cache.js";
 import { contextCacheKeyForRepository, type ContextCacheKey, type ContextManifest } from "./types.js";
 import { prepareWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
-import { protectManagedRoot } from "../workspace/protect.js";
+import { assertNoSymlinkedAncestors, protectManagedRoot } from "../workspace/protect.js";
 import type { ContextMapper } from "./mapper.js";
 import type { RepositoryRef } from "../target/types.js";
 
@@ -101,12 +101,19 @@ export interface PrepareContextDependencies {
 }
 
 /**
- * How long to wait for a concurrent publisher that holds the claim. Bounded
- * and short: this blocks a review, and losing the wait only costs this run its
- * context, never correctness.
+ * How long to wait for a concurrent publisher that holds the claim. Bounded,
+ * because this blocks a review and losing the wait costs this run only its
+ * context, never correctness — but bounded at THIRTY seconds rather than the
+ * two it used to be. The claim is held for the whole of `promoteContext`:
+ * hashing every mapped artifact and then renaming the staging directory into
+ * place. On a large repository that is comfortably more than two seconds, and
+ * giving up inside it meant reviewing without context — or, under
+ * `--context require`, exiting 1 — on a perfectly valid review whose context
+ * had already been built and was moments from landing. Thirty seconds is still
+ * negligible beside the mapping run this wait exists to avoid duplicating.
  */
-const PUBLICATION_WAIT_ATTEMPTS = 10;
-const PUBLICATION_WAIT_INTERVAL_MS = 200;
+const PUBLICATION_WAIT_ATTEMPTS = 60;
+const PUBLICATION_WAIT_INTERVAL_MS = 500;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
@@ -146,6 +153,19 @@ export function contextCacheKey(request: {
  * failing is not re-run by a later success at the same head and base, because
  * nothing in the fingerprint changed. The summary says the context was
  * unavailable, and `@tgdbot review force:` re-runs it.
+ *
+ * `maxChars` here is the OPERATOR'S ceiling, not the byte budget the repository
+ * pack is finally rendered against. The CLI reserves the dependency section's
+ * length out of that ceiling first (see `repositoryContextBudget`), so the
+ * effective budget is smaller whenever `--dependency-facts on` produced a
+ * section, and its exact size moves with what the registry answered. That
+ * length cannot be hashed here without fetching it before the dedup decision,
+ * which is the network call dedup exists to avoid. What this field pins is
+ * therefore the operator's intent — changing `--context-max-chars` invalidates
+ * a prior review, as it should — and the flag that governs the reservation
+ * (`--dependency-facts`) is hashed separately by `computeReviewConfigHash`.
+ * Registry ANSWERS are not covered by the config hash at all, here or for the
+ * dependency section itself.
  */
 export function contextFingerprint(request: {
   readonly mode: ContextMode;
@@ -176,6 +196,18 @@ export function contextFingerprint(request: {
 }
 
 /**
+ * The outcome of publishing a freshly mapped staging directory. `ours`
+ * distinguishes an entry THIS run promoted from one a concurrent run had
+ * already published: only the former may be discarded if it turns out to be
+ * unrenderable, because discarding another run's entry would destroy work this
+ * run did not do and cannot redo any better.
+ */
+interface PublishedMapping {
+  readonly manifest: ContextManifest;
+  readonly ours: boolean;
+}
+
+/**
  * Publishes a freshly mapped staging directory, tolerating the two concurrent
  * publication outcomes the cache defines: another run that published the same
  * content (reuse it) and another run mid-publication (re-look-up, and take
@@ -188,20 +220,22 @@ async function publishMapping(
   artifactPaths: readonly string[],
   degradedReasons: readonly string[],
   createdAt: string,
-): Promise<ContextManifest | undefined> {
+): Promise<PublishedMapping | undefined> {
   try {
-    return await cache.promoteContext(stagingPath, {
+    const manifest = await cache.promoteContext(stagingPath, {
       key,
       createdAt,
       artifacts: declareMappedArtifacts(artifactPaths),
       degradedReasons: [...degradedReasons],
     });
+    return { manifest, ours: true };
   } catch (error) {
     if (error instanceof ContextCacheConflictError) {
       // A concurrent run already published a complete entry. It is as good as
       // ours would have been — same base commit, same mapper — so read it
       // rather than failing.
-      return await cache.lookupContext(key);
+      const manifest = await cache.lookupContext(key);
+      return manifest === undefined ? undefined : { manifest, ours: false };
     }
     if (error instanceof ContextCachePublicationInProgressError) {
       // The winner holds the claim but may still be hashing or renaming, so a
@@ -211,7 +245,7 @@ async function publishMapping(
       for (let attempt = 0; attempt < PUBLICATION_WAIT_ATTEMPTS; attempt += 1) {
         await delay(PUBLICATION_WAIT_INTERVAL_MS);
         const landed = await cache.lookupContext(key);
-        if (landed !== undefined) return landed;
+        if (landed !== undefined) return { manifest: landed, ours: false };
       }
       return undefined;
     }
@@ -260,11 +294,39 @@ export async function prepareReviewContext(
     await protectManagedRoot(physicalCacheRoot, "Context cache", { rejectPreviouslyShared: true });
     cache = createCache(physicalCacheRoot);
     key = contextCacheKey(request);
+    // Re-checked close to use, the way the managed workspace re-checks its own
+    // root before it acts on it. `protectManagedRoot` walked the ancestors ONCE;
+    // this establishes that neither the root nor the path down to this run's
+    // entry and staging area has become a symlink since. The ancestors above
+    // the root need no second look here: the walk above refuses any ancestor
+    // owned by another user, so nobody who could swap the root out from under
+    // this check survived it.
+    await assertNoSymlinkedAncestors(
+      physicalCacheRoot,
+      [cache.entryPath(key), path.join(physicalCacheRoot, "staging")],
+      "Context cache",
+    );
   } catch (error) {
     return unavailable([`context cache is unusable: ${errorMessage(error)}`]);
   }
 
-  const pack = async (manifest: ContextManifest, cacheHit: boolean): Promise<ContextPreparation> => {
+  /**
+   * `discardOnFailure` is set only for an entry THIS run just promoted. The
+   * cache key covers the base commit, the schema, the mapper and the policy —
+   * but nothing about the rules or the pack renderer, so an entry that
+   * publishes cleanly and then cannot render is not self-correcting: every
+   * later run at that base finds it, re-pays the same failing build, and
+   * degrades (or, under `require`, exits 1) until `CONTEXT_SCHEMA_VERSION`
+   * moves. Discarding our own unrenderable entry makes the next run re-map
+   * instead. Deliberately NOT done for an entry a concurrent run published:
+   * that would destroy work this run did not do, on the strength of a failure
+   * that may be local to this process.
+   */
+  const pack = async (
+    manifest: ContextManifest,
+    cacheHit: boolean,
+    discardOnFailure = false,
+  ): Promise<ContextPreparation> => {
     onProgress({ stage: "pack", status: "started" });
     try {
       const packs = await buildContextPacks({
@@ -286,19 +348,43 @@ export async function prepareReviewContext(
       // A manifest that cannot produce a pack is not a usable context, even
       // though it published: the commonest cause is a degraded entry with no
       // knowledge graph, which `buildContextPacks` refuses by design.
-      return unavailable([`context pack could not be built: ${errorMessage(error)}`]);
+      const reasons = [`context pack could not be built: ${errorMessage(error)}`];
+      if (discardOnFailure) {
+        // Best-effort by design: this is a cleanup, and failing to clean up
+        // must not change what the caller is told about the pack failure that
+        // prompted it. The path is beneath the cache root this run already
+        // resolved and locked down to 0700, so nothing outside it is reachable
+        // from here. A concurrent reader mid-lookup is unharmed — `lookupContext`
+        // treats a vanished or changed entry as a miss by construction.
+        const discarded = await rm(cache.entryPath(key), { recursive: true, force: true })
+          .then(() => true)
+          .catch(() => false);
+        reasons.push(
+          discarded
+            ? "the unrenderable cache entry was discarded; the next run will re-map"
+            : "the unrenderable cache entry could not be discarded and will be retried as-is",
+        );
+      }
+      return unavailable(reasons);
     }
   };
 
+  // `pack()` is called OUTSIDE this try on purpose. Under `--context require`
+  // `unavailable()` throws `ContextRequiredError`, so a `pack()` failure inside
+  // the lookup's try would be caught by the lookup's own catch and re-wrapped as
+  // "context cache lookup failed: … context pack could not be built: …" — the
+  // wrong stage, with the real reasons demoted to a nested string. Same hazard
+  // the map/publish block below is structured to avoid.
+  let cached: ContextManifest | undefined;
   try {
     onProgress({ stage: "lookup", status: "started" });
-    const cached = await cache.lookupContext(key);
+    cached = await cache.lookupContext(key);
     onProgress({ stage: "lookup", status: "completed" });
-    if (cached !== undefined) return await pack(cached, true);
   } catch (error) {
     onProgress({ stage: "lookup", status: "failed" });
     return unavailable([`context cache lookup failed: ${errorMessage(error)}`]);
   }
+  if (cached !== undefined) return await pack(cached, true);
 
   if (request.ruleNames.length === 0) {
     // Nothing would read the result. Mapping is the most expensive step in a
@@ -346,7 +432,7 @@ export async function prepareReviewContext(
     return unavailable([`context staging directory could not be created: ${errorMessage(error)}`]);
   }
 
-  let published: ContextManifest | undefined;
+  let published: PublishedMapping | undefined;
   // Collected rather than returned from inside the `try`. Under `require`,
   // `unavailable()` THROWS — so calling it in there would have the catch below
   // swallow its own ContextRequiredError and wrap it in a second one, handing
@@ -407,7 +493,7 @@ export async function prepareReviewContext(
   if (published === undefined) {
     return unavailable(["context could not be published and no concurrent entry was found"]);
   }
-  return await pack(published, false);
+  return await pack(published.manifest, false, published.ours);
 }
 
 /**

@@ -94,11 +94,21 @@ function isMissing(error: unknown): boolean {
     "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
+// Resolves to a path with NO symlink component, so that everything downstream —
+// the ancestor walk, the lock, the mirror, the worktree — operates on the same
+// physical directory it inspected. A root that already exists must be resolved
+// too: `lstat` succeeding proves only that something is there, not that the
+// path reaching it is stable. Returning the logical path in that case left a
+// mutable ancestor link (say under /tmp) in place, and the ancestor checks then
+// FOLLOW it — so it can be retargeted after the checks pass, at a prebuilt
+// mirror whose `hooks/post-checkout` runs on the next `git worktree add`.
+// `realpath` removes that by construction; a link swapped afterwards no longer
+// names the directory this function returned.
 async function physicalWorkspaceRoot(requestedRoot: string): Promise<string> {
   let existing = path.resolve(requestedRoot);
   try {
     await lstat(existing);
-    return existing;
+    return await realpath(existing);
   } catch (error) {
     if (!isMissing(error)) throw error;
   }

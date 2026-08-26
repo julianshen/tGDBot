@@ -713,6 +713,37 @@ describe("prepareWorkspace", () => {
     expect(result.repositoryRoot.startsWith(`${result.root}${path.sep}`)).toBe(true);
   });
 
+  // The sibling test above covers a root that does not exist yet. An EXISTING
+  // one used to take a different path: `lstat` succeeded, so the LOGICAL path
+  // was returned with its ancestor link intact — and the ancestor checks then
+  // FOLLOW that link rather than noticing it. The link could therefore be
+  // retargeted after the checks passed, at a prebuilt mirror whose
+  // `hooks/post-checkout` git runs on the next `worktree add`. Resolving it
+  // removes that by construction: the returned path no longer names the link.
+  it("canonicalizes a symlinked ancestor above a workspace root that already exists", async () => {
+    const parent = await tempRoot();
+    const outside = await tempRoot();
+    const linkedParent = path.join(parent, "linked");
+    await symlink(outside, linkedParent);
+    const root = path.join(linkedParent, "workspace");
+    // The root exists BEFORE the call — the case the resolution used to skip.
+    await mkdir(root, { recursive: true, mode: 0o700 });
+    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+      if (tool === "gh") await mkdir(args[3]!, { recursive: true });
+      if (args.includes("add")) await mkdir(args.at(-2)!, { recursive: true });
+      return "";
+    });
+
+    const result = await prepareWorkspace({ root, repo, baseSha }, { exec });
+
+    const physical = await realpath(path.join(outside, "workspace"));
+    // Already physical, not merely equal after resolution: nothing downstream
+    // has to re-resolve, and no later retarget of `linked` can redirect it.
+    expect(result.root).toBe(physical);
+    expect(result.root.startsWith(linkedParent)).toBe(false);
+    expect(result.mirrorPath.startsWith(`${physical}${path.sep}`)).toBe(true);
+  });
+
   it("removes a newly-created worktree when ownership-marker creation fails", async () => {
     const root = await tempRoot();
     const paths = deriveWorkspacePaths({ root, repo, baseSha });

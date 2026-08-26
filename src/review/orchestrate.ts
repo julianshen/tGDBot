@@ -7,7 +7,7 @@
 // module is a plain formatting/safety-net layer on top of its output.
 import { selectClarification } from "../conversation/clarification.js";
 import { renderInlineComment, renderSummaryComment } from "./comment-format.js";
-import type { ClarificationPresentation, FindingContext, RenderOptions } from "./comment-format.js";
+import type { ClarificationPresentation, ContextUnavailableLabel, FindingContext, RenderOptions } from "./comment-format.js";
 import type { InlineComment } from "./comment-format.js";
 import {
   changedFiles,
@@ -61,7 +61,7 @@ export type OrchestrateOptions = {
   relatedWork?: readonly RelatedWorkItem[];
   ruleOrder?: readonly string[];
   reviewBinding?: ReviewBindingOptions;
-  contextUnavailable?: readonly string[];
+  contextUnavailable?: readonly ContextUnavailableLabel[];
   clarification?: ClarificationPresentation;
   excludeClarificationIds?: readonly string[];
   deferredClarificationCount?: number;
