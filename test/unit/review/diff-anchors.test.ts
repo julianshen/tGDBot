@@ -552,3 +552,54 @@ describe("changedFiles stays head-side only", () => {
     expect(changedFiles(EDIT_AND_RENAME)).toEqual(["src/kept.ts", "src/relocated.ts"]);
   });
 });
+
+const QUOTED = `diff --git "a/src/caf\\303\\251.ts" "b/src/caf\\303\\251.ts"
+--- "a/src/caf\\303\\251.ts"
++++ "b/src/caf\\303\\251.ts"
+@@ -1,1 +1,1 @@
+-const a = 1;
++const a = 2;
+`;
+
+const QUOTED_RENAME = `diff --git "a/src/ol\\303\\251.ts" "b/src/nouve\\303\\241.ts"
+rename from "src/ol\\303\\251.ts"
+rename to "src/nouve\\303\\241.ts"
+@@ -1,1 +1,1 @@
+-const a = 1;
++const a = 2;
+`;
+
+describe("git-quoted paths in the diff header", () => {
+  it("decodes an octal-escaped UTF-8 name rather than dropping the file", () => {
+    // Git quotes any path with a non-ASCII byte under the default
+    // core.quotePath, so an unquoted-only regex loses the file entirely — it
+    // vanishes from the summary, from changed-line matching, and from context
+    // selection, where the pack then claims no graph nodes matched.
+    expect(changedFiles(QUOTED)).toEqual(["src/café.ts"]);
+    expect(changedFilesWithRenameSources(QUOTED)).toEqual(["src/café.ts"]);
+  });
+
+  it("keeps both sides of a quoted rename", () => {
+    expect(changedFiles(QUOTED_RENAME)).toEqual(["src/nouveá.ts"]);
+    expect(changedFilesWithRenameSources(QUOTED_RENAME))
+      .toEqual(["src/nouveá.ts", "src/olé.ts"]);
+  });
+
+  it("still parses ordinary unquoted headers, spaces included", () => {
+    expect(changedFiles("diff --git a/dir/a b.ts b/dir/a b.ts"))
+      .toEqual(["dir/a b.ts"]);
+    expect(changedFiles(SIMPLE)).toEqual(["src/a.go"]);
+  });
+
+  it("decodes the escaped quote and backslash forms", () => {
+    expect(changedFiles('diff --git "a/say \\"hi\\".ts" "b/say \\"hi\\".ts"'))
+      .toEqual(['say "hi".ts']);
+    expect(changedFiles('diff --git "a/back\\\\slash.ts" "b/back\\\\slash.ts"'))
+      .toEqual(["back\\slash.ts"]);
+  });
+
+  it("ignores a malformed header instead of emitting a broken path", () => {
+    expect(changedFiles('diff --git "a/unterminated.ts b/x.ts')).toEqual([]);
+    expect(changedFiles("diff --git nota/x b/y")).toEqual([]);
+  });
+});

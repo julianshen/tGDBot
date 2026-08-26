@@ -80,20 +80,84 @@ function stripDiffPathPrefix(target: string): string {
  * have no right-hand side and therefore never appear in `commentableLines`.
  * Used for the summary's "Files reviewed" list.
  */
-export function changedFiles(diff: string): string[] {
-  const files: string[] = [];
-  const seen = new Set<string>();
-  for (const line of diff.split("\n")) {
-    // `diff --git a/<old> b/<new>` — take the NEW path (the b/ side).
-    const match = /^diff --git a\/(?:.+) b\/(.+)$/.exec(line);
-    if (!match) continue;
-    const file = match[1].trim();
-    if (file && !seen.has(file)) {
-      seen.add(file);
-      files.push(file);
-    }
+/**
+ * Git quotes a path in the `diff --git` header whenever it contains a byte
+ * outside the printable ASCII range (or a quote or backslash), producing
+ * `diff --git "a/caf\303\251.ts" "b/caf\303\251.ts"` under the default
+ * `core.quotePath`. A plain `a/... b/...` regex misses those files entirely,
+ * so they vanish from the summary's file list, from changed-line matching, and
+ * from the trusted-base context selection — where the pack then reports that
+ * no graph nodes matched.
+ *
+ * Returns the two sides with their `a/` and `b/` prefixes already removed, or
+ * undefined when the line is not a `diff --git` header.
+ */
+export function parseDiffGitHeader(line: string): { readonly a: string; readonly b: string } | undefined {
+  const rest = line.startsWith("diff --git ") ? line.slice("diff --git ".length) : undefined;
+  if (rest === undefined) return undefined;
+
+  if (rest.startsWith('"')) {
+    const first = readQuotedPath(rest);
+    if (first === undefined || !rest.startsWith(" ", first.end)) return undefined;
+    const secondRaw = rest.slice(first.end + 1);
+    const second = secondRaw.startsWith('"')
+      ? readQuotedPath(secondRaw)
+      : { value: secondRaw, end: secondRaw.length };
+    if (second === undefined || second.end !== secondRaw.length) return undefined;
+    return stripSides(first.value, second.value);
   }
-  return files;
+
+  // Unquoted. Kept greedy on the a/ side exactly as before: a path may contain
+  // a space, which git does NOT quote, so there is no unambiguous split.
+  const match = /^a\/(.+) b\/(.+)$/.exec(rest);
+  if (!match) return undefined;
+  return { a: match[1]!.trim(), b: match[2]!.trim() };
+}
+
+function stripSides(first: string, second: string): { a: string; b: string } | undefined {
+  if (!first.startsWith("a/") || !second.startsWith("b/")) return undefined;
+  return { a: first.slice(2), b: second.slice(2) };
+}
+
+const ESCAPES: Readonly<Record<string, string>> = {
+  a: "\u0007", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", '"': '"', "\\": "\\",
+};
+
+/**
+ * Reads one C-style quoted path, decoding `\nnn` octal escapes as raw bytes so
+ * a multi-byte UTF-8 name reassembles correctly rather than one mojibake
+ * character per byte.
+ */
+function readQuotedPath(input: string): { value: string; end: number } | undefined {
+  const bytes: number[] = [];
+  for (let index = 1; index < input.length; index += 1) {
+    const character = input[index]!;
+    if (character === '"') {
+      return { value: Buffer.from(bytes).toString("utf8"), end: index + 1 };
+    }
+    if (character !== "\\") {
+      bytes.push(...Buffer.from(character, "utf8"));
+      continue;
+    }
+    const next = input[index + 1];
+    if (next === undefined) return undefined;
+    if (next >= "0" && next <= "7") {
+      const octal = input.slice(index + 1, index + 4);
+      if (!/^[0-7]{3}$/.test(octal)) return undefined;
+      bytes.push(Number.parseInt(octal, 8));
+      index += 3;
+      continue;
+    }
+    const mapped = ESCAPES[next];
+    if (mapped === undefined) return undefined;
+    bytes.push(...Buffer.from(mapped, "utf8"));
+    index += 1;
+  }
+  return undefined;
+}
+
+export function changedFiles(diff: string): string[] {
+  return collectChangedPaths(diff, (header) => [header.b]);
 }
 
 /**
@@ -112,15 +176,19 @@ export function changedFiles(diff: string): string[] {
  * Added files legitimately match nothing: they do not exist at the base.
  */
 export function changedFilesWithRenameSources(diff: string): string[] {
+  return collectChangedPaths(diff, (header) => [header.b, header.a]);
+}
+
+function collectChangedPaths(
+  diff: string,
+  select: (header: { readonly a: string; readonly b: string }) => readonly string[],
+): string[] {
   const files: string[] = [];
   const seen = new Set<string>();
   for (const line of diff.split("\n")) {
-    // Same greediness as `changedFiles`, so the b/ side is parsed identically;
-    // the a/ side is simply no longer discarded.
-    const match = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
-    if (!match) continue;
-    for (const candidate of [match[2], match[1]]) {
-      const file = candidate.trim();
+    const header = parseDiffGitHeader(line);
+    if (header === undefined) continue;
+    for (const file of select(header)) {
       if (file && !seen.has(file)) {
         seen.add(file);
         files.push(file);
