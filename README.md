@@ -438,6 +438,23 @@ files reviewed, the rules that ran, and any rule that failed (and why). It also
 carries the `<!-- tgd-review-agent:sha=... -->` marker, which is what makes the
 bot idempotent per commit.
 
+**Every comment the tool writes is signed.** The last visible line of an inline
+finding, of the summary, and of every conversational reply is:
+
+```md
+---
+
+_🤖 Posted by [tGDBot](https://github.com/julianshen/tGDBot)_
+```
+
+The machine markers above are HTML comments and therefore invisible in the
+rendered page. That is fine for a bot account whose avatar says what it is, and
+not fine in the common local case: run the CLI under your own `gh`/`glab` login
+and your teammates see review comments that look hand-written by a colleague.
+The signature is static text appended after all sanitization, so nothing in a
+diff or a finding can forge, move, or duplicate it — and nothing parses it:
+stale-thread cleanup still keys on the hidden marker alone.
+
 On a new commit the review runs again and posts fresh inline comments; the
 previous run's inline threads are **resolved (collapsed), never deleted** — they
 stay on the PR as reviewable history, but folded out of the way so comments

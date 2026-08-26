@@ -17,6 +17,7 @@ import { selectClarification } from "../../src/conversation/clarification.js";
 import { poll } from "../../src/poll/poll.js";
 import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
 import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
+import { BOT_SIGNATURE, BOT_SIGNATURE_BLOCK } from "../../src/review/comment-format.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
 import { GitHubDiffIncompleteError } from "../../src/vcs/github-large-diff.js";
 import { deriveInlineChildId, formatInlineRecoveryMarker, formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
@@ -544,6 +545,12 @@ describe("review", () => {
     const [, replyInput] = h.vcsAdapter.postGeneralReply.mock.calls[0] as [unknown, { body: string }];
     expect(replyInput.body).toContain("the error path drops the cause");
     expect(replyInput.body).toContain("check the error handling");
+    // The reply is ONE comment, so it carries ONE signature — the conversation
+    // renderer's. The summary it wraps must therefore be built unsigned, or the
+    // wrapped copy shows up escaped in the body above it (Codex review).
+    expect(replyInput.body.split(BOT_SIGNATURE)).toHaveLength(2);
+    expect(replyInput.body.trimEnd()).toContain(BOT_SIGNATURE_BLOCK);
+    expect(replyInput.body).not.toContain("Posted by \\[tGDBot");
     // ...and nothing else moved.
     expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
     expect(h.vcsAdapter.resolveStaleReviewThreads).not.toHaveBeenCalled();
@@ -1740,6 +1747,25 @@ describe("inline review comments", () => {
     h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
     return h;
   }
+
+  // The summary is signed at composition time, not by the renderer: relocated
+  // findings are appended after the frozen summary body, so a signature
+  // rendered with the summary would land in the middle of the comment.
+  it("signs the posted summary after any relocated findings and before the marker", async () => {
+    const h = inlineHarness(partialPresentation());
+    h.vcsAdapter.createInlineReview.mockRejectedValue(new Error("inline unsupported"));
+    expect(await review(h.args, depsFrom(h))).toBe(0);
+
+    const finalBody = String(h.vcsAdapter.upsertComment.mock.calls.at(-1)?.[1]);
+    const relocated = finalBody.indexOf("finding 0");
+    const signature = finalBody.indexOf(BOT_SIGNATURE);
+    const dedupMarker = finalBody.indexOf("<!-- tgd-review-agent:sha=");
+    expect(relocated).toBeGreaterThan(-1);
+    expect(signature).toBeGreaterThan(relocated);
+    expect(dedupMarker).toBeGreaterThan(signature);
+    expect(finalBody).toContain(BOT_SIGNATURE_BLOCK);
+    expect(finalBody.indexOf(BOT_SIGNATURE)).toBe(finalBody.lastIndexOf(BOT_SIGNATURE));
+  });
 
   it("completes anchored fallback publication for an adapter without durable inline recovery capability", async () => {
     const h = inlineHarness(partialPresentation());
