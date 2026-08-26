@@ -22,6 +22,18 @@ function validateAbsoluteRoot(value: string, platform: NodeJS.Platform, name: st
   return platformPath.normalize(value);
 }
 
+/**
+ * Resolves where context lives, in strict precedence: `--context-dir`, then
+ * `TGD_REVIEW_CONTEXT_DIR`, then the platform default (`%LOCALAPPDATA%` on
+ * Windows, `$XDG_CACHE_HOME` then `~/.cache` elsewhere).
+ *
+ * Every source must be an absolute path with no NUL byte, and is normalized.
+ * Throws when the platform default's variable is unset rather than guessing a
+ * location — a container may set neither, and the caller degrades on the throw.
+ * Everything written under this root is either regenerable cache or a managed
+ * git checkout, and its contents are read back as `[TRUSTED_CONTEXT]`, so where
+ * it lands is a security decision as much as a tidiness one.
+ */
 export function selectContextRoot(options: ContextRootSelection = {}): string {
   const platform = options.platform ?? process.platform;
   const env = options.env ?? process.env;

@@ -125,6 +125,13 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * The cache identity for one repository at one base commit. Stamped with the
+ * schema, mapper and policy versions so that changing any of them makes every
+ * existing entry a miss rather than a stale hit — there is no in-place
+ * migration, and reading an old entry under new rules is the failure this
+ * prevents.
+ */
 export function contextCacheKey(request: {
   readonly repository: RepositoryRef;
   readonly baseSha: string;
@@ -253,6 +260,29 @@ async function publishMapping(
   }
 }
 
+/**
+ * Walks the whole context chain for one review: cache lookup → base worktree →
+ * map on a miss → publish → one pack per rule. The single place that does so,
+ * and injectable through `ReviewDependencies` so a review test never builds a
+ * worktree or starts a mapper.
+ *
+ * Two invariants govern everything here.
+ *
+ * **Mapping only ever runs against the PR's BASE commit.** The mapper runs a pi
+ * session holding `bash`/`edit`/`write` — the tools ADR-003 removed from review
+ * subagents — so pointing it at a pull request's own checkout would hand code
+ * execution to anyone able to open one. `prepareWorkspace` refuses a worktree
+ * that is not at the requested base, and the returned SHA is checked again here.
+ *
+ * **Context is best-effort.** Under `auto` every failure returns
+ * `{ status: "unavailable", reasons }` and the review proceeds on the diff
+ * alone; only `require` turns that into a throw. Reasons are for the operator's
+ * stderr, not the published comment — a mapper diagnostic can name local
+ * filesystem paths, so the comment carries a label instead.
+ *
+ * Never returns a partially-built result: a pack is produced for every rule
+ * name or for none, because `validateDispatchContext` rejects partial coverage.
+ */
 export async function prepareReviewContext(
   request: ContextPreparationRequest,
   dependencies: PrepareContextDependencies = {},

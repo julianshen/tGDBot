@@ -829,6 +829,15 @@ export function renderContextPack(
   };
 }
 
+/**
+ * Builds the pack for a SINGLE rule, selecting and rendering in one step.
+ *
+ * `buildContextPacks` is what a review uses: N rules share one selection, so
+ * the graphs are parsed once rather than once per rule. This entry point
+ * remains for a caller with exactly one rule, and for the tests that pin
+ * rendering behaviour without a rule set. Both paths render identically —
+ * `renderContextPack` is the only renderer.
+ */
 export async function buildContextPack(input: BuildContextPackInput): Promise<ContextPackResult> {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     return invalid("Context pack input must be an object");

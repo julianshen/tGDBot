@@ -21,6 +21,11 @@ const KIND_BY_PATH: ReadonlyMap<string, ArtifactKind> = new Map([
   [METADATA_PATH, "mapping-metadata"],
 ]);
 
+/**
+ * The declared kind for a mapped artifact path, or `undefined` for a path the
+ * layout does not define. Undefined rather than a guess: the caller decides
+ * whether an unknown path is an error or simply not of interest.
+ */
 export function artifactKindForPath(artifactPath: string): ArtifactKind | undefined {
   return KIND_BY_PATH.get(artifactPath);
 }
