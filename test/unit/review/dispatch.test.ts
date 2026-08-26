@@ -2658,4 +2658,24 @@ describe("referencesDeclaredBy — URLs with delimiters", () => {
 
     expect(declared.has("https://example.com/docs")).toBe(true);
   });
+
+  // Admitting delimiters and trimming AFTERWARDS is not enough: with no space
+  // between two links the greedy match runs through both, and balancing the
+  // tail leaves one unusable string while the second URL is never registered
+  // at all. The scan has to stop at the delimiter that closes nothing.
+  it("separates two markdown links written back to back", () => {
+    const declared = referencesDeclaredBy("[a](https://x.example.com/a)[b](https://y.example.com/b)");
+
+    expect([...declared].sort()).toEqual([
+      "https://x.example.com/a",
+      "https://y.example.com/b",
+    ]);
+  });
+
+  it("separates a parenthesised URL followed immediately by another", () => {
+    const declared = referencesDeclaredBy("(https://x.example.com/a)(https://y.example.com/b)");
+
+    expect(declared.has("https://x.example.com/a")).toBe(true);
+    expect(declared.has("https://y.example.com/b")).toBe(true);
+  });
 });
