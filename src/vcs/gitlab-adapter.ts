@@ -1228,6 +1228,35 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     return resolved;
   }
 
+  async getMergeBaseSha(
+    locator: ReviewLocator,
+    baseSha: string,
+    headSha: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolveMergeRequestLocator(locator);
+    try {
+      const out = await this.execGlab([
+        "api",
+        "--method",
+        "GET",
+        "--hostname",
+        repo.host,
+        projectEndpoint(repo, "repository/merge_base"),
+        "--raw-field",
+        `refs[]=${baseSha}`,
+        "--raw-field",
+        `refs[]=${headSha}`,
+      ]);
+      const parsed = JSON.parse(out) as { id?: unknown };
+      return typeof parsed.id === "string" && parsed.id.length > 0 ? parsed.id : undefined;
+    } catch {
+      // GitLab also reports it as `diff_refs.start_sha` on the merge request
+      // itself, which the caller prefers; this is the fallback for callers that
+      // do not have it.
+      return undefined;
+    }
+  }
+
   async getFileAtRef(
     locator: ReviewLocator,
     ref: string,

@@ -174,23 +174,33 @@ function isPinnedSpec(raw: string): boolean {
  * This is all the diff is asked for now. It says WHICH file and WHICH lines
  * changed; the manifest itself says what those lines mean.
  */
-function manifestByLine(diff: string): Map<number, string> {
-  const byLine = new Map<number, string>();
-  let manifest: string | undefined;
+function manifestByLine(diff: string): Map<number, ChangedManifest> {
+  const byLine = new Map<number, ChangedManifest>();
+  let manifest: ChangedManifest | undefined;
+  let basePath: string | undefined;
   let inHunk = false;
   for (const [index, line] of diff.split("\n").entries()) {
     if (line.startsWith("diff --git ")) {
       manifest = undefined;
+      basePath = undefined;
       inHunk = false;
       continue;
     }
     if (!inHunk) {
+      // The OLD path, which a rename makes different from the new one. `/dev/null`
+      // means the file is added by this pull request and has no base side.
+      const from = /^--- (?:a\/(.+)|\/dev\/null)$/u.exec(line);
+      if (from) {
+        const path = from[1];
+        basePath = path !== undefined && MANIFEST_PATH_RE.test(path) ? path : undefined;
+        continue;
+      }
       const header = /^\+\+\+ b\/(.+)$/u.exec(line);
       if (header) {
         const path = header[1] ?? "";
         const basename = path.slice(path.lastIndexOf("/") + 1);
         manifest = MANIFEST_BASENAMES.has(basename) && MANIFEST_PATH_RE.test(path)
-          ? path
+          ? { path, basePath }
           : undefined;
         continue;
       }
@@ -205,9 +215,27 @@ function manifestByLine(diff: string): Map<number, string> {
   return byLine;
 }
 
+/**
+ * A manifest this diff touches, at both ends.
+ *
+ * `basePath` differs from `path` when the file was RENAMED, and is undefined
+ * when the pull request adds it. Reading the base side at the new path returned
+ * nothing, which read as "this manifest is new", so every dependency in a
+ * renamed file was reported and queried rather than the one that moved
+ * (PR #67 review, round two).
+ */
+export interface ChangedManifest {
+  readonly path: string;
+  readonly basePath: string | undefined;
+}
+
 /** The manifest files this diff touches, for the host to fetch and parse. */
-export function changedManifestPaths(diff: string): string[] {
-  return [...new Set(manifestByLine(diff).values())];
+export function changedManifests(diff: string): ChangedManifest[] {
+  const byPath = new Map<string, ChangedManifest>();
+  for (const manifest of manifestByLine(diff).values()) {
+    if (!byPath.has(manifest.path)) byPath.set(manifest.path, manifest);
+  }
+  return [...byPath.values()];
 }
 
 /** One manifest's contents at the head ref, or undefined if it could not be read. */
@@ -283,7 +311,7 @@ export interface DependencyExtraction {
  * flood the review with dependencies nobody touched.
  */
 export function dependencyChanges(
-  paths: readonly string[],
+  manifests: readonly ChangedManifest[],
   head: ManifestSource,
   base: ManifestSource = new Map(),
 ): DependencyExtraction {
@@ -291,7 +319,7 @@ export function dependencyChanges(
   const unreadable: string[] = [];
   const seen = new Set<string>();
 
-  for (const path of paths) {
+  for (const { path, basePath } of manifests) {
     const headText = head.get(path);
     if (headText === undefined) {
       unreadable.push(path);
@@ -304,7 +332,8 @@ export function dependencyChanges(
     }
     // Absent at base is a NEW manifest, which is an answer. Present but
     // unparseable is a failure, and there is no honest diff against it.
-    const baseText = base.get(path);
+    // Read at the OLD path: a rename changes it, and an added manifest has none.
+    const baseText = basePath === undefined ? undefined : base.get(basePath);
     const baseDeps = baseText === undefined ? new Map() : declaredDependencies(baseText);
     if (baseDeps === undefined) {
       unreadable.push(path);
@@ -313,8 +342,13 @@ export function dependencyChanges(
 
     for (const [name, { section, spec }] of headDeps) {
       if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
-      // Unchanged is not a change. This is the whole comparison.
-      if (baseDeps.get(name)?.spec === spec) continue;
+      // Unchanged is not a change. This is the whole comparison — and SECTION
+      // counts as much as spec: a package moving from devDependencies to
+      // dependencies at the same version enters the production tree, which is
+      // a change worth reviewing and one the pack claims to describe (PR #67
+      // review, round two).
+      const before = baseDeps.get(name);
+      if (before !== undefined && before.spec === spec && before.section === section) continue;
       const version = stripRange(spec);
       if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
       const key = `${name}@${spec}`;

@@ -34,7 +34,7 @@ import { redactedMessage } from "./conversation/redact.js";
 import { isTransientGhFailure } from "./vcs/gh-retry.js";
 import { isDiffIncompleteError } from "./vcs/github-large-diff.js";
 import {
-  changedManifestPaths,
+  changedManifests,
   dependencyChanges as extractDependencyChanges,
   dependencyContextPack,
 } from "./review/dependency-changes.js";
@@ -1160,7 +1160,7 @@ export async function review(
   const dependencyFactsUnavailable =
     args.dependencyFacts === "on"
     && args.dispatch === "legacy"
-    && changedManifestPaths(diff).length > 0;
+    && changedManifests(diff).length > 0;
   if (dependencyFactsUnavailable) {
     console.warn(
       "tgd-review-agent: --dependency-facts needs --dispatch direct; the legacy engine cannot " +
@@ -1176,8 +1176,8 @@ export async function review(
   // A manifest that cannot be read contributes no changes and is named in the
   // pack instead, because "we did not look" and "we looked and it was fine"
   // must not render the same.
-  const manifestPaths = args.dependencyFacts === "on" && !dependencyFactsUnavailable
-    ? changedManifestPaths(diff)
+  const manifestsToRead = args.dependencyFacts === "on" && !dependencyFactsUnavailable
+    ? changedManifests(diff)
     : [];
   // Read at BOTH ends. What a pull request CHANGED is the difference between
   // the two dependency maps — an added diff line carries no structural
@@ -1187,14 +1187,26 @@ export async function review(
   // A read that fails is recorded, never treated as "the file declares
   // nothing": that is the difference between "we did not look" and "we looked
   // and it was fine".
+  // The point the branches DIVERGED, not the target's current tip. A pull
+  // request diff is a three-dot comparison, so once the target branch advances
+  // its own dependency updates would otherwise read as this pull request's
+  // (PR #67 review, round two). GitLab reports it on the merge request itself;
+  // GitHub needs asking. Resolved only when there is a manifest to read, so an
+  // ordinary review makes no extra call, and it falls back to the tip rather
+  // than guessing when the provider cannot say.
+  const comparisonBaseSha = manifestsToRead.length === 0
+    ? pr.baseSha
+    : pr.startSha
+      ?? await config.vcsAdapter.getMergeBaseSha(config.locator, pr.baseSha, pr.headSha)
+      ?? pr.baseSha;
   const headManifests = new Map<string, string | undefined>();
   const baseManifests = new Map<string, string | undefined>();
   const unreachableManifests: string[] = [];
-  for (const path of manifestPaths) {
-    const read = async (ref: string): Promise<string | undefined> =>
-      config.vcsAdapter.getFileAtRef(config.locator, ref, path);
+  for (const { path, basePath } of manifestsToRead) {
+    const read = async (ref: string, at: string): Promise<string | undefined> =>
+      config.vcsAdapter.getFileAtRef(config.locator, ref, at);
     try {
-      headManifests.set(path, await read(pr.headSha));
+      headManifests.set(path, await read(pr.headSha, path));
     } catch (error) {
       console.warn(
         `tgd-review-agent: could not read ${path} at ${pr.headSha} (${redactedMessage(error)})`,
@@ -1202,18 +1214,19 @@ export async function review(
       unreachableManifests.push(path);
       continue;
     }
+    // A manifest this pull request ADDS has no base side to read.
+    if (basePath === undefined) continue;
     try {
-      // Absent at base is a NEW manifest, which the extractor reads as such.
-      baseManifests.set(path, await read(pr.baseSha));
+      baseManifests.set(basePath, await read(comparisonBaseSha, basePath));
     } catch (error) {
       console.warn(
-        `tgd-review-agent: could not read ${path} at ${pr.baseSha} (${redactedMessage(error)})`,
+        `tgd-review-agent: could not read ${basePath} at ${comparisonBaseSha} (${redactedMessage(error)})`,
       );
       unreachableManifests.push(path);
     }
   }
   const extraction = extractDependencyChanges(
-    manifestPaths.filter((path) => !unreachableManifests.includes(path)),
+    manifestsToRead.filter((manifest) => !unreachableManifests.includes(manifest.path)),
     headManifests,
     baseManifests,
   );

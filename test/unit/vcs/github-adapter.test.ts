@@ -884,6 +884,42 @@ describe("GitHubAdapter", () => {
     });
   });
 
+  // --- getMergeBaseSha (PR #67 review) ---
+  //
+  // A GitHub pull request diff is a THREE-DOT comparison, against the point
+  // where the branches diverged. `baseRefOid` is the target branch's current
+  // tip, which is a different commit once the target advances.
+  describe("getMergeBaseSha", () => {
+    it("asks the compare API for the point the branches diverged", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({
+        merge_base_commit: { sha: "mergebase1" },
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBe("mergebase1");
+      expect(execGh).toHaveBeenCalledWith(
+        expect.arrayContaining(["repos/{owner}/{repo}/compare/basetip...headsha"]),
+      );
+    });
+
+    // Not knowing is an answer the caller can act on; guessing is not.
+    it("returns undefined when the comparison is unavailable", async () => {
+      const execGh = vi.fn(async () => {
+        throw new Error("gh: Not Found (HTTP 404)");
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBeUndefined();
+    });
+
+    it("returns undefined when the response has no merge base", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({ status: "diverged" }));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBeUndefined();
+    });
+  });
+
   // --- getFileAtRef (issue #56) ---
   //
   // The general form of the machinery getRuleFilesFromBase already used, so

@@ -331,6 +331,10 @@ function makeHarness(options: {
     // one at HEAD, so the double answers per ref. At base the packages the
     // dependency tests bump are older or absent; at head they are what those
     // tests expect to see reported.
+    // PR #67: the comparison base is the point the branches diverged, which the
+    // adapter resolves. The double answers with the base sha, so the base
+    // manifest below is what these tests compare against.
+    getMergeBaseSha: vi.fn().mockResolvedValue(pr.baseSha),
     getFileAtRef: vi.fn(async (_locator: unknown, ref: string) => JSON.stringify(
       ref === pr.baseSha
         ? {
@@ -4369,5 +4373,94 @@ describe("review — manifests are read at the head ref", () => {
     expect(exitCode).toBe(0);
     expect(packFor(h)).toMatch(/could NOT be read/i);
     warn.mockRestore();
+  });
+});
+
+// PR #67 review, round two: a pull request diff is a THREE-DOT comparison, so
+// the base side is the point the branches diverged — not the target branch's
+// current tip. Once the target advances, reading the tip attributes the
+// TARGET's dependency updates to this pull request.
+describe("review — the comparison base is where the branches diverged", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -3,7 +3,7 @@",
+    '+    "lodash": "4.17.21",',
+  ].join("\n");
+
+  const packFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  const manifestAt = (versions: Record<string, string>) =>
+    JSON.stringify({ dependencies: versions });
+
+  it("reads the base manifest at the merge base, not the base tip", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockResolvedValue("ccccccc1");
+    // The target branch bumped lodash on its own after the branches diverged.
+    h.vcsAdapter.getFileAtRef.mockImplementation(async (_l: unknown, ref: string) => {
+      if (ref === "aaaaaaa1") return manifestAt({ lodash: "4.17.21" });
+      if (ref === "ccccccc1") return manifestAt({ lodash: "4.17.20" });
+      return manifestAt({ lodash: "4.17.21" }); // the tip, which must not be used
+    });
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "ccccccc1", "package.json",
+    );
+    // Read at the tip, lodash looks unchanged and nothing is reported at all.
+    expect(packFor(h)).toContain("lodash");
+  });
+
+  // GitLab reports it on the merge request itself, so no extra call is needed.
+  it("prefers the merge request's own start sha when it has one", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1", startSha: "ddddddd1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(h.vcsAdapter.getMergeBaseSha).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "ddddddd1", "package.json",
+    );
+  });
+
+  // An approximate base beats no review; the provider not knowing is not fatal.
+  it("falls back to the base sha when the provider cannot say", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockResolvedValue(undefined);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "bbbbbbb1", "package.json",
+    );
+  });
+
+  it("asks for no merge base when there is no manifest to read", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(h.vcsAdapter.getMergeBaseSha).not.toHaveBeenCalled();
   });
 });

@@ -1975,6 +1975,27 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
    * one extra `gh api` round trip per nested directory; neither is
    * necessary for v1's flat `.tgd-review/rules/*.md` layout.
    */
+  async getMergeBaseSha(
+    locator: ReviewLocator,
+    baseSha: string,
+    headSha: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolvePullLocator(locator);
+    try {
+      const out = await this.execGh([
+        "api", `${apiRepo(repo)}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
+        ...apiHost(repo),
+      ]);
+      const parsed = JSON.parse(out) as { merge_base_commit?: { sha?: unknown } };
+      const sha = parsed.merge_base_commit?.sha;
+      return typeof sha === "string" && sha.length > 0 ? sha : undefined;
+    } catch {
+      // Not knowing is an answer the caller can act on. It falls back to the
+      // base tip, which is approximate rather than wrong-in-a-new-way.
+      return undefined;
+    }
+  }
+
   async getFileAtRef(
     locator: ReviewLocator,
     ref: string,

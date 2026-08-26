@@ -4,7 +4,7 @@
 // property, because it is the whole reason the feature can exist.
 import { describe, expect, it } from "vitest";
 import {
-  changedManifestPaths,
+  changedManifests,
   dependencyChanges,
   dependencyContextPack,
   registryUrlFor,
@@ -30,7 +30,7 @@ function agreeingManifests(diff: string): Map<string, string> {
     if (entry) dependencies[entry[1]!] = entry[2]!;
   }
   const text = JSON.stringify({ name: "app", version: "1.0.0", dependencies });
-  return new Map(changedManifestPaths(diff).map((path) => [path, text]));
+  return new Map(changedManifests(diff).map(({ path }) => [path, text]));
 }
 
 /**
@@ -39,7 +39,7 @@ function agreeingManifests(diff: string): Map<string, string> {
  * were always about: the diff adds these entries and they are dependencies.
  */
 function changesFrom(diff: string) {
-  return dependencyChanges(changedManifestPaths(diff), agreeingManifests(diff)).changes;
+  return dependencyChanges(changedManifests(diff), agreeingManifests(diff)).changes;
 }
 
 describe("dependencyChangesFromDiff", () => {
@@ -524,7 +524,10 @@ describe("dependencyChanges — a pin and a range are different changes", () => 
       ["web/package.json", JSON.stringify({ dependencies: { pkg: "1.2.3" } })],
     ]);
 
-    const changes = dependencyChanges([...head.keys()], head).changes;
+    const changes = dependencyChanges(
+      [...head.keys()].map((path) => ({ path, basePath: path })),
+      head,
+    ).changes;
 
     expect(changes).toHaveLength(2);
     expect(changes.some((c) => c.pinned)).toBe(true);
@@ -639,7 +642,7 @@ describe("dependencyChanges — the manifests decide, not the diff", () => {
   });
   const run = (head: Record<string, unknown>, base: Record<string, unknown> = {}) =>
     dependencyChanges(
-      ["package.json"],
+      [{ path: "package.json", basePath: "package.json" }],
       new Map([["package.json", manifest(head)]]),
       new Map([["package.json", manifest(base)]]),
     ).changes;
@@ -694,7 +697,7 @@ describe("dependencyChanges — the manifests decide, not the diff", () => {
 
   it("treats a manifest that is new at head as all-new", () => {
     const changes = dependencyChanges(
-      ["package.json"],
+      [{ path: "package.json", basePath: "package.json" }],
       new Map([["package.json", manifest({})]]),
       new Map(),
     ).changes;
@@ -704,7 +707,7 @@ describe("dependencyChanges — the manifests decide, not the diff", () => {
 });
 
 
-describe("changedManifestPaths", () => {
+describe("changedManifests", () => {
   it("lists each manifest the diff touches, once", () => {
     const diff = [
       "diff --git a/package.json b/package.json",
@@ -721,7 +724,10 @@ describe("changedManifestPaths", () => {
       '+    "vue": "3.0.0",',
     ].join("\n");
 
-    expect(changedManifestPaths(diff)).toEqual(["package.json", "web/package.json"]);
+    expect(changedManifests(diff)).toEqual([
+      { path: "package.json", basePath: "package.json" },
+      { path: "web/package.json", basePath: "web/package.json" },
+    ]);
   });
 
   it("ignores files that are not manifests", () => {
@@ -733,7 +739,7 @@ describe("changedManifestPaths", () => {
       '+    "lodash": "4.17.21",',
     ].join("\n");
 
-    expect(changedManifestPaths(diff)).toEqual([]);
+    expect(changedManifests(diff)).toEqual([]);
   });
 
   // The forged-header defence matters more now: this path is FETCHED.
@@ -747,7 +753,7 @@ describe("changedManifestPaths", () => {
       '+    "lodash": "4.17.21",',
     ].join("\n");
 
-    expect(changedManifestPaths(diff)).toEqual([]);
+    expect(changedManifests(diff)).toEqual([]);
   });
 });
 
@@ -759,20 +765,20 @@ describe("dependencyChanges — what could not be examined is reported", () => {
   const good = JSON.stringify({ dependencies: { lodash: "4.17.21" } });
 
   it("reports a head manifest that is not valid JSON", () => {
-    const result = dependencyChanges(["package.json"], new Map([["package.json", "{ not json"]]));
+    const result = dependencyChanges([{ path: "package.json", basePath: "package.json" }], new Map([["package.json", "{ not json"]]));
 
     expect(result.changes).toEqual([]);
     expect(result.unreadable).toEqual(["package.json"]);
   });
 
   it("reports a head manifest whose root is not an object", () => {
-    const result = dependencyChanges(["package.json"], new Map([["package.json", "[1,2,3]"]]));
+    const result = dependencyChanges([{ path: "package.json", basePath: "package.json" }], new Map([["package.json", "[1,2,3]"]]));
 
     expect(result.unreadable).toEqual(["package.json"]);
   });
 
   it("reports a head manifest that could not be fetched", () => {
-    const result = dependencyChanges(["package.json"], new Map([["package.json", undefined]]));
+    const result = dependencyChanges([{ path: "package.json", basePath: "package.json" }], new Map([["package.json", undefined]]));
 
     expect(result.unreadable).toEqual(["package.json"]);
   });
@@ -782,7 +788,7 @@ describe("dependencyChanges — what could not be examined is reported", () => {
   // dependencies nobody touched.
   it("reports a base manifest that is not valid JSON", () => {
     const result = dependencyChanges(
-      ["package.json"],
+      [{ path: "package.json", basePath: "package.json" }],
       new Map([["package.json", good]]),
       new Map([["package.json", "{ not json"]]),
     );
@@ -794,7 +800,7 @@ describe("dependencyChanges — what could not be examined is reported", () => {
   // Absent at base is NOT a failure — it is a manifest this pull request adds.
   it("treats an absent base manifest as new, not unreadable", () => {
     const result = dependencyChanges(
-      ["package.json"],
+      [{ path: "package.json", basePath: "package.json" }],
       new Map([["package.json", good]]),
       new Map([["package.json", undefined]]),
     );
@@ -805,11 +811,124 @@ describe("dependencyChanges — what could not be examined is reported", () => {
 
   it("keeps examining the manifests it can read", () => {
     const result = dependencyChanges(
-      ["a/package.json", "b/package.json"],
+      [
+        { path: "a/package.json", basePath: "a/package.json" },
+        { path: "b/package.json", basePath: "b/package.json" },
+      ],
       new Map([["a/package.json", "{ not json"], ["b/package.json", good]]),
     );
 
     expect(result.unreadable).toEqual(["a/package.json"]);
     expect(result.changes.map((c) => c.manifest)).toEqual(["b/package.json"]);
+  });
+});
+
+// PR #67 review, round two: a package moving from devDependencies to
+// dependencies at the same version is a real change — it enters the production
+// dependency tree — and the spec-only comparison discarded it. The pack claims
+// to establish `section`, so it must notice when that is what moved.
+describe("dependencyChanges — a section change is a change", () => {
+  const at = (deps: Record<string, unknown>) => JSON.stringify(deps);
+  const run = (head: Record<string, unknown>, base: Record<string, unknown>) =>
+    dependencyChanges(
+      [{ path: "package.json", basePath: "package.json" }],
+      new Map([["package.json", at(head)]]),
+      new Map([["package.json", at(base)]]),
+    ).changes;
+
+  it("reports a package promoted to a runtime dependency", () => {
+    const changes = run(
+      { dependencies: { lodash: "4.17.21" } },
+      { devDependencies: { lodash: "4.17.21" } },
+    );
+
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatchObject({ name: "lodash", section: "dependencies" });
+  });
+
+  it("reports a package demoted out of the runtime tree", () => {
+    const changes = run(
+      { devDependencies: { lodash: "4.17.21" } },
+      { dependencies: { lodash: "4.17.21" } },
+    );
+
+    expect(changes[0]?.section).toBe("devDependencies");
+  });
+
+  it("still says nothing when neither the spec nor the section moved", () => {
+    expect(run(
+      { dependencies: { lodash: "4.17.21" } },
+      { dependencies: { lodash: "4.17.21" } },
+    )).toEqual([]);
+  });
+});
+
+// PR #67 review, round two: a renamed manifest has an OLD path on the `---`
+// side and a NEW one on `+++`. Reading base at the new path returns nothing,
+// which reads as "this manifest is new", so every dependency in it is reported
+// and queried instead of the one that actually moved.
+describe("changedManifests — a renamed manifest keeps its old path", () => {
+  it("pairs the new path with the old one", () => {
+    const diff = [
+      "diff --git a/old/package.json b/new/package.json",
+      "similarity index 98%",
+      "rename from old/package.json",
+      "rename to new/package.json",
+      "--- a/old/package.json",
+      "+++ b/new/package.json",
+      '@@ -3,7 +3,7 @@ "dependencies": {',
+      '+    "lodash": "4.17.21",',
+    ].join("\n");
+
+    expect(changedManifests(diff)).toEqual([
+      { path: "new/package.json", basePath: "old/package.json" },
+    ]);
+  });
+
+  it("uses the same path at both ends when nothing was renamed", () => {
+    const diff = [
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      "@@ -3,7 +3,7 @@",
+      '+    "lodash": "4.17.21",',
+    ].join("\n");
+
+    expect(changedManifests(diff)).toEqual([
+      { path: "package.json", basePath: "package.json" },
+    ]);
+  });
+
+  // A manifest this pull request ADDS has no base side at all.
+  it("has no base path for a newly added manifest", () => {
+    const diff = [
+      "diff --git a/package.json b/package.json",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/package.json",
+      "@@ -0,0 +1,3 @@",
+      '+    "lodash": "4.17.21",',
+    ].join("\n");
+
+    expect(changedManifests(diff)).toEqual([
+      { path: "package.json", basePath: undefined },
+    ]);
+  });
+
+  it("reports only the dependency that moved across a rename", () => {
+    const head = new Map([["new/package.json", JSON.stringify({
+      dependencies: { lodash: "4.17.21", react: "18.0.0" },
+    })]]);
+    const base = new Map([["old/package.json", JSON.stringify({
+      dependencies: { lodash: "4.17.20", react: "18.0.0" },
+    })]]);
+
+    const result = dependencyChanges(
+      [{ path: "new/package.json", basePath: "old/package.json" }],
+      head,
+      base,
+    );
+
+    expect(result.changes.map((c) => c.name)).toEqual(["lodash"]);
   });
 });

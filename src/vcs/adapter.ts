@@ -181,6 +181,24 @@ export interface VcsAdapter {
     ref: string,
     path: string,
   ): Promise<string | undefined>;
+
+  /**
+   * The commit the two branches diverged from, if it can be determined.
+   *
+   * A pull request diff is a THREE-DOT comparison — it shows what the head
+   * branch did, not what the target branch did meanwhile. `baseSha` is the
+   * target's current tip, so once the target advances the two are different
+   * commits, and reading a file at the tip attributes the TARGET's changes to
+   * this pull request (PR #67 review).
+   *
+   * `undefined` when the provider cannot say. The caller falls back rather than
+   * guessing, and a wrong merge base is worse than a known-approximate one.
+   */
+  getMergeBaseSha(
+    locator: ReviewLocator,
+    baseSha: string,
+    headSha: string,
+  ): Promise<string | undefined>;
 }
 
 export interface InlineReviewComment {
