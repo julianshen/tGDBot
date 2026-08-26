@@ -180,6 +180,29 @@ function stripRange(raw: string): string {
   return raw.replace(/^[\^~><= ]+/u, "").trim();
 }
 
+/**
+ * How many nesting levels a line's indentation represents.
+ *
+ * A dependency entry sits at depth 2 — inside a top-level object — while a
+ * field like `version` sits at depth 1, and that difference is the only signal
+ * left when git's hunk omits the enclosing key. Testing for four SPACES encoded
+ * one house style: a tab-indented manifest matched nothing and every dependency
+ * change in it was dropped silently (PR #54 review, final round).
+ *
+ * A tab is one level; two spaces are one level. Under the 4-space style a
+ * top-level field reads as depth 2 and still gets through, exactly as it did
+ * before — that is what the unconfirmed label, the separate budget and the
+ * runtime-key list are for. A 1-space manifest still reads its entries as depth
+ * 1 and is missed, which is the pre-existing behaviour and the reason #56
+ * proposes parsing the file instead of guessing from it.
+ */
+function indentDepth(line: string): number {
+  const indent = /^[\t ]*/u.exec(line)?.[0] ?? "";
+  const tabs = (indent.match(/\t/gu) ?? []).length;
+  const spaces = indent.length - tabs;
+  return tabs + Math.floor(spaces / 2);
+}
+
 /** True when the spec names one release outright, with no range operator. */
 function isPinnedSpec(raw: string): boolean {
   return isExactVersion(raw.trim());
@@ -261,7 +284,7 @@ function manifestContextByLine(diff: string): Map<number, { manifest: string; co
     // field like "version". Not proof, but the alternative — dropping every
     // bump whose header git did not include — misses most real ones.
     if (section === "unknown") {
-      if (!/^\s{4,}"/u.test(content)) continue;
+      if (indentDepth(content) < 2) continue;
       const key = /^\s*"([^"]+)"\s*:/u.exec(content)?.[1];
       if (key !== undefined && RUNTIME_KEYS.has(key)) continue;
     }

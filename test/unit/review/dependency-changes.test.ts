@@ -885,3 +885,33 @@ describe("dependency extraction — scoped workspace paths", () => {
     expect(dependencyChangesFromDiff(diff)).toEqual([]);
   });
 });
+
+// PR #54 review, final round: the unknown-section fallback tested for four
+// SPACES, so a tab-indented manifest matched nothing and every dependency
+// change in it was dropped in silence, even with --dependency-facts on.
+describe("dependency extraction — indentation styles", () => {
+  const diffWith = (indent: string, key = "lodash") => [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    // No enclosing key in the hunk: indentation is the only signal.
+    "@@ -80,7 +80,7 @@",
+    `+${indent}"${key}": "4.17.21",`,
+  ].join("\n");
+
+  it("reads a tab-indented dependency entry", () => {
+    expect(dependencyChangesFromDiff(diffWith("\t\t"))).toHaveLength(1);
+  });
+
+  it("still reads the four-space form", () => {
+    expect(dependencyChangesFromDiff(diffWith("    "))).toHaveLength(1);
+  });
+
+  it("does not read a top-level field in a tab-indented manifest", () => {
+    expect(dependencyChangesFromDiff(diffWith("\t", "version"))).toEqual([]);
+  });
+
+  it("does not read a top-level field in a two-space manifest", () => {
+    expect(dependencyChangesFromDiff(diffWith("  ", "version"))).toEqual([]);
+  });
+});
