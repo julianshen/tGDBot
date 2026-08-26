@@ -667,6 +667,9 @@ function renderContextUnavailable(input: SummaryInput): string | undefined {
     labels.includes("memory")
       ? "> Memory context was unavailable for this run."
       : undefined,
+    labels.includes("repository")
+      ? "> Repository context was unavailable for this run. The review used the diff and trusted rules only, without the trusted-base map of the surrounding code."
+      : undefined,
   ].filter((note): note is string => note !== undefined);
   if (notes.length === 0) return undefined;
   return `> [!NOTE]\n${notes.join("\n")}`;

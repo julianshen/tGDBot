@@ -42,6 +42,10 @@ describe("parseCommandArgs", () => {
       trustLocalRules: false,
       dispatch: "direct",
       maxDiffChars: undefined,
+      context: "auto",
+      contextMaxChars: undefined,
+      allowDegradedContext: false,
+      contextDir: undefined,
       stateDir: undefined,
     });
   });
@@ -84,6 +88,10 @@ describe("parseArgs", () => {
       trustLocalRules: false,
       dispatch: "direct",
       maxDiffChars: undefined,
+      context: "auto",
+      contextMaxChars: undefined,
+      allowDegradedContext: false,
+      contextDir: undefined,
       model: undefined,
     });
   });
@@ -105,6 +113,13 @@ describe("parseArgs", () => {
       "--trust-local-rules",
       "--dispatch",
       "legacy",
+      "--context",
+      "require",
+      "--context-max-chars",
+      "12000",
+      "--allow-degraded-context",
+      "--context-dir",
+      "/srv/ctx",
     ]);
 
     expect(result).toEqual({
@@ -117,6 +132,10 @@ describe("parseArgs", () => {
       dryRun: true,
       trustLocalRules: true,
       dispatch: "legacy",
+      context: "require",
+      contextMaxChars: 12_000,
+      allowDegradedContext: true,
+      contextDir: "/srv/ctx",
     });
   });
 
@@ -134,6 +153,58 @@ describe("parseArgs", () => {
       expect(() => parseArgs(["review", "--pr", "42", "--dispatch", "turbo"])).toThrow(
         /--dispatch/,
       );
+    });
+  });
+
+  // #58: trusted-base repository context. `auto` is the default, so a review
+  // that says nothing about context still gets it when it can be mapped.
+  describe("--context", () => {
+    it("defaults to auto", () => {
+      expect(parseArgs(["review", "--pr", "42"]).context).toBe("auto");
+      expect(parseArgs(["review", "--pr", "42"]).allowDegradedContext).toBe(false);
+      expect(parseArgs(["review", "--pr", "42"]).contextMaxChars).toBeUndefined();
+      expect(parseArgs(["review", "--pr", "42"]).contextDir).toBeUndefined();
+    });
+
+    it("accepts each mode", () => {
+      for (const mode of ["off", "auto", "require"] as const) {
+        expect(parseArgs(["review", "--pr", "42", "--context", mode]).context).toBe(mode);
+      }
+    });
+
+    it("rejects an unknown mode by name", () => {
+      expect(() => parseArgs(["review", "--pr", "42", "--context", "maybe"])).toThrow(/--context/);
+    });
+
+    it("accepts --allow-degraded-context as a flag", () => {
+      expect(parseArgs(["review", "--pr", "42", "--allow-degraded-context"]).allowDegradedContext)
+        .toBe(true);
+    });
+
+    it("takes a per-rule size ceiling inside the pack builder's bounds", () => {
+      expect(parseArgs(["review", "--pr", "42", "--context-max-chars", "12000"]).contextMaxChars)
+        .toBe(12_000);
+    });
+
+    it("rejects an out-of-range or non-numeric ceiling at the flag, naming it", () => {
+      // Below MIN, above MAX, and not a number at all: each must fail here
+      // rather than surfacing later as a context that silently went missing.
+      for (const bad of ["100", "999999", "lots", "-1", ""]) {
+        expect(() => parseArgs(["review", "--pr", "42", "--context-max-chars", bad]))
+          .toThrow(/--context-max-chars/);
+      }
+    });
+
+    it("requires --context-dir to be absolute", () => {
+      expect(parseArgs(["review", "--pr", "42", "--context-dir", "/srv/ctx"]).contextDir)
+        .toBe("/srv/ctx");
+      expect(() => parseArgs(["review", "--pr", "42", "--context-dir", "relative/ctx"]))
+        .toThrow(/--context-dir/);
+    });
+
+    it("is available to poll as well, so a command review runs the same way", () => {
+      const polled = parseCommandArgs(["poll", "--repo", "acme/app", "--context", "off"]);
+      expect(polled.context).toBe("off");
     });
   });
 

@@ -235,3 +235,85 @@ describe("the severity contract states a defensible bar", () => {
     expect(agent).toMatch(/building,\s+testing,\s+packaging\s+or\s+deploying/i);
   });
 });
+
+describe("buildDispatchPrompt trusted-base context", () => {
+  it("embeds each rule's pack in its own task text", () => {
+    const rules = [
+      { ...makeRule(), name: "correctness" },
+      { ...makeRule(), name: "security" },
+    ];
+    const packs = new Map<string, ContextPackResult>([
+      ["correctness", makePack("CORRECTNESS CONTEXT BODY")],
+      ["security", makePack("SECURITY CONTEXT BODY")],
+    ]);
+
+    const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", false, undefined, packs);
+
+    expect(prompt).toContain("CORRECTNESS CONTEXT BODY");
+    expect(prompt).toContain("SECURITY CONTEXT BODY");
+    // Regression guard for the defect this feature was blocked on: the
+    // orchestrated path used to pass `undefined` for the pack unconditionally,
+    // so it could not carry context at all while the direct path could.
+    expect(prompt).toContain("[TRUSTED_CONTEXT:");
+  });
+
+  it("puts the pack in the trusted section, never in the untrusted diff", () => {
+    const rule = makeRule();
+    const prompt = buildDispatchPrompt(
+      [rule],
+      "diff --git a/x b/x",
+      false,
+      undefined,
+      new Map([[rule.name, makePack("TRUSTED BASE EVIDENCE")]]),
+    );
+    const token = boundaryToken(prompt);
+
+    expect(enclosed(prompt, "TRUSTED_CONTEXT", token)).toContain("TRUSTED BASE EVIDENCE");
+    expect(enclosed(prompt, "UNTRUSTED_DIFF", token)).not.toContain("TRUSTED BASE EVIDENCE");
+  });
+
+  it("omits the section entirely for a rule with no pack", () => {
+    const rules = [
+      { ...makeRule(), name: "with-context" },
+      { ...makeRule(), name: "without-context" },
+    ];
+    const prompt = buildDispatchPrompt(
+      rules,
+      "diff",
+      false,
+      undefined,
+      new Map([["with-context", makePack("ONLY FOR THE FIRST RULE")]]),
+    );
+
+    // One TRUSTED_CONTEXT section for the one rule that has a pack.
+    expect(prompt.match(/\[TRUSTED_CONTEXT:/g)).toHaveLength(1);
+  });
+
+  it("produces the prompt it always did when no packs are supplied", () => {
+    const rules = [makeRule()];
+    expect(buildDispatchPrompt(rules, "diff", false, undefined, new Map()))
+      .toBe(buildDispatchPrompt(rules, "diff", false));
+  });
+
+  it("counts pack size in the cost warning, not just the diff", () => {
+    const rules = [
+      { ...makeRule(), name: "one" },
+      { ...makeRule(), name: "two" },
+    ];
+    const diff = "d".repeat(100);
+    const pack = makePack("c".repeat(600_000));
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (message: string) => void warnings.push(message);
+    try {
+      // The diff alone is nowhere near the threshold; the packs are what push
+      // this run over it, and the warning has to see them.
+      buildDispatchPrompt(rules, diff, false, undefined, new Map([["one", pack]]));
+    } finally {
+      console.warn = original;
+    }
+
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("trusted-base context");
+  });
+});

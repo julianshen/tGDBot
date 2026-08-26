@@ -76,6 +76,14 @@ export function computeReviewConfigHash(
   config: ReviewConfigForDedup,
   relatedWorkFingerprint?: string,
   conversationFingerprint?: string,
+  /**
+   * Identifies the trusted-base context this review would be given — the
+   * context mode plus the cache key identity, not the produced manifest. See
+   * `contextFingerprint`. Appended inside a tagged object rather than as a
+   * bare positional so it can never be confused with `conversationFingerprint`
+   * when that one is absent.
+   */
+  contextFingerprint?: string,
 ): string {
   // A positional array (not an object) so the serialization can't drift on key
   // ordering; every field that affects review output is included explicitly.
@@ -97,6 +105,7 @@ export function computeReviewConfigHash(
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,
     ...(conversationFingerprint === undefined ? [] : [conversationFingerprint]),
+    ...(contextFingerprint === undefined ? [] : [{ context: contextFingerprint }]),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
 }

@@ -142,12 +142,25 @@ const ADVISOR_INSTRUCTION =
 // rather than silent.
 const DIFF_COST_WARNING_THRESHOLD_CHARS = 500_000; // ~125k tokens at ~4 chars/token
 
-function warnIfDiffCostRisk(rules: EffectiveRule[], diff: string): void {
-  const totalChars = diff.length * rules.length;
+function warnIfDiffCostRisk(
+  rules: EffectiveRule[],
+  diff: string,
+  packsByRule?: ReadonlyMap<string, ContextPackResult>,
+): void {
+  // The trusted-base context pack is embedded per rule for exactly the same
+  // reason the diff is (each reviewer is a fresh child session), so it scales
+  // the same way and belongs in the same accounting. Counting only the diff
+  // under-reported a review that carries a 30k-char pack per rule.
+  const packChars = rules.reduce(
+    (total, rule) => total + (packsByRule?.get(rule.name)?.text.length ?? 0),
+    0,
+  );
+  const totalChars = diff.length * rules.length + packChars;
   if (rules.length > 1 && totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
+    const packNote = packChars === 0 ? "" : ` plus ~${packChars} chars of trusted-base context`;
     console.warn(
       `dispatchRules: dispatch prompt embeds the ${diff.length}-char diff once per rule ` +
-        `(${rules.length} rules, ~${totalChars} chars total) — this is required because each ` +
+        `(${rules.length} rules, ~${totalChars} chars total${packNote}) — this is required because each ` +
         `dispatched "reviewer" subagent runs in a fresh, isolated child session with no access ` +
         `to the orchestrator's own context, but it does mean cost/context-window usage scales ` +
         `with rule count on large diffs or rule sets.`,
@@ -228,8 +241,15 @@ export function buildDispatchPrompt(
   diff: string,
   useAdvisor: boolean,
   conversationContext?: ReviewConversationContext,
+  /**
+   * Trusted-base context, keyed by rule name. Before this parameter existed
+   * the orchestrated path passed `undefined` here unconditionally, so
+   * `--dispatch legacy` could not carry context at all while `direct` could —
+   * a silent difference in what the two engines showed a reviewer.
+   */
+  packsByRule?: ReadonlyMap<string, ContextPackResult>,
 ): string {
-  warnIfDiffCostRisk(rules, diff);
+  warnIfDiffCostRisk(rules, diff, packsByRule);
 
   const ruleNames = rules.map((rule) => rule.name);
 
@@ -241,7 +261,7 @@ export function buildDispatchPrompt(
         `  agent: "reviewer"`,
         `  model: "${modelRef}"`,
         `  task: """`,
-        buildTaskText(rule, diff, undefined, conversationContext),
+        buildTaskText(rule, diff, packsByRule?.get(rule.name), conversationContext),
         `  """`,
       ].join("\n");
     })

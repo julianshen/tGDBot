@@ -67,6 +67,12 @@ import type { DispatchResult, Finding, ReviewDispatchInput } from "./review/type
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
+import {
+  ContextRequiredError,
+  contextFingerprint,
+  prepareReviewContext as prepareReviewContextReal,
+} from "./context/prepare.js";
+import { contextRoots, selectContextRoot } from "./context/root.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
@@ -174,6 +180,12 @@ export interface ReviewDependencies {
   ) => OrchestrationResult;
   createStateStore?: typeof createConversationStateStore;
   publicationHooks?: PublicationExecutorHooks;
+  /**
+   * Prepares trusted-base repository context. Injectable so a review test
+   * never has to build a git worktree or start a mapping session — the same
+   * stance `dispatchRules` takes for its session factory.
+   */
+  prepareContext?: typeof prepareReviewContextReal;
   now?: () => string;
 }
 
@@ -793,8 +805,10 @@ export async function review(
             undefined,
             input.orchestratorModel,
             input.conversationContext,
+            input.contextPacks,
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
+  const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
   const publicationHooks = deps.publicationHooks;
@@ -930,7 +944,21 @@ export async function review(
         (cause === undefined ? "" : ` (${cause})`),
     );
   }
-  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);
+  // Computed BEFORE any mapping, and from the cache key identity rather than a
+  // produced manifest, so it can take part in the dedup decision that decides
+  // whether mapping is worth doing at all. See `contextFingerprint`.
+  const contextIdentity = contextFingerprint({
+    mode: config.context,
+    baseSha: pr.baseSha,
+    ...(config.contextMaxChars === undefined ? {} : { maxChars: config.contextMaxChars }),
+    allowDegraded: config.allowDegradedContext,
+  });
+  const configHash = computeReviewConfigHash(
+    config,
+    relatedWorkFingerprint(extracted),
+    loadedContext.fingerprint,
+    ...(contextIdentity === undefined ? [] : [contextIdentity]),
+  );
   const storeBinding = storeBindingOf(stateStore, repository);
   const publicationIdentity = reviewPublicationIdentity({
     repository: storeBinding,
@@ -1104,11 +1132,77 @@ export async function review(
     return EXIT_FATAL;
   }
 
+  // Trusted-base repository context. Deliberately prepared HERE — after the
+  // dedup skip above and after the rule set is known to be non-empty — because
+  // mapping is by far the most expensive step in a review, and a run that is
+  // going to be skipped, or that has no rules to hand a pack to, must never
+  // pay for it.
+  let contextPreparation: Awaited<ReturnType<typeof prepareReviewContextReal>>;
+  try {
+    // Root selection can itself throw — it reads HOME/XDG_CACHE_HOME, and a
+    // container may set neither. It sits INSIDE the try so that failure
+    // degrades like any other context failure instead of killing a review
+    // that could still run on the diff alone.
+    const roots = config.context === "off"
+      // `off` must touch nothing at all, including the environment lookup:
+      // asking for no context cannot be a reason to fail on an unset HOME.
+      ? { workspaceRoot: "", cacheRoot: "" }
+      : contextRoots(selectContextRoot({
+        ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
+      }));
+    contextPreparation = await prepareContextFn(
+      {
+        mode: config.context,
+        repository,
+        baseSha: pr.baseSha,
+        headSha: pr.headSha,
+        changedFiles: changedFiles(diff),
+        ruleNames: rules.map((rule) => rule.name),
+        ...(config.contextMaxChars === undefined ? {} : { maxChars: config.contextMaxChars }),
+        allowDegraded: config.allowDegradedContext,
+        ...roots,
+      },
+      {},
+    );
+  } catch (error) {
+    // `--context require` is the mode whose whole point is that reviewing
+    // without repository context is worse than not reviewing: it exits fatal
+    // with the reason, before any comment is written.
+    if (error instanceof ContextRequiredError) {
+      console.error(`tgd-review-agent: ${error.message}`);
+      logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [], reason: "context-required" });
+      return EXIT_FATAL;
+    }
+    if (config.context === "require") throw error;
+    // Everything else degrades. `prepareReviewContext` is already a
+    // never-throws boundary under `auto`, so reaching here means the failure
+    // was in selecting the roots or in the injected seam itself — neither is
+    // a reason to abandon a review that can still run without context.
+    console.warn(`tgd-review-agent: repository context could not be prepared: ${redactedMessage(error)}`);
+    contextPreparation = { status: "unavailable", reasons: [redactedMessage(error)] };
+  }
+  if (contextPreparation.status === "unavailable") {
+    // Never fatal under `auto`: the review proceeds on the diff and the rules
+    // alone, and says so in the summary. The reasons themselves stay on
+    // stderr — they are mapper diagnostics that can name local paths, and the
+    // published comment carries only the label.
+    console.warn(
+      `tgd-review-agent: repository context is unavailable; reviewing without it ` +
+        `(${contextPreparation.reasons.join("; ")})`,
+    );
+  } else if (contextPreparation.status === "ready") {
+    console.log(
+      `tgd-review-agent: repository context ready for ${rules.length} rule(s) ` +
+        `(${contextPreparation.cacheHit ? "cached" : "mapped"} at base ${pr.baseSha})`,
+    );
+  }
+
   const dispatchResult = await dispatchRulesFn({
     rules,
     diff,
     useAdvisor: config.advisor === "on",
     orchestratorModel: config.model,
+    ...(contextPreparation.status === "ready" ? { contextPacks: contextPreparation.packs } : {}),
     ...(loadedContext.conversationContext === undefined
       ? {}
       : { conversationContext: loadedContext.conversationContext }),
@@ -1156,6 +1250,13 @@ export async function review(
         now,
         hooks: publicationHooks,
       });
+  // "repository" joins the existing discussion/memory labels rather than
+  // carrying the mapper's message: the summary is published, and a raw mapper
+  // diagnostic can name local filesystem paths.
+  const reviewContextLabels = [
+    ...loadedContext.unavailable,
+    ...(contextPreparation.status === "unavailable" ? ["repository"] : []),
+  ];
   const orchestration = orchestrateFn(dispatchResult, diff, {
     inline: true,
     ...renderOpts,
@@ -1164,7 +1265,7 @@ export async function review(
     discussionMemories: loadedContext.discussionMemories,
     reviewBinding,
     ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
-    ...(loadedContext.unavailable.length === 0 ? {} : { contextUnavailable: loadedContext.unavailable }),
+    ...(reviewContextLabels.length === 0 ? {} : { contextUnavailable: reviewContextLabels }),
   });
   // Issue #36: the severity mix, on its own machine-readable line so
   // calibration drift is trackable ACROSS runs. A rule set returning 80%

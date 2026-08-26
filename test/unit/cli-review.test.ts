@@ -18,6 +18,7 @@ import { poll } from "../../src/poll/poll.js";
 import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
 import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
+import { ContextRequiredError, contextFingerprint } from "../../src/context/prepare.js";
 import { GitHubDiffIncompleteError } from "../../src/vcs/github-large-diff.js";
 import { deriveInlineChildId, formatInlineRecoveryMarker, formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
@@ -221,6 +222,13 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",
+    // Off by default in this harness: mapping is the one review step that
+    // needs a real git mirror and a model session, and no test here is about
+    // that. `contextFingerprint` returns undefined for "off", so every config
+    // hash below stays exactly what it was before context existed. Tests that
+    // DO exercise context set it explicitly and inject `prepareContext`.
+    context: "off",
+    allowDegradedContext: false,
     ...overrides,
   };
 }
@@ -279,6 +287,7 @@ interface Harness {
   loadRules: ReturnType<typeof vi.fn>;
   dispatchRules: ReturnType<typeof vi.fn>;
   orchestrate: ReturnType<typeof vi.fn>;
+  prepareContext: ReturnType<typeof vi.fn>;
   publicationHooks?: ReviewDependencies["publicationHooks"];
 }
 
@@ -372,6 +381,7 @@ function makeHarness(options: {
     resolveConfig: vi.fn().mockReturnValue(config),
     loadRules: vi.fn().mockResolvedValue(loadResult),
     dispatchRules: vi.fn().mockResolvedValue(dispatchResult),
+    prepareContext: vi.fn().mockResolvedValue({ status: "off" }),
     orchestrate: vi.fn().mockReturnValue(orchestrationResult),
   };
 }
@@ -383,6 +393,9 @@ function depsFrom(h: Harness) {
     dispatchRules: h.dispatchRules,
     orchestrate: h.orchestrate,
     publicationHooks: h.publicationHooks,
+    // Belt and braces alongside `context: "off"` above: even if a test
+    // overrides the mode, it must never reach a real worktree or mapper.
+    prepareContext: h.prepareContext,
   };
 }
 
@@ -3987,5 +4000,191 @@ describe("review: discussion context failures are diagnosable and non-blocking",
     // with no way to tell pagination from malformed data from an outage.
     expect(error!.message).toMatch(/refusing to publish/u);
     expect(error!.message).toMatch(/HTTP 502 upstream unavailable/u);
+  });
+});
+
+// #58: trusted-base repository context reaching the reviewing rules. The
+// preparation itself is covered in test/unit/context/prepare.test.ts; these
+// cover the CLI's side of it — what it hands to dispatch, what it says when
+// there is none, and that it never blocks a review it could still run.
+describe("repository context", () => {
+  function readyPacks(...ruleNames: string[]) {
+    const packs: Record<string, { text: string; manifestHash: string; truncated: boolean; sources: [] }> = {};
+    for (const name of ruleNames) {
+      packs[name] = {
+        text: `# Trusted Rule Context\n\nRule: ${name}\n`,
+        manifestHash: "b".repeat(64),
+        truncated: false,
+        sources: [],
+      };
+    }
+    return { status: "ready" as const, packs, manifestHash: "b".repeat(64), degradedReasons: [], cacheHit: false };
+  }
+
+  it("hands every rule's pack to dispatch", async () => {
+    const h = makeHarness({
+      args: makeArgs({ context: "auto" }),
+      loadResult: {
+        rules: [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })],
+        errors: [],
+      },
+    });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a", "rule-b"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as { contextPacks?: Record<string, unknown> };
+    expect(Object.keys(dispatched.contextPacks ?? {}).sort()).toEqual(["rule-a", "rule-b"]);
+  });
+
+  it("prepares context against the BASE commit, never the head", async () => {
+    const pr = makePr({ headSha: "cafef00d", baseSha: "0badbeef" });
+    const h = makeHarness({ pr, args: makeArgs({ context: "auto" }) });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { baseSha: string; headSha: string };
+    expect(request.baseSha).toBe("0badbeef");
+    expect(request.headSha).toBe("cafef00d");
+  });
+
+  it("reviews without context, and says so, when preparation fails", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "auto" }) });
+    h.prepareContext.mockResolvedValue({ status: "unavailable", reasons: ["mapping timed out"] });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as { contextPacks?: unknown };
+    expect(dispatched.contextPacks).toBeUndefined();
+    // The summary carries a label, never the raw mapper diagnostic: that text
+    // can name local filesystem paths and the summary is published.
+    const orchestrated = h.orchestrate.mock.calls[0]![2] as { contextUnavailable?: string[] };
+    expect(orchestrated.contextUnavailable).toContain("repository");
+    expect(JSON.stringify(orchestrated)).not.toContain("mapping timed out");
+    // The operator still gets the reason, on stderr.
+    expect(warnSpy.mock.calls.flat().join(" ")).toContain("mapping timed out");
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("exits fatal without posting when --context require cannot be satisfied", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "require" }) });
+    h.prepareContext.mockRejectedValue(new ContextRequiredError(["no base worktree"]));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(1);
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(errorSpy.mock.calls.flat().join(" ")).toContain("no base worktree");
+    errorSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it("never prepares context when --context off", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "off" }) });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { mode: string };
+    expect(request.mode).toBe("off");
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as { contextPacks?: unknown };
+    expect(dispatched.contextPacks).toBeUndefined();
+  });
+
+  it("degrades rather than failing when context preparation throws unexpectedly", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "auto" }) });
+    // Not a ContextRequiredError: e.g. an unset HOME while selecting the cache
+    // root. Under `auto` that must never take down a review it could still run.
+    h.prepareContext.mockRejectedValue(new Error("HOME is required to select the context directory"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    const orchestrated = h.orchestrate.mock.calls[0]![2] as { contextUnavailable?: string[] };
+    expect(orchestrated.contextUnavailable).toContain("repository");
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("propagates an unexpected failure in require mode instead of reviewing blind", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "require" }) });
+    h.prepareContext.mockRejectedValue(new Error("HOME is required to select the context directory"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/HOME is required/);
+
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
+  it("prepares context only after the dedup skip, so a skipped run never maps", async () => {
+    const args = makeArgs({ context: "auto" });
+    const pr = makePr({ headSha: "cafef00d" });
+    const cfg = computeReviewConfigHash(
+      args,
+      undefined,
+      undefined,
+      contextFingerprint({ mode: "auto", baseSha: pr.baseSha, allowDegraded: false }),
+    );
+    const h = makeHarness({
+      args,
+      pr,
+      botComment: {
+        id: "999",
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
+        lastReviewedSha: "cafef00d",
+        reviewedConfig: cfg,
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    // Mapping is the most expensive step in a review; a run that is going to
+    // be skipped must not pay for it.
+    expect(h.prepareContext).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
+  it("re-reviews when the context mode changes, because the config hash moves", async () => {
+    const pr = makePr({ headSha: "cafef00d" });
+    const offArgs = makeArgs({ context: "off" });
+    const offHash = computeReviewConfigHash(offArgs);
+    const h = makeHarness({
+      args: makeArgs({ context: "auto" }),
+      pr,
+      botComment: {
+        id: "999",
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${offHash} -->`,
+        lastReviewedSha: "cafef00d",
+        reviewedConfig: offHash,
+      },
+    });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
   });
 });
