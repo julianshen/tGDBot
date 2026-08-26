@@ -157,7 +157,9 @@ function warnIfDiffCostRisk(
   );
   const totalChars = diff.length * rules.length + packChars;
   if (rules.length > 1 && totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
-    const packNote = packChars === 0 ? "" : ` plus ~${packChars} chars of trusted-base context`;
+    // A breakdown of the total, not an addition to it: `totalChars` already
+    // includes `packChars`, and "plus ~N" read as though it did not.
+    const packNote = packChars === 0 ? "" : `, of which ~${packChars} is trusted-base context`;
     console.warn(
       `dispatchRules: dispatch prompt embeds the ${diff.length}-char diff once per rule ` +
         `(${rules.length} rules, ~${totalChars} chars total${packNote}) — this is required because each ` +

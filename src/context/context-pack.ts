@@ -844,15 +844,27 @@ export async function buildContextPack(input: BuildContextPackInput): Promise<Co
  * One pack per rule, over a single selection. `dispatch-context.ts` requires
  * every pack in a dispatch to carry the same manifest hash, which holds here
  * by construction: they all come from one manifest.
+ *
+ * Every name is VALIDATED through `normalizeRuleName`, but each pack is keyed
+ * by the name the caller actually passed. `loadRules` stores a rule's
+ * frontmatter `name` verbatim (`rules/loader.ts`), and `validateDispatchContext`
+ * looks a pack up by that exact string — so keying by the trimmed form would
+ * leave a rule whose name carries surrounding whitespace unable to find its
+ * pack, failing the whole dispatch, and would silently collapse two names that
+ * differ only by whitespace into one shared pack.
  */
 export async function buildContextPacks(
   input: SelectContextInput & { maxChars?: number },
   ruleNames: readonly string[],
 ): Promise<Record<string, ContextPackResult>> {
-  const names = [...new Set(ruleNames.map(normalizeRuleName))];
   const maxChars = resolveMaxChars(input.maxChars);
   const selection = await selectContext(input);
   const packs: Record<string, ContextPackResult> = Object.create(null) as Record<string, ContextPackResult>;
-  for (const name of names) packs[name] = renderContextPack(selection, name, maxChars);
+  for (const name of ruleNames) {
+    normalizeRuleName(name);
+    // Deduplicate on the caller's exact key, not the normalized one.
+    if (Object.hasOwn(packs, name)) continue;
+    packs[name] = renderContextPack(selection, name, maxChars);
+  }
   return packs;
 }

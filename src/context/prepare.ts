@@ -300,6 +300,17 @@ export async function prepareReviewContext(
   }
 
   let published: ContextManifest | undefined;
+  // Collected rather than returned from inside the `try`. Under `require`,
+  // `unavailable()` THROWS — so calling it in there would have the catch below
+  // swallow its own ContextRequiredError and wrap it in a second one, handing
+  // the caller a nested message and a single concatenated string in place of
+  // the mapper's actual reasons. Recording the reasons and deciding after the
+  // block removes that hazard instead of catching it.
+  let failureReasons: string[] | undefined;
+  // Which stage a thrown error belongs to. Reporting a mapper crash as a
+  // publish failure would send anyone reading progress events to the wrong
+  // half of the pipeline.
+  let stage: "map" | "publish" = "map";
   try {
     const mapper = await (dependencies.createMapper ?? defaultMapperFactory)();
     onProgress({ stage: "map", status: "started" });
@@ -312,38 +323,40 @@ export async function prepareReviewContext(
     });
     if (mapped.status === "failed") {
       onProgress({ stage: "map", status: "failed" });
-      return unavailable([mapped.failure?.message ?? "mapping failed"]);
-    }
-    if (mapped.status === "degraded") {
+      failureReasons = [mapped.failure?.message ?? "mapping failed"];
+    } else if (mapped.status === "degraded") {
       onProgress({ stage: "map", status: "completed" });
       // A degraded map has a CONTEXT.md but no usable graph, and a pack
       // without a knowledge graph is not something a rule can reason over.
       // Report precisely what was missing instead of publishing an entry that
       // could never produce a pack.
-      return unavailable(
-        mapped.degradedReasons.length === 0 ? ["mapping degraded"] : mapped.degradedReasons,
+      failureReasons = mapped.degradedReasons.length === 0
+        ? ["mapping degraded"]
+        : [...mapped.degradedReasons];
+    } else {
+      onProgress({ stage: "map", status: "completed" });
+      stage = "publish";
+      onProgress({ stage: "publish", status: "started" });
+      published = await publishMapping(
+        cache,
+        stagingPath,
+        key,
+        mapped.artifactPaths,
+        mapped.degradedReasons,
+        now(),
       );
+      onProgress({ stage: "publish", status: published === undefined ? "failed" : "completed" });
     }
-    onProgress({ stage: "map", status: "completed" });
-    onProgress({ stage: "publish", status: "started" });
-    published = await publishMapping(
-      cache,
-      stagingPath,
-      key,
-      mapped.artifactPaths,
-      mapped.degradedReasons,
-      now(),
-    );
-    onProgress({ stage: "publish", status: published === undefined ? "failed" : "completed" });
   } catch (error) {
-    onProgress({ stage: "publish", status: "failed" });
-    return unavailable([`context mapping failed: ${errorMessage(error)}`]);
+    onProgress({ stage, status: "failed" });
+    failureReasons = [`context ${stage === "map" ? "mapping" : "publication"} failed: ${errorMessage(error)}`];
   } finally {
     // A successful promotion renames the staging directory away, so this only
     // ever removes what promotion left behind.
     await rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
   }
 
+  if (failureReasons !== undefined) return unavailable(failureReasons);
   if (published === undefined) {
     return unavailable(["context could not be published and no concurrent entry was found"]);
   }

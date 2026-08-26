@@ -329,6 +329,44 @@ describe("prepareReviewContext", () => {
       .toContain("No graph nodes matched the changed files.");
   });
 
+  it("keys each pack by the rule name the caller passed, untrimmed", async () => {
+    // `loadRules` stores a rule's frontmatter name verbatim and
+    // `validateDispatchContext` looks the pack up by that exact string, so a
+    // trimmed key would leave the rule unable to find its pack and fail the
+    // whole dispatch.
+    const { worktree, request } = await baseRequest({ ruleNames: ["  spaced  ", "plain"] });
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(Object.keys(prepared.packs).sort()).toEqual(["  spaced  ", "plain"]);
+  });
+
+  it("keeps two names that differ only by whitespace as two packs", async () => {
+    const { worktree, request } = await baseRequest({ ruleNames: ["dup", "dup "] });
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(Object.keys(prepared.packs).sort()).toEqual(["dup", "dup "]);
+  });
+
+  it("still rejects a rule name that is not usable at all", async () => {
+    const { worktree, request } = await baseRequest({ ruleNames: ["   "] });
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+    });
+
+    expect(prepared.status).toBe("unavailable");
+  });
+
   it("does nothing at all when context is off", async () => {
     const { worktree, request } = await baseRequest({ mode: "off" });
     const mapper = stubMapper();
@@ -434,9 +472,9 @@ describe("prepareReviewContext", () => {
     expect(strictMapper.calls[0]!.allowDegradedContext).toBeUndefined();
   });
 
-  it("throws in require mode rather than reviewing blind", async () => {
+  it("throws in require mode rather than reviewing blind, carrying the real reason", async () => {
     const { worktree, request } = await baseRequest({ mode: "require" });
-    await expect(prepareReviewContext(request, {
+    const thrown = await prepareReviewContext(request, {
       prepareWorkspace: stubWorkspace(worktree),
       createMapper: () => stubMapper({
         result: () => ({
@@ -448,7 +486,50 @@ describe("prepareReviewContext", () => {
           failure: { stage: "context-map", code: "pi-session-failed", message: "no model available" },
         }),
       }),
-    })).rejects.toThrow(ContextRequiredError);
+    }).then(() => undefined, (error: unknown) => error);
+
+    expect(thrown).toBeInstanceOf(ContextRequiredError);
+    // `unavailable()` throws under `require`, and that throw happens where the
+    // mapping catch could see it. If the catch wraps its own error, `reasons`
+    // degrades to one concatenated string carrying a nested message, and the
+    // caller loses the mapper's actual reason.
+    expect((thrown as ContextRequiredError).reasons).toEqual(["no model available"]);
+    expect((thrown as ContextRequiredError).message).not.toContain("--context require was set but no trusted-base context could be prepared: --context require");
+  });
+
+  it("throws the degraded reasons intact in require mode", async () => {
+    const { worktree, request } = await baseRequest({ mode: "require", allowDegraded: true });
+    const thrown = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper({
+        result: () => ({
+          status: "degraded",
+          manifestPath: "",
+          artifactPaths: [],
+          analyzedFiles: 0,
+          degradedReasons: ["knowledge-graph-unavailable", "domain-context-unavailable"],
+        }),
+      }),
+    }).then(() => undefined, (error: unknown) => error);
+
+    expect(thrown).toBeInstanceOf(ContextRequiredError);
+    expect((thrown as ContextRequiredError).reasons)
+      .toEqual(["knowledge-graph-unavailable", "domain-context-unavailable"]);
+  });
+
+  it("reports a mapper crash against the map stage, not publish", async () => {
+    const { worktree, request } = await baseRequest();
+    const events: Array<{ stage: string; status: string }> = [];
+    await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => ({ map: () => Promise.reject(new Error("session crashed")) }),
+      onProgress: (event) => void events.push(event),
+    });
+
+    // It never reached publication, so saying "publish failed" would send a
+    // reader to the wrong half of the pipeline.
+    expect(events).toContainEqual({ stage: "map", status: "failed" });
+    expect(events.some((event) => event.stage === "publish")).toBe(false);
   });
 
   it("never maps when there is no rule to hand a pack to", async () => {

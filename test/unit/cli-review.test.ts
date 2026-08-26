@@ -4146,7 +4146,7 @@ describe("repository context", () => {
     logSpy.mockRestore();
   });
 
-  it("never prepares context when --context off", async () => {
+  it("passes mode off through to preparation, and dispatches no packs", async () => {
     const h = makeHarness({ args: makeArgs({ context: "off" }) });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 

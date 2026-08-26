@@ -315,5 +315,9 @@ describe("buildDispatchPrompt trusted-base context", () => {
 
     expect(warnings).toHaveLength(1);
     expect(warnings[0]).toContain("trusted-base context");
+    // The note is a breakdown of the total, not an addition to it: the total
+    // already includes the packs, and "plus ~N" read as though it did not.
+    expect(warnings[0]).toContain("of which");
+    expect(warnings[0]).not.toContain("plus ~");
   });
 });
