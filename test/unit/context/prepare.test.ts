@@ -1,8 +1,8 @@
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { chown, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ContextCache } from "../../../src/context/cache.js";
+import { ContextCache, ContextCachePublicationInProgressError } from "../../../src/context/cache.js";
 import {
   CONTEXT_MAPPER_VERSION,
   CONTEXT_POLICY_VERSION,
@@ -585,18 +585,71 @@ describe("prepareReviewContext", () => {
     expect(prepared.packs["tgd-review"]!.text.length).toBeLessThanOrEqual(4000);
   });
 
-  it("re-maps when forceRemap is set, ignoring a warm entry", async () => {
+  it("refuses a cache root owned by another user", async () => {
+    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    const { worktree, request } = await baseRequest();
+    const mapper = stubMapper();
+    await mkdir(request.cacheRoot as string, { recursive: true });
+    // Ownership is what supplies provenance: `lookupContext` checks an entry
+    // against its own manifest, and a manifest says nothing about who wrote
+    // it, so a root someone else can write is a root that can hand the
+    // reviewing model attacker-authored `[TRUSTED_CONTEXT]`.
+    await chown(request.cacheRoot as string, 65534, 65534).catch(() => undefined);
+
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => mapper,
+    });
+
+    expect(prepared.status).toBe("unavailable");
+    expect(mapper.calls).toHaveLength(0);
+  });
+
+  it("makes the cache root private to the current user", async () => {
+    if (process.platform === "win32") return;
     const { worktree, request } = await baseRequest();
     await prepareReviewContext(request, {
       prepareWorkspace: stubWorkspace(worktree),
       createMapper: () => stubMapper(),
     });
 
-    const second = stubMapper();
-    await prepareReviewContext({ ...request, forceRemap: true }, {
+    const info = await stat(request.cacheRoot as string);
+    expect(info.mode & 0o077).toBe(0);
+  });
+
+  it("waits for a concurrent publication rather than giving up on one miss", async () => {
+    const { worktree, request } = await baseRequest();
+    // First run publishes normally, so a real entry exists to be found.
+    await prepareReviewContext(request, {
       prepareWorkspace: stubWorkspace(worktree),
-      createMapper: () => second,
+      createMapper: () => stubMapper(),
     });
-    expect(second.calls).toHaveLength(1);
+    const published = await new ContextCache(request.cacheRoot as string)
+      .lookupContext(contextCacheKey({ repository, baseSha: BASE_SHA }));
+    expect(published).toBeDefined();
+
+    // Now simulate the loser of a race: promotion reports the winner still
+    // holds the claim, and the entry only becomes visible a moment later.
+    let lookups = 0;
+    const cache = new ContextCache(request.cacheRoot as string);
+    const racing = {
+      root: cache.root,
+      entryPath: (key: Parameters<ContextCache["entryPath"]>[0]) => cache.entryPath(key),
+      lookupContext: async (key: Parameters<ContextCache["lookupContext"]>[0]) => {
+        lookups += 1;
+        // Miss on the first two lookups (the initial cache check, and the
+        // immediate post-conflict one), then let it land.
+        return lookups <= 2 ? undefined : cache.lookupContext(key);
+      },
+      promoteContext: () => Promise.reject(new ContextCachePublicationInProgressError("busy")),
+    } as unknown as ContextCache;
+
+    const prepared = await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree),
+      createMapper: () => stubMapper(),
+      createCache: () => racing,
+    });
+
+    expect(prepared.status).toBe("ready");
   });
 });

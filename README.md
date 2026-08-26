@@ -479,6 +479,17 @@ hash, so each open PR re-reviews once after the change and is then stable
 again; `off` hashes exactly as it did before this feature existed, so opting
 out costs no re-review at all.
 
+**The cache root must be private to you.** Before anything is read from it,
+the context cache root is checked the same way the managed git workspace root
+already is: a real directory you own, under ancestors no other user can
+replace, then chmod 0700. This is not belt-and-braces —
+`ContextCache.lookupContext` verifies that an entry's artifacts match the
+hashes in its own manifest, but a manifest is self-describing and says nothing
+about who wrote it. On a shared writable root, another local user could
+pre-create the deterministic entry with a perfectly self-consistent manifest,
+and its text would go straight into `[TRUSTED_CONTEXT]`. Hash integrity is not
+provenance. Point `--context-dir` somewhere only you can write.
+
 `--dry-run` prepares context exactly as a real run would, so the preview it
 prints is the review you would actually get. That means a dry run on a cold
 cache pays for the first map; pair it with `--context off` if you only wanted

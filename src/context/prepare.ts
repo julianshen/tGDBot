@@ -29,6 +29,7 @@ import {
 } from "./cache.js";
 import { contextCacheKeyForRepository, type ContextCacheKey, type ContextManifest } from "./types.js";
 import { prepareWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
+import { assertNoSymlinkedAncestors, protectManagedRoot } from "../workspace/protect.js";
 import type { ContextMapper } from "./mapper.js";
 import type { RepositoryRef } from "../target/types.js";
 
@@ -76,7 +77,6 @@ export interface ContextPreparationRequest {
   readonly allowDegraded: boolean;
   readonly workspaceRoot: string;
   readonly cacheRoot: string;
-  readonly forceRemap?: boolean;
 }
 
 export type ContextPreparation =
@@ -98,6 +98,20 @@ export interface PrepareContextDependencies {
   readonly createCache?: (root: string) => ContextCache;
   readonly now?: () => string;
   readonly onProgress?: (event: { stage: "lookup" | "workspace" | "map" | "publish" | "pack"; status: "started" | "completed" | "failed" }) => void;
+}
+
+/**
+ * How long to wait for a concurrent publisher that holds the claim. Bounded
+ * and short: this blocks a review, and losing the wait only costs this run its
+ * context, never correctness.
+ */
+const PUBLICATION_WAIT_ATTEMPTS = 10;
+const PUBLICATION_WAIT_INTERVAL_MS = 200;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 function errorMessage(error: unknown): string {
@@ -183,13 +197,23 @@ async function publishMapping(
       degradedReasons: [...degradedReasons],
     });
   } catch (error) {
-    if (
-      error instanceof ContextCacheConflictError ||
-      error instanceof ContextCachePublicationInProgressError
-    ) {
-      // A concurrent run won the race. Its entry is as good as ours would have
-      // been — same base commit, same mapper — so read it rather than failing.
+    if (error instanceof ContextCacheConflictError) {
+      // A concurrent run already published a complete entry. It is as good as
+      // ours would have been — same base commit, same mapper — so read it
+      // rather than failing.
       return await cache.lookupContext(key);
+    }
+    if (error instanceof ContextCachePublicationInProgressError) {
+      // The winner holds the claim but may still be hashing or renaming, so a
+      // single immediate lookup can miss an entry that appears moments later —
+      // and treating that as final would review without context (or, under
+      // `require`, fail) for no reason. Poll briefly for it to land.
+      for (let attempt = 0; attempt < PUBLICATION_WAIT_ATTEMPTS; attempt += 1) {
+        await delay(PUBLICATION_WAIT_INTERVAL_MS);
+        const landed = await cache.lookupContext(key);
+        if (landed !== undefined) return landed;
+      }
+      return undefined;
     }
     throw error;
   }
@@ -214,6 +238,18 @@ export async function prepareReviewContext(
   let cache: ContextCache;
   let key: ContextCacheKey;
   try {
+    // Before ANY entry under this root is read: `lookupContext` verifies that
+    // an entry's artifacts match the hashes in its own manifest, but a
+    // manifest is self-describing and says nothing about who wrote it. On a
+    // shared writable root — which `--context-dir` and TGD_REVIEW_CONTEXT_DIR
+    // can both point at — another local user can pre-create the deterministic
+    // entry with a perfectly self-consistent manifest, and its text is then
+    // handed to the reviewing model inside `[TRUSTED_CONTEXT]`. Hash integrity
+    // is not provenance; ownership of the directory is what supplies it. Same
+    // guard the managed git workspace already applies to its own root.
+    await mkdir(request.cacheRoot, { recursive: true });
+    await assertNoSymlinkedAncestors(request.cacheRoot, [], "Context cache");
+    await protectManagedRoot(request.cacheRoot, "Context cache");
     cache = createCache(request.cacheRoot);
     key = contextCacheKey(request);
   } catch (error) {
@@ -248,10 +284,7 @@ export async function prepareReviewContext(
 
   try {
     onProgress({ stage: "lookup", status: "started" });
-    const cached = await cache.lookupContext(
-      key,
-      request.forceRemap === true ? { forceRemap: true } : {},
-    );
+    const cached = await cache.lookupContext(key);
     onProgress({ stage: "lookup", status: "completed" });
     if (cached !== undefined) return await pack(cached, true);
   } catch (error) {
