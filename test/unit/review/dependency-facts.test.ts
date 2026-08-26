@@ -4,10 +4,11 @@ import { describe, expect, it, vi } from "vitest";
 import { fetchDependencyFacts } from "../../../src/review/dependency-facts.js";
 import type { DependencyChange } from "../../../src/review/dependency-changes.js";
 
-const change = (name: string, version: string): DependencyChange => ({
+const change = (name: string, version: string, pinned = true): DependencyChange => ({
   name,
   version,
   manifest: "package.json",
+  pinned,
 });
 
 const registry = (body: Record<string, unknown>) => vi.fn(async () => body);
@@ -240,5 +241,79 @@ describe("fetchDependencyFacts — a thrown value need not be an Error", () => {
 
     expect(fact?.unknown).toBeDefined();
     expect(fact?.unknown).not.toContain("undefined");
+  });
+});
+
+// PR #54 review, round five: `^1.2.3` resolves to whatever 1.x the resolver
+// picks, so the registry's answer about 1.2.3 specifically says nothing about
+// what the build installs. Reporting the lower bound as absent or deprecated
+// produced a confidently false claim.
+describe("fetchDependencyFacts — only a pin earns a per-version fact", () => {
+  const document = {
+    "dist-tags": { latest: "1.9.0" },
+    versions: { "1.2.3": { deprecated: "old" }, "1.9.0": {} },
+  };
+
+  it("makes no publication or deprecation claim about a range", async () => {
+    const [fact] = await fetchDependencyFacts(
+      [change("pkg", "1.2.3", false)],
+      registry(document),
+    );
+
+    expect(fact?.published).toBeUndefined();
+    expect(fact?.deprecated).toBeUndefined();
+  });
+
+  it("still reports currency for a range", async () => {
+    const [fact] = await fetchDependencyFacts(
+      [change("pkg", "1.2.3", false)],
+      registry(document),
+    );
+
+    expect(fact?.latest).toBe("1.9.0");
+  });
+
+  it("answers fully for a pin", async () => {
+    const [fact] = await fetchDependencyFacts([change("pkg", "1.2.3")], registry(document));
+
+    expect(fact?.published).toBe(true);
+    expect(fact?.deprecated).toBe("old");
+  });
+});
+
+// PR #54 review, round five: one packument carries every version, so keying the
+// request map by name@version asked the same URL repeatedly. A monorepo pinning
+// different versions of one package in several workspaces could spend most of
+// the lookup budget re-fetching one document.
+describe("fetchDependencyFacts — one request per package", () => {
+  it("asks once and answers for every version of that package", async () => {
+    const fetchJson = registry({
+      "dist-tags": { latest: "3.0.0" },
+      versions: { "1.0.0": { deprecated: "ancient" }, "2.0.0": {}, "3.0.0": {} },
+    });
+
+    const facts = await fetchDependencyFacts(
+      [change("pkg", "1.0.0"), change("pkg", "2.0.0"), change("pkg", "9.9.9")],
+      fetchJson,
+    );
+
+    expect(fetchJson).toHaveBeenCalledTimes(1);
+    expect(facts).toHaveLength(3);
+    expect(facts.find((f) => f.version === "1.0.0")?.deprecated).toBe("ancient");
+    expect(facts.find((f) => f.version === "2.0.0")?.published).toBe(true);
+    expect(facts.find((f) => f.version === "9.9.9")?.published).toBe(false);
+  });
+
+  it("gives every version the same failure when the one lookup fails", async () => {
+    const fetchJson = vi.fn(async () => { throw new Error("ECONNRESET"); });
+
+    const facts = await fetchDependencyFacts(
+      [change("pkg", "1.0.0"), change("pkg", "2.0.0")],
+      fetchJson,
+    );
+
+    expect(fetchJson).toHaveBeenCalledTimes(1);
+    expect(facts).toHaveLength(2);
+    for (const fact of facts) expect(fact.unknown).toMatch(/ECONNRESET/);
   });
 });

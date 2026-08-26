@@ -132,11 +132,41 @@ export function readFindingDecision(
  */
 export const MAX_REFERENCES_PER_FINDING = 5;
 
+/**
+ * Drops trailing `)` or `]` that the URL never opened, plus any punctuation
+ * exposed underneath. `.../a_(b)` keeps its pair; `(see .../docs)` gives the
+ * closing paren back to the sentence.
+ */
+function trimUnbalanced(url: string): string {
+  let end = url.length;
+  const opens: Record<string, string> = { ")": "(", "]": "[" };
+  for (;;) {
+    const last = url[end - 1];
+    if (last === undefined) break;
+    const open = opens[last];
+    if (open === undefined) break;
+    const slice = url.slice(0, end);
+    const balanced =
+      slice.split(open).length - 1 >= slice.split(last).length - 1;
+    if (balanced) break;
+    end -= 1;
+    while (end > 0 && /[.,;:]/u.test(url[end - 1] ?? "")) end -= 1;
+  }
+  return url.slice(0, end);
+}
+
 export function referencesDeclaredBy(ruleBody: string): Set<string> {
   const declared = new Set<string>();
-  for (const match of ruleBody.matchAll(/https?:\/\/[^\s<>()\[\]"'`]+/gu)) {
-    const url = match[0].replace(/[.,;:]+$/u, "");
-    if (url.length <= 2_000) declared.add(url);
+  // Delimiters are admitted and then BALANCED, rather than excluded outright.
+  // Excluding them truncated legitimate targets like `/Function_(computing)`,
+  // and a reviewer citing the real URL then failed the exact-match check and
+  // lost its citation without a word (PR #54 review, round five). They were
+  // excluded for a reason, though: prose wraps URLs in brackets, and
+  // `(see https://example.com/docs)` ends in punctuation, not path — so the
+  // trim below gives back any closing delimiter that was never opened.
+  for (const match of ruleBody.matchAll(/https?:\/\/[^\s<>"'`]+/gu)) {
+    const url = trimUnbalanced(match[0].replace(/[.,;:]+$/u, ""));
+    if (url.length > 0 && url.length <= 2_000) declared.add(url);
   }
   return declared;
 }

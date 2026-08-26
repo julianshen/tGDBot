@@ -279,7 +279,13 @@ export function parseReconsiderOutput(
   // (PR #54 review). The snapshot's array was already validated on the way in,
   // and a reassessment has no authority to add to it or take from it, so it
   // simply carries over — including the response's attempt to replace it.
-  if (original?.references !== undefined) {
+  //
+  // CONFIRMED only. "Confirmed" means the finding still holds, so the evidence
+  // for it still holds. "Revised" means the claim itself changed, and attaching
+  // the old documentation to a new claim asserts support this parser cannot
+  // check (PR #54 review, round five) — a citation that no longer backs what it
+  // sits under is worse than none.
+  if (parsed.outcome === "confirmed" && original?.references !== undefined) {
     Object.assign(merged, { references: original.references });
   } else {
     delete (merged as { references?: unknown }).references;

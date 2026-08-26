@@ -81,7 +81,13 @@ function readRegistryDocument(
     typeof distTags === "object" && distTags !== null && !Array.isArray(distTags)
       ? (distTags as Record<string, unknown>).latest
       : undefined;
-  const exact = isExactVersion(change.version);
+  // Only a PIN earns a per-version fact. `^1.2.3` installs whatever 1.x the
+  // resolver picks, so the registry's answer about 1.2.3 specifically says
+  // nothing about what the build gets — and reporting a deprecated or absent
+  // lower bound as the installed version was a confidently false claim
+  // (PR #54 review, round five). `isExactVersion` still guards the lookup key
+  // itself, since a range's stripped remainder need not be a valid key.
+  const exact = change.pinned && isExactVersion(change.version);
   const entry = exact ? (versions as Record<string, unknown>)[change.version] : undefined;
   const published = exact
     ? Object.hasOwn(versions as Record<string, unknown>, change.version)
@@ -112,58 +118,60 @@ export async function fetchDependencyFacts(
 ): Promise<DependencyFact[]> {
   const now = options.now ?? (() => Date.now());
   const deadline = now() + (options.deadlineMs ?? DEFAULT_DEADLINE_MS);
-  const unique = new Map<string, DependencyChange>();
+  // Grouped by NAME, not by name@version: one packument carries every version,
+  // so asking again per version spent the lookup budget re-fetching the same
+  // document — and a monorepo pinning several versions of one package is
+  // exactly where that budget matters (PR #54 review, round five).
+  const byName = new Map<string, DependencyChange[]>();
   for (const change of changes) {
-    const key = `${change.name}@${change.version}`;
-    if (!unique.has(key)) unique.set(key, change);
+    const group = byName.get(change.name);
+    if (group === undefined) byName.set(change.name, [change]);
+    else if (!group.some((seen) => seen.version === change.version)) group.push(change);
   }
-  const queue = [...unique.values()];
-  const facts: DependencyFact[] = new Array(queue.length);
+  const queue = [...byName.values()];
+  const facts: DependencyFact[][] = new Array(queue.length);
 
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < queue.length) {
       const index = next++;
-      const change = queue[index]!;
+      const group = queue[index]!;
+      const first = group[0]!;
+      const asUnknown = (unknown: string): DependencyFact[] =>
+        group.map((change) => ({ name: change.name, version: change.version, unknown }));
       // Never silence: a package nobody got to is UNKNOWN, not clean.
       if (now() >= deadline) {
-        facts[index] = {
-          name: change.name,
-          version: change.version,
-          unknown: "the lookup budget for this review ran out before this package was checked",
-        };
+        facts[index] = asUnknown(
+          "the lookup budget for this review ran out before this package was checked",
+        );
         continue;
       }
       // Defence in depth: the parser cannot emit an invalid name, so this is
       // reachable only by a caller that skipped it. Never let one through to a
       // request.
-      if (!isValidPackageName(change.name)) {
-        facts[index] = {
-          name: change.name,
-          version: change.version,
-          unknown: "the package name is not one the registry would accept",
-        };
+      if (!isValidPackageName(first.name)) {
+        facts[index] = asUnknown("the package name is not one the registry would accept");
         continue;
       }
       try {
-        facts[index] = readRegistryDocument(change, await fetchJson(registryUrlFor(change.name)));
+        const document = await fetchJson(registryUrlFor(first.name));
+        facts[index] = group.map((change) => readRegistryDocument(change, document));
       } catch (error) {
         // One dead lookup must not cost the others, and must not read as "we
         // checked and it was fine".
-        facts[index] = {
-          name: change.name,
-          version: change.version,
-          // A cast is not a check: a fetcher can reject with a string or a
-          // plain object, and `(error as Error).message` then rendered
-          // "reached (undefined)" — nothing, at the moment an operator most
-          // needs something (PR #54 review, round four).
-          unknown: `the registry could not be reached (${
+        //
+        // A cast is not a check: a fetcher can reject with a string or a
+        // plain object, and `(error as Error).message` then rendered
+        // "reached (undefined)" — nothing, at the moment an operator most
+        // needs something (PR #54 review, round four).
+        facts[index] = asUnknown(
+          `the registry could not be reached (${
             error instanceof Error ? error.message : String(error)
           })`,
-        };
+        );
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
-  return facts;
+  return facts.flat();
 }

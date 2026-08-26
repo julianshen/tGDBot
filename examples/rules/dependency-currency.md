@@ -14,8 +14,13 @@ have, and you cannot look anything up yourself.
 Report only what the context supports:
 
 - a version the registry does not publish — usually a typo or a withdrawn
-  release, and the build will not install
-- a deprecated version, quoting the registry's own notice
+  release, and the build will not install. The host states this only for an
+  exact pin; for a RANGE it says nothing, because the range may well resolve to
+  a release that does exist
+- a version the registry marks deprecated. The host does NOT pass on the
+  publisher's wording — that text is written by whoever owns the package and is
+  not trustworthy input — so report the fact and send the reader to the registry
+  for the detail. Do not invent or paraphrase a notice you were not given
 - a version materially behind `latest`, when the gap matters for this change
   (a major version behind, or the bump was clearly meant to be an upgrade)
 - a dependency added to the wrong section, such as a runtime dependency landing

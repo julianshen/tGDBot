@@ -26,6 +26,29 @@ export interface DependencyChange {
   readonly version: string;
   /** The manifest it changed in, for attributing a finding. */
   readonly manifest: string;
+  /**
+   * Whether the manifest names this EXACT release, with no range operator.
+   *
+   * `^1.2.3` installs whatever 1.x the resolver picks, so the registry's answer
+   * about 1.2.3 specifically says nothing about what the build will get — and
+   * reporting a deprecated or absent lower bound as the installed version
+   * produced a confidently false claim (PR #54 review, round five). Only a pin
+   * earns a per-version fact.
+   */
+  readonly pinned: boolean;
+  /**
+   * Whether the host ESTABLISHED that this line sits in a dependency map,
+   * rather than inferring it from indentation.
+   *
+   * git emits only nearby context, so an ordinary bump in a long list has no
+   * `"dependencies": {` in its hunk and the section is genuinely unknown.
+   * Dropping those loses most real changes; presenting them as parsed facts
+   * asserts something unproven, and a denylist of non-dependency keys was the
+   * wrong shape — a custom object full of package-shaped entries walks past any
+   * such list (PR #54 review, round five). So the uncertainty is RECORDED: it
+   * orders the budget and it is stated in the pack.
+   */
+  readonly inDependencySection: boolean;
 }
 
 /** The one host queried. Not configurable: an allowlist of exactly one. */
@@ -106,6 +129,15 @@ const RUNTIME_KEYS = new Set(["node", "npm", "yarn", "pnpm", "bun", "deno", "vsc
  */
 const MAX_PACKAGES_PER_DIFF = 200;
 
+/**
+ * How much of a diff is read before ordering.
+ *
+ * Larger than the ceiling so that a real dependency hunk late in a big diff can
+ * still outrank guesses found earlier, and bounded so a pathological diff does
+ * not turn into unbounded work.
+ */
+const MAX_SCANNED_PACKAGES = 2_000;
+
 /** True for a name the registry itself would accept. */
 export function isValidPackageName(name: string): boolean {
   return name.length > 0 && name.length <= PACKAGE_NAME_MAX && PACKAGE_NAME_RE.test(name);
@@ -131,6 +163,11 @@ function stripRange(raw: string): string {
   return raw.replace(/^[\^~><= ]+/u, "").trim();
 }
 
+/** True when the spec names one release outright, with no range operator. */
+function isPinnedSpec(raw: string): boolean {
+  return isExactVersion(raw.trim());
+}
+
 /**
  * The dependency maps whose entries are packages. Anything else in a manifest
  * — `version`, `engines`, `scripts` — is not, and treating every string pair as
@@ -154,8 +191,8 @@ const DEPENDENCY_SECTIONS = new Set([
  * (PR #54 review) — so headers are tied to real `diff --git` boundaries, the
  * same discipline `review/diff-anchors` uses for the same reason.
  */
-function manifestContextByLine(diff: string): Map<number, string> {
-  const byLine = new Map<number, string>();
+function manifestContextByLine(diff: string): Map<number, { manifest: string; confirmed: boolean }> {
+  const byLine = new Map<number, { manifest: string; confirmed: boolean }>();
   let manifest: string | undefined;
   let inHunk = false;
   let section: "dependency" | "other" | "unknown" = "unknown";
@@ -211,7 +248,7 @@ function manifestContextByLine(diff: string): Map<number, string> {
       const key = /^\s*"([^"]+)"\s*:/u.exec(content)?.[1];
       if (key !== undefined && RUNTIME_KEYS.has(key)) continue;
     }
-    byLine.set(index, manifest);
+    byLine.set(index, { manifest, confirmed: section === "dependency" });
   }
   return byLine;
 }
@@ -231,20 +268,37 @@ export function dependencyChangesFromDiff(diff: string): DependencyChange[] {
   const seen = new Set<string>();
   const changes: DependencyChange[] = [];
   for (const [index, line] of lines.entries()) {
-    if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
-    const manifest = manifests.get(index);
-    if (manifest === undefined || !line.startsWith("+")) continue;
+    // No early break on the ceiling: stopping mid-scan let whatever appeared
+    // FIRST take the whole budget, so a long guessed block could exhaust it
+    // before a real dependency hunk further down was reached. The cap is
+    // applied after ordering instead (PR #54 review, round five).
+    if (changes.length >= MAX_SCANNED_PACKAGES) break;
+    const context = manifests.get(index);
+    if (context === undefined || !line.startsWith("+")) continue;
+    const manifest = context.manifest;
     const entry = /^\+\s*"([^"]+)"\s*:\s*"([^"]+)"/u.exec(line);
     if (!entry) continue;
     const name = entry[1] ?? "";
-    const version = stripRange(entry[2] ?? "");
+    const spec = entry[2] ?? "";
+    const version = stripRange(spec);
     if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
     const key = `${name}@${version}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    changes.push({ name, version, manifest });
+    changes.push({
+      name,
+      version,
+      manifest,
+      pinned: isPinnedSpec(spec),
+      inDependencySection: context.confirmed,
+    });
   }
-  return changes;
+  // Established entries first, order otherwise preserved, then the ceiling.
+  // A guess must never displace something the host actually parsed.
+  return [
+    ...changes.filter((change) => change.inDependencySection),
+    ...changes.filter((change) => !change.inDependencySection),
+  ].slice(0, MAX_PACKAGES_PER_DIFF);
 }
 
 /**
@@ -296,7 +350,14 @@ export function dependencyContextPack(
   if (changes.length === 0) return undefined;
   const factFor = new Map(facts.map((fact) => [`${fact.name}@${fact.version}`, fact]));
   const lines = changes.map((change) => {
-    const head = `- ${change.name}@${change.version} (${change.manifest})`;
+    // An unestablished entry is labelled as one. git's context often omits the
+    // enclosing key, so indentation was the only signal — that is a guess, and
+    // presenting a guess as a parsed fact is the thing this pack must not do
+    // (PR #54 review, round five).
+    const provenance = change.inDependencySection
+      ? ""
+      : " — the host could not confirm this line sits in a dependency map; it may not be a dependency at all";
+    const head = `- ${change.name}@${change.version} (${change.manifest})${provenance}`;
     const fact = factFor.get(`${change.name}@${change.version}`);
     if (fact === undefined) return head;
     const notes: string[] = [];

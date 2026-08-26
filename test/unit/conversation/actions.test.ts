@@ -1036,3 +1036,40 @@ describe("parseReconsiderOutput — citations survive reassessment", () => {
     expect(result?.finding?.references).toBeUndefined();
   });
 });
+
+// PR #54 review, round five: carrying the snapshot's citations onto a REVISED
+// finding attaches evidence to a claim it may no longer support. "Confirmed"
+// means the finding still holds, so its documentation still holds; "revised"
+// means the claim changed, and this parser cannot revalidate a citation
+// against the rule.
+describe("parseReconsiderOutput — a revised claim does not inherit evidence", () => {
+  const original = {
+    ruleName: "rule-a",
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking" as const,
+    message: "Original claim.",
+    references: ["https://docs.example.com/ttl"],
+  };
+  const core = {
+    file: "a.ts",
+    line: 3,
+    category: "correctness",
+    severity: "blocking",
+  };
+  const result = (outcome: string, message: string) => parseReconsiderOutput(
+    JSON.stringify({ outcome, rationale: "Because.", finding: { ...core, message } }),
+    original,
+  );
+
+  it("drops the citations when the claim was revised", () => {
+    expect(result("revised", "A materially different claim.")?.finding?.references)
+      .toBeUndefined();
+  });
+
+  it("keeps them when the claim was confirmed", () => {
+    expect(result("confirmed", "Original claim.")?.finding?.references)
+      .toEqual(["https://docs.example.com/ttl"]);
+  });
+});

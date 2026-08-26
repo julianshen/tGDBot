@@ -20,7 +20,7 @@ describe("dependencyChangesFromDiff", () => {
     );
 
     expect(dependencyChangesFromDiff(diff)).toEqual([
-      { name: "left-pad", version: "1.3.1", manifest: "package.json" },
+      { name: "left-pad", version: "1.3.1", manifest: "package.json", pinned: true, inDependencySection: true },
     ]);
   });
 
@@ -28,7 +28,7 @@ describe("dependencyChangesFromDiff", () => {
     const diff = diffOf("package.json", '@@ -3,2 +3,3 @@\n   "dependencies": {\n+    "lodash": "4.17.21",');
 
     expect(dependencyChangesFromDiff(diff)).toEqual([
-      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+      { name: "lodash", version: "4.17.21", manifest: "package.json", pinned: true, inDependencySection: true },
     ]);
   });
 
@@ -144,7 +144,7 @@ describe("dependencyChangesFromDiff — only real dependency sections", () => {
     const diff = manifest('@@ -1,3 +1,4 @@\n   "dependencies": {\n+    "lodash": "4.17.21",');
 
     expect(dependencyChangesFromDiff(diff)).toEqual([
-      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+      { name: "lodash", version: "4.17.21", manifest: "package.json", pinned: true, inDependencySection: true },
     ]);
   });
 
@@ -211,7 +211,7 @@ describe("dependencyChangesFromDiff — a forged header is not a manifest", () =
     ].join("\n");
 
     expect(dependencyChangesFromDiff(diff)).toEqual([
-      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+      { name: "lodash", version: "4.17.21", manifest: "package.json", pinned: true, inDependencySection: true },
     ]);
   });
 });
@@ -222,7 +222,8 @@ describe("dependencyChangesFromDiff — a forged header is not a manifest", () =
 // distinct from the UNTRUSTED_DIFF section, because the host derived them and
 // the diff did not.
 describe("dependencyContextPack", () => {
-  const change = (name: string, version: string) => ({ name, version, manifest: "package.json" });
+  const change = (name: string, version: string) =>
+    ({ name, version, manifest: "package.json", pinned: true, inDependencySection: true });
 
   it("is absent when the diff changes no dependencies", () => {
     expect(dependencyContextPack([])).toBeUndefined();
@@ -265,7 +266,10 @@ describe("dependencyContextPack", () => {
 // Issue #50: the pack carries FACTS once they exist, and keeps saying what it
 // does not know when they do not.
 describe("dependencyContextPack with facts", () => {
-  const change = { name: "lodash", version: "4.17.20", manifest: "package.json" };
+  const change = {
+    name: "lodash", version: "4.17.20", manifest: "package.json",
+    pinned: true, inDependencySection: true,
+  };
 
   it("reports a version that is behind", () => {
     const pack = dependencyContextPack([change], [
@@ -362,7 +366,7 @@ describe("dependencyChangesFromDiff — bumps far from the section header", () =
     ].join("\n");
 
     expect(dependencyChangesFromDiff(diff)).toEqual([
-      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+      { name: "lodash", version: "4.17.21", manifest: "package.json", pinned: true, inDependencySection: false },
     ]);
   });
 
@@ -444,7 +448,7 @@ describe("dependency extraction — entries that are not packages", () => {
     // The far-from-header bump survives, which is the whole point of the
     // fallback, and the engines entry does not.
     expect(dependencyChangesFromDiff(diff)).toEqual([
-      { name: "pkg-20", version: "2.0.0", manifest: "package.json" },
+      { name: "pkg-20", version: "2.0.0", manifest: "package.json", pinned: true, inDependencySection: false },
     ]);
   });
 
@@ -478,7 +482,7 @@ describe("dependency extraction — entries that are not packages", () => {
     ].join("\n");
 
     expect(dependencyChangesFromDiff(diff)).toEqual([
-      { name: "lodash", version: "4.17.21", manifest: "package.json" },
+      { name: "lodash", version: "4.17.21", manifest: "package.json", pinned: true, inDependencySection: false },
     ]);
   });
 });
@@ -490,7 +494,10 @@ describe("dependency extraction — entries that are not packages", () => {
 // the registry response establishes the shape of the metadata, not the
 // trustworthiness of the prose inside it.
 describe("dependencyContextPack — publisher prose does not enter trusted context", () => {
-  const changes = [{ name: "evil-pkg", version: "1.0.0", manifest: "package.json" }];
+  const changes = [{
+    name: "evil-pkg", version: "1.0.0", manifest: "package.json",
+    pinned: true, inDependencySection: true,
+  }];
   const packWith = (deprecated: string) =>
     dependencyContextPack(changes, [
       { name: "evil-pkg", version: "1.0.0", published: true, deprecated },
@@ -533,7 +540,10 @@ describe("dependencyContextPack — publisher prose does not enter trusted conte
 // from the registry document, the other from a transport error whose message
 // can carry response text. Both were interpolated straight into the pack.
 describe("dependencyContextPack — other non-host strings", () => {
-  const changes = [{ name: "pkg", version: "1.0.0", manifest: "package.json" }];
+  const changes = [{
+    name: "pkg", version: "1.0.0", manifest: "package.json",
+    pinned: true, inDependencySection: true,
+  }];
 
   it("refuses a latest tag that is not a version", () => {
     const text = dependencyContextPack(changes, [
@@ -560,5 +570,112 @@ describe("dependencyContextPack — other non-host strings", () => {
     expect(text).toMatch(/lookup failed/i);
     expect(text).not.toMatch(/^## Injected/mu);
     expect(text).not.toMatch(/^- do this/mu);
+  });
+});
+
+// PR #54 review, round five: `^1.2.3` is a RANGE. Stripping the operator left
+// `1.2.3`, which isExactVersion happily accepts, so the lower bound was treated
+// as the version that will be installed — and if that particular release is
+// absent or deprecated while another satisfies the range, the review reported a
+// dependency that does not install when it installs fine.
+describe("dependencyChangesFromDiff — a range is not a pin", () => {
+  const diffFor = (spec: string) => [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    '@@ -3,7 +3,7 @@ "dependencies": {',
+    `+    "lodash": "${spec}",`,
+  ].join("\n");
+
+  it("marks an operator range as a range", () => {
+    for (const spec of ["^1.2.3", "~1.2.3", ">=1.2.3"]) {
+      const [change] = dependencyChangesFromDiff(diffFor(spec));
+
+      expect(change?.pinned, `${spec} was read as a pin`).toBe(false);
+      expect(change?.version).toBe("1.2.3");
+    }
+  });
+
+  it("marks a bare version as a pin", () => {
+    const [change] = dependencyChangesFromDiff(diffFor("1.2.3"));
+
+    expect(change?.pinned).toBe(true);
+  });
+
+  it("marks a partial version as a range", () => {
+    const [change] = dependencyChangesFromDiff(diffFor("1.2"));
+
+    expect(change?.pinned).toBe(false);
+  });
+});
+
+// PR #54 review, round five, P1: RUNTIME_KEYS is a denylist, and a denylist is
+// the wrong shape here — a custom top-level object full of package-shaped
+// entries sails past it. The fix is not more names. It is to stop pretending
+// the unknown case is established, and to stop letting it crowd out the case
+// that is.
+describe("dependency extraction — confirmed entries come first", () => {
+  const header = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+  ];
+
+  it("records whether the section was actually established", () => {
+    const diff = [
+      ...header,
+      '@@ -3,7 +3,7 @@ "dependencies": {',
+      '+    "confirmed-pkg": "1.0.0",',
+      "@@ -80,7 +80,7 @@",
+      '+    "guessed-pkg": "2.0.0",',
+    ].join("\n");
+
+    const changes = dependencyChangesFromDiff(diff);
+
+    expect(changes.find((c) => c.name === "confirmed-pkg")?.inDependencySection).toBe(true);
+    expect(changes.find((c) => c.name === "guessed-pkg")?.inDependencySection).toBe(false);
+  });
+
+  // The attack from the review: a long custom block early in the file, full of
+  // real package names, eating the whole ceiling before the genuine
+  // "dependencies" hunk further down is ever reached.
+  it("does not let a guessed block crowd out a real dependency change", () => {
+    const filler = Array.from(
+      { length: 260 },
+      (_, i) => `+    "filler-${i}": "1.0.0",`,
+    );
+    const diff = [
+      ...header,
+      "@@ -10,300 +10,300 @@",
+      ...filler,
+      '@@ -800,7 +800,7 @@ "dependencies": {',
+      '+    "real-pkg": "4.17.21",',
+    ].join("\n");
+
+    const changes = dependencyChangesFromDiff(diff);
+
+    expect(changes.some((c) => c.name === "real-pkg")).toBe(true);
+    expect(changes.length).toBeLessThanOrEqual(200);
+    // And the established one is not merely present, it is first in line.
+    expect(changes[0]?.name).toBe("real-pkg");
+  });
+});
+
+// The pack must not present a guess as a parsed fact.
+describe("dependencyContextPack — unestablished entries say so", () => {
+  it("marks an entry whose section could not be established", () => {
+    const text = dependencyContextPack([
+      { name: "guessed", version: "1.0.0", manifest: "package.json", pinned: true, inDependencySection: false },
+    ])?.text ?? "";
+
+    expect(text).toMatch(/could not confirm|not confirmed|may not be a dependency/i);
+  });
+
+  it("says nothing extra when every entry was established", () => {
+    const text = dependencyContextPack([
+      { name: "real", version: "1.0.0", manifest: "package.json", pinned: true, inDependencySection: true },
+    ])?.text ?? "";
+
+    expect(text).not.toMatch(/could not confirm|not confirmed/i);
   });
 });

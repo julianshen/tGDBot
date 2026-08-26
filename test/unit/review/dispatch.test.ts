@@ -2613,3 +2613,49 @@ describe("a task's findings are stamped with the rule that ran", () => {
     expect(findings[0]?.references).toEqual(["https://docs.example.com/a"]);
   });
 });
+
+// PR #54 review, round five: the extractor excluded parentheses and brackets
+// outright, so a rule declaring `.../Function_(computing)` registered only the
+// prefix. A reviewer citing the real URL then failed the exact-match check and
+// lost its citation silently; one citing the extracted prefix published a link
+// to somewhere other than the documentation the rule named.
+describe("referencesDeclaredBy — URLs with delimiters", () => {
+  it("keeps a parenthesised path whole", () => {
+    const url = "https://example.com/wiki/Function_(computing)";
+
+    expect(referencesDeclaredBy(`See ${url} for the contract.`).has(url)).toBe(true);
+  });
+
+  it("keeps a bracketed path whole", () => {
+    const url = "https://example.com/docs/array[0]";
+
+    expect(referencesDeclaredBy(`See ${url}.`).has(url)).toBe(true);
+  });
+
+  it("keeps nested parentheses whole", () => {
+    const url = "https://example.com/a_(b_(c))";
+
+    expect(referencesDeclaredBy(`See ${url}.`).has(url)).toBe(true);
+  });
+
+  // The reason the delimiters were excluded in the first place: prose wraps
+  // URLs in parentheses, and the closing one is punctuation, not path.
+  it("does not swallow a closing parenthesis that belongs to the sentence", () => {
+    const declared = referencesDeclaredBy("the contract (see https://example.com/docs) is clear");
+
+    expect(declared.has("https://example.com/docs")).toBe(true);
+    expect(declared.has("https://example.com/docs)")).toBe(false);
+  });
+
+  it("still strips trailing sentence punctuation", () => {
+    const declared = referencesDeclaredBy("See https://example.com/docs.");
+
+    expect(declared.has("https://example.com/docs")).toBe(true);
+  });
+
+  it("keeps a markdown link target out of the trailing bracket", () => {
+    const declared = referencesDeclaredBy("[the docs](https://example.com/docs)");
+
+    expect(declared.has("https://example.com/docs")).toBe(true);
+  });
+});
