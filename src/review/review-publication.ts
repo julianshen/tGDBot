@@ -117,28 +117,41 @@ export function composeFrozenSummary(
       return key !== undefined && fallbackIds.has(key);
     })
     .map((child) => child.body);
-  // The frozen summary body was rendered with a signature already (buildBody
-  // appends one), but relocated findings are appended AFTER it here — so a
-  // replayed manifest would show the signature mid-comment. Strip and re-append
-  // instead of rendering around it: the signature marks the end of the comment,
-  // whatever else this path adds, and the dedup marker stays last.
+  // Every piece composed here arrives already signed — the frozen summary body
+  // (buildBody signs it) and each relocated finding (a fallback child's body is
+  // the rendered INLINE comment, footer included). Left alone, a replayed
+  // manifest would show one apparent footer per relocated finding, mid-comment,
+  // plus the real one (Codex review). Strip them all and sign once at the end:
+  // the signature marks the end of the COMMENT, whatever this path assembled,
+  // and the dedup marker stays last.
   const base = stripSignature(summary.body);
   const signed = marker.length === 0
     ? BOT_SIGNATURE_BLOCK
     : `${BOT_SIGNATURE_BLOCK}\n\n${marker}`;
-  return [base, ...extras, signed].join("\n\n");
+  return [base, ...extras.map(stripSignature), signed].join("\n\n");
 }
 
 /**
- * Removes a trailing signature block so it can be re-appended after content
- * that belongs before it. Tolerates a body that has none — an older manifest,
- * or a renderer that did not add one.
+ * Removes the visible signature block — anywhere in the body, not only at the
+ * end — so a body can be composed into a larger comment that signs itself once.
+ * Machine markers are untouched: a relocated inline body keeps the marker that
+ * stale-thread cleanup and recovery read.
+ *
+ * Only the EXACT block is removed. Finding text cannot contain it: sanitizeText
+ * defangs lookalikes into a code span and drops their italics, so the exact byte
+ * sequence appears only where a renderer put it. Tolerates a body with none — an
+ * older manifest, or a renderer that did not sign.
  */
 export function stripSignature(body: string): string {
-  const trimmed = body.trimEnd();
-  return trimmed.endsWith(BOT_SIGNATURE_BLOCK)
-    ? trimmed.slice(0, -BOT_SIGNATURE_BLOCK.length).trimEnd()
-    : trimmed;
+  if (!body.includes(BOT_SIGNATURE_BLOCK)) return body.trimEnd();
+  // Newlines are normalized only where the block was, so nothing else in the
+  // body — a fenced block's own blank lines, say — is reflowed.
+  return body
+    .split(BOT_SIGNATURE_BLOCK)
+    .map((part, index) => (index === 0 ? part.replace(/\n+$/u, "") : part.replace(/^\n+/u, "")))
+    .filter((part) => part.length > 0)
+    .join("\n\n")
+    .trimEnd();
 }
 
 function sameTerminalResult(
