@@ -452,4 +452,56 @@ describe("composeFrozenSummary with relocated findings", () => {
     // signature is removed, so stale-thread cleanup is unaffected.
     expect(composed).toContain(INLINE_COMMENT_MARKER);
   });
+
+  // A `suggestion` is emitted verbatim (ADR-007), so it can legitimately carry
+  // the exact block — a proposed edit to a Markdown footer, including this
+  // repository's own README. Stripping every occurrence deleted it from the
+  // proposed fix (Codex review); only the renderer's footer may be removed.
+  it("keeps a signature that a relocated finding proposes as a code change", () => {
+    const relocated = renderInlineComment({
+      file: "README.md",
+      line: 3,
+      severity: "warning",
+      category: "docs",
+      message: "The footer is missing.",
+      ruleName: "rule-a",
+      suggestion: `## Footer\n\n${BOT_SIGNATURE_BLOCK}`,
+    });
+    expect(relocated.split(BOT_SIGNATURE_BLOCK)).toHaveLength(3); // suggestion + footer
+
+    const action = {
+      children: [
+        child({ id: "summary", kind: "summary", body: `## Review summary\n\n${BOT_SIGNATURE_BLOCK}` }),
+        child({
+          id: "fb-1",
+          kind: "fallback",
+          status: "fallback-selected",
+          body: relocated,
+          placement: { kind: "fallback" },
+        }),
+      ],
+    } as unknown as PublicationAction;
+
+    const composed = composeFrozenSummary(action, new Set(), marker);
+
+    // The proposed fix survives intact...
+    expect(composed).toContain(`## Footer\n\n${BOT_SIGNATURE_BLOCK}`);
+    // ...and the comment still ends with exactly one footer, then the marker.
+    expect(composed.trimEnd().endsWith(`${BOT_SIGNATURE_BLOCK}\n\n${marker}`)).toBe(true);
+    // Two occurrences total: the one inside the fenced suggestion, and the footer.
+    expect(composed.split(BOT_SIGNATURE_BLOCK)).toHaveLength(3);
+  });
+
+  it("leaves a body alone when its only signature sits inside a suggestion", () => {
+    const body = [
+      "**A finding.**",
+      "",
+      "```suggestion",
+      BOT_SIGNATURE_BLOCK,
+      "```",
+      "",
+      "trailing prose",
+    ].join("\n");
+    expect(stripSignature(body)).toBe(body);
+  });
 });
