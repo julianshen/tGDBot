@@ -6,9 +6,11 @@ import { ContextValidationError } from "../../../src/context/artifact-validator.
 import { computeManifestHash, ContextCache } from "../../../src/context/cache.js";
 import {
   buildContextPack,
+  combineContextPacks,
   MAX_CONTEXT_MAX_CHARS,
   MIN_CONTEXT_MAX_CHARS,
 } from "../../../src/context/context-pack.js";
+import type { ContextPackResult } from "../../../src/context/context-pack.js";
 import type { ContextCacheKey, ContextManifest, ContextManifestInput } from "../../../src/context/types.js";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 
@@ -579,5 +581,73 @@ describe("buildContextPack", () => {
       changedFiles: [],
       maxChars: MIN_CONTEXT_MAX_CHARS,
     })).rejects.toThrow(/mandatory.*exceeds|maxChars/iu);
+  });
+});
+
+// The dispatch contract allows exactly one pack per rule under one manifest
+// hash, so two producers of trusted context have to be folded together rather
+// than one displacing the other.
+describe("combineContextPacks", () => {
+  const pack = (
+    text: string,
+    hash: string,
+    untrustedText?: string,
+  ): ContextPackResult => ({
+    text,
+    ...(untrustedText === undefined ? {} : { untrustedText }),
+    manifestHash: hash,
+    truncated: false,
+    sources: [],
+  });
+  const HASH_A = "a".repeat(64);
+  const HASH_B = "b".repeat(64);
+
+  it("returns undefined when no producer supplied a pack", () => {
+    expect(combineContextPacks([undefined, undefined])).toBeUndefined();
+  });
+
+  it("passes a lone pack through unchanged, untrusted half included", () => {
+    const only = pack("trusted", HASH_A, "ids");
+    expect(combineContextPacks([undefined, only])).toBe(only);
+  });
+
+  // #63: the halves are combined half-for-half. Folding an untrusted half into
+  // the trusted text would undo the provenance split the moment two producers
+  // are present — which is exactly the case this function exists for.
+  it("combines trusted with trusted and untrusted with untrusted", () => {
+    const combined = combineContextPacks([
+      pack("repository map", HASH_A),
+      pack("Entry 1 is deprecated.", HASH_B, "Entry 1 = evil-name@1.0.0 (package.json)"),
+    ]);
+
+    expect(combined?.text).toBe("repository map\n\nEntry 1 is deprecated.");
+    expect(combined?.untrustedText).toBe("Entry 1 = evil-name@1.0.0 (package.json)");
+    expect(combined?.text).not.toContain("evil-name");
+  });
+
+  it("leaves the untrusted half absent when neither producer had one", () => {
+    const combined = combineContextPacks([pack("one", HASH_A), pack("two", HASH_B)]);
+
+    expect(combined?.text).toBe("one\n\ntwo");
+    expect(combined?.untrustedText).toBeUndefined();
+  });
+
+  it("joins two untrusted halves rather than dropping either", () => {
+    const combined = combineContextPacks([
+      pack("first", HASH_A, "ids one"),
+      pack("second", HASH_B, "ids two"),
+    ]);
+
+    expect(combined?.untrustedText).toBe("ids one\n\nids two");
+  });
+
+  // The hash is what dedup and the dispatch contract key on, so it has to move
+  // when either component moves.
+  it("derives a hash from the component hashes", () => {
+    const base = combineContextPacks([pack("one", HASH_A), pack("two", HASH_B)]);
+    const moved = combineContextPacks([pack("one", HASH_A), pack("two", "c".repeat(64))]);
+
+    expect(base?.manifestHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(moved?.manifestHash).not.toBe(base?.manifestHash);
   });
 });

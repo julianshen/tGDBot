@@ -1393,10 +1393,17 @@ describe("review", () => {
 
     await review(h.args, depsFrom(h));
 
-    const passed = h.dispatchRules.mock.calls[0]?.[0] as { contextPacks?: Record<string, { text: string }> };
+    const passed = h.dispatchRules.mock.calls[0]?.[0] as {
+      contextPacks?: Record<string, { text: string; untrustedText?: string }>;
+    };
     expect(passed.contextPacks).toBeDefined();
     expect(Object.keys(passed.contextPacks ?? {})).toEqual(["rule-a"]);
-    expect(passed.contextPacks?.["rule-a"]?.text).toContain("left-pad@1.3.1");
+    // #63: the identifier still reaches the rule, on the untrusted side of the
+    // pack — the author wrote "left-pad", so the trusted half cannot vouch for
+    // it. End-to-end through the real CLI wiring, not just the pack builder.
+    expect(passed.contextPacks?.["rule-a"]?.untrustedText).toContain("left-pad@1.3.1");
+    expect(passed.contextPacks?.["rule-a"]?.text).not.toContain("left-pad");
+    expect(passed.contextPacks?.["rule-a"]?.text).toContain("Entry 1");
 
     vi.restoreAllMocks();
   });
@@ -4445,6 +4452,14 @@ describe("review — dependency facts", () => {
     return input?.contextPacks?.["rule-a"]?.text;
   };
 
+  /** The diff-derived half (#63): identifiers the host did not establish. */
+  const untrustedPackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { untrustedText?: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.untrustedText;
+  };
+
   // Final round: with the feature off there is no pack at all, because its
   // identifiers are diff-controlled — see "the dependency pack is part of the
   // opt-in" below.
@@ -4476,6 +4491,11 @@ describe("review — dependency facts", () => {
     expect(packFor(h)).toMatch(/deprecated/i);
     expect(packFor(h)).not.toContain("use lodash-es");
     expect(packFor(h)).not.toMatch(/NOT been checked/);
+    // #63: the registry's answer is host-established and stays trusted; the
+    // package it is about is the author's string and moves to the untrusted
+    // half. Both together are what makes the finding reportable.
+    expect(packFor(h)).not.toContain("lodash");
+    expect(untrustedPackFor(h)).toContain("lodash");
   });
 
   // An outage must not read as a clean bill of health, and must not fail the
@@ -4589,6 +4609,14 @@ describe("review — the dependency pack is part of the opt-in", () => {
     return input?.contextPacks?.["rule-a"]?.text;
   };
 
+  /** The diff-derived half (#63): identifiers the host did not establish. */
+  const untrustedPackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { untrustedText?: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.untrustedText;
+  };
+
   it("supplies no pack at all when the feature is off", async () => {
     const h = makeHarness();
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
@@ -4610,6 +4638,7 @@ describe("review — the dependency pack is part of the opt-in", () => {
       }),
     });
 
-    expect(packFor(h)).toContain("lodash");
+    expect(untrustedPackFor(h)).toContain("lodash");
+    expect(packFor(h)).not.toContain("lodash");
   });
 });
