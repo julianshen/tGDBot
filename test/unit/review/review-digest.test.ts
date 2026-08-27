@@ -5,6 +5,7 @@ import {
   BOT_SIGNATURE_BLOCK,
   renderInlineComment,
   MAX_REVIEW_DIGEST_CHARS,
+  exceedsAtomicPayload,
   renderReviewDigest,
 } from "../../../src/review/comment-format.js";
 import { parseBotMarker } from "../../../src/review/comment-marker.js";
@@ -252,5 +253,78 @@ describe("renderReviewDigest — the legend is generated, not written", () => {
     }));
 
     expect(body).toMatch(/not committable/i);
+  });
+});
+
+// Issue #55, constraint 3: the review body rides in the same POST as the
+// inline comments, so it has to be charged against the run's atomic payload
+// pre-flight. Being capped by construction is what lets that accounting happen
+// without composing the digest — which matters, because the pre-flight runs
+// before the summary is written and composing early would memoize a digest
+// missing the very link it exists to carry.
+describe("the digest is bounded so the payload pre-flight can account for it", () => {
+  it("never exceeds the budget the pre-flight charges", () => {
+    // Every shape the builder can produce, including the pathological ones.
+    const shapes = [
+      input(),
+      input({ focusDirection: "x".repeat(5_000) }),
+      input({ rulesRun: Array.from({ length: 2_000 }, (_, i) => `rule-${"n".repeat(50)}-${i}`) }),
+      input({
+        summaryUrl: `https://github.com/o/r/pull/1#issuecomment-${"9".repeat(500)}`,
+        botLogin: "b".repeat(1_000),
+      }),
+      input({
+        allFindings: Array.from({ length: 500 }, () => finding({
+          suggestion: "x", references: ["https://docs.example.com/a"],
+        })),
+      }),
+    ];
+
+    for (const shape of shapes) {
+      expect(renderReviewDigest(shape).length).toBeLessThanOrEqual(MAX_REVIEW_DIGEST_CHARS);
+    }
+  });
+
+  // GitHub caps a single body at 65,536; the digest is nowhere near it, and
+  // that headroom is the point rather than a coincidence.
+  it("stays far below the provider's own body limit", () => {
+    expect(MAX_REVIEW_DIGEST_CHARS).toBeLessThan(65_536 / 4);
+  });
+});
+
+// Issue #55, constraint 3. The arithmetic used to be duplicated in the CLI's
+// pre-flight and the publication path's — two copies of one limit, and
+// untestable without driving a whole run. One definition now, so this can
+// assert the accounting directly.
+describe("exceedsAtomicPayload", () => {
+  const entry = (bodyChars: number, markerChars = 0) => ({ bodyChars, markerChars });
+
+  it("accepts an ordinary review", () => {
+    expect(exceedsAtomicPayload([entry(2_000), entry(3_000)])).toBe(false);
+  });
+
+  // The point of the change: a run that fits only because the review body was
+  // not counted must be rejected, since that body ships in the same request.
+  it("charges the review body's budget", () => {
+    // Just inside on the comments alone, and over once the digest is charged.
+    const perComment = 9_000;
+    // As many as fit under the ceiling on their own — which is what leaves the
+    // digest's budget as the only thing that can push the total over.
+    const count = Math.floor(1_000_000 / (perComment + 256));
+    const entries = Array.from({ length: count }, () => entry(perComment));
+    const withoutDigest = entries.reduce((sum, e) => sum + e.bodyChars + 256, 0);
+
+    expect(withoutDigest).toBeLessThanOrEqual(1_000_000);
+    expect(withoutDigest + MAX_REVIEW_DIGEST_CHARS).toBeGreaterThan(1_000_000);
+    expect(exceedsAtomicPayload(entries)).toBe(true);
+  });
+
+  it("rejects one comment over the provider's body limit", () => {
+    expect(exceedsAtomicPayload([entry(65_500)])).toBe(true);
+  });
+
+  it("counts a recovery marker against the comment's own limit", () => {
+    expect(exceedsAtomicPayload([entry(65_000)])).toBe(false);
+    expect(exceedsAtomicPayload([entry(65_000, 500)])).toBe(true);
   });
 });

@@ -40,6 +40,7 @@ import {
 import {
   BOT_SIGNATURE_BLOCK_RE,
   botSignatureBlock,
+  exceedsAtomicPayload,
   renderReviewDigest,
 } from "./comment-format.js";
 import { formatMarker } from "./dedup.js";
@@ -606,10 +607,10 @@ export async function publishReviewFromManifest(options: {
         const allInlineIds = new Set(inlineChildren.map((entry) => clientIdOf(entry)));
         if (inlineChildren.length > 0 && provider === "github") {
           if (inlineChildren.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
-          const payloadChars = inlineChildren.reduce((total, entry, index) =>
-            total + entry.body.length + (inlineRecovery?.children[index]?.marker.length ?? entry.marker.length) + 256, 0);
-          if (payloadChars > 1_000_000 || inlineChildren.some((entry, index) =>
-            entry.body.length + (inlineRecovery?.children[index]?.marker.length ?? entry.marker.length) + 128 > 65_536)) {
+          if (exceedsAtomicPayload(inlineChildren.map((entry, index) => ({
+            bodyChars: entry.body.length,
+            markerChars: inlineRecovery?.children[index]?.marker.length ?? entry.marker.length,
+          })))) {
             throw new Error("GitHub inline review exceeds the safe atomic payload size");
           }
         }

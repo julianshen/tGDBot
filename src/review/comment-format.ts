@@ -1521,3 +1521,38 @@ export function renderReviewDigest(input: ReviewDigestInput): string {
   const trimmed = body.length <= room ? body : `${body.slice(0, Math.max(0, room - 2))}…`;
   return `${trimmed}${suffix}`;
 }
+
+/**
+ * Whether one atomic inline review would exceed what the provider accepts.
+ *
+ * GitHub caps a single comment body at 65,536 characters and the whole request
+ * well below a megabyte. The arithmetic lived in two places — the CLI's
+ * pre-flight and the publication path's — which is two copies of a limit that
+ * can drift apart, and it made the accounting untestable without driving a
+ * whole run. One definition, used by both.
+ *
+ * The review BODY is charged at its MAXIMUM rather than its composed length
+ * (issue #55). The publication pre-flight runs before the summary is written,
+ * and composing the digest there would memoize it without the summary link it
+ * exists to carry — so being bounded by construction is what lets it be
+ * accounted for without being built.
+ */
+export function exceedsAtomicPayload(
+  entries: readonly { readonly bodyChars: number; readonly markerChars: number }[],
+): boolean {
+  const total = MAX_REVIEW_DIGEST_CHARS + entries.reduce(
+    (sum, entry) => sum + entry.bodyChars + entry.markerChars + PER_COMMENT_OVERHEAD_CHARS,
+    0,
+  );
+  return total > MAX_ATOMIC_PAYLOAD_CHARS
+    || entries.some((entry) => entry.bodyChars + entry.markerChars + PER_COMMENT_HEADROOM_CHARS > MAX_COMMENT_CHARS);
+}
+
+/** Request framing per comment: JSON keys, path, line, quoting. */
+const PER_COMMENT_OVERHEAD_CHARS = 256;
+/** Headroom when checking ONE comment against the provider's body limit. */
+const PER_COMMENT_HEADROOM_CHARS = 128;
+/** The provider's per-comment body limit. */
+const MAX_COMMENT_CHARS = 65_536;
+/** The whole request's safe ceiling. */
+const MAX_ATOMIC_PAYLOAD_CHARS = 1_000_000;

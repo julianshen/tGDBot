@@ -29,6 +29,7 @@ import {
 } from "./review/review-publication.js";
 import {
   BOT_SIGNATURE_BLOCK,
+  exceedsAtomicPayload,
   renderReviewDigest,
   type ClarificationPresentation,
   type ContextUnavailableLabel,
@@ -1661,8 +1662,10 @@ export async function review(
       // write. A safe placeholder exercises the exact same bounded encoder.
       if (provider === "github") {
         if (orchestration.inlineComments.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
-        const payloadChars = orchestration.inlineComments.reduce((total, comment, index) => total + comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 256, 0);
-        if (payloadChars > 1_000_000 || orchestration.inlineComments.some((comment, index) => comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 128 > 65_536)) {
+        if (exceedsAtomicPayload(orchestration.inlineComments.map((comment, index) => ({
+          bodyChars: comment.body.length,
+          markerChars: inlineRecovery?.children[index]?.marker.length ?? 0,
+        })))) {
           throw new Error("GitHub inline review exceeds the safe atomic payload size");
         }
       }
