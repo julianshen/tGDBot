@@ -67,7 +67,7 @@ export interface DependencyAdvisoryFact {
 const CONCURRENCY = 3;
 const DEFAULT_DEADLINE_MS = 60_000;
 
-function readAdvisory(value: unknown): DependencyAdvisory | undefined {
+function readAdvisory(value: unknown, name: string, version: string): DependencyAdvisory | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const vuln = value as Record<string, unknown>;
   const id = vuln.id;
@@ -82,29 +82,96 @@ function readAdvisory(value: unknown): DependencyAdvisory | undefined {
     ? rawSeverity.toUpperCase()
     : undefined;
 
+  const fixed = readFixed(vuln.affected, name, version);
   return {
     id,
     ...(severity === undefined ? {} : { severity }),
-    ...(readFixed(vuln.affected) === undefined ? {} : { fixed: readFixed(vuln.affected)! }),
+    ...(fixed === undefined ? {} : { fixed }),
   };
 }
 
-/** The first release that fixes it, if the record names one that parses. */
-function readFixed(affected: unknown): string | undefined {
+/**
+ * Orders two exact versions numerically, component by component.
+ *
+ * Enough for OSV's SEMVER ranges, which carry plain released versions. A
+ * prerelease tail sorts BELOW the same release, which is semver's own rule and
+ * the conservative direction here: it keeps `2.0.0-rc.1` inside the interval
+ * that `2.0.0` opens rather than out of it.
+ */
+function compareVersions(left: string, right: string): number {
+  const parts = (value: string): { numbers: number[]; prerelease: boolean } => {
+    const [core = "", tail] = value.split("-", 2);
+    return {
+      numbers: core.split(".").map((piece) => Number.parseInt(piece, 10) || 0),
+      prerelease: tail !== undefined,
+    };
+  };
+  const a = parts(left);
+  const b = parts(right);
+  const width = Math.max(a.numbers.length, b.numbers.length);
+  for (let index = 0; index < width; index += 1) {
+    const difference = (a.numbers[index] ?? 0) - (b.numbers[index] ?? 0);
+    if (difference !== 0) return difference < 0 ? -1 : 1;
+  }
+  if (a.prerelease === b.prerelease) return 0;
+  return a.prerelease ? -1 : 1;
+}
+
+/**
+ * The release that fixes THIS advisory for THIS package at THIS version.
+ *
+ * OSV allows several `affected` entries in one record — for different packages,
+ * and for the same package with different fix paths — and each carries its own
+ * ranges. Taking the first semver-shaped `fixed` anywhere in the record named a
+ * version that might fix a different package, or an earlier interval this
+ * version is not in (PR #70 review, found by both reviewers). A wrong
+ * "fixed in X" is worse than none: it tells a reader to ship something still
+ * vulnerable.
+ *
+ * So: entries for this package in this ecosystem, SEMVER ranges only, and the
+ * `fixed` belonging to the interval that actually contains the queried version.
+ * Outside every interval, the record names no fix that applies here.
+ */
+function readFixed(affected: unknown, name: string, version: string): string | undefined {
   if (!Array.isArray(affected)) return undefined;
   for (const entry of affected) {
     if (typeof entry !== "object" || entry === null) continue;
-    const ranges = (entry as Record<string, unknown>).ranges;
+    const record = entry as Record<string, unknown>;
+    const pkg = record.package;
+    if (typeof pkg !== "object" || pkg === null) continue;
+    const meta = pkg as Record<string, unknown>;
+    if (meta.name !== name || meta.ecosystem !== ECOSYSTEM) continue;
+
+    const ranges = record.ranges;
     if (!Array.isArray(ranges)) continue;
     for (const range of ranges) {
       if (typeof range !== "object" || range === null) continue;
-      const events = (range as Record<string, unknown>).events;
+      const rangeRecord = range as Record<string, unknown>;
+      // Only SEMVER intervals are comparable as versions. A GIT range's events
+      // are commits.
+      if (rangeRecord.type !== "SEMVER") continue;
+      const events = rangeRecord.events;
       if (!Array.isArray(events)) continue;
+
+      // Events come in order: an `introduced` opens an interval and the next
+      // `fixed` closes it.
+      let openedAt: string | undefined;
       for (const event of events) {
         if (typeof event !== "object" || event === null) continue;
-        const fixed = (event as Record<string, unknown>).fixed;
-        // A version, or nothing. `latest` is not a version.
-        if (isExactVersion(String(fixed))) return String(fixed);
+        const eventRecord = event as Record<string, unknown>;
+        const introduced = eventRecord.introduced;
+        if (typeof introduced === "string") {
+          // OSV writes "0" for "from the beginning".
+          openedAt = introduced === "0" ? "0.0.0" : introduced;
+          continue;
+        }
+        const fixed = eventRecord.fixed;
+        if (typeof fixed !== "string" || !isExactVersion(fixed)) continue;
+        if (openedAt === undefined) continue;
+        const atOrAfterStart = compareVersions(version, openedAt) >= 0;
+        const beforeFix = compareVersions(version, fixed) < 0;
+        if (atOrAfterStart && beforeFix) return fixed;
+        openedAt = undefined;
       }
     }
   }
@@ -126,7 +193,7 @@ function readResponse(
     return { ...base, unknown: "the advisory database returned no usable document" };
   }
   const all = vulns
-    .map(readAdvisory)
+    .map((vuln) => readAdvisory(vuln, change.name, change.version))
     .filter((advisory): advisory is DependencyAdvisory => advisory !== undefined);
   const advisories = all.slice(0, MAX_ADVISORIES_PER_PACKAGE);
   const further = all.length - advisories.length;

@@ -1259,3 +1259,51 @@ describe("dependencyContextPack — advisories", () => {
     expect(pack?.text).toMatch(/advisor/i);
   });
 });
+
+// PR #70 review: `advisoriesRan` was inferred from the advisory facts merely
+// EXISTING. A range-only diff produces a fact per package saying "not checked,
+// this is a range" without OSV ever being queried — so both closing branches
+// dropped the warning while no advisory data existed at all.
+describe("dependencyContextPack — the closing text tracks what was answered", () => {
+  const pin = {
+    name: "lodash", version: "4.17.20", spec: "4.17.20",
+    manifest: "package.json", pinned: true, section: "dependencies",
+  };
+  const range = { ...pin, spec: "^4.17.20", pinned: false };
+
+  // The registry pass SUCCEEDED, so the closing takes its "anything not stated
+  // was not established" branch — and that branch is where the advisory clause
+  // was going missing.
+  const registryAnswered = [{
+    name: "lodash", version: "4.17.20", spec: "4.17.20", published: true,
+  }];
+  const registryAnsweredRange = [{
+    name: "lodash", version: "4.17.20", spec: "^4.17.20", latest: "4.17.21",
+  }];
+
+  it("warns when every advisory fact is an unchecked range", () => {
+    const pack = dependencyContextPack([range], registryAnsweredRange, [], [{
+      name: "lodash", version: "4.17.20", spec: "^4.17.20",
+      unknown: "this is a range, so which release installs is not known here",
+    }]);
+
+    expect(pack?.text).toMatch(/no advisory answer was obtained/i);
+  });
+
+  it("warns when every advisory lookup failed", () => {
+    const pack = dependencyContextPack([pin], registryAnswered, [], [{
+      name: "lodash", version: "4.17.20", spec: "4.17.20",
+      unknown: "the advisory database could not be reached",
+    }]);
+
+    expect(pack?.text).toMatch(/no advisory answer was obtained/i);
+  });
+
+  it("does not warn once at least one package got an answer", () => {
+    const pack = dependencyContextPack([pin], registryAnswered, [], [{
+      name: "lodash", version: "4.17.20", spec: "4.17.20", advisories: [],
+    }]);
+
+    expect(pack?.text).not.toMatch(/no advisory answer was obtained/i);
+  });
+});

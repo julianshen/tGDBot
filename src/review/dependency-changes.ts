@@ -521,7 +521,12 @@ export function dependencyContextPack(
     return notes.length === 0 ? head : `${head}\n${notes.map((note) => `  - ${note}`).join("\n")}`;
   });
   const checked = facts.some((fact) => fact.unknown === undefined);
-  const advisoriesRan = advisoryFacts.length > 0;
+  // An ANSWER, not merely a fact. A range-only diff produces a fact per package
+  // saying "not checked" without OSV being queried at all, and treating that as
+  // a completed pass dropped the warning while no advisory data existed
+  // (PR #70 review). The same holds when every lookup failed: attempted and
+  // unanswered leaves the reader with nothing either way.
+  const advisoriesRan = advisoryFacts.some((fact) => fact.advisories !== undefined);
   const closing = checked
     ? [
         "Anything not stated above was not established. A package with no note",
@@ -529,8 +534,8 @@ export function dependencyContextPack(
         "it — do not read silence as approval.",
         ...(advisoriesRan
           ? []
-          : ["No advisory database was consulted at all, so say nothing about",
-             "known vulnerabilities."]),
+          : ["No advisory answer was obtained for any package here, so say",
+             "nothing about known vulnerabilities."]),
       ]
     : [
         "These versions have NOT been checked against a registry"
