@@ -4426,18 +4426,24 @@ describe("review — the comparison base is where the branches diverged", () => 
     expect(packFor(h)).toContain("lodash");
   });
 
-  // GitLab reports it on the merge request itself, so no extra call is needed.
-  it("prefers the merge request's own start sha when it has one", async () => {
+  // Round four: `startSha` is NOT a merge base. GitLab maps `diff_refs.start_sha`
+  // to it, which is the commit on the TARGET side — the tip comparison this
+  // exists to avoid. Only the adapter's own merge-base answer is used.
+  it("does not mistake the merge request's start sha for a merge base", async () => {
     const h = makeHarness({
       pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1", startSha: "ddddddd1" }),
       args: makeArgs({ dependencyFacts: "on" }),
     });
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockResolvedValue("ccccccc1");
 
     await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
 
-    expect(h.vcsAdapter.getMergeBaseSha).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.getMergeBaseSha).toHaveBeenCalled();
     expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "ccccccc1", "package.json",
+    );
+    expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalledWith(
       expect.anything(), "ddddddd1", "package.json",
     );
   });
@@ -4486,5 +4492,63 @@ describe("review — the comparison base is where the branches diverged", () => 
     await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
 
     expect(h.vcsAdapter.getMergeBaseSha).not.toHaveBeenCalled();
+  });
+});
+
+// PR #67 review, round four: a generated monorepo update can touch hundreds of
+// package.json files, and each one cost up to two sequential provider requests
+// BEFORE the 200-package extraction cap applied. That stalls the review and can
+// exhaust an API quota, mostly on manifests with no relevant change.
+describe("review — manifest reads are bounded", () => {
+  const manifestDiffFor = (count: number) =>
+    Array.from({ length: count }, (_, i) => [
+      `diff --git a/w${i}/package.json b/w${i}/package.json`,
+      `--- a/w${i}/package.json`,
+      `+++ b/w${i}/package.json`,
+      "@@ -3,7 +3,7 @@",
+      '+    "lodash": "4.17.21",',
+    ].join("\n")).join("\n");
+
+  const packFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  it("stops reading after a bounded number of manifests", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(manifestDiffFor(300));
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    // Two reads per manifest at most, and far fewer than 600.
+    expect(h.vcsAdapter.getFileAtRef.mock.calls.length).toBeLessThanOrEqual(100);
+  });
+
+  // Bounded is not the same as silent: what was skipped has to be stated.
+  it("reports the manifests it did not read", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(manifestDiffFor(300));
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(packFor(h)).toMatch(/could NOT be read/i);
+  });
+
+  it("reads every manifest when there are few", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(manifestDiffFor(3));
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef.mock.calls.length).toBe(6);
+    expect(packFor(h)).not.toMatch(/could NOT be read/i);
   });
 });

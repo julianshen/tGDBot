@@ -600,6 +600,14 @@ async function persistAndPublishReviewClarification(options: {
 // but something also failed — whether that's a rule failing to load, or
 // every loaded rule failing at dispatch time).
 const EXIT_OK = 0;
+/**
+ * How many changed manifests one review will read.
+ *
+ * Two provider requests each, so this is the ceiling on the outbound cost of
+ * the dependency feature before the registry is even reached.
+ */
+const MAX_MANIFESTS_READ = 25;
+
 const EXIT_FATAL = 1;
 const EXIT_PARTIAL = 2;
 
@@ -1176,9 +1184,18 @@ export async function review(
   // A manifest that cannot be read contributes no changes and is named in the
   // pack instead, because "we did not look" and "we looked and it was fine"
   // must not render the same.
-  const manifestsToRead = args.dependencyFacts === "on" && !dependencyFactsUnavailable
+  // Bounded before any provider request. A generated monorepo update can touch
+  // hundreds of manifests, and each costs up to two sequential reads BEFORE the
+  // extraction ceiling applies — enough to stall a review or exhaust an API
+  // quota, mostly on files with no relevant change (PR #67 review, round four).
+  // What is skipped is reported, not silently dropped.
+  const allChangedManifests = args.dependencyFacts === "on" && !dependencyFactsUnavailable
     ? changedManifests(diff)
     : [];
+  const manifestsToRead = allChangedManifests.slice(0, MAX_MANIFESTS_READ);
+  const skippedManifests = allChangedManifests
+    .slice(MAX_MANIFESTS_READ)
+    .map((manifest) => manifest.path);
   // Read at BOTH ends. What a pull request CHANGED is the difference between
   // the two dependency maps — an added diff line carries no structural
   // location, so an entry added under `overrides` that happens to match an
@@ -1203,20 +1220,21 @@ export async function review(
   // comparison is not.
   let comparisonBaseSha: string | undefined;
   if (manifestsToRead.length > 0) {
-    if (pr.startSha !== undefined) {
-      comparisonBaseSha = pr.startSha;
-    } else {
-      try {
-        comparisonBaseSha = await config.vcsAdapter.getMergeBaseSha(
-          config.locator,
-          pr.baseSha,
-          pr.headSha,
-        );
-      } catch (error) {
-        console.warn(
-          `tgd-review-agent: could not resolve the merge base (${redactedMessage(error)})`,
-        );
-      }
+    // Only the adapter's own merge-base answer. `startSha` is NOT one: GitLab
+    // maps `diff_refs.start_sha` to it, which is the commit on the TARGET side,
+    // so preferring it reintroduced exactly the tip comparison this exists to
+    // avoid (PR #67 review, round four). GitLab's `base_sha` is the merge base,
+    // and its adapter answers from the merge-base endpoint.
+    try {
+      comparisonBaseSha = await config.vcsAdapter.getMergeBaseSha(
+        config.locator,
+        pr.baseSha,
+        pr.headSha,
+      );
+    } catch (error) {
+      console.warn(
+        `tgd-review-agent: could not resolve the merge base (${redactedMessage(error)})`,
+      );
     }
     if (comparisonBaseSha === undefined) {
       console.warn(
@@ -1263,7 +1281,11 @@ export async function review(
     baseManifests,
   );
   const dependencyChanges = extraction.changes;
-  const unreadableManifests = [...unreachableManifests, ...extraction.unreadable];
+  const unreadableManifests = [
+    ...unreachableManifests,
+    ...extraction.unreadable,
+    ...skippedManifests,
+  ];
   // Opt-in, and the only outbound request the tool makes. Without it the pack
   // still ships the parsed versions and says plainly that nothing was checked —
   // which is why leaving this unwired shipped a rule that could never see the

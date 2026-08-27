@@ -1026,3 +1026,84 @@ describe("dependencyChanges — cases the two-ref comparison has to get right", 
     expect(result.changes).toEqual([]);
   });
 });
+
+// PR #67 review, round four: a manifest git emits as a BINARY diff has
+// `diff --git` and `Binary files ... differ` but no `@@` hunk. Recording the
+// path only once inside a hunk meant such a manifest was never listed, so it
+// was never fetched and never reported — silently omitted, which is the one
+// outcome this feature is not allowed to produce.
+describe("changedManifests — a manifest with no text hunk", () => {
+  it("lists a manifest git emitted as binary", () => {
+    const diff = [
+      "diff --git a/package.json b/package.json",
+      "index 1111111..2222222 100644",
+      "Binary files a/package.json and b/package.json differ",
+    ].join("\n");
+
+    // A binary MODIFICATION existed at base, so it has a base side. It will
+    // then fail to parse at head and be reported unexamined, which is the
+    // point: reported rather than silently skipped.
+    expect(changedManifests(diff)).toEqual([
+      { path: "package.json", basePath: "package.json" },
+    ]);
+  });
+
+  it("lists a manifest whose section carries only a rename", () => {
+    const diff = [
+      "diff --git a/old/package.json b/new/package.json",
+      "similarity index 100%",
+      "rename from old/package.json",
+      "rename to new/package.json",
+    ].join("\n");
+
+    expect(changedManifests(diff)).toEqual([
+      { path: "new/package.json", basePath: "old/package.json" },
+    ]);
+  });
+
+  // The forged-header defence is unchanged: a header-shaped line INSIDE a hunk
+  // is content, and this path is the one that gets fetched.
+  it("still ignores a header-shaped line inside another file's hunk", () => {
+    const diff = [
+      "diff --git a/src/evil.ts b/src/evil.ts",
+      "--- a/src/evil.ts",
+      "+++ b/src/evil.ts",
+      "@@ -1,2 +1,3 @@",
+      "+++ b/package.json",
+      '+    "lodash": "4.17.21",',
+    ].join("\n");
+
+    expect(changedManifests(diff)).toEqual([]);
+  });
+});
+
+// PR #67 review, round four: with merge-base resolution failing, EVERY changed
+// manifest lands in the unreadable list, and a generated monorepo diff can
+// carry thousands of paths of up to 512 characters. Rendering them all made a
+// pack that can exceed the model's context and fail every rule dispatch, while
+// still reporting `truncated: false`.
+describe("dependencyContextPack — the unexamined list is bounded", () => {
+  const many = Array.from({ length: 400 }, (_, i) => `packages/w${i}/package.json`);
+
+  it("lists a bounded number and says how many more there were", () => {
+    const pack = dependencyContextPack([], [], many);
+    const text = pack?.text ?? "";
+
+    expect(text).toMatch(/could NOT be read/i);
+    expect(text).toContain("packages/w0/package.json");
+    expect(text.length).toBeLessThan(4_000);
+    // The count must survive even though the paths do not.
+    expect(text).toMatch(/400|more/i);
+  });
+
+  it("marks the pack truncated when it dropped some", () => {
+    expect(dependencyContextPack([], [], many)?.truncated).toBe(true);
+  });
+
+  it("lists a short list in full and does not claim truncation", () => {
+    const pack = dependencyContextPack([], [], ["package.json", "web/package.json"]);
+
+    expect(pack?.text).toContain("web/package.json");
+    expect(pack?.truncated).toBe(false);
+  });
+});

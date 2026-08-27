@@ -122,6 +122,9 @@ const MANIFEST_PATH_RE = /^[A-Za-z0-9._@\/-]{1,512}$/u;
  */
 const MAX_PACKAGES_PER_DIFF = 200;
 
+/** How many manifest paths the pack will name before summarising the rest. */
+const MAX_LISTED_MANIFESTS = 20;
+
 /** True for a name the registry itself would accept. */
 export function isValidPackageName(name: string): boolean {
   return name.length > 0 && name.length <= PACKAGE_NAME_MAX && PACKAGE_NAME_RE.test(name);
@@ -161,7 +164,7 @@ function isPinnedSpec(raw: string): boolean {
 
 
 /**
- * Which manifest each added line belongs to.
+ * The manifests a diff touches, from the FILE SECTIONS rather than the hunks.
  *
  * `+++ b/…` is a file header ONLY outside a hunk. Inside one it is content: an
  * added line whose text is `++ b/package.json` renders as `+++ b/package.json`,
@@ -169,59 +172,67 @@ function isPinnedSpec(raw: string): boolean {
  * any file and walk straight through the closed allowlist this module rests on
  * (PR #54 review) — so headers are tied to real `diff --git` boundaries, the
  * same discipline `review/diff-anchors` uses for the same reason. That matters
- * more since #56, not less: the path chosen here is the path fetched.
+ * more since #56, not less: the path recognised here is the path fetched.
  *
- * This is all the diff is asked for now. It says WHICH file and WHICH lines
- * changed; the manifest itself says what those lines mean.
+ * Recorded when the SECTION ends, not when a hunk begins. A manifest git emits
+ * as a binary diff, or a pure rename, has no `@@` at all, and requiring one
+ * meant the file was never listed, never fetched, and never reported — silently
+ * omitted (PR #67 review, round four).
  */
-function manifestByLine(diff: string): Map<number, ChangedManifest> {
-  const byLine = new Map<number, ChangedManifest>();
-  let manifest: ChangedManifest | undefined;
+function collectManifests(diff: string): ChangedManifest[] {
+  const found: ChangedManifest[] = [];
+  let path: string | undefined;
   let basePath: string | undefined;
   let inHunk = false;
-  for (const [index, line] of diff.split("\n").entries()) {
+
+  const flush = (): void => {
+    if (path !== undefined) found.push({ path, basePath });
+    path = undefined;
+    basePath = undefined;
+  };
+
+  for (const line of diff.split("\n")) {
     if (line.startsWith("diff --git ")) {
-      manifest = undefined;
-      basePath = undefined;
+      flush();
       inHunk = false;
+      // The section header names both sides, which is the only place a binary
+      // or rename-only section says what changed.
+      const both = /^diff --git a\/(.+) b\/(.+)$/u.exec(line);
+      if (both) {
+        const from = both[1] ?? "";
+        const to = both[2] ?? "";
+        if (isManifestPath(to)) {
+          path = to;
+          basePath = isManifestPath(from) ? from : undefined;
+        }
+      }
       continue;
     }
-    if (!inHunk) {
-      // The OLD path, which a rename makes different from the new one. `/dev/null`
-      // means the file is added by this pull request and has no base side.
-      const from = /^--- (?:a\/(.+)|\/dev\/null)$/u.exec(line);
-      if (from) {
-        // The old path has to be a MANIFEST too. `config.json` renamed to
-        // `package.json` would otherwise have its `dependencies` object
-        // compared as if it were a manifest's, silencing entries that are
-        // genuinely new here (PR #67 review, round three).
-        const path = from[1];
-        const fromBasename = path?.slice(path.lastIndexOf("/") + 1);
-        basePath = path !== undefined
-          && MANIFEST_PATH_RE.test(path)
-          && MANIFEST_BASENAMES.has(fromBasename ?? "")
-          ? path
-          : undefined;
-        continue;
-      }
-      const header = /^\+\+\+ b\/(.+)$/u.exec(line);
-      if (header) {
-        const path = header[1] ?? "";
-        const basename = path.slice(path.lastIndexOf("/") + 1);
-        manifest = MANIFEST_BASENAMES.has(basename) && MANIFEST_PATH_RE.test(path)
-          ? { path, basePath }
-          : undefined;
-        continue;
-      }
-    }
-    if (line.startsWith("@@")) {
-      inHunk = true;
+    if (inHunk) continue;
+    // An explicit `---`/`+++` pair overrides the section header, which is what
+    // distinguishes an ADDED manifest (`--- /dev/null`) from a modified one.
+    const from = /^--- (?:a\/(.+)|\/dev\/null)$/u.exec(line);
+    if (from) {
+      const old = from[1];
+      basePath = old !== undefined && isManifestPath(old) ? old : undefined;
       continue;
     }
-    if (manifest === undefined || !inHunk) continue;
-    byLine.set(index, manifest);
+    const to = /^\+\+\+ b\/(.+)$/u.exec(line);
+    if (to) {
+      const next = to[1] ?? "";
+      path = isManifestPath(next) ? next : undefined;
+      continue;
+    }
+    if (line.startsWith("@@")) inHunk = true;
   }
-  return byLine;
+  flush();
+  return found;
+}
+
+/** A repository path this module is willing to name and fetch. */
+function isManifestPath(path: string): boolean {
+  const basename = path.slice(path.lastIndexOf("/") + 1);
+  return MANIFEST_BASENAMES.has(basename) && MANIFEST_PATH_RE.test(path);
 }
 
 /**
@@ -241,7 +252,7 @@ export interface ChangedManifest {
 /** The manifest files this diff touches, for the host to fetch and parse. */
 export function changedManifests(diff: string): ChangedManifest[] {
   const byPath = new Map<string, ChangedManifest>();
-  for (const manifest of manifestByLine(diff).values()) {
+  for (const manifest of collectManifests(diff)) {
     if (!byPath.has(manifest.path)) byPath.set(manifest.path, manifest);
   }
   return [...byPath.values()];
@@ -474,13 +485,21 @@ export function dependencyContextPack(
   // dependencies were not examined, and an absent section would read as an
   // examined one that found nothing — the silent-degradation failure this
   // project rejects everywhere else (#33/#35, and issue #56).
+  // Bounded. When merge-base resolution fails, EVERY changed manifest lands
+  // here, and a generated monorepo diff carries thousands of paths of up to 512
+  // characters — enough to blow the model's context and fail every dispatch
+  // (PR #67 review, round four). The COUNT is what a rule acts on, so it
+  // survives even when the paths do not.
+  const shownUnreadable = unreadableManifests.slice(0, MAX_LISTED_MANIFESTS);
+  const hiddenUnreadable = unreadableManifests.length - shownUnreadable.length;
   const unreadable = unreadableManifests.length === 0
     ? []
     : [
         "",
-        "These manifests changed but could NOT be read, so no dependency change",
-        "in them was examined at all:",
-        ...unreadableManifests.map((path) => `- ${path}`),
+        `These ${unreadableManifests.length} manifest(s) changed but could NOT be read, so no`,
+        "dependency change in them was examined at all:",
+        ...shownUnreadable.map((path) => `- ${path}`),
+        ...(hiddenUnreadable > 0 ? [`- ...and ${hiddenUnreadable} more, not listed here`] : []),
       ];
   const text = [
     "## Dependency changes in this pull request",
@@ -495,7 +514,7 @@ export function dependencyContextPack(
   return {
     text,
     manifestHash: createHash("sha256").update(text, "utf8").digest("hex"),
-    truncated: false,
+    truncated: hiddenUnreadable > 0,
     sources: [],
   };
 }
