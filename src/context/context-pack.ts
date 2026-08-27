@@ -904,14 +904,19 @@ export async function buildContextPacks(
 }
 
 /**
- * Folds several trusted-context packs for one rule into the single pack the
- * dispatch contract allows.
+ * Folds several context packs for one rule into the single pack the dispatch
+ * contract allows.
  *
  * `validateDispatchContext` requires exactly one pack per rule and one shared
  * manifest hash across them all, so two independent producers — the
  * repository map and the host's dependency facts — cannot each hand dispatch
  * their own. Concatenating keeps both, in a fixed order so the same inputs
  * always render the same prompt.
+ *
+ * Each pack's two halves are folded SEPARATELY: trusted text with trusted
+ * text, untrusted with untrusted. Merging an untrusted half into the trusted
+ * side would undo the provenance split (see `ContextPackResult.untrustedText`)
+ * at precisely the moment it matters — when more than one producer is present.
  *
  * The combined hash is taken over the component hashes rather than the joined
  * text: each component already hashes its own content, and hashing the hashes
