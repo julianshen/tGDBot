@@ -101,6 +101,11 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",
+    // This file exercises DEFAULT wiring, so nothing here is injected. Context
+    // stays off: mapping needs a real git mirror and a model session, and a
+    // wiring test must not reach for either.
+    context: "off",
+    allowDegradedContext: false,
     stateDir: overrides.stateDir ?? (stateRoots.push(realpathSync(mkdtempSync(path.join(os.tmpdir(), "tgd-wiring-state-")))), stateRoots.at(-1)),
     ...overrides,
   };
@@ -281,6 +286,7 @@ describe("review — default dependency wiring", () => {
       undefined, // createSession → real default
       "x/y", // orchestratorModel
       undefined, // conversationContext when none was loaded
+      undefined, // contextPacks — --context off prepares none
     );
     expect(dispatchRulesDirect).not.toHaveBeenCalled();
     logSpy.mockRestore();

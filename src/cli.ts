@@ -27,7 +27,7 @@ import {
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
-import { BOT_SIGNATURE_BLOCK, type ClarificationPresentation } from "./review/comment-format.js";
+import { BOT_SIGNATURE_BLOCK, type ClarificationPresentation, type ContextUnavailableLabel } from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
@@ -56,7 +56,7 @@ import {
   formatMarker,
   stateRootDomainIdentifier,
 } from "./review/dedup.js";
-import { changedFiles, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
+import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
 import {
   formatPendingMarker,
   replacePendingMarker,
@@ -70,6 +70,18 @@ import type { DispatchResult, Finding, ReviewDispatchInput } from "./review/type
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
+import {
+  ContextRequiredError,
+  contextFingerprint,
+  prepareReviewContext as prepareReviewContextReal,
+} from "./context/prepare.js";
+import { contextRoots, selectContextRoot } from "./context/root.js";
+import {
+  combineContextPacks,
+  DEFAULT_CONTEXT_MAX_CHARS,
+  MIN_CONTEXT_MAX_CHARS,
+} from "./context/context-pack.js";
+import type { ContextPackResult } from "./context/context-pack.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
@@ -174,7 +186,7 @@ export interface ReviewDependencies {
       inline?: boolean;
       suggestions?: boolean;
       relatedWork?: readonly RelatedWorkItem[];
-      contextUnavailable?: readonly string[];
+      contextUnavailable?: readonly ContextUnavailableLabel[];
       reviewBinding?: { repositoryDigest: string; reviewNumber: number; headSha: string };
       clarification?: ClarificationPresentation;
       deferredClarificationCount?: number;
@@ -183,6 +195,12 @@ export interface ReviewDependencies {
   ) => OrchestrationResult;
   createStateStore?: typeof createConversationStateStore;
   publicationHooks?: PublicationExecutorHooks;
+  /**
+   * Prepares trusted-base repository context. Injectable so a review test
+   * never has to build a git worktree or start a mapping session — the same
+   * stance `dispatchRules` takes for its session factory.
+   */
+  prepareContext?: typeof prepareReviewContextReal;
   now?: () => string;
 }
 
@@ -395,10 +413,10 @@ async function loadOptionalReviewContext(options: {
   fingerprint?: string;
   existingIssues: readonly ExistingReviewIssue[];
   discussionMemories: readonly DiscussionMemory[];
-  unavailable: string[];
+  unavailable: ContextUnavailableLabel[];
   unavailableReason?: string;
 }> {
-  const unavailable: string[] = [];
+  const unavailable: ContextUnavailableLabel[] = [];
   let unavailableReason: string | undefined;
   const resolved = options.identity !== undefined || options.identityUnavailable !== undefined
     ? { identity: options.identity, unavailable: options.identityUnavailable, reason: options.identityUnavailableReason }
@@ -828,8 +846,10 @@ export async function review(
             undefined,
             input.orchestratorModel,
             input.conversationContext,
+            input.contextPacks,
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
+  const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
   const fetchJsonFn = deps.fetchJson ?? fetchJsonReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
@@ -966,7 +986,21 @@ export async function review(
         (cause === undefined ? "" : ` (${cause})`),
     );
   }
-  const configHash = computeReviewConfigHash(config, relatedWorkFingerprint(extracted), loadedContext.fingerprint);
+  // Computed BEFORE any mapping, and from the cache key identity rather than a
+  // produced manifest, so it can take part in the dedup decision that decides
+  // whether mapping is worth doing at all. See `contextFingerprint`.
+  const contextIdentity = contextFingerprint({
+    mode: config.context,
+    baseSha: pr.baseSha,
+    ...(config.contextMaxChars === undefined ? {} : { maxChars: config.contextMaxChars }),
+    allowDegraded: config.allowDegradedContext,
+  });
+  const configHash = computeReviewConfigHash(
+    config,
+    relatedWorkFingerprint(extracted),
+    loadedContext.fingerprint,
+    ...(contextIdentity === undefined ? [] : [contextIdentity]),
+  );
   const storeBinding = storeBindingOf(stateStore, repository);
   const publicationIdentity = reviewPublicationIdentity({
     repository: storeBinding,
@@ -1145,26 +1179,20 @@ export async function review(
   // dispatch contract rejects a partial map — and omitted entirely when nothing
   // changed, so an ordinary review gains no empty section.
   const dependencyChanges = dependencyChangesFromDiff(diff);
-  // The legacy orchestrator has no context-pack concept: its prompt builder
-  // never receives one, so the map below would be dropped on the floor while
-  // the registry requests still went out — an operator paying for lookups and
-  // getting a run that cannot produce a dependency finding (PR #54 review).
-  // Say so instead of plumbing trusted-context surface into an engine that is
-  // on its way out.
-  const dependencyFactsUnavailable =
-    args.dependencyFacts === "on" && args.dispatch === "legacy" && dependencyChanges.length > 0;
-  if (dependencyFactsUnavailable) {
-    console.warn(
-      "tgd-review-agent: --dependency-facts needs --dispatch direct; the legacy engine cannot " +
-        "carry host context, so no registry lookup was made and no dependency context was supplied",
-    );
-  }
+  // The guard that used to stand here suppressed dependency facts under
+  // `--dispatch legacy`, because the legacy orchestrator's prompt builder never
+  // received a context pack and the registry lookups would have been paid for
+  // and thrown away (PR #54 review). Wiring context for #58 removed that
+  // premise: `buildDispatchPrompt` now takes `packsByRule` and embeds it per
+  // rule, and `dispatchRules` validates it exactly as the direct engine does.
+  // Suppressing the feature on a stale premise would deny an operator the facts
+  // they asked for, so both engines now carry them.
   // Opt-in, and the only outbound request the tool makes. Without it the pack
   // still ships the parsed versions and says plainly that nothing was checked —
   // which is why leaving this unwired shipped a rule that could never see the
   // facts it exists to check (PR #54 review).
   const dependencyFacts =
-    args.dependencyFacts === "on" && !dependencyFactsUnavailable && dependencyChanges.length > 0
+    args.dependencyFacts === "on" && dependencyChanges.length > 0
       ? await fetchDependencyFacts(dependencyChanges, fetchJsonFn)
       : [];
   // Part of the opt-in, not a default. Package names and manifest paths come
@@ -1179,9 +1207,107 @@ export async function review(
   const dependencyPack = args.dependencyFacts === "on"
     ? dependencyContextPack(dependencyChanges, dependencyFacts)
     : undefined;
-  const contextPacks = dependencyPack === undefined
-    ? undefined
-    : Object.fromEntries(rules.map((rule) => [rule.name, dependencyPack]));
+  // --context-max-chars is the operator's per-rule cost control, and the two
+  // producers share one rule's pack — so the repository map is rendered against
+  // what is LEFT after the dependency section, not against the whole ceiling.
+  // Reserving beats truncating the combined text: the repository pack is the
+  // one with a principled way to shrink (it drops whole evidence entries and
+  // reports the omission counts), while the dependency section is a list of
+  // factual claims that must not be cut mid-sentence.
+  //
+  // Clamped at MIN_CONTEXT_MAX_CHARS: a very large dependency section could
+  // otherwise leave no room at all, and a review is better served by a small
+  // repository pack than none. In that case the combined text does exceed the
+  // ceiling, which is the honest trade and is documented in the README.
+  const repositoryContextBudget = Math.max(
+    MIN_CONTEXT_MAX_CHARS,
+    (config.contextMaxChars ?? DEFAULT_CONTEXT_MAX_CHARS) - (dependencyPack?.text.length ?? 0),
+  );
+  // Trusted-base repository context. Deliberately prepared HERE — after the
+  // dedup skip above and after the rule set is known to be non-empty — because
+  // mapping is by far the most expensive step in a review, and a run that is
+  // going to be skipped, or that has no rules to hand a pack to, must never
+  // pay for it.
+  let contextPreparation: Awaited<ReturnType<typeof prepareReviewContextReal>>;
+  try {
+    // Root selection can itself throw — it reads HOME/XDG_CACHE_HOME, and a
+    // container may set neither. It sits INSIDE the try so that failure
+    // degrades like any other context failure instead of killing a review
+    // that could still run on the diff alone.
+    const roots = config.context === "off"
+      // `off` must touch nothing at all, including the environment lookup:
+      // asking for no context cannot be a reason to fail on an unset HOME.
+      ? { workspaceRoot: "", cacheRoot: "" }
+      : contextRoots(selectContextRoot({
+        ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
+      }));
+    contextPreparation = await prepareContextFn(
+      {
+        mode: config.context,
+        repository,
+        baseSha: pr.baseSha,
+        headSha: pr.headSha,
+        // Both sides of the diff: the map is built from the base commit,
+        // where a renamed file still sits under its old path.
+        changedFiles: changedFilesWithRenameSources(diff),
+        ruleNames: rules.map((rule) => rule.name),
+        maxChars: repositoryContextBudget,
+        allowDegraded: config.allowDegradedContext,
+        ...roots,
+      },
+      {},
+    );
+  } catch (error) {
+    // `--context require` is the mode whose whole point is that reviewing
+    // without repository context is worse than not reviewing: it exits fatal
+    // with the reason, before any comment is written.
+    if (error instanceof ContextRequiredError) {
+      console.error(`tgd-review-agent: ${error.message}`);
+      logStatus({ status: "skipped", findingsCount: 0, rulesRun: [], rulesFailed: [], reason: "context-required" });
+      return EXIT_FATAL;
+    }
+    if (config.context === "require") throw error;
+    // Everything else degrades. `prepareReviewContext` is already a
+    // never-throws boundary under `auto`, so reaching here means the failure
+    // was in selecting the roots or in the injected seam itself — neither is
+    // a reason to abandon a review that can still run without context.
+    console.warn(`tgd-review-agent: repository context could not be prepared: ${redactedMessage(error)}`);
+    contextPreparation = { status: "unavailable", reasons: [redactedMessage(error)] };
+  }
+  if (contextPreparation.status === "unavailable") {
+    // Never fatal under `auto`: the review proceeds on the diff and the rules
+    // alone, and says so in the summary. The reasons themselves stay on
+    // stderr — they are mapper diagnostics that can name local paths, and the
+    // published comment carries only the label.
+    console.warn(
+      `tgd-review-agent: repository context is unavailable; reviewing without it ` +
+        `(${contextPreparation.reasons.join("; ")})`,
+    );
+  } else if (contextPreparation.status === "ready") {
+    console.log(
+      `tgd-review-agent: repository context ready for ${rules.length} rule(s) ` +
+        `(${contextPreparation.cacheHit ? "cached" : "mapped"} at base ${pr.baseSha})`,
+    );
+  }
+
+
+  // Two independent producers of trusted context now exist — the repository
+  // map and the host's dependency facts — and the dispatch contract
+  // allows exactly ONE pack per rule, sharing one manifest hash. Neither can
+  // be dropped, so they are folded together per rule; a rule with neither gets
+  // no pack, and a review with no packs at all sends none.
+  const repositoryPacks = contextPreparation.status === "ready" ? contextPreparation.packs : undefined;
+  const combinedPacks = new Map<string, ContextPackResult>();
+  for (const rule of rules) {
+    const combined = combineContextPacks([repositoryPacks?.[rule.name], dependencyPack]);
+    if (combined !== undefined) combinedPacks.set(rule.name, combined);
+  }
+  // Partial coverage is a caller error the dispatch validator rejects, so it is
+  // all rules or none. Both producers are per-review rather than per-rule, so
+  // this only ever holds when one of them is absent for every rule alike.
+  const contextPacks = combinedPacks.size === rules.length && combinedPacks.size > 0
+    ? Object.fromEntries(combinedPacks)
+    : undefined;
   const dispatchResult = await dispatchRulesFn({
     rules,
     diff,
@@ -1235,6 +1361,13 @@ export async function review(
         now,
         hooks: publicationHooks,
       });
+  // "repository" joins the existing discussion/memory labels rather than
+  // carrying the mapper's message: the summary is published, and a raw mapper
+  // diagnostic can name local filesystem paths.
+  const reviewContextLabels: ContextUnavailableLabel[] = [
+    ...loadedContext.unavailable,
+    ...(contextPreparation.status === "unavailable" ? ["repository" as const] : []),
+  ];
   const orchestration = orchestrateFn(dispatchResult, diff, {
     inline: true,
     ...renderOpts,
@@ -1243,7 +1376,7 @@ export async function review(
     discussionMemories: loadedContext.discussionMemories,
     reviewBinding,
     ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
-    ...(loadedContext.unavailable.length === 0 ? {} : { contextUnavailable: loadedContext.unavailable }),
+    ...(reviewContextLabels.length === 0 ? {} : { contextUnavailable: reviewContextLabels }),
   });
   // Issue #36: the severity mix, on its own machine-readable line so
   // calibration drift is trackable ACROSS runs. A rule set returning 80%

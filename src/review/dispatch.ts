@@ -28,6 +28,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { RuleDefinition } from "../rules/types.js";
 import { buildDispatchPrompt } from "./dispatch-prompt.js";
+import { validateDispatchContext } from "./dispatch-context.js";
 import {
   enforceSuggestionProvenance,
   fallbackResult,
@@ -45,7 +46,8 @@ import {
   describeAuthContext,
   PI_AUTH_ERROR_RE,
 } from "./session-hermetics.js";
-import type { DispatchResult, ReviewConversationContext } from "./types.js";
+import type { DispatchResult, ReviewConversationContext, RuleContextPacks } from "./types.js";
+import type { ContextPackResult } from "../context/context-pack.js";
 
 // Re-exported public surface (unchanged by the design-review #8 split).
 export type { DispatchResult, Finding } from "./types.js";
@@ -211,6 +213,12 @@ export async function dispatchRules(
    */
   orchestratorModel?: string,
   conversationContext?: ReviewConversationContext,
+  /**
+   * Caller-owned trusted-base context, keyed by rule name. Validated by
+   * `validateDispatchContext` exactly as the direct engine validates it, so
+   * both engines reject the same malformed input for the same reason.
+   */
+  contextPacks?: RuleContextPacks,
 ): Promise<DispatchResult> {
   // SINGLE-FLIGHT GUARD (design-review item #5). runDispatch mutates a
   // process-global — process.env.PI_CODING_AGENT_DIR — for the duration of a
@@ -224,8 +232,21 @@ export async function dispatchRules(
   // never rejects (runDispatch is itself a never-throws boundary, and the
   // defensive catch below keeps one hypothetical rejection from wedging every
   // later call), so this cannot deadlock or leak an error across calls.
+  // Validated OUTSIDE the chain and before the run: a malformed context pack
+  // is a caller error and must reject, not degrade into an all-failed
+  // provider result the way a session failure does. Same stance as
+  // `dispatchRulesDirect`.
+  const validatedContext = validateDispatchContext(rules, contextPacks);
   const run = dispatchChain.then(() =>
-    runDispatch(rules, diff, useAdvisor, createSession, orchestratorModel, conversationContext),
+    runDispatch(
+      rules,
+      diff,
+      useAdvisor,
+      createSession,
+      orchestratorModel,
+      conversationContext,
+      validatedContext.packsByRule,
+    ),
   );
   dispatchChain = run.catch(() => undefined);
   return run;
@@ -241,6 +262,7 @@ async function runDispatch(
   createSession: DispatchSessionFactory,
   orchestratorModel?: string,
   conversationContext?: ReviewConversationContext,
+  packsByRule?: ReadonlyMap<string, ContextPackResult>,
 ): Promise<DispatchResult> {
   // Hermetic agent dir + PI_CODING_AGENT_DIR override (intercom-bridge fix,
   // see createIsolatedAgentDir) are set up ONLY for the real session factory.
@@ -335,7 +357,7 @@ async function runDispatch(
     };
 
     const session = await createSession(useAdvisor, sessionCwd, modelRequest);
-    const prompt = buildDispatchPrompt(effective, diff, useAdvisor, conversationContext);
+    const prompt = buildDispatchPrompt(effective, diff, useAdvisor, conversationContext, packsByRule);
 
     // Capture the subagent tool's structured per-task results (details.results)
     // so we can deterministically reconcile the orchestrator's self-reported

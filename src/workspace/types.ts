@@ -4,6 +4,17 @@ export interface WorkspaceRequest {
   root: string;
   repo: RepositoryRef;
   baseSha: string;
+  /**
+   * Refuse a root other users could previously write, rather than adopting it.
+   *
+   * Off by default, preserving the adopt-and-secure behaviour this module has
+   * always had and its tests assert. Callers that go on to RUN something out of
+   * the workspace turn it on: a previously-shared root can hold a
+   * pre-created bare mirror carrying the expected origin plus an attacker's
+   * `hooks/post-checkout`, and the `git worktree add` below executes that hook.
+   * chmod 0700 locks such a mirror in rather than shutting it out.
+   */
+  rejectPreviouslySharedRoot?: boolean;
 }
 
 export interface WorkspacePaths {

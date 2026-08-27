@@ -35,6 +35,7 @@ const CONTROL_CHARACTER_RE = /[\u0000-\u001f\u007f]/u;
  * list is silently short: the response is a normal 200 with no marker saying
  * anything is missing.
  */
+import { quoteGitPathOperand } from "../review/diff-anchors.js";
 export const GITHUB_PULL_FILES_CAP = 3000;
 
 export interface ReconstructedDiff {
@@ -217,7 +218,13 @@ export function reconstructDiffFromFiles(
     const removed = status === "removed";
     const moved = status === "renamed" || status === "copied";
 
-    lines.push(`diff --git a/${oldPath} b/${newPath}`);
+    // Quoted the way git would quote them. Interpolating the paths raw
+    // produced headers git never emits — `a/foo"bar.ts b/foo"bar.ts` for a
+    // name containing a quote — and every parser written against git's actual
+    // format then had to guess at them. Two separate parsing defects came from
+    // that guessing; fixing the producer removes the whole class rather than
+    // the two instances found so far.
+    lines.push(`diff --git ${quoteGitPathOperand("a", oldPath)} ${quoteGitPathOperand("b", newPath)}`);
     if (moved) {
       const verb = status === "renamed" ? "rename" : "copy";
       lines.push(`${verb} from ${oldPath}`, `${verb} to ${newPath}`);

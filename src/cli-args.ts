@@ -1,6 +1,7 @@
 import path from "node:path";
 import { parseArgs as nodeParseArgs } from "node:util";
 import { parseReviewTarget } from "./target/review-target.js";
+import { MAX_CONTEXT_MAX_CHARS, MIN_CONTEXT_MAX_CHARS } from "./context/context-pack.js";
 
 export interface SharedReviewOptions {
   vcs: "github" | "gitlab";
@@ -29,6 +30,19 @@ export interface SharedReviewOptions {
   dispatch: "direct" | "legacy";
   /** Hard diff-size cost ceiling; absent means unlimited. */
   maxDiffChars?: number;
+  /**
+   * Whether to give the reviewing rules trusted-base repository context.
+   * `auto` maps when it can and degrades to a context-free review when it
+   * cannot; `require` refuses to review blind; `off` never maps, which also
+   * means never paying for the first map of a large repository.
+   */
+  context: "off" | "auto" | "require";
+  /** Per-rule context-pack size ceiling; absent uses the pack builder's default. */
+  contextMaxChars?: number;
+  /** Lets mapping publish a partial result instead of failing outright. */
+  allowDegradedContext: boolean;
+  /** Absolute root for the managed base worktree and the context cache. */
+  contextDir?: string;
   stateDir?: string;
 }
 
@@ -54,6 +68,8 @@ const DEFAULTS = {
   dryRun: false,
   trustLocalRules: false,
   dispatch: "direct" as const,
+  context: "auto" as const,
+  allowDegradedContext: false,
 };
 
 export function parseCommandArgs(argv: string[]): CommandArgs {
@@ -80,6 +96,10 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "trust-local-rules": { type: "boolean" },
       "max-diff-chars": { type: "string" },
       dispatch: { type: "string" },
+      context: { type: "string" },
+      "context-max-chars": { type: "string" },
+      "allow-degraded-context": { type: "boolean" },
+      "context-dir": { type: "string" },
       "state-dir": { type: "string" },
     },
   });
@@ -161,6 +181,35 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     maxDiffChars = Number(maxDiffCharsRaw);
   }
 
+  const context = (values.context as string | undefined) ?? DEFAULTS.context;
+  if (context !== "off" && context !== "auto" && context !== "require") {
+    throw new Error(`Invalid --context value: "${context}" (expected "off", "auto" or "require")`);
+  }
+
+  const contextMaxCharsRaw = values["context-max-chars"] as string | undefined;
+  let contextMaxChars: number | undefined;
+  if (contextMaxCharsRaw !== undefined) {
+    // Bounds are enforced by the pack builder itself; rejecting them here too
+    // means an out-of-range value fails at the flag, naming the flag, instead
+    // of surfacing later as a context that silently went unavailable.
+    if (!/^\d+$/.test(contextMaxCharsRaw)) {
+      throw new Error(
+        `Invalid --context-max-chars value: "${contextMaxCharsRaw}" (expected a positive integer)`,
+      );
+    }
+    contextMaxChars = Number(contextMaxCharsRaw);
+    if (contextMaxChars < MIN_CONTEXT_MAX_CHARS || contextMaxChars > MAX_CONTEXT_MAX_CHARS) {
+      throw new Error(
+        `Invalid --context-max-chars value: "${contextMaxCharsRaw}" (expected ${MIN_CONTEXT_MAX_CHARS}-${MAX_CONTEXT_MAX_CHARS})`,
+      );
+    }
+  }
+
+  const contextDir = values["context-dir"] as string | undefined;
+  if (contextDir !== undefined && (contextDir.length === 0 || !path.isAbsolute(contextDir))) {
+    throw new Error(`Invalid --context-dir value: "${contextDir}" (expected an absolute path)`);
+  }
+
   const stateDir = values["state-dir"] as string | undefined;
   if (stateDir !== undefined && (stateDir.length === 0 || !path.isAbsolute(stateDir))) {
     throw new Error(`Invalid --state-dir value: "${stateDir}" (expected an absolute path)`);
@@ -172,6 +221,11 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     model,
     maxDiffChars,
     dispatch,
+    context,
+    contextMaxChars,
+    allowDegradedContext:
+      (values["allow-degraded-context"] as boolean | undefined) ?? DEFAULTS.allowDegradedContext,
+    contextDir,
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,

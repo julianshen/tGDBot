@@ -147,15 +147,39 @@ const ADVISOR_INSTRUCTION =
 // rather than silent.
 const DIFF_COST_WARNING_THRESHOLD_CHARS = 500_000; // ~125k tokens at ~4 chars/token
 
-function warnIfDiffCostRisk(rules: EffectiveRule[], diff: string): void {
-  const totalChars = diff.length * rules.length;
-  if (rules.length > 1 && totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
+function warnIfDiffCostRisk(
+  rules: EffectiveRule[],
+  diff: string,
+  packsByRule?: ReadonlyMap<string, ContextPackResult>,
+): void {
+  // The trusted-base context pack is embedded per rule for exactly the same
+  // reason the diff is (each reviewer is a fresh child session), so it scales
+  // the same way and belongs in the same accounting. Counting only the diff
+  // under-reported a review that carries a 30k-char pack per rule.
+  const packChars = rules.reduce(
+    (total, rule) => total + (packsByRule?.get(rule.name)?.text.length ?? 0),
+    0,
+  );
+  const totalChars = diff.length * rules.length + packChars;
+  // Gated on the SIZE alone. It used to also require more than one rule, on the
+  // reasoning that the warning is about per-rule duplication — but the operator
+  // is being told what this dispatch will cost, and a single rule carrying a
+  // huge diff and a full context pack costs that whether or not anything is
+  // duplicated. Under the old gate exactly that run warned nowhere.
+  if (totalChars > DIFF_COST_WARNING_THRESHOLD_CHARS) {
+    // A breakdown of the total, not an addition to it: `totalChars` already
+    // includes `packChars`, and "plus ~N" read as though it did not.
+    const packNote = packChars === 0 ? "" : `, of which ~${packChars} is trusted-base context`;
+    // The scaling half of the message is only true when there is something to
+    // scale; on a single rule it would be describing a multiplier of one.
+    const scalingNote = rules.length > 1
+      ? ` — this is required because each dispatched "reviewer" subagent runs in a fresh, isolated ` +
+        `child session with no access to the orchestrator's own context, but it does mean ` +
+        `cost/context-window usage scales with rule count on large diffs or rule sets.`
+      : `.`;
     console.warn(
       `dispatchRules: dispatch prompt embeds the ${diff.length}-char diff once per rule ` +
-        `(${rules.length} rules, ~${totalChars} chars total) — this is required because each ` +
-        `dispatched "reviewer" subagent runs in a fresh, isolated child session with no access ` +
-        `to the orchestrator's own context, but it does mean cost/context-window usage scales ` +
-        `with rule count on large diffs or rule sets.`,
+        `(${rules.length} rule${rules.length === 1 ? "" : "s"}, ~${totalChars} chars total${packNote})${scalingNote}`,
     );
   }
 }
@@ -233,8 +257,15 @@ export function buildDispatchPrompt(
   diff: string,
   useAdvisor: boolean,
   conversationContext?: ReviewConversationContext,
+  /**
+   * Trusted-base context, keyed by rule name. Before this parameter existed
+   * the orchestrated path passed `undefined` here unconditionally, so
+   * `--dispatch legacy` could not carry context at all while `direct` could —
+   * a silent difference in what the two engines showed a reviewer.
+   */
+  packsByRule?: ReadonlyMap<string, ContextPackResult>,
 ): string {
-  warnIfDiffCostRisk(rules, diff);
+  warnIfDiffCostRisk(rules, diff, packsByRule);
 
   const ruleNames = rules.map((rule) => rule.name);
 
@@ -246,7 +277,7 @@ export function buildDispatchPrompt(
         `  agent: "reviewer"`,
         `  model: "${modelRef}"`,
         `  task: """`,
-        buildTaskText(rule, diff, undefined, conversationContext),
+        buildTaskText(rule, diff, packsByRule?.get(rule.name), conversationContext),
         `  """`,
       ].join("\n");
     })

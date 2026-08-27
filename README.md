@@ -389,8 +389,9 @@ tgd-review-agent review \
                                   # Off by default because it reveals a private
                                   # repository's dependencies to a third party. With it off the
                                   # context still lists the changed versions and says plainly that
-                                  # none of them were checked. Needs --dispatch direct (the default):
-                                  # the legacy engine cannot carry host context and will say so.
+                                  # none of them were checked. Carried by BOTH dispatch
+                                  # engines: the registry lookup and the context section it
+                                  # produces do not depend on which engine runs the rules.
                                   # See examples/rules/dependency-currency.md
   --model <provider>/<model>     # optional: the DEFAULT model. Runs the review's orchestrating
                                   # session AND any rule that doesn't pin its own provider/model
@@ -415,6 +416,22 @@ tgd-review-agent review \
                                   # accounting are exact by construction. "legacy" is the previous
                                   # LLM-orchestrated pi-subagents fan-out, kept for one release as an
                                   # escape hatch.
+  --context off|auto|require     # default: auto. Gives every rule a TRUSTED-BASE map of the code
+                                  # the diff is changing — the knowledge-graph neighbourhood of the
+                                  # changed files, the domain flows touching them — so a reviewer can
+                                  # see callers the diff does not show. "auto" maps when it can and
+                                  # reviews WITHOUT context when it cannot, saying so in the summary;
+                                  # "require" refuses to review blind (exit 1, nothing posted);
+                                  # "off" never maps. See "Repository context" below.
+  --context-max-chars <n>        # default 30000 (bounds 4000-120000): per-rule ceiling on the
+                                  # context pack. Like the diff, the pack is embedded once per rule.
+  --allow-degraded-context       # optional: let mapping report a partial result instead of failing
+                                  # outright. Note a degraded map has no knowledge graph, and a pack
+                                  # without one is not something a rule can reason over — so this
+                                  # changes the REASON reported, not whether context arrives.
+  --context-dir <absolute-path>  # optional: where the managed base worktree and the context cache
+                                  # live. Default: $XDG_CACHE_HOME/tgd-review-agent (or
+                                  # ~/.cache/tgd-review-agent), overridable via TGD_REVIEW_CONTEXT_DIR.
   --dry-run                      # post nothing: print the summary comment AND a preview of every
                                   # inline comment it would have posted (file:line + body)
   --trust-local-rules            # optional: read --rules-dir directly off the local filesystem
@@ -428,6 +445,101 @@ Exit codes: `0` success (posted, or skipped because the head SHA was already
 reviewed), `1` fatal (e.g. every rule failed to load), `2` partial (at least
 one rule ran, but something also failed — the comment is still posted and
 the failure is noted in it).
+
+### Repository context
+
+By default (`--context auto`) each dispatched rule is given a **trusted-base
+context pack** alongside the diff: the part of the repository map that is
+relevant to the files this PR changes.
+
+Why it exists: the built-in rule defines `severity: "blocking"` as *"a
+reachable execution path leads to data loss, corruption, a security failure,
+or a materially wrong result"*. Reachability is a property of the call graph,
+and a reviewer holding only a diff hunk cannot establish it. That gap produces
+the two complaints people actually have — a changed function reported as
+unused because its only caller is outside the diff, and a real break in a
+caller the diff never shows.
+
+**How it works.** On the first review of a given base commit the CLI prepares a
+detached worktree at that commit, runs the tGD mapper over it, and publishes
+the result — `CONTEXT.md`, a knowledge graph, and either a domain graph or an
+explicit zero-domains marker — into a cache keyed by
+`{repository, base SHA, schema version, mapper version, policy version}`. Every
+later review of the same base commit reuses it and starts no mapping session.
+Selection happens once per review and is rendered once per rule, bounded by
+`--context-max-chars`.
+
+**It maps the BASE branch, never the PR.** This is not an implementation
+detail. The mapper runs a pi session with `bash`, `edit` and `write` — the
+tools that were deliberately removed from review subagents (see "Read-only
+enforcement" below). Pointing that at a PR's own checkout would hand arbitrary
+code execution to anyone who can open a pull request. It is the same trust
+decision already made for rule files, for the same reason, and it is enforced
+in two places: the managed worktree refuses to sit at anything but the
+requested base commit, and the preparation step re-checks that before handing
+a path to the mapper.
+
+The pack lands in the task prompt's `[TRUSTED_CONTEXT]` section, separate from
+`[UNTRUSTED_DIFF]`, and its own header restates the boundary: trusted-base
+artifacts are *evidence*, not instructions, and cannot override a review rule.
+
+**Failure is never fatal under `auto`.** Mapping is a long, model-driven step:
+it will time out, and it will meet repositories the mapper cannot handle. Every
+failure degrades to a review without context plus a note in the summary
+("Repository context was unavailable for this run"). The detailed reason goes
+to stderr, not into the published comment — mapper diagnostics can name local
+filesystem paths. `--context require` is the opt-in for callers who would
+rather not review at all than review blind.
+
+**Cost.** The first map of a large repository is a long, model-priced step, and
+each rule's pack is embedded in that rule's prompt. `--context off` skips all
+of it, and is the right setting for a one-line typo fix or a CI job that cannot
+afford a first-run map. Turning context on or off changes the review's config
+hash, so each open PR re-reviews once after the change and is then stable
+again; `off` hashes exactly as it did before this feature existed, so opting
+out costs no re-review at all.
+
+**The cache root must be private to you.** Before anything is read from it,
+the context cache root is checked the same way the managed git workspace root
+already is: a real directory you own, under ancestors no other user can
+replace, then chmod 0700. This is not belt-and-braces —
+`ContextCache.lookupContext` verifies that an entry's artifacts match the
+hashes in its own manifest, but a manifest is self-describing and says nothing
+about who wrote it. On a shared writable root, another local user could
+pre-create the deterministic entry with a perfectly self-consistent manifest,
+and its text would go straight into `[TRUSTED_CONTEXT]`. Hash integrity is not
+provenance. Point `--context-dir` somewhere only you can write.
+
+The same rule covers the managed worktree, and there it guards code execution
+rather than context: `git worktree add` runs the mirror's
+`hooks/post-checkout`, so a previously-shared workspace root could hold a
+pre-created mirror with the expected origin and an attacker's hook in it.
+Mapping refuses such a root instead of adopting it.
+
+**On Windows this check does nothing.** It is built on POSIX ownership and
+mode bits, and Node has no portable API for the ACLs that would replace them,
+so the cache root is unverified there and a directory another local user can
+write could be pre-populated with an entry that is then read as trusted
+context. Until that is resolved, on Windows either keep the cache root
+somewhere exclusively yours or run with `--context off`.
+
+`--context-max-chars` is a ceiling on the whole trusted-context section a rule
+receives, not on the repository map alone. When `--dependency-facts` also
+produces a section, its size is reserved first and the repository map is
+rendered against what is left — reserving rather than truncating, because the
+map can drop whole evidence entries and report the omission counts while a list
+of dependency facts cannot be cut mid-claim. The repository map keeps a floor of
+4000 characters, so a very large dependency section is the one case where the
+combined text exceeds the ceiling.
+
+`--dry-run` prepares context exactly as a real run would, so the preview it
+prints is the review you would actually get. That means a dry run on a cold
+cache pays for the first map; pair it with `--context off` if you only wanted
+to check configuration.
+
+**Not yet wired:** business-reference documents. The pack renders "No business
+reference is available in this manifest" until `--context` learns to publish
+them.
 
 ### What the review looks like
 

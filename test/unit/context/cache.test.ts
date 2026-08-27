@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, link, lstat, mkdtemp, mkdir, open, readFile, rename, rm, symlink, truncate, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, mkdir, open, readFile, rename, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -1639,5 +1639,87 @@ describe("ContextCache", () => {
     await expect(cache.promoteContext(staging, input())).rejects.toBeInstanceOf(ContextCacheConflictError);
     await expect(cache.lookupContext(key)).resolves.toEqual(first);
     await expect(readFile(path.join(staging, "CONTEXT.md"), "utf8")).resolves.toContain("Different");
+  });
+});
+
+// `promoteContext` deliberately leaves its claim behind when a process dies
+// mid-publication, so a later publisher cannot guess it is stale and overlap a
+// live one. Left at that, a single crash breaks the base commit permanently:
+// nothing else creates the entry, so every later run re-maps, finds the claim
+// held, and gives up — as a non-zero exit under `--context require` — until
+// someone deletes the directory by hand.
+describe("ContextCache.reclaimStaleClaim", () => {
+  const claimFor = (cache: ContextCache): string => `${cache.entryPath(key)}.publishing`;
+
+  it("reports nothing to reclaim when no claim exists", async () => {
+    const cache = new ContextCache(await tempRoot());
+    await expect(cache.reclaimStaleClaim(key)).resolves.toBe(false);
+  });
+
+  // The property that keeps the original reason intact. A publisher holds its
+  // claim for one `promoteContext` — hashing artifacts, then renaming them into
+  // place — and must never have it pulled out from under it.
+  it("leaves a claim younger than the age threshold alone", async () => {
+    const cache = new ContextCache(await tempRoot());
+    const claim = claimFor(cache);
+    await mkdir(claim, { recursive: true });
+
+    await expect(cache.reclaimStaleClaim(key)).resolves.toBe(false);
+    await expect(lstat(claim)).resolves.toBeDefined();
+  });
+
+  it("reclaims a claim older than the age threshold", async () => {
+    const cache = new ContextCache(await tempRoot());
+    const claim = claimFor(cache);
+    await mkdir(claim, { recursive: true });
+    // What a crash leaves behind: the claim, with the staged entry still inside.
+    await mkdir(path.join(claim, "entry"), { recursive: true });
+    await writeFile(path.join(claim, "entry", "CONTEXT.md"), "# abandoned\n", "utf8");
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(claim, twoHoursAgo, twoHoursAgo);
+
+    await expect(cache.reclaimStaleClaim(key)).resolves.toBe(true);
+    await expect(lstat(claim)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Two reviews of the same base can start together. The reclaim commits at the
+  // `rename`, so exactly one of them may report having done it — a second
+  // "true" would have two publishers each believing they cleared the way.
+  it("lets exactly one of two racing reclaimers report the reclaim", async () => {
+    const cache = new ContextCache(await tempRoot());
+    const claim = claimFor(cache);
+    await mkdir(claim, { recursive: true });
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(claim, twoHoursAgo, twoHoursAgo);
+
+    const results = await Promise.all([cache.reclaimStaleClaim(key), cache.reclaimStaleClaim(key)]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    await expect(lstat(claim)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // A symlink at the claim path is not a claim this cache wrote. Following it
+  // would move or delete a directory outside the root entirely.
+  it("refuses to reclaim through a symlink, however old", async () => {
+    const cache = new ContextCache(await tempRoot());
+    const outside = await tempRoot();
+    const claim = claimFor(cache);
+    await mkdir(path.dirname(claim), { recursive: true });
+    await symlink(outside, claim);
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    await utimes(outside, twoHoursAgo, twoHoursAgo);
+
+    await expect(cache.reclaimStaleClaim(key)).resolves.toBe(false);
+    await expect(lstat(outside)).resolves.toBeDefined();
+  });
+
+  it("honours a caller-supplied age threshold and clock", async () => {
+    const cache = new ContextCache(await tempRoot());
+    const claim = claimFor(cache);
+    await mkdir(claim, { recursive: true });
+
+    // Same claim, same instant: stale under a one-millisecond threshold read an
+    // hour later, fresh under the default.
+    await expect(cache.reclaimStaleClaim(key, 60 * 60 * 1000)).resolves.toBe(false);
+    await expect(cache.reclaimStaleClaim(key, 1, Date.now() + 60 * 60 * 1000)).resolves.toBe(true);
   });
 });
