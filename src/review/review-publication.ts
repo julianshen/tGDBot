@@ -454,6 +454,36 @@ export async function publishReviewFromManifest(options: {
    * what guarantees they ARE the same bytes, with no timestamp or re-sorted set
    * to make two attempts differ (issue #55).
    */
+  /**
+   * The account the tips must name.
+   *
+   * The command parser requires the AUTHENTICATED account's exact mention, so a
+   * placeholder renders every command in the digest inert on any installation
+   * not called `tgdbot` — which is the bring-your-own-token case (PR #72
+   * review). Resolved once; a failure drops the tips rather than publishing
+   * commands that cannot work.
+   */
+  let botLogin: string | undefined;
+  let botLoginResolved = false;
+  async function resolveBotLogin(): Promise<string | undefined> {
+    if (botLoginResolved) return botLogin;
+    botLoginResolved = true;
+    try {
+      // Present on the conversation-capable adapters, which is every adapter
+      // the CLI constructs; typed narrowly here so a bare VcsAdapter still
+      // satisfies the contract.
+      const identity = (vcsAdapter as Partial<{
+        getAuthenticatedBotIdentity: () => Promise<{ login: string }>;
+      }>).getAuthenticatedBotIdentity;
+      botLogin = identity === undefined
+        ? undefined
+        : (await identity.call(vcsAdapter)).login;
+    } catch {
+      botLogin = undefined;
+    }
+    return botLogin;
+  }
+
   let reviewDigest: string | undefined;
   function reviewBody(): string | undefined {
     const summary = orchestration?.summaryInput;
@@ -486,6 +516,12 @@ export async function publishReviewFromManifest(options: {
       // confirmed identity is available by the time this composes.
       ...(botComment === null ? {} : { summaryUrl: summaryIdentityOf(botComment).url }),
       ...(orchestration?.modelsUsed === undefined ? {} : { models: orchestration.modelsUsed }),
+      ...(botLogin === undefined ? {} : { botLogin }),
+      // The legend describes the INLINE comments, so it is driven by the
+      // findings that become them rather than by every finding.
+      inlineFindings: orchestration?.inlineComments
+        .map((comment) => orchestration.findingByClientId?.get(comment.clientId))
+        .filter((finding): finding is Finding => finding !== undefined) ?? [],
     });
   }
 
@@ -494,6 +530,8 @@ export async function publishReviewFromManifest(options: {
     children: readonly PublicationChild[],
   ): Promise<Map<string, PublicationWriteResult>> {
     const comments = children.map((entry) => toInlineComment(entry, provider));
+    // Before the first compose, so the login is part of the memoized bytes.
+    await resolveBotLogin();
     const results = new Map<string, PublicationWriteResult>();
     try {
       const outcomes = await vcsAdapter.createInlineReview(

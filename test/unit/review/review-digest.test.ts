@@ -5,6 +5,7 @@ import {
   BOT_SIGNATURE_BLOCK,
   renderInlineComment,
   MAX_REVIEW_DIGEST_CHARS,
+  botSignature,
   exceedsAtomicPayload,
   renderReviewDigest,
 } from "../../../src/review/comment-format.js";
@@ -53,15 +54,33 @@ describe("renderReviewDigest — what the run found", () => {
     expect(body).toMatch(/1 .*[Ww]arning/);
   });
 
-  it("says how many landed inline and how many did not", () => {
+  // PR #72 review: the body is composed BEFORE the write and reused byte-for-
+  // byte by every bisect attempt, so a posted count could permanently claim
+  // something that never happened — review bodies are append-only. It points
+  // at the summary instead, which is decided after and can be corrected.
+  it("claims no posted count, and points at the summary instead", () => {
     const body = renderReviewDigest(input({
       allFindings: [finding(), finding(), finding()],
       inlineCount: 2,
       unanchored: [finding()],
+      summaryUrl: "https://github.com/o/r/pull/1#issuecomment-99",
     }));
 
-    expect(body).toMatch(/2/);
-    expect(body).toMatch(/1.*(could not be anchored|summary)/i);
+    expect(body).not.toMatch(/posted \d+ finding/i);
+    expect(body).toMatch(/review summary/i);
+  });
+
+  // An unanchorable finding and one the provider rejected are different
+  // failures, and only the summary knows which happened.
+  it("does not blame the diff for a provider rejection", () => {
+    const body = renderReviewDigest(input({
+      allFindings: [finding()],
+      inlineCount: 0,
+      unanchored: [],
+      publishFailed: [finding()],
+    }));
+
+    expect(body).not.toMatch(/could not be anchored/i);
   });
 
   it("names the rules that ran and the ones that failed", () => {
@@ -326,5 +345,73 @@ describe("exceedsAtomicPayload", () => {
   it("counts a recovery marker against the comment's own limit", () => {
     expect(exceedsAtomicPayload([entry(65_000)])).toBe(false);
     expect(exceedsAtomicPayload([entry(65_000, 500)])).toBe(true);
+  });
+});
+
+// PR #72 review: `allFindings` includes findings destined for the summary, so
+// a suggestion on one of those added a legend row describing a block no inline
+// comment carries.
+describe("renderReviewDigest — the legend describes the inline comments", () => {
+  it("ignores a section only an unanchored finding would have", () => {
+    const body = renderReviewDigest(input({
+      allFindings: [finding({ suggestion: "const x = 1;" }), finding()],
+      inlineFindings: [finding()],
+      inlineCount: 1,
+      unanchored: [finding({ suggestion: "const x = 1;" })],
+    }));
+
+    expect(body).not.toMatch(/suggestion block/i);
+  });
+
+  it("describes a section an inline finding does have", () => {
+    const body = renderReviewDigest(input({
+      allFindings: [finding({ suggestion: "const x = 1;" })],
+      inlineFindings: [finding({ suggestion: "const x = 1;" })],
+      inlineCount: 1,
+    }));
+
+    expect(body).toMatch(/suggestion block/i);
+  });
+});
+
+describe("botSignature — a model label cannot break the digest's cap", () => {
+  it("caps each label", () => {
+    const line = botSignature([`anthropic/${"m".repeat(5_000)}`]);
+
+    expect(line.length).toBeLessThan(300);
+  });
+
+  it("keeps the digest inside its budget with pathological models", () => {
+    const body = renderReviewDigest(input({
+      models: Array.from({ length: 3 }, (_, i) => `p${i}/${"m".repeat(5_000)}`),
+    }));
+
+    expect(body.length).toBeLessThanOrEqual(MAX_REVIEW_DIGEST_CHARS);
+  });
+});
+
+// PR #72 review: the command parser requires the AUTHENTICATED account's exact
+// mention, so a placeholder makes every command shown here inert on any
+// installation not called `tgdbot`.
+describe("renderReviewDigest — the reply commands", () => {
+  it("names the real account when it is known", () => {
+    const body = renderReviewDigest(input({ botLogin: "acme-review-bot" }));
+
+    expect(body).toContain("@acme-review-bot explain");
+    expect(body).not.toContain("@tgdbot");
+  });
+
+  // Showing commands that cannot work is worse than showing none.
+  it("omits them entirely when the account is not known", () => {
+    const body = renderReviewDigest(input());
+
+    expect(body).not.toMatch(/@\w+ explain/);
+    expect(body).not.toMatch(/Replying to/i);
+  });
+
+  it("sanitizes a hostile login", () => {
+    const body = renderReviewDigest(input({ botLogin: "```suggestion\nrm -rf /\n```" }));
+
+    expect(body).not.toContain("```suggestion");
   });
 });

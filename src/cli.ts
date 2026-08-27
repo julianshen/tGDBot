@@ -28,7 +28,7 @@ import {
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
 import {
-  BOT_SIGNATURE_BLOCK,
+  botSignatureBlock,
   exceedsAtomicPayload,
   renderReviewDigest,
   type ClarificationPresentation,
@@ -1573,7 +1573,10 @@ export async function review(
     // Visible "written by the tool" line, last before the dedup marker on every
     // summary this path composes. composeFrozenSummary re-places it when a
     // replayed manifest appends relocated findings after the frozen body.
-    if (sign) suffixParts.push(BOT_SIGNATURE_BLOCK);
+    // Named with the models the run used, so provenance does not depend on
+    // which publication path produced the comment (PR #72 review). The inline
+    // comments and the digest already did this; the managed summary did not.
+    if (sign) suffixParts.push(botSignatureBlock(o.modelsUsed));
     if (marker.length > 0) suffixParts.push(marker);
     const suffix = `\n\n${suffixParts.join("\n\n")}`;
     const maxSummaryLength = providerLimit ? 65_536 - suffix.length : Number.MAX_SAFE_INTEGER;

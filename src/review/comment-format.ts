@@ -75,6 +75,15 @@ export const BOT_SIGNATURE_BLOCK_RE =
 const MAX_SIGNED_MODELS = 3;
 
 /**
+ * How long one model label may be.
+ *
+ * The count was bounded and the LENGTH was not, so three pathological specs
+ * could push the signature — and with it the digest — past its declared cap
+ * (PR #72 review).
+ */
+const MAX_SIGNED_MODEL_CHARS = 64;
+
+/**
  * The signature, naming the model or models that actually produced the review.
  *
  * A reader who disagrees with a finding should be able to tell what wrote it
@@ -94,7 +103,11 @@ export function botSignature(models?: readonly string[]): string {
   const distinct = [...new Set((models ?? []).map((model) => sanitizeInline(model).trim()))]
     .filter((model) => model.length > 0);
   if (distinct.length === 0) return BOT_SIGNATURE;
-  const shown = distinct.slice(0, MAX_SIGNED_MODELS);
+  const shown = distinct
+    .slice(0, MAX_SIGNED_MODELS)
+    .map((model) => model.length <= MAX_SIGNED_MODEL_CHARS
+      ? model
+      : `${model.slice(0, MAX_SIGNED_MODEL_CHARS - 1)}…`);
   const hidden = distinct.length - shown.length;
   const named = shown.map((model) => `\`${model}\``).join(", ")
     + (hidden > 0 ? ` +${hidden} more` : "");
@@ -1392,6 +1405,13 @@ export interface ReviewDigestInput {
   readonly suggestions?: boolean;
   /** Resolved `provider/model` specs the rules ran on, for the signature. */
   readonly models?: readonly string[];
+  /**
+   * The findings that will be rendered as INLINE comments.
+   *
+   * Drives the legend, which describes what those comments contain. Falls back
+   * to `allFindings` for callers that do not distinguish them.
+   */
+  readonly inlineFindings?: readonly Finding[];
 }
 
 /** `a1b2c3d4e5f6` → `a1b2c3d`, the length a reader recognises. */
@@ -1429,7 +1449,10 @@ function badgeLegend(): string[] {
  * run's findings actually trigger its section.
  */
 function sectionLegend(input: ReviewDigestInput): string[] {
-  const findings = input.allFindings;
+  // The findings that will actually be rendered INLINE. `allFindings` includes
+  // unanchored ones, so a suggestion on a finding destined for the summary
+  // added a legend row for a block no inline comment carries (PR #72 review).
+  const findings = input.inlineFindings ?? input.allFindings;
   const rows: string[] = [];
   if (findings.some((finding) => emitsSuggestion(finding))) {
     rows.push(input.suggestions === false
@@ -1443,9 +1466,18 @@ function sectionLegend(input: ReviewDigestInput): string[] {
   return rows;
 }
 
-/** The conversation commands, collapsed so repeated runs do not stack walls of text. */
-function tips(botLogin: string | undefined): string {
-  const bot = `@${sanitizeInline(botLogin ?? "tgdbot")}`;
+/**
+ * The conversation commands, collapsed so repeated runs do not stack walls of
+ * text — and OMITTED when the account is not known.
+ *
+ * The command parser requires the authenticated account's exact mention, so a
+ * placeholder renders every command here inert on any installation not called
+ * `tgdbot` — the bring-your-own-token case (PR #72 review). Showing commands
+ * that cannot work is worse than showing none.
+ */
+function tips(botLogin: string | undefined): string | undefined {
+  if (botLogin === undefined || botLogin.trim().length === 0) return undefined;
+  const bot = `@${sanitizeInline(botLogin)}`;
   return detailsBlock(`Replying to ${bot}`, [
     `In a finding's own thread: \`${bot} explain\`, \`${bot} reconsider <reason>\`.`,
     "",
@@ -1474,7 +1506,6 @@ export function renderReviewDigest(input: ReviewDigestInput): string {
     .map((severity) => `${counts[severity]} ${SEVERITY_BADGE[severity].toLowerCase()}`)
     .join(" · ");
 
-  const relocated = input.unanchored.length + (input.publishFailed?.length ?? 0);
   const fileCount = input.filesReviewed.length;
   const total = input.allFindings.length;
 
@@ -1482,12 +1513,17 @@ export function renderReviewDigest(input: ReviewDigestInput): string {
     ? `### tGDBot review of \`${sha}\` — ${total} finding${total === 1 ? "" : "s"} in ${fileCount} file${fileCount === 1 ? "" : "s"}`
     : `### tGDBot focused review of \`${sha}\` — asked to look at: ${sanitizeInline(input.focusDirection)}`;
 
-  const placement = [
-    `This run posted ${input.inlineCount} finding${input.inlineCount === 1 ? "" : "s"} as inline comments`,
-    relocated > 0
-      ? `${relocated} could not be anchored${input.summaryUrl === undefined ? "" : ` — see the [review summary](${input.summaryUrl})`}.`
-      : input.summaryUrl === undefined ? "." : `full detail is in the [review summary](${input.summaryUrl}).`,
-  ].join(relocated > 0 ? " · " : " · ");
+  // No claim about how many findings were POSTED. This body is composed before
+  // the write and is reused byte-for-byte by every bisect attempt, so an
+  // accepted subset would otherwise carry a count that never happened and can
+  // never be corrected — review bodies are append-only (PR #72 review).
+  //
+  // It also does not say WHY a finding is not inline. An unanchorable finding
+  // and one the provider rejected are different failures, and only the summary
+  // knows which happened, because that is decided after this composes.
+  const placement = input.summaryUrl === undefined
+    ? "Findings not shown inline are in the review summary."
+    : `Findings not shown inline are in the [review summary](${input.summaryUrl}), which is authoritative for what this run found and where each finding went.`;
 
   const rules = [
     input.rulesRun.length > 0 ? `Rules: ${nameList(input.rulesRun)}` : undefined,
@@ -1510,8 +1546,7 @@ export function renderReviewDigest(input: ReviewDigestInput): string {
     ...(rules === "" ? [] : [rules]),
     "",
     guide,
-    "",
-    tips(input.botLogin),
+    ...(tips(input.botLogin) === undefined ? [] : ["", tips(input.botLogin)!]),
   ].join("\n");
 
   const suffix = `\n\n${botSignatureBlock(input.models)}\n\n<!-- ${REVIEW_DIGEST_MARKER} sha=${sha} -->`;

@@ -297,6 +297,9 @@ describe("dispatchRules", () => {
     expect(result).toEqual({
       ...wellFormed,
       findings: [{ ...wellFormed.findings[0], decision: "new" }],
+      // PR #72: the engine reports what it dispatched on, so a published
+      // comment can name the model that produced it.
+      modelsUsed: ["anthropic/claude-opus-4-5"],
     });
   });
 
@@ -308,7 +311,7 @@ describe("dispatchRules", () => {
 
     const result = await dispatchRules([makeRule()], "diff --git a/x b/x", false, async () => stub.session);
 
-    expect(result).toEqual(wellFormed);
+    expect(result).toEqual({ ...wellFormed, modelsUsed: ["anthropic/claude-opus-4-5"] });
   });
 
   // AC-5.4: Given the stubbed session's final message is malformed
@@ -590,7 +593,10 @@ describe("dispatchRules isolated session cwd (ADR-003)", () => {
       },
     );
 
-    expect(result).toEqual({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] });
+    expect(result).toEqual({
+      findings: [], rulesRun: ["rule-a"], rulesFailed: [],
+      modelsUsed: ["anthropic/claude-opus-4-5"],
+    });
     expect(capturedCwd).toBeDefined();
   });
 

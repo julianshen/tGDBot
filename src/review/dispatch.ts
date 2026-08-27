@@ -333,14 +333,26 @@ async function runDispatch(
     }
     // Appends the never-dispatched rules' failures to whatever the dispatch
     // produced, so the summary names every rule exactly once.
-    const withUnresolved = (result: DispatchResult): DispatchResult =>
-      unresolvedNames.length === 0
-        ? result
+    // Every model this run dispatched on, so a published comment can name what
+    // produced it. The legacy engine resolved these exactly as the direct one
+    // does and simply never reported them, leaving `--dispatch legacy` reviews
+    // unsigned by model (PR #72 review).
+    //
+    // Derived from what was DISPATCHED rather than from `rulesRun`: a rule
+    // whose output failed to parse still reached the model and still consumed
+    // it, so omitting it would understate what ran.
+    const modelsUsed = [...new Set(effective.map((rule) => `${rule.provider}/${rule.model}`))];
+
+    const withUnresolved = (result: DispatchResult): DispatchResult => {
+      const withModels = modelsUsed.length === 0 ? result : { ...result, modelsUsed };
+      return unresolvedNames.length === 0
+        ? withModels
         : {
-            ...result,
-            rulesFailed: [...result.rulesFailed, ...unresolvedNames],
-            ruleFailureReasons: { ...(result.ruleFailureReasons ?? {}), ...unresolved },
+            ...withModels,
+            rulesFailed: [...withModels.rulesFailed, ...unresolvedNames],
+            ruleFailureReasons: { ...(withModels.ruleFailureReasons ?? {}), ...unresolved },
           };
+    };
 
     // Candidates for the orchestrating session's model, highest priority first.
     // An explicit --model is a single, user-demanded candidate (failures are
