@@ -41,6 +41,9 @@ const SEVERITIES = new Set(["LOW", "MODERATE", "MEDIUM", "HIGH", "CRITICAL"]);
  */
 const ADVISORY_ID_RE = /^[A-Z][A-Z0-9]{1,15}(?:-[A-Za-z0-9]{1,16}){1,6}$/u;
 
+/** OSV's `introduced: "0"`: an interval that starts before every version. */
+const UNBOUNDED = Symbol("unbounded");
+
 /** How many advisories are reported for one package before the rest are counted. */
 const MAX_ADVISORIES_PER_PACKAGE = 10;
 
@@ -60,6 +63,14 @@ export interface DependencyAdvisoryFact {
   readonly advisories?: readonly DependencyAdvisory[];
   /** How many were found beyond those reported. */
   readonly furtherAdvisories?: number;
+  /**
+   * How many records the database returned that could not be read.
+   *
+   * Reported, never absorbed. OSV saying "here are vulnerabilities" and this
+   * module rejecting all of them must not render as "no known advisories" — a
+   * clean bill of health manufactured out of a rejection (PR #70 review).
+   */
+  readonly unreadableAdvisories?: number;
   /** Why nothing could be established. Present iff no lookup answer. */
   readonly unknown?: string;
 }
@@ -91,30 +102,65 @@ function readAdvisory(value: unknown, name: string, version: string): Dependency
 }
 
 /**
- * Orders two exact versions numerically, component by component.
+ * SemVer precedence, as the specification defines it.
  *
- * Enough for OSV's SEMVER ranges, which carry plain released versions. A
- * prerelease tail sorts BELOW the same release, which is semver's own rule and
- * the conservative direction here: it keeps `2.0.0-rc.1` inside the interval
- * that `2.0.0` opens rather than out of it.
+ * Hand-rolled, and the reviewers were right to go straight at it: the first
+ * attempt collapsed every prerelease with the same numeric core to "equal", so
+ * `2.0.0-rc.4` and `2.0.0-rc.5` were indistinguishable and the wrong interval
+ * could be chosen — which here means naming a fix that does not fix
+ * (PR #70 review, round two).
+ *
+ * The rules, in order: numeric core compared field by field; a release outranks
+ * any prerelease of itself; two prereleases compare identifier by identifier,
+ * numerically when both are numeric, lexically when neither is, and numeric
+ * BELOW alphanumeric when they differ; a prerelease that is a prefix of a
+ * longer one ranks below it. Build metadata carries no precedence at all.
  */
 function compareVersions(left: string, right: string): number {
-  const parts = (value: string): { numbers: number[]; prerelease: boolean } => {
-    const [core = "", tail] = value.split("-", 2);
+  const parse = (value: string): { numbers: number[]; pre: string[] } => {
+    // Build metadata is not part of precedence, so it is discarded first.
+    const withoutBuild = value.split("+", 1)[0] ?? "";
+    const separator = withoutBuild.indexOf("-");
+    const core = separator === -1 ? withoutBuild : withoutBuild.slice(0, separator);
+    const tail = separator === -1 ? "" : withoutBuild.slice(separator + 1);
     return {
       numbers: core.split(".").map((piece) => Number.parseInt(piece, 10) || 0),
-      prerelease: tail !== undefined,
+      pre: tail === "" ? [] : tail.split("."),
     };
   };
-  const a = parts(left);
-  const b = parts(right);
+  const a = parse(left);
+  const b = parse(right);
+
   const width = Math.max(a.numbers.length, b.numbers.length);
   for (let index = 0; index < width; index += 1) {
     const difference = (a.numbers[index] ?? 0) - (b.numbers[index] ?? 0);
     if (difference !== 0) return difference < 0 ? -1 : 1;
   }
-  if (a.prerelease === b.prerelease) return 0;
-  return a.prerelease ? -1 : 1;
+
+  // A release outranks any prerelease of the same core.
+  if (a.pre.length === 0 && b.pre.length === 0) return 0;
+  if (a.pre.length === 0) return 1;
+  if (b.pre.length === 0) return -1;
+
+  const identifiers = Math.max(a.pre.length, b.pre.length);
+  for (let index = 0; index < identifiers; index += 1) {
+    const left = a.pre[index];
+    const right = b.pre[index];
+    // A prefix ranks below the longer identifier list that extends it.
+    if (left === undefined) return -1;
+    if (right === undefined) return 1;
+    const leftNumeric = /^\d+$/u.test(left);
+    const rightNumeric = /^\d+$/u.test(right);
+    if (leftNumeric && rightNumeric) {
+      const difference = Number.parseInt(left, 10) - Number.parseInt(right, 10);
+      if (difference !== 0) return difference < 0 ? -1 : 1;
+      continue;
+    }
+    // Numeric identifiers always rank below alphanumeric ones.
+    if (leftNumeric !== rightNumeric) return leftNumeric ? -1 : 1;
+    if (left !== right) return left < right ? -1 : 1;
+  }
+  return 0;
 }
 
 /**
@@ -155,20 +201,26 @@ function readFixed(affected: unknown, name: string, version: string): string | u
 
       // Events come in order: an `introduced` opens an interval and the next
       // `fixed` closes it.
-      let openedAt: string | undefined;
+      let openedAt: string | typeof UNBOUNDED | undefined;
       for (const event of events) {
         if (typeof event !== "object" || event === null) continue;
         const eventRecord = event as Record<string, unknown>;
         const introduced = eventRecord.introduced;
         if (typeof introduced === "string") {
-          // OSV writes "0" for "from the beginning".
-          openedAt = introduced === "0" ? "0.0.0" : introduced;
+          // "0" means FROM THE BEGINNING — unbounded, not the release 0.0.0,
+          // which excluded a prerelease sorting below it. Anything that is not
+          // a version does not open an interval: mapping its components to
+          // zero let `latest` swallow everything below the fix (PR #70 review,
+          // round two).
+          openedAt = introduced === "0"
+            ? UNBOUNDED
+            : isExactVersion(introduced) ? introduced : undefined;
           continue;
         }
         const fixed = eventRecord.fixed;
         if (typeof fixed !== "string" || !isExactVersion(fixed)) continue;
         if (openedAt === undefined) continue;
-        const atOrAfterStart = compareVersions(version, openedAt) >= 0;
+        const atOrAfterStart = openedAt === UNBOUNDED || compareVersions(version, openedAt) >= 0;
         const beforeFix = compareVersions(version, fixed) < 0;
         if (atOrAfterStart && beforeFix) return fixed;
         openedAt = undefined;
@@ -192,12 +244,25 @@ function readResponse(
   if (!Array.isArray(vulns)) {
     return { ...base, unknown: "the advisory database returned no usable document" };
   }
-  const all = vulns
-    .map((vuln) => readAdvisory(vuln, change.name, change.version))
-    .filter((advisory): advisory is DependencyAdvisory => advisory !== undefined);
+  const read = vulns.map((vuln) => readAdvisory(vuln, change.name, change.version));
+  const all = read.filter((advisory): advisory is DependencyAdvisory => advisory !== undefined);
+  const unreadable = read.length - all.length;
+  // The database answered "yes" and nothing survived reading it. That is not a
+  // clean result, and reporting one would be the worst possible summary of it.
+  if (all.length === 0 && unreadable > 0) {
+    return {
+      ...base,
+      unknown: `the advisory database returned ${unreadable} record(s) that could not be read`,
+    };
+  }
   const advisories = all.slice(0, MAX_ADVISORIES_PER_PACKAGE);
   const further = all.length - advisories.length;
-  return { ...base, advisories, ...(further > 0 ? { furtherAdvisories: further } : {}) };
+  return {
+    ...base,
+    advisories,
+    ...(further > 0 ? { furtherAdvisories: further } : {}),
+    ...(unreadable > 0 ? { unreadableAdvisories: unreadable } : {}),
+  };
 }
 
 /**
