@@ -9,7 +9,7 @@ import {
   type InlineRecoveryChild,
   type InlineRecoveryState,
 } from "../review/comment-marker.js";
-import { compareOrderKeys, AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
+import { compareOrderKeys, isCommitSha, AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -1988,7 +1988,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       ]);
       const parsed = JSON.parse(out) as { merge_base_commit?: { sha?: unknown } };
       const sha = parsed.merge_base_commit?.sha;
-      return typeof sha === "string" && sha.length > 0 ? sha : undefined;
+      return isCommitSha(sha) ? sha : undefined;
     } catch {
       // Not knowing is an answer the caller can act on. It falls back to the
       // base tip, which is approximate rather than wrong-in-a-new-way.

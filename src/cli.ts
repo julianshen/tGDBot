@@ -1194,15 +1194,47 @@ export async function review(
   // GitHub needs asking. Resolved only when there is a manifest to read, so an
   // ordinary review makes no extra call, and it falls back to the tip rather
   // than guessing when the provider cannot say.
-  const comparisonBaseSha = manifestsToRead.length === 0
-    ? pr.baseSha
-    : pr.startSha
-      ?? await config.vcsAdapter.getMergeBaseSha(config.locator, pr.baseSha, pr.headSha)
-      ?? pr.baseSha;
+  //
+  // When it cannot be resolved, the manifests are reported UNEXAMINED rather
+  // than compared against the tip. Falling back selects a known-wrong
+  // comparison — if the target advanced, its dependency updates are attributed
+  // to this pull request, which is the failure the merge base exists to prevent
+  // (PR #67 review, round three). An unexamined manifest is honest; a wrong
+  // comparison is not.
+  let comparisonBaseSha: string | undefined;
+  if (manifestsToRead.length > 0) {
+    if (pr.startSha !== undefined) {
+      comparisonBaseSha = pr.startSha;
+    } else {
+      try {
+        comparisonBaseSha = await config.vcsAdapter.getMergeBaseSha(
+          config.locator,
+          pr.baseSha,
+          pr.headSha,
+        );
+      } catch (error) {
+        console.warn(
+          `tgd-review-agent: could not resolve the merge base (${redactedMessage(error)})`,
+        );
+      }
+    }
+    if (comparisonBaseSha === undefined) {
+      console.warn(
+        "tgd-review-agent: the merge base could not be resolved, so no manifest was examined; " +
+          "comparing against the target branch tip would attribute its own dependency changes " +
+          "to this pull request",
+      );
+    }
+  }
   const headManifests = new Map<string, string | undefined>();
   const baseManifests = new Map<string, string | undefined>();
   const unreachableManifests: string[] = [];
   for (const { path, basePath } of manifestsToRead) {
+    // No comparison base means no honest comparison, so nothing is examined.
+    if (comparisonBaseSha === undefined && basePath !== undefined) {
+      unreachableManifests.push(path);
+      continue;
+    }
     const read = async (ref: string, at: string): Promise<string | undefined> =>
       config.vcsAdapter.getFileAtRef(config.locator, ref, at);
     try {
@@ -1215,7 +1247,7 @@ export async function review(
       continue;
     }
     // A manifest this pull request ADDS has no base side to read.
-    if (basePath === undefined) continue;
+    if (basePath === undefined || comparisonBaseSha === undefined) continue;
     try {
       baseManifests.set(basePath, await read(comparisonBaseSha, basePath));
     } catch (error) {

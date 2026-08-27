@@ -34,12 +34,17 @@ function agreeingManifests(diff: string): Map<string, string> {
 }
 
 /**
- * Extraction against a head manifest that agrees with the diff, with no base
- * manifest — i.e. everything the head declares is new. That is what these cases
- * were always about: the diff adds these entries and they are dependencies.
+ * Extraction against a head manifest that agrees with the diff, over a base
+ * that declared nothing — so everything the head declares counts as a change.
+ * That is what these cases were always about: the diff adds these entries and
+ * they are dependencies.
  */
 function changesFrom(diff: string) {
-  return dependencyChanges(changedManifests(diff), agreeingManifests(diff)).changes;
+  const manifests = changedManifests(diff);
+  const emptyBase = new Map(
+    manifests.flatMap(({ basePath }) => basePath === undefined ? [] : [[basePath, "{}"] as const]),
+  );
+  return dependencyChanges(manifests, agreeingManifests(diff), emptyBase).changes;
 }
 
 describe("dependencyChangesFromDiff", () => {
@@ -525,7 +530,7 @@ describe("dependencyChanges — a pin and a range are different changes", () => 
     ]);
 
     const changes = dependencyChanges(
-      [...head.keys()].map((path) => ({ path, basePath: path })),
+      [...head.keys()].map((path) => ({ path, basePath: undefined })),
       head,
     ).changes;
 
@@ -697,7 +702,7 @@ describe("dependencyChanges — the manifests decide, not the diff", () => {
 
   it("treats a manifest that is new at head as all-new", () => {
     const changes = dependencyChanges(
-      [{ path: "package.json", basePath: "package.json" }],
+      [{ path: "package.json", basePath: undefined }],
       new Map([["package.json", manifest({})]]),
       new Map(),
     ).changes;
@@ -797,12 +802,14 @@ describe("dependencyChanges — what could not be examined is reported", () => {
     expect(result.unreadable).toEqual(["package.json"]);
   });
 
-  // Absent at base is NOT a failure — it is a manifest this pull request adds.
-  it("treats an absent base manifest as new, not unreadable", () => {
+  // A manifest this pull request ADDS has no base side, and that is not a
+  // failure. A base path that exists but reads as nothing IS one — see
+  // "reports an unreadable base as unreadable" below.
+  it("treats a manifest with no base side as new, not unreadable", () => {
     const result = dependencyChanges(
-      [{ path: "package.json", basePath: "package.json" }],
+      [{ path: "package.json", basePath: undefined }],
       new Map([["package.json", good]]),
-      new Map([["package.json", undefined]]),
+      new Map(),
     );
 
     expect(result.unreadable).toEqual([]);
@@ -812,8 +819,8 @@ describe("dependencyChanges — what could not be examined is reported", () => {
   it("keeps examining the manifests it can read", () => {
     const result = dependencyChanges(
       [
-        { path: "a/package.json", basePath: "a/package.json" },
-        { path: "b/package.json", basePath: "b/package.json" },
+        { path: "a/package.json", basePath: undefined },
+        { path: "b/package.json", basePath: undefined },
       ],
       new Map([["a/package.json", "{ not json"], ["b/package.json", good]]),
     );
@@ -930,5 +937,92 @@ describe("changedManifests — a renamed manifest keeps its old path", () => {
     );
 
     expect(result.changes.map((c) => c.name)).toEqual(["lodash"]);
+  });
+});
+
+// PR #67 review, round three.
+describe("dependencyChanges — cases the two-ref comparison has to get right", () => {
+  const head = (deps: Record<string, unknown>) => JSON.stringify(deps);
+
+  // A rename FROM something that is not a manifest: `config.json` renamed to
+  // `package.json`. Its old `dependencies` object is not a manifest's, so
+  // comparing against it can silence a dependency that is genuinely new here.
+  it("treats a rename from an unsupported path as a new manifest", () => {
+    const diff = [
+      "diff --git a/config.json b/package.json",
+      "rename from config.json",
+      "rename to package.json",
+      "--- a/config.json",
+      "+++ b/package.json",
+      "@@ -3,7 +3,7 @@",
+      '+    "lodash": "4.17.21",',
+    ].join("\n");
+
+    expect(changedManifests(diff)).toEqual([
+      { path: "package.json", basePath: undefined },
+    ]);
+  });
+
+  // A base side that EXISTS but could not be read is not an empty manifest.
+  // Treating it as one made every dependency look newly added.
+  it("reports an unreadable base as unreadable, not as an empty manifest", () => {
+    const result = dependencyChanges(
+      [{ path: "package.json", basePath: "package.json" }],
+      new Map([["package.json", head({ dependencies: { lodash: "4.17.21" } })]]),
+      new Map([["package.json", undefined]]),
+    );
+
+    expect(result.changes).toEqual([]);
+    expect(result.unreadable).toEqual(["package.json"]);
+  });
+
+  it("still treats a manifest with no base side as new", () => {
+    const result = dependencyChanges(
+      [{ path: "package.json", basePath: undefined }],
+      new Map([["package.json", head({ dependencies: { lodash: "4.17.21" } })]]),
+      new Map(),
+    );
+
+    expect(result.unreadable).toEqual([]);
+    expect(result.changes).toHaveLength(1);
+  });
+
+  // A library declares `react` in devDependencies AND peerDependencies. Keying
+  // by name alone kept the first and discarded the peer entry, so a change to
+  // only the peer range compared equal and vanished.
+  it("keeps a package declared in more than one section", () => {
+    const result = dependencyChanges(
+      [{ path: "package.json", basePath: "package.json" }],
+      new Map([["package.json", head({
+        devDependencies: { react: "18.0.0" },
+        peerDependencies: { react: ">=18.0.0" },
+      })]]),
+      new Map([["package.json", head({
+        devDependencies: { react: "18.0.0" },
+        peerDependencies: { react: ">=17.0.0" },
+      })]]),
+    );
+
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0]).toMatchObject({
+      name: "react",
+      section: "peerDependencies",
+      spec: ">=18.0.0",
+    });
+  });
+
+  it("says nothing when neither section moved", () => {
+    const manifest = head({
+      devDependencies: { react: "18.0.0" },
+      peerDependencies: { react: ">=17.0.0" },
+    });
+
+    const result = dependencyChanges(
+      [{ path: "package.json", basePath: "package.json" }],
+      new Map([["package.json", manifest]]),
+      new Map([["package.json", manifest]]),
+    );
+
+    expect(result.changes).toEqual([]);
   });
 });

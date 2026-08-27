@@ -191,8 +191,17 @@ function manifestByLine(diff: string): Map<number, ChangedManifest> {
       // means the file is added by this pull request and has no base side.
       const from = /^--- (?:a\/(.+)|\/dev\/null)$/u.exec(line);
       if (from) {
+        // The old path has to be a MANIFEST too. `config.json` renamed to
+        // `package.json` would otherwise have its `dependencies` object
+        // compared as if it were a manifest's, silencing entries that are
+        // genuinely new here (PR #67 review, round three).
         const path = from[1];
-        basePath = path !== undefined && MANIFEST_PATH_RE.test(path) ? path : undefined;
+        const fromBasename = path?.slice(path.lastIndexOf("/") + 1);
+        basePath = path !== undefined
+          && MANIFEST_PATH_RE.test(path)
+          && MANIFEST_BASENAMES.has(fromBasename ?? "")
+          ? path
+          : undefined;
         continue;
       }
       const header = /^\+\+\+ b\/(.+)$/u.exec(line);
@@ -256,9 +265,14 @@ const DEPENDENCY_SECTIONS = [
  * object, an array. Distinct from "declares nothing": one is an answer and the
  * other is a failure, and the pack says different things about them.
  */
+/** `section` and `name` together: one package may be declared in several. */
+function declarationKey(section: string, name: string): string {
+  return `${section}\u0000${name}`;
+}
+
 function declaredDependencies(
   text: string,
-): Map<string, { section: string; spec: string }> | undefined {
+): Map<string, { section: string; name: string; spec: string }> | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -267,15 +281,17 @@ function declaredDependencies(
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
   const manifest = parsed as Record<string, unknown>;
-  const declared = new Map<string, { section: string; spec: string }>();
+  const declared = new Map<string, { section: string; name: string; spec: string }>();
   for (const section of DEPENDENCY_SECTIONS) {
     const entries = manifest[section];
     if (typeof entries !== "object" || entries === null || Array.isArray(entries)) continue;
     for (const [name, spec] of Object.entries(entries as Record<string, unknown>)) {
-      // First section wins, matching npm's own precedence closely enough for a
-      // review: a package in both `dependencies` and `devDependencies` is a
-      // runtime dependency.
-      if (typeof spec === "string" && !declared.has(name)) declared.set(name, { section, spec });
+      // Every declaration is kept, keyed by SECTION AND NAME. Collapsing onto
+      // the name discarded the second one, so a library declaring `react` in
+      // both devDependencies and peerDependencies lost the peer entry, and a
+      // change to only the peer range compared equal and vanished (PR #67
+      // review, round three).
+      if (typeof spec === "string") declared.set(declarationKey(section, name), { section, name, spec });
     }
   }
   return declared;
@@ -330,30 +346,40 @@ export function dependencyChanges(
       unreadable.push(path);
       continue;
     }
-    // Absent at base is a NEW manifest, which is an answer. Present but
-    // unparseable is a failure, and there is no honest diff against it.
-    // Read at the OLD path: a rename changes it, and an added manifest has none.
-    const baseText = basePath === undefined ? undefined : base.get(basePath);
-    const baseDeps = baseText === undefined ? new Map() : declaredDependencies(baseText);
-    if (baseDeps === undefined) {
-      unreadable.push(path);
-      continue;
+    // No base side at all is a NEW manifest, which is an answer. A base side
+    // that EXISTS but could not be read is a failure: treating it as an empty
+    // manifest made every dependency look newly added and sent the lot to the
+    // registry (PR #67 review, round three). Read at the OLD path, since a
+    // rename changes it.
+    let baseDeps = new Map<string, { section: string; name: string; spec: string }>();
+    if (basePath !== undefined) {
+      const baseText = base.get(basePath);
+      if (baseText === undefined) {
+        unreadable.push(path);
+        continue;
+      }
+      const parsedBase = declaredDependencies(baseText);
+      if (parsedBase === undefined) {
+        unreadable.push(path);
+        continue;
+      }
+      baseDeps = parsedBase;
     }
 
-    for (const [name, { section, spec }] of headDeps) {
+    for (const [key, { section, name, spec }] of headDeps) {
       if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
       // Unchanged is not a change. This is the whole comparison — and SECTION
       // counts as much as spec: a package moving from devDependencies to
       // dependencies at the same version enters the production tree, which is
       // a change worth reviewing and one the pack claims to describe (PR #67
       // review, round two).
-      const before = baseDeps.get(name);
+      const before = baseDeps.get(key);
       if (before !== undefined && before.spec === spec && before.section === section) continue;
       const version = stripRange(spec);
       if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
-      const key = `${name}@${spec}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const identity = `${section}\u0000${name}@${spec}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       changes.push({ name, version, spec, manifest: path, pinned: isPinnedSpec(spec), section });
     }
   }

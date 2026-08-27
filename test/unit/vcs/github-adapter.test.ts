@@ -892,11 +892,12 @@ describe("GitHubAdapter", () => {
   describe("getMergeBaseSha", () => {
     it("asks the compare API for the point the branches diverged", async () => {
       const execGh = vi.fn(async () => JSON.stringify({
-        merge_base_commit: { sha: "mergebase1" },
+        merge_base_commit: { sha: "0b1c2d3e4f5a60718293a4b5c6d7e8f901234567" },
       }));
       const adapter = new GitHubAdapter(execGh);
 
-      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBe("mergebase1");
+      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha"))
+        .toBe("0b1c2d3e4f5a60718293a4b5c6d7e8f901234567");
       expect(execGh).toHaveBeenCalledWith(
         expect.arrayContaining(["repos/{owner}/{repo}/compare/basetip...headsha"]),
       );
@@ -910,6 +911,20 @@ describe("GitHubAdapter", () => {
       const adapter = new GitHubAdapter(execGh);
 
       expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBeUndefined();
+    });
+
+    // A value that is not a commit becomes a manifest REF, and a branch name
+    // resolves to that branch's tip — the very comparison this exists to avoid.
+    it("returns undefined for a value that is not a commit sha", async () => {
+      for (const sha of ["main", "", "refs/heads/main", "zzzz", 42]) {
+        const execGh = vi.fn(async () => JSON.stringify({ merge_base_commit: { sha } }));
+        const adapter = new GitHubAdapter(execGh);
+
+        expect(
+          await adapter.getMergeBaseSha(locator42, "basetip", "headsha"),
+          `${JSON.stringify(sha)} was accepted`,
+        ).toBeUndefined();
+      }
     });
 
     it("returns undefined when the response has no merge base", async () => {

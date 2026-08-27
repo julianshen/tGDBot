@@ -264,6 +264,8 @@ interface Harness {
     findBotComment: ReturnType<typeof vi.fn>;
     upsertComment: ReturnType<typeof vi.fn>;
     getRuleFilesFromBase: ReturnType<typeof vi.fn>;
+    getFileAtRef: ReturnType<typeof vi.fn>;
+    getMergeBaseSha: ReturnType<typeof vi.fn>;
     createInlineReview: ReturnType<typeof vi.fn>;
     prepareInlineReviewRecovery: ReturnType<typeof vi.fn>;
     recoverInlineReview: ReturnType<typeof vi.fn>;
@@ -4440,20 +4442,42 @@ describe("review — the comparison base is where the branches diverged", () => 
     );
   });
 
-  // An approximate base beats no review; the provider not knowing is not fatal.
-  it("falls back to the base sha when the provider cannot say", async () => {
+  // Round three changed this. Falling back to the base TIP selects a
+  // known-wrong comparison: if the target advanced, its dependency updates are
+  // attributed to this pull request — the exact failure the merge base exists
+  // to prevent. An unexamined manifest is honest; a wrong comparison is not.
+  it("marks manifests unexamined when the merge base cannot be resolved", async () => {
     const h = makeHarness({
       pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1" }),
       args: makeArgs({ dependencyFacts: "on" }),
     });
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
     h.vcsAdapter.getMergeBaseSha.mockResolvedValue(undefined);
+    const fetchJson = vi.fn();
 
-    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+    await review(h.args, { ...depsFrom(h), fetchJson });
 
-    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+    expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalledWith(
       expect.anything(), "bbbbbbb1", "package.json",
     );
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(packFor(h)).toMatch(/could NOT be read/i);
+  });
+
+  it("says the same when the merge-base lookup fails outright", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockRejectedValue(new Error("HTTP 403"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(exitCode).toBe(0);
+    expect(packFor(h)).toMatch(/could NOT be read/i);
+    warn.mockRestore();
   });
 
   it("asks for no merge base when there is no manifest to read", async () => {

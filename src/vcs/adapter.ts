@@ -415,6 +415,17 @@ export function validateInlinePublishOutcomes(
   return validated;
 }
 
+/**
+ * A commit object name, and nothing else.
+ *
+ * A merge-base response that says `"main"` would be used as a manifest REF, and
+ * a branch name resolves to that branch's tip — precisely the comparison the
+ * merge base exists to avoid (PR #67 review).
+ */
+export function isCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{7,40}$/u.test(value);
+}
+
 export interface RuleFileContent {
   path: string; // relative path within the rules directory, e.g. "security-review.md"
   content: string; // raw file content

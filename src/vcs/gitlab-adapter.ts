@@ -12,7 +12,7 @@ import {
   validateInlinePublishOutcomes,
   validateConversationItemIdentity,
 } from "./adapter.js";
-import { compareOrderKeys } from "./adapter.js";
+import { compareOrderKeys, isCommitSha } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -1248,7 +1248,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
         `refs[]=${headSha}`,
       ]);
       const parsed = JSON.parse(out) as { id?: unknown };
-      return typeof parsed.id === "string" && parsed.id.length > 0 ? parsed.id : undefined;
+      return isCommitSha(parsed.id) ? parsed.id : undefined;
     } catch {
       // GitLab also reports it as `diff_refs.start_sha` on the merge request
       // itself, which the caller prefers; this is the fallback for callers that
