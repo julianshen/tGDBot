@@ -586,7 +586,7 @@ describe("prepareReviewContext", () => {
   });
 
   it("refuses a cache root owned by another user", async () => {
-    if (process.platform === "win32" || process.getuid?.() === 0) return;
+    if (process.platform === "win32" || process.getuid?.() === undefined) return;
     const { worktree, request } = await baseRequest();
     const mapper = stubMapper();
     await mkdir(request.cacheRoot as string, { recursive: true });
@@ -594,7 +594,17 @@ describe("prepareReviewContext", () => {
     // against its own manifest, and a manifest says nothing about who wrote
     // it, so a root someone else can write is a root that can hand the
     // reviewing model attacker-authored `[TRUSTED_CONTEXT]`.
-    await chown(request.cacheRoot as string, 65534, 65534).catch(() => undefined);
+    //
+    // Giving a directory away requires privilege, so this is one of the few
+    // tests that needs MORE of it, not less — and it must skip when it cannot
+    // set itself up. It previously swallowed the failed `chown` and asserted
+    // the refusal against a root that had never changed hands, which meant it
+    // could not pass for an unprivileged user and was skipped for a privileged
+    // one: no configuration ran it, and the refusal was never verified at all.
+    // Same shape as the ancestor-ownership test below.
+    const gaveAway = await chown(request.cacheRoot as string, 65534, 65534)
+      .then(() => true, () => false);
+    if (!gaveAway) return;
 
     const prepared = await prepareReviewContext(request, {
       prepareWorkspace: stubWorkspace(worktree),
@@ -602,6 +612,10 @@ describe("prepareReviewContext", () => {
     });
 
     expect(prepared.status).toBe("unavailable");
+    if (prepared.status !== "unavailable") throw new Error("unreachable");
+    expect(prepared.reasons.join(" ")).toContain("must be owned by the current user");
+    // The refusal has to land before the expensive, code-executing half of the
+    // pipeline, not after it.
     expect(mapper.calls).toHaveLength(0);
   });
 
