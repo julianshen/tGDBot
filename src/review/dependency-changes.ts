@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ContextPackResult } from "../context/context-pack.js";
 import type { DependencyFact } from "./dependency-facts.js";
+import type { DependencyAdvisoryFact } from "./dependency-advisories.js";
 
 // Issue #50: reviewing a dependency bump needs facts the checkout does not
 // contain — whether a version is current, withdrawn, deprecated, or carries a
@@ -398,6 +399,29 @@ export function dependencyChanges(
 }
 
 /**
+ * One dependency's advisory result, as host-established notes.
+ *
+ * Ids and severities only — the record's `summary` and `details` are prose
+ * written by whoever filed it and never leave `dependency-advisories` (#50).
+ * A package that could not be checked says so; it must never read as clear.
+ */
+function renderAdvisoryNotes(fact: DependencyAdvisoryFact | undefined): string[] {
+  if (fact === undefined) return [];
+  if (fact.advisories === undefined) {
+    return [`advisories NOT checked — ${fact.unknown ?? "no reason given"}`];
+  }
+  if (fact.advisories.length === 0) return ["no known advisories against this exact version"];
+  const listed = fact.advisories.map((advisory) => {
+    const severity = advisory.severity === undefined ? "" : ` (${advisory.severity})`;
+    const fixed = advisory.fixed === undefined ? "" : `, fixed in ${advisory.fixed}`;
+    return `advisory ${advisory.id}${severity}${fixed}`;
+  });
+  return fact.furtherAdvisories === undefined || fact.furtherAdvisories === 0
+    ? listed
+    : [...listed, `and ${fact.furtherAdvisories} further advisories, not listed here`];
+}
+
+/**
  * The dependency changes, rendered as trusted context for a rule.
  *
  * Delivered through the context-pack seam as TWO halves, because the pack does
@@ -425,11 +449,13 @@ export function dependencyContextPack(
   changes: readonly DependencyChange[],
   facts: readonly DependencyFact[] = [],
   unreadableManifests: readonly string[] = [],
+  advisoryFacts: readonly DependencyAdvisoryFact[] = [],
 ): ContextPackResult | undefined {
   if (changes.length === 0 && unreadableManifests.length === 0) return undefined;
   // Keyed by SPEC: a pin and a range share a stripped version, so name@version
   // handed both changes whichever fact was written last (round six).
   const factFor = new Map(facts.map((fact) => [`${fact.name}@${fact.spec}`, fact]));
+  const advisoryFor = new Map(advisoryFacts.map((fact) => [`${fact.name}@${fact.spec}`, fact]));
   const lines = changes.map((change, index) => {
     // The entry LABEL, not the package. `name`, `spec` and `manifest` are all
     // strings the pull-request author chose, and this half of the pack means
@@ -445,8 +471,14 @@ export function dependencyContextPack(
     // what tells a rule whether a package entered the production tree.
     const head = `- ${label} (${change.section})`;
     const fact = factFor.get(`${change.name}@${change.spec}`);
-    if (fact === undefined) return head;
-    const notes: string[] = [];
+    const advisory = advisoryFor.get(`${change.name}@${change.spec}`);
+    const advisoryNotes = renderAdvisoryNotes(advisory);
+    if (fact === undefined) {
+      return advisoryNotes.length === 0
+        ? head
+        : `${head}\n${advisoryNotes.map((note) => `  - ${note}`).join("\n")}`;
+    }
+    const notes: string[] = [...advisoryNotes];
     // An unchecked package must read as unchecked, never as clean.
     // `unknown` is host-authored by construction — see fetchDependencyFacts,
     // which logs the remote detail rather than putting it here.
@@ -489,16 +521,23 @@ export function dependencyContextPack(
     return notes.length === 0 ? head : `${head}\n${notes.map((note) => `  - ${note}`).join("\n")}`;
   });
   const checked = facts.some((fact) => fact.unknown === undefined);
+  const advisoriesRan = advisoryFacts.length > 0;
   const closing = checked
     ? [
         "Anything not stated above was not established. A package with no note",
         "beyond its version was not checked, or the registry said nothing about",
         "it — do not read silence as approval.",
+        ...(advisoriesRan
+          ? []
+          : ["No advisory database was consulted at all, so say nothing about",
+             "known vulnerabilities."]),
       ]
     : [
-        "These versions have NOT been checked against a registry or advisory",
-        "database: whether each is current, deprecated, withdrawn, or affected by",
-        "a known advisory is unknown here. Do not assert otherwise.",
+        "These versions have NOT been checked against a registry"
+          + (advisoriesRan ? "" : " or advisory database")
+          + ": whether each is current, deprecated, withdrawn"
+          + (advisoriesRan ? "" : ", or affected by a known advisory")
+          + " is unknown here. Do not assert otherwise.",
       ];
   // A manifest the host could not read is stated, never omitted. Its
   // dependencies were not examined, and an absent section would read as an
