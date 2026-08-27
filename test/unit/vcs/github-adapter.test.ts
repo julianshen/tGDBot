@@ -2259,14 +2259,19 @@ describe("createInlineReview: multi-line suggestion ranges", () => {
       { clientId: "finding-0", path: "a.ts", line: 13, startLine: 11, body: "multi", position: {} as never },
       { clientId: "finding-1", path: "b.ts", line: 5, body: "single", position: {} as never },
     ];
-    const outcomes = await adapter.createInlineReview({ kind: "repository", repo, number: 42 }, "d".repeat(40), comments);
+    // Issue #55: the caller composes the review body; the adapter must not
+    // invent markdown, and must send exactly what it was handed.
+    const outcomes = await adapter.createInlineReview(
+      { kind: "repository", repo, number: 42 }, "d".repeat(40), comments, undefined,
+      "DIGEST-FROM-CALLER",
+    );
     expect(outcomes).toMatchObject([
       { clientId: "finding-0", status: "posted", identity: { commentId: "100" } },
       { clientId: "finding-1", status: "posted", identity: { commentId: "101" } },
     ]);
     expect(calls.filter((call) => call.args.includes("POST"))).toHaveLength(1);
     expect(JSON.parse(calls.find((call) => call.args.includes("POST"))!.stdin!)).toMatchObject({
-      commit_id: "d".repeat(40), event: "COMMENT", body: "tGD inline review",
+      commit_id: "d".repeat(40), event: "COMMENT", body: "DIGEST-FROM-CALLER",
       comments: [{ path: "a.ts", line: 13, side: "RIGHT", start_line: 11, start_side: "RIGHT" }, { path: "b.ts", line: 5, side: "RIGHT" }],
     });
   });
@@ -2818,5 +2823,78 @@ describe("GitHubAdapter large-diff fallback", () => {
     const adapter = new GitHubAdapter(execGh);
 
     await expect(adapter.getDiff(locator188)).rejects.toThrow(/exceeds requested bound/i);
+  });
+});
+
+// Issue #55, the constraint that makes the digest safe: `payloadFor` runs for
+// EVERY attempt, including each subset the bisect tries, and each accepted
+// subset creates its own review. Because the digest describes the RUN rather
+// than one review event, the same bytes are correct on all of them — but only
+// if they really are the same bytes. Anything recomputed per attempt (a
+// timestamp, a re-sorted set) would silently break that.
+describe("createInlineReview: the review body is identical on every attempt", () => {
+  // A stub that accepts a POST and can then answer the recovery listing for
+  // whatever was accepted, so the run reaches completion rather than throwing.
+  const stubFor = (bodies: string[], rejectWholeBatch: boolean): ExecGh => {
+    const accepted: { path: string; line: number; body: string }[] = [];
+    return async (args, stdin) => {
+      if (args[1] === "user") return JSON.stringify({ login: "octo-bot" });
+      if (args[1] === "graphql") {
+        return inlineThreadsFixture(
+          accepted.map((_, index) => 100 + index),
+          accepted.map((entry) => entry.path),
+        );
+      }
+      if (args.includes("POST")) {
+        const payload = JSON.parse(stdin!) as {
+          body: string;
+          comments: { path: string; line: number; body: string }[];
+        };
+        bodies.push(payload.body);
+        if (rejectWholeBatch && payload.comments.length > 1) {
+          throw new Error("GitHub rejected request (HTTP 422)");
+        }
+        accepted.push(...payload.comments);
+        return "{}";
+      }
+      return JSON.stringify(accepted.map((entry, index) => ({
+        id: 100 + index, body: entry.body, user: { login: "octo-bot" },
+        path: entry.path, line: entry.line, side: "RIGHT", commit_id: "d".repeat(40),
+        html_url: `https://github.com/octo-org/octo-repo/pull/42#discussion_r${100 + index}`,
+        pull_request_url: "https://api.github.com/repos/octo-org/octo-repo/pulls/42",
+      })));
+    };
+  };
+
+  it("sends the same bytes for the whole batch and for every bisect subset", async () => {
+    const bodies: string[] = [];
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(stubFor(bodies, true), repo);
+    const comments = ["a.ts", "b.ts", "c.ts", "d.ts"].map((path, index) => ({
+      clientId: `finding-${index}`, path, line: 10 + index, body: `finding ${index}`,
+      position: {} as never,
+    }));
+
+    await adapter.createInlineReview(
+      { kind: "repository", repo, number: 42 }, "d".repeat(40), comments, undefined,
+      "THE-RUN-DIGEST",
+    ).catch(() => undefined);
+
+    // Several attempts happened, and every one carried identical bytes.
+    expect(bodies.length).toBeGreaterThan(1);
+    expect(new Set(bodies).size).toBe(1);
+    expect(bodies[0]).toBe("THE-RUN-DIGEST");
+  });
+
+  it("keeps the previous constant when the caller supplies no body", async () => {
+    const bodies: string[] = [];
+    const repo = parseRepositoryRef("octo-org/octo-repo", "github");
+    const adapter = new GitHubAdapter(stubFor(bodies, false), repo);
+
+    await adapter.createInlineReview({ kind: "repository", repo, number: 42 }, "d".repeat(40), [
+      { clientId: "finding-0", path: "a.ts", line: 10, body: "finding", position: {} as never },
+    ]).catch(() => undefined);
+
+    expect(bodies).toEqual(["tGD inline review"]);
   });
 });

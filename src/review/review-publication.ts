@@ -37,7 +37,12 @@ import {
   type InlineRecoveryState,
   type TerminalReviewResult,
 } from "./comment-marker.js";
-import { BOT_SIGNATURE_BLOCK } from "./comment-format.js";
+import {
+  BOT_SIGNATURE_BLOCK_RE,
+  botSignatureBlock,
+  exceedsAtomicPayload,
+  renderReviewDigest,
+} from "./comment-format.js";
 import { formatMarker } from "./dedup.js";
 import { orchestrate, type OrchestrationResult } from "./orchestrate.js";
 import type { Finding } from "./types.js";
@@ -103,6 +108,8 @@ export function composeFrozenSummary(
   action: PublicationAction,
   fallbackIds: ReadonlySet<string>,
   marker: string,
+  /** Resolved `provider/model` specs, named in the signature this composes. */
+  models?: readonly string[],
 ): string {
   const summary = action.children.find((child) => child.kind === "summary");
   if (summary === undefined) throw new Error("publication manifest is missing the summary child");
@@ -125,9 +132,10 @@ export function composeFrozenSummary(
   // the signature marks the end of the COMMENT, whatever this path assembled,
   // and the dedup marker stays last.
   const base = stripSignature(summary.body);
+  const signature = botSignatureBlock(models);
   const signed = marker.length === 0
-    ? BOT_SIGNATURE_BLOCK
-    : `${BOT_SIGNATURE_BLOCK}\n\n${marker}`;
+    ? signature
+    : `${signature}\n\n${marker}`;
   return [base, ...extras.map(stripSignature), signed].join("\n\n");
 }
 
@@ -150,9 +158,17 @@ export function stripSignature(body: string): string {
   // Markdown footer, say, including this repository's own README. Removing
   // every occurrence would silently delete that from the proposed fix (Codex
   // review). A body whose only copy sits inside a suggestion is left alone.
-  const index = body.lastIndexOf(BOT_SIGNATURE_BLOCK);
+  // Matched by SHAPE, not by fixed bytes: the signature now names the model
+  // that produced the review, so its length varies. The pattern is the same one
+  // the renderer composes from, so the two cannot drift apart.
+  let index = -1;
+  let length = 0;
+  for (const match of body.matchAll(BOT_SIGNATURE_BLOCK_RE)) {
+    index = match.index;
+    length = match[0].length;
+  }
   if (index === -1) return body.trimEnd();
-  const after = body.slice(index + BOT_SIGNATURE_BLOCK.length);
+  const after = body.slice(index + length);
   if (!ONLY_MARKERS_RE.test(after)) return body.trimEnd();
   // Newlines are normalized only where the block was, so nothing else in the
   // body — a fenced block's own blank lines, say — is reflowed.
@@ -402,7 +418,7 @@ export async function publishReviewFromManifest(options: {
     if (orchestration !== undefined && buildBody !== undefined) {
       return buildBody(orchestration, failedIds, marker, undefined, failureReasons(action));
     }
-    return composeFrozenSummary(action, failedIds, marker);
+    return composeFrozenSummary(action, failedIds, marker, orchestration?.modelsUsed);
   };
 
   const summaryIdentityOf = (comment: BotComment) => ({
@@ -429,11 +445,93 @@ export async function publishReviewFromManifest(options: {
     }
   }
 
+  /**
+   * The review body, composed ONCE per run.
+   *
+   * `payloadFor` runs for every attempt, including each subset the bisect
+   * tries, and an accepted subset creates its own review. The digest describes
+   * the RUN, so the same bytes stay true on all of them — and memoizing here is
+   * what guarantees they ARE the same bytes, with no timestamp or re-sorted set
+   * to make two attempts differ (issue #55).
+   */
+  /**
+   * The account the tips must name.
+   *
+   * The command parser requires the AUTHENTICATED account's exact mention, so a
+   * placeholder renders every command in the digest inert on any installation
+   * not called `tgdbot` — which is the bring-your-own-token case (PR #72
+   * review). Resolved once; a failure drops the tips rather than publishing
+   * commands that cannot work.
+   */
+  let botLogin: string | undefined;
+  let botLoginResolved = false;
+  async function resolveBotLogin(): Promise<string | undefined> {
+    if (botLoginResolved) return botLogin;
+    botLoginResolved = true;
+    try {
+      // Present on the conversation-capable adapters, which is every adapter
+      // the CLI constructs; typed narrowly here so a bare VcsAdapter still
+      // satisfies the contract.
+      const identity = (vcsAdapter as Partial<{
+        getAuthenticatedBotIdentity: () => Promise<{ login: string }>;
+      }>).getAuthenticatedBotIdentity;
+      botLogin = identity === undefined
+        ? undefined
+        : (await identity.call(vcsAdapter)).login;
+    } catch {
+      botLogin = undefined;
+    }
+    return botLogin;
+  }
+
+  let reviewDigest: string | undefined;
+  function reviewBody(): string | undefined {
+    const summary = orchestration?.summaryInput;
+    if (summary === undefined) return undefined;
+    try {
+      reviewDigest ??= composeDigest(summary);
+    } catch (error) {
+      // The digest is a nicety. It must never be the reason a review fails to
+      // post, so a composition failure degrades to the provider's default body
+      // rather than propagating into the publication path.
+      console.warn(
+        `tgd-review-agent: could not compose the review digest (${error instanceof Error ? error.message : String(error)})`,
+      );
+      return undefined;
+    }
+    return reviewDigest;
+  }
+
+  function composeDigest(summary: OrchestrationResult["summaryInput"]): string {
+    return renderReviewDigest({
+      headSha: pr.headSha,
+      allFindings: summary.allFindings,
+      inlineCount: summary.inlineCount,
+      unanchored: summary.unanchored,
+      ...(summary.publishFailed === undefined ? {} : { publishFailed: summary.publishFailed }),
+      filesReviewed: summary.filesReviewed,
+      rulesRun: summary.rulesRun,
+      rulesFailed: summary.rulesFailed,
+      // The summary is upserted before any inline write, so its provider-
+      // confirmed identity is available by the time this composes.
+      ...(botComment === null ? {} : { summaryUrl: summaryIdentityOf(botComment).url }),
+      ...(orchestration?.modelsUsed === undefined ? {} : { models: orchestration.modelsUsed }),
+      ...(botLogin === undefined ? {} : { botLogin }),
+      // The legend describes the INLINE comments, so it is driven by the
+      // findings that become them rather than by every finding.
+      inlineFindings: orchestration?.inlineComments
+        .map((comment) => orchestration.findingByClientId?.get(comment.clientId))
+        .filter((finding): finding is Finding => finding !== undefined) ?? [],
+    });
+  }
+
   async function publishInlines(
     action: PublicationAction,
     children: readonly PublicationChild[],
   ): Promise<Map<string, PublicationWriteResult>> {
     const comments = children.map((entry) => toInlineComment(entry, provider));
+    // Before the first compose, so the login is part of the memoized bytes.
+    await resolveBotLogin();
     const results = new Map<string, PublicationWriteResult>();
     try {
       const outcomes = await vcsAdapter.createInlineReview(
@@ -441,6 +539,7 @@ export async function publishReviewFromManifest(options: {
         pr.headSha,
         comments,
         inlineRecovery,
+        reviewBody(),
       );
       try {
         const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
@@ -546,10 +645,10 @@ export async function publishReviewFromManifest(options: {
         const allInlineIds = new Set(inlineChildren.map((entry) => clientIdOf(entry)));
         if (inlineChildren.length > 0 && provider === "github") {
           if (inlineChildren.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
-          const payloadChars = inlineChildren.reduce((total, entry, index) =>
-            total + entry.body.length + (inlineRecovery?.children[index]?.marker.length ?? entry.marker.length) + 256, 0);
-          if (payloadChars > 1_000_000 || inlineChildren.some((entry, index) =>
-            entry.body.length + (inlineRecovery?.children[index]?.marker.length ?? entry.marker.length) + 128 > 65_536)) {
+          if (exceedsAtomicPayload(inlineChildren.map((entry, index) => ({
+            bodyChars: entry.body.length,
+            markerChars: inlineRecovery?.children[index]?.marker.length ?? entry.marker.length,
+          })))) {
             throw new Error("GitHub inline review exceeds the safe atomic payload size");
           }
         }
@@ -961,6 +1060,29 @@ export async function publishFocusedReview(options: {
 
   let inlineOutcomes: readonly InlinePublishOutcome[] | undefined;
 
+  /**
+   * The review body for a FOCUSED run, composed once.
+   *
+   * A focused run looked where it was asked to look, so it must not present
+   * itself as a whole-PR review (issue #55). It carries no finding counts for
+   * the same reason: the reply already restates its findings, and the digest
+   * describes rather than repeats.
+   */
+  let focusedDigest: string | undefined;
+  function focusedReviewBody(): string {
+    focusedDigest ??= renderReviewDigest({
+      headSha: options.pr.headSha,
+      allFindings: [],
+      inlineCount: prepared.children.filter((entry) => entry.kind === "inline").length,
+      unanchored: [],
+      filesReviewed: [],
+      rulesRun: [],
+      rulesFailed: [],
+      focusDirection: options.direction,
+    });
+    return focusedDigest;
+  }
+
   const writer: PublicationWriter = {
     async lookupChild(pending) {
       const parsed = parseChildMarker((pending.body.split(/\r?\n/u).at(-1) ?? "").trim());
@@ -983,6 +1105,8 @@ export async function publishFocusedReview(options: {
             locator,
             options.pr.headSha,
             siblings.map((entry) => toInlineComment(entry, provider)),
+            undefined,
+            focusedReviewBody(),
           );
         }
         const mine = inlineOutcomes.find((outcome) => outcome.clientId === clientIdOf(pending));

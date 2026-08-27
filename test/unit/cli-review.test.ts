@@ -5054,3 +5054,50 @@ describe("review — advisory lookups", () => {
     expect(wholePackFor(h)).toMatch(/this is the latest/i);
   });
 });
+
+// PR #72 review, raised by both bots: the digest and the inline comments named
+// the model, and the MANAGED SUMMARY did not — so provenance depended on which
+// publication path produced the comment.
+describe("review — the summary names the model too", () => {
+  const withModels = (models?: string[]) => makeHarness({
+    botComment: null,
+    dispatchResult: {
+      findings: [],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+      ...(models === undefined ? {} : { modelsUsed: models }),
+    },
+    orchestrationResult: {
+      commentBody: "**No actionable comments.** ✅",
+      inlineComments: [],
+      findingsCount: 0,
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+      ...(models === undefined ? {} : { modelsUsed: models }),
+    } as never,
+  });
+
+  const summaryBodies = (h: Harness): string =>
+    h.vcsAdapter.upsertComment.mock.calls.map((call) => String(call[1])).join("\n");
+
+  it("names the model on the summary it upserts", async () => {
+    const h = withModels(["anthropic/claude-opus-4-5"]);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    expect(summaryBodies(h)).toContain("anthropic/claude-opus-4-5");
+    vi.restoreAllMocks();
+  });
+
+  it("leaves the summary unadorned when no model resolved", async () => {
+    const h = withModels(undefined);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    expect(summaryBodies(h)).toContain("Posted by");
+    expect(summaryBodies(h)).not.toContain(" using ");
+    vi.restoreAllMocks();
+  });
+});

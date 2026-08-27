@@ -27,7 +27,13 @@ import {
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
-import { BOT_SIGNATURE_BLOCK, type ClarificationPresentation, type ContextUnavailableLabel } from "./review/comment-format.js";
+import {
+  botSignatureBlock,
+  exceedsAtomicPayload,
+  renderReviewDigest,
+  type ClarificationPresentation,
+  type ContextUnavailableLabel,
+} from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
@@ -1567,7 +1573,10 @@ export async function review(
     // Visible "written by the tool" line, last before the dedup marker on every
     // summary this path composes. composeFrozenSummary re-places it when a
     // replayed manifest appends relocated findings after the frozen body.
-    if (sign) suffixParts.push(BOT_SIGNATURE_BLOCK);
+    // Named with the models the run used, so provenance does not depend on
+    // which publication path produced the comment (PR #72 review). The inline
+    // comments and the digest already did this; the managed summary did not.
+    if (sign) suffixParts.push(botSignatureBlock(o.modelsUsed));
     if (marker.length > 0) suffixParts.push(marker);
     const suffix = `\n\n${suffixParts.join("\n\n")}`;
     const maxSummaryLength = providerLimit ? 65_536 - suffix.length : Number.MAX_SAFE_INTEGER;
@@ -1589,6 +1598,22 @@ export async function review(
   // of the inline comments it WOULD have posted, so a dry run shows the whole
   // review, not just half of it.
   if (config.dryRun) {
+    // The review BODY is part of what would be posted, so a dry run shows it
+    // too — otherwise the preview omits the one surface GitHub treats as the
+    // review itself (issue #55).
+    if (orchestration.inlineComments.length > 0) {
+      console.log("\n----- review body -----");
+      console.log(renderReviewDigest({
+        headSha: pr.headSha,
+        allFindings: orchestration.summaryInput.allFindings,
+        inlineCount: orchestration.summaryInput.inlineCount,
+        unanchored: orchestration.summaryInput.unanchored,
+        filesReviewed: orchestration.summaryInput.filesReviewed,
+        rulesRun: orchestration.summaryInput.rulesRun,
+        rulesFailed: orchestration.summaryInput.rulesFailed,
+        ...(orchestration.modelsUsed === undefined ? {} : { models: orchestration.modelsUsed }),
+      }));
+    }
     for (const comment of orchestration.inlineComments) {
       console.log(`\n----- inline comment: ${comment.path}:${comment.line} -----`);
       console.log(comment.body);
@@ -1640,8 +1665,10 @@ export async function review(
       // write. A safe placeholder exercises the exact same bounded encoder.
       if (provider === "github") {
         if (orchestration.inlineComments.length > 100) throw new Error("GitHub inline review exceeds the safe atomic comment count");
-        const payloadChars = orchestration.inlineComments.reduce((total, comment, index) => total + comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 256, 0);
-        if (payloadChars > 1_000_000 || orchestration.inlineComments.some((comment, index) => comment.body.length + (inlineRecovery?.children[index]?.marker.length ?? 0) + 128 > 65_536)) {
+        if (exceedsAtomicPayload(orchestration.inlineComments.map((comment, index) => ({
+          bodyChars: comment.body.length,
+          markerChars: inlineRecovery?.children[index]?.marker.length ?? 0,
+        })))) {
           throw new Error("GitHub inline review exceeds the safe atomic payload size");
         }
       }

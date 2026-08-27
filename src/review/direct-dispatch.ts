@@ -434,11 +434,20 @@ interface RuleOutcome {
       }
     }
 
+    // The specs the rules actually ran on, so the published signature can name
+    // them rather than the reader guessing.
+    //
+    // Derived from what was DISPATCHED, not from `rulesRun`: a rule whose
+    // output failed to parse still reached the model and still consumed it, so
+    // filtering on success understated what ran (PR #72 review).
+    const modelsUsed = [...new Set(effective.map((rule) => `${rule.provider}/${rule.model}`))];
+
     return {
       findings,
       rulesRun,
       rulesFailed,
       ruleFailureReasons,
+      ...(modelsUsed.length === 0 ? {} : { modelsUsed }),
       ...(validatedContext.manifestHash === undefined
         ? {}
         : { contextManifestHash: validatedContext.manifestHash }),
