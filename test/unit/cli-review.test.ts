@@ -19,6 +19,7 @@ import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
 import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
 import { BOT_SIGNATURE, BOT_SIGNATURE_BLOCK } from "../../src/review/comment-format.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
+import { ContextRequiredError, contextFingerprint } from "../../src/context/prepare.js";
 import { GitHubDiffIncompleteError } from "../../src/vcs/github-large-diff.js";
 import { deriveInlineChildId, formatInlineRecoveryMarker, formatPendingMarker, parseBotMarker } from "../../src/review/comment-marker.js";
 import type { ResolvedConfig } from "../../src/config.js";
@@ -222,6 +223,13 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",
+    // Off by default in this harness: mapping is the one review step that
+    // needs a real git mirror and a model session, and no test here is about
+    // that. `contextFingerprint` returns undefined for "off", so every config
+    // hash below stays exactly what it was before context existed. Tests that
+    // DO exercise context set it explicitly and inject `prepareContext`.
+    context: "off",
+    allowDegradedContext: false,
     ...overrides,
   };
 }
@@ -282,6 +290,7 @@ interface Harness {
   loadRules: ReturnType<typeof vi.fn>;
   dispatchRules: ReturnType<typeof vi.fn>;
   orchestrate: ReturnType<typeof vi.fn>;
+  prepareContext: ReturnType<typeof vi.fn>;
   publicationHooks?: ReviewDependencies["publicationHooks"];
 }
 
@@ -398,6 +407,7 @@ function makeHarness(options: {
     resolveConfig: vi.fn().mockReturnValue(config),
     loadRules: vi.fn().mockResolvedValue(loadResult),
     dispatchRules: vi.fn().mockResolvedValue(dispatchResult),
+    prepareContext: vi.fn().mockResolvedValue({ status: "off" }),
     orchestrate: vi.fn().mockReturnValue(orchestrationResult),
   };
 }
@@ -409,6 +419,9 @@ function depsFrom(h: Harness) {
     dispatchRules: h.dispatchRules,
     orchestrate: h.orchestrate,
     publicationHooks: h.publicationHooks,
+    // Belt and braces alongside `context: "off"` above: even if a test
+    // overrides the mode, it must never reach a real worktree or mapper.
+    prepareContext: h.prepareContext,
   };
 }
 
@@ -1405,10 +1418,17 @@ describe("review", () => {
 
     await review(h.args, depsFrom(h));
 
-    const passed = h.dispatchRules.mock.calls[0]?.[0] as { contextPacks?: Record<string, { text: string }> };
+    const passed = h.dispatchRules.mock.calls[0]?.[0] as {
+      contextPacks?: Record<string, { text: string; untrustedText?: string }>;
+    };
     expect(passed.contextPacks).toBeDefined();
     expect(Object.keys(passed.contextPacks ?? {})).toEqual(["rule-a"]);
-    expect(passed.contextPacks?.["rule-a"]?.text).toContain("left-pad@1.3.1");
+    // #63: the identifier still reaches the rule, on the untrusted side of the
+    // pack — the author wrote "left-pad", so the trusted half cannot vouch for
+    // it. End-to-end through the real CLI wiring, not just the pack builder.
+    expect(passed.contextPacks?.["rule-a"]?.untrustedText).toContain("left-pad@1.3.1");
+    expect(passed.contextPacks?.["rule-a"]?.text).not.toContain("left-pad");
+    expect(passed.contextPacks?.["rule-a"]?.text).toContain("Entry 1");
 
     vi.restoreAllMocks();
   });
@@ -4087,6 +4107,348 @@ describe("review: discussion context failures are diagnosable and non-blocking",
   });
 });
 
+// #58: trusted-base repository context reaching the reviewing rules. The
+// preparation itself is covered in test/unit/context/prepare.test.ts; these
+// cover the CLI's side of it — what it hands to dispatch, what it says when
+// there is none, and that it never blocks a review it could still run.
+describe("repository context", () => {
+  function readyPacks(...ruleNames: string[]) {
+    const packs: Record<string, { text: string; manifestHash: string; truncated: boolean; sources: [] }> = {};
+    for (const name of ruleNames) {
+      packs[name] = {
+        text: `# Trusted Rule Context\n\nRule: ${name}\n`,
+        manifestHash: "b".repeat(64),
+        truncated: false,
+        sources: [],
+      };
+    }
+    return { status: "ready" as const, packs, manifestHash: "b".repeat(64), degradedReasons: [], cacheHit: false };
+  }
+
+  it("hands every rule's pack to dispatch", async () => {
+    const h = makeHarness({
+      args: makeArgs({ context: "auto" }),
+      loadResult: {
+        rules: [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })],
+        errors: [],
+      },
+    });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a", "rule-b"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as { contextPacks?: Record<string, unknown> };
+    expect(Object.keys(dispatched.contextPacks ?? {}).sort()).toEqual(["rule-a", "rule-b"]);
+  });
+
+  it("prepares context against the BASE commit, never the head", async () => {
+    const pr = makePr({ headSha: "cafef00d", baseSha: "0badbeef" });
+    const h = makeHarness({ pr, args: makeArgs({ context: "auto" }) });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { baseSha: string; headSha: string };
+    expect(request.baseSha).toBe("0badbeef");
+    expect(request.headSha).toBe("cafef00d");
+  });
+
+  it("sends a renamed file's BASE path to context preparation, not just its new one", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "auto" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(
+      [
+        "diff --git a/src/old-name.ts b/src/new-name.ts",
+        "rename from src/old-name.ts",
+        "rename to src/new-name.ts",
+        "--- a/src/old-name.ts",
+        "+++ b/src/new-name.ts",
+        "@@ -1,1 +1,1 @@",
+        "-const a = 1;",
+        "+const a = 2;",
+        "",
+      ].join("\n"),
+    );
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { changedFiles: string[] };
+    // The map is built from the base commit, where this file is still
+    // `src/old-name.ts`; sending only the new path finds no graph node.
+    expect(request.changedFiles).toContain("src/old-name.ts");
+    expect(request.changedFiles).toContain("src/new-name.ts");
+  });
+
+  it("reviews without context, and says so, when preparation fails", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "auto" }) });
+    h.prepareContext.mockResolvedValue({ status: "unavailable", reasons: ["mapping timed out"] });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as { contextPacks?: unknown };
+    expect(dispatched.contextPacks).toBeUndefined();
+    // The summary carries a label, never the raw mapper diagnostic: that text
+    // can name local filesystem paths and the summary is published.
+    const orchestrated = h.orchestrate.mock.calls[0]![2] as { contextUnavailable?: string[] };
+    expect(orchestrated.contextUnavailable).toContain("repository");
+    expect(JSON.stringify(orchestrated)).not.toContain("mapping timed out");
+    // The operator still gets the reason, on stderr.
+    expect(warnSpy.mock.calls.flat().join(" ")).toContain("mapping timed out");
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("exits fatal without posting when --context require cannot be satisfied", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "require" }) });
+    h.prepareContext.mockRejectedValue(new ContextRequiredError(["no base worktree"]));
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(1);
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+    expect(errorSpy.mock.calls.flat().join(" ")).toContain("no base worktree");
+    errorSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  it("passes mode off through to preparation, and dispatches no packs", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "off" }) });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { mode: string };
+    expect(request.mode).toBe("off");
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as { contextPacks?: unknown };
+    expect(dispatched.contextPacks).toBeUndefined();
+  });
+
+  it("degrades rather than failing when context preparation throws unexpectedly", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "auto" }) });
+    // Not a ContextRequiredError: e.g. an unset HOME while selecting the cache
+    // root. Under `auto` that must never take down a review it could still run.
+    h.prepareContext.mockRejectedValue(new Error("HOME is required to select the context directory"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+    const orchestrated = h.orchestrate.mock.calls[0]![2] as { contextUnavailable?: string[] };
+    expect(orchestrated.contextUnavailable).toContain("repository");
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("propagates an unexpected failure in require mode instead of reviewing blind", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "require" }) });
+    h.prepareContext.mockRejectedValue(new Error("HOME is required to select the context directory"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(review(h.args, depsFrom(h))).rejects.toThrow(/HOME is required/);
+
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
+  it("prepares context only after the dedup skip, so a skipped run never maps", async () => {
+    const args = makeArgs({ context: "auto" });
+    const pr = makePr({ headSha: "cafef00d" });
+    const cfg = computeReviewConfigHash(
+      args,
+      undefined,
+      undefined,
+      contextFingerprint({ mode: "auto", baseSha: pr.baseSha, allowDegraded: false }),
+    );
+    const h = makeHarness({
+      args,
+      pr,
+      botComment: {
+        id: "999",
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
+        lastReviewedSha: "cafef00d",
+        reviewedConfig: cfg,
+      },
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, depsFrom(h));
+
+    expect(exitCode).toBe(0);
+    // Mapping is the most expensive step in a review; a run that is going to
+    // be skipped must not pay for it.
+    expect(h.prepareContext).not.toHaveBeenCalled();
+    expect(h.dispatchRules).not.toHaveBeenCalled();
+    logSpy.mockRestore();
+  });
+
+  it("folds repository context and dependency facts into one pack per rule", async () => {
+    // Two independent producers of trusted context now exist, and the dispatch
+    // contract allows exactly ONE pack per rule sharing one manifest hash — so
+    // neither may quietly displace the other.
+    const h = makeHarness({
+      args: makeArgs({ context: "auto", dependencyFacts: "on" }),
+      loadResult: { rules: [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })], errors: [] },
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue([
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      '@@ -3,7 +3,7 @@ "dependencies": {',
+      '-    "lodash": "4.17.20",',
+      '+    "lodash": "4.17.21",',
+      "",
+    ].join("\n"));
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a", "rule-b"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as {
+      contextPacks?: Record<string, { text: string; manifestHash: string }>;
+    };
+    expect(Object.keys(dispatched.contextPacks ?? {}).sort()).toEqual(["rule-a", "rule-b"]);
+    for (const name of ["rule-a", "rule-b"]) {
+      const pack = dispatched.contextPacks![name]!;
+      expect(pack.text).toContain("# Trusted Rule Context");
+      expect(pack.text).toContain("Dependency changes in this pull request");
+    }
+    // One shared hash across rules, and not either component's own hash.
+    const hashes = new Set(Object.values(dispatched.contextPacks!).map((pack) => pack.manifestHash));
+    expect(hashes.size).toBe(1);
+    expect([...hashes][0]).not.toBe("b".repeat(64));
+  });
+
+  it("still sends the repository pack alone when no manifest changed", async () => {
+    const h = makeHarness({ args: makeArgs({ context: "auto", dependencyFacts: "on" }) });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as {
+      contextPacks?: Record<string, { text: string; manifestHash: string }>;
+    };
+    const pack = dispatched.contextPacks!["rule-a"]!;
+    expect(pack.text).toContain("# Trusted Rule Context");
+    expect(pack.text).not.toContain("Dependency changes in this pull request");
+    // A single component is passed through untouched, hash included.
+    expect(pack.manifestHash).toBe("b".repeat(64));
+  });
+
+  it("reserves the dependency section's share of the size ceiling", async () => {
+    // --context-max-chars is a per-rule cost control, and the two producers
+    // share one rule's pack — so the repository map must be rendered against
+    // what is LEFT, not against the whole ceiling.
+    const h = makeHarness({
+      args: makeArgs({ context: "auto", dependencyFacts: "on", contextMaxChars: 12_000 }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue([
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      '@@ -3,7 +3,7 @@ "dependencies": {',
+      '-    "lodash": "4.17.20",',
+      '+    "lodash": "4.17.21",',
+      "",
+    ].join("\n"));
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { maxChars?: number };
+    expect(request.maxChars).toBeLessThan(12_000);
+    expect(request.maxChars).toBeGreaterThanOrEqual(4_000);
+  });
+
+  it("spends the whole ceiling on the repository map when no manifest changed", async () => {
+    const h = makeHarness({
+      args: makeArgs({ context: "auto", dependencyFacts: "on", contextMaxChars: 12_000 }),
+    });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    const request = h.prepareContext.mock.calls[0]![0] as { maxChars?: number };
+    expect(request.maxChars).toBe(12_000);
+  });
+
+  it("carries dependency facts on the legacy engine too, now that it takes packs", async () => {
+    // The suppression this replaces was correct when written: the legacy
+    // prompt builder never received a pack. Wiring context removed that
+    // premise, and leaving the guard would deny an operator facts they asked
+    // for on a reason that no longer holds.
+    const h = makeHarness({
+      args: makeArgs({ context: "off", dependencyFacts: "on", dispatch: "legacy" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue([
+      "diff --git a/package.json b/package.json",
+      "--- a/package.json",
+      "+++ b/package.json",
+      '@@ -3,7 +3,7 @@ "dependencies": {',
+      '-    "lodash": "4.17.20",',
+      '+    "lodash": "4.17.21",',
+      "",
+    ].join("\n"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as {
+      contextPacks?: Record<string, { text: string }>;
+    };
+    expect(dispatched.contextPacks?.["rule-a"]?.text).toContain("Dependency changes in this pull request");
+    expect(warnSpy.mock.calls.flat().join(" ")).not.toContain("needs --dispatch direct");
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it("re-reviews when the context mode changes, because the config hash moves", async () => {
+    const pr = makePr({ headSha: "cafef00d" });
+    const offArgs = makeArgs({ context: "off" });
+    const offHash = computeReviewConfigHash(offArgs);
+    const h = makeHarness({
+      args: makeArgs({ context: "auto" }),
+      pr,
+      botComment: {
+        id: "999",
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${offHash} -->`,
+        lastReviewedSha: "cafef00d",
+        reviewedConfig: offHash,
+      },
+    });
+    h.prepareContext.mockResolvedValue(readyPacks("rule-a"));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    logSpy.mockRestore();
+    expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+  });
+});
+
 // PR #54 review: the fetch layer built for #50 was invoked only by its own
 // tests. Every real review called dependencyContextPack with no facts, so the
 // dependency-currency rule could never see a latest version, a deprecation, or
@@ -4113,6 +4475,14 @@ describe("review — dependency facts", () => {
       | { contextPacks?: Record<string, { text: string }> }
       | undefined;
     return input?.contextPacks?.["rule-a"]?.text;
+  };
+
+  /** The diff-derived half (#63): identifiers the host did not establish. */
+  const untrustedPackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { untrustedText?: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.untrustedText;
   };
 
   // Final round: with the feature off there is no pack at all, because its
@@ -4146,6 +4516,11 @@ describe("review — dependency facts", () => {
     expect(packFor(h)).toMatch(/deprecated/i);
     expect(packFor(h)).not.toContain("use lodash-es");
     expect(packFor(h)).not.toMatch(/NOT been checked/);
+    // #63: the registry's answer is host-established and stays trusted; the
+    // package it is about is the author's string and moves to the untrusted
+    // half. Both together are what makes the finding reportable.
+    expect(packFor(h)).not.toContain("lodash");
+    expect(untrustedPackFor(h)).toContain("lodash");
   });
 
   // An outage must not read as a clean bill of health, and must not fail the
@@ -4181,6 +4556,13 @@ describe("review — dependency facts", () => {
 // while the registry requests still went out. Silent is the problem: the
 // operator asked for a dependency review, paid for the lookups, and got a run
 // that could not produce a single dependency finding.
+// PR #65: this suite asserted that legacy dispatch SUPPRESSED dependency facts,
+// which was correct while the legacy prompt builder could not receive a context
+// pack. Wiring repository context gave `buildDispatchPrompt` a `packsByRule`
+// parameter and `dispatchRules` the same validation the direct engine has, so
+// the premise is gone and the suppression would now deny an operator facts they
+// asked for on a reason that no longer holds. The suite now pins the opposite
+// contract, deliberately, rather than being deleted.
 describe("review — dependency facts under legacy dispatch", () => {
   const MANIFEST_DIFF = [
     "diff --git a/package.json b/package.json",
@@ -4191,18 +4573,28 @@ describe("review — dependency facts under legacy dispatch", () => {
     '+    "lodash": "4.17.21",',
   ].join("\n");
 
-  it("asks the registry nothing, and says why, when the engine cannot carry it", async () => {
+  it("asks the registry and reaches the rules, now that the engine carries packs", async () => {
     const h = makeHarness({
       args: makeArgs({ dependencyFacts: "on", dispatch: "legacy" }),
     });
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
-    const fetchJson = vi.fn();
+    const fetchJson = vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" },
+      versions: { "4.17.21": {} },
+    });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await review(h.args, { ...depsFrom(h), fetchJson });
 
-    expect(fetchJson).not.toHaveBeenCalled();
-    expect(warn.mock.calls.flat().join(" ")).toMatch(/dependency.facts.*legacy|legacy.*dependency/i);
+    expect(fetchJson).toHaveBeenCalled();
+    const dispatched = h.dispatchRules.mock.calls[0]![0] as {
+      contextPacks?: Record<string, { text: string }>;
+    };
+    expect(dispatched.contextPacks?.["rule-a"]?.text)
+      .toContain("Dependency changes in this pull request");
+    // The old warning must be gone, not merely unreachable: a lookup that
+    // happened while the operator was told it had not is worse than either.
+    expect(warn.mock.calls.flat().join(" ")).not.toMatch(/needs --dispatch direct/i);
     warn.mockRestore();
   });
 
@@ -4242,6 +4634,14 @@ describe("review — the dependency pack is part of the opt-in", () => {
     return input?.contextPacks?.["rule-a"]?.text;
   };
 
+  /** The diff-derived half (#63): identifiers the host did not establish. */
+  const untrustedPackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { untrustedText?: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"]?.untrustedText;
+  };
+
   it("supplies no pack at all when the feature is off", async () => {
     const h = makeHarness();
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
@@ -4263,7 +4663,8 @@ describe("review — the dependency pack is part of the opt-in", () => {
       }),
     });
 
-    expect(packFor(h)).toContain("lodash");
+    expect(untrustedPackFor(h)).toContain("lodash");
+    expect(packFor(h)).not.toContain("lodash");
   });
 });
 
@@ -4281,11 +4682,15 @@ describe("review — manifests are read at the head ref", () => {
     '+    "node": "22.0.0",',
   ].join("\n");
 
-  const packFor = (h: Harness): string | undefined => {
+  // Both halves. #63 moved the author's identifiers into `untrustedText`, so a
+  // test asking "did this package reach the rules" reads the whole pack; the
+  // tests that care WHICH half say so explicitly with `packFor`.
+  const wholePackFor = (h: Harness): string | undefined => {
     const input = h.dispatchRules.mock.calls[0]?.[0] as
-      | { contextPacks?: Record<string, { text: string }> }
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
       | undefined;
-    return input?.contextPacks?.["rule-a"]?.text;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
   };
 
   it("asks for each changed manifest at the head sha", async () => {
@@ -4316,8 +4721,8 @@ describe("review — manifests are read at the head ref", () => {
       "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
     }) });
 
-    expect(packFor(h)).toContain("lodash");
-    expect(packFor(h)).not.toMatch(/(^|\W)node@/);
+    expect(wholePackFor(h)).toContain("lodash");
+    expect(wholePackFor(h)).not.toMatch(/(^|\W)node@/);
   });
 
   // PR #67: extraction compares BASE against HEAD, so a dependency that did not
@@ -4339,8 +4744,8 @@ describe("review — manifests are read at the head ref", () => {
       expect.anything(), "deadbeef", "package.json",
     );
     // lodash moved 4.17.20 -> 4.17.21; react is 18.0.0 at both ends.
-    expect(packFor(h)).toContain("lodash");
-    expect(packFor(h)).not.toContain("react");
+    expect(wholePackFor(h)).toContain("lodash");
+    expect(wholePackFor(h)).not.toContain("react");
   });
 
   it("makes no manifest request when the feature is off", async () => {
@@ -4360,8 +4765,8 @@ describe("review — manifests are read at the head ref", () => {
 
     await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
 
-    expect(packFor(h)).toMatch(/could NOT be read/i);
-    expect(packFor(h)).toContain("package.json");
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
+    expect(wholePackFor(h)).toContain("package.json");
   });
 
   it("survives a manifest read that fails outright", async () => {
@@ -4373,7 +4778,7 @@ describe("review — manifests are read at the head ref", () => {
     const exitCode = await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
 
     expect(exitCode).toBe(0);
-    expect(packFor(h)).toMatch(/could NOT be read/i);
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
     warn.mockRestore();
   });
 });
@@ -4391,11 +4796,15 @@ describe("review — the comparison base is where the branches diverged", () => 
     '+    "lodash": "4.17.21",',
   ].join("\n");
 
-  const packFor = (h: Harness): string | undefined => {
+  // Both halves. #63 moved the author's identifiers into `untrustedText`, so a
+  // test asking "did this package reach the rules" reads the whole pack; the
+  // tests that care WHICH half say so explicitly with `packFor`.
+  const wholePackFor = (h: Harness): string | undefined => {
     const input = h.dispatchRules.mock.calls[0]?.[0] as
-      | { contextPacks?: Record<string, { text: string }> }
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
       | undefined;
-    return input?.contextPacks?.["rule-a"]?.text;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
   };
 
   const manifestAt = (versions: Record<string, string>) =>
@@ -4423,7 +4832,7 @@ describe("review — the comparison base is where the branches diverged", () => 
       expect.anything(), "ccccccc1", "package.json",
     );
     // Read at the tip, lodash looks unchanged and nothing is reported at all.
-    expect(packFor(h)).toContain("lodash");
+    expect(wholePackFor(h)).toContain("lodash");
   });
 
   // Round four: `startSha` is NOT a merge base. GitLab maps `diff_refs.start_sha`
@@ -4467,7 +4876,7 @@ describe("review — the comparison base is where the branches diverged", () => 
       expect.anything(), "bbbbbbb1", "package.json",
     );
     expect(fetchJson).not.toHaveBeenCalled();
-    expect(packFor(h)).toMatch(/could NOT be read/i);
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
   });
 
   it("says the same when the merge-base lookup fails outright", async () => {
@@ -4482,7 +4891,7 @@ describe("review — the comparison base is where the branches diverged", () => 
     const exitCode = await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
 
     expect(exitCode).toBe(0);
-    expect(packFor(h)).toMatch(/could NOT be read/i);
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
     warn.mockRestore();
   });
 
@@ -4509,11 +4918,15 @@ describe("review — manifest reads are bounded", () => {
       '+    "lodash": "4.17.21",',
     ].join("\n")).join("\n");
 
-  const packFor = (h: Harness): string | undefined => {
+  // Both halves. #63 moved the author's identifiers into `untrustedText`, so a
+  // test asking "did this package reach the rules" reads the whole pack; the
+  // tests that care WHICH half say so explicitly with `packFor`.
+  const wholePackFor = (h: Harness): string | undefined => {
     const input = h.dispatchRules.mock.calls[0]?.[0] as
-      | { contextPacks?: Record<string, { text: string }> }
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
       | undefined;
-    return input?.contextPacks?.["rule-a"]?.text;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
   };
 
   it("stops reading after a bounded number of manifests", async () => {
@@ -4537,7 +4950,7 @@ describe("review — manifest reads are bounded", () => {
       "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
     }) });
 
-    expect(packFor(h)).toMatch(/could NOT be read/i);
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
   });
 
   it("reads every manifest when there are few", async () => {
@@ -4549,6 +4962,6 @@ describe("review — manifest reads are bounded", () => {
     }) });
 
     expect(h.vcsAdapter.getFileAtRef.mock.calls.length).toBe(6);
-    expect(packFor(h)).not.toMatch(/could NOT be read/i);
+    expect(wholePackFor(h)).not.toMatch(/could NOT be read/i);
   });
 });

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, rename as fsRename, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, realpath, rename as fsRename, rm, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   ContextValidationError,
@@ -15,6 +15,24 @@ import type {
   ContextManifestInput,
   DocumentRecord,
 } from "./types.js";
+
+/**
+ * Age past which a publication claim is treated as abandoned.
+ *
+ * `promoteContext` deliberately leaves its claim behind when a process dies
+ * mid-publication, so that a later publisher cannot guess it is stale and
+ * overlap a live one. That is the right instinct and the wrong end state:
+ * nothing else ever creates the entry, so every later run re-maps, finds the
+ * claim still held, and gives up — permanently, and under `--context require`
+ * as a non-zero exit — until someone deletes the directory by hand.
+ *
+ * An hour resolves it without weakening the original reason. A live publisher
+ * holds its claim for one `promoteContext`: hashing the mapped artifacts and
+ * renaming them into place. That is seconds to tens of seconds on a large
+ * repository, and the reclaim is atomic besides, so the only way to lose this
+ * race is to be an hour into a rename.
+ */
+const STALE_CLAIM_AGE_MS = 60 * 60 * 1000;
 
 const HASH_PATTERN = /^[a-f0-9]{64}$/;
 const MAX_READY_MANIFEST_BYTES = 1024 * 1024;
@@ -397,6 +415,56 @@ export class ContextCache {
       if (error instanceof ContextValidationError || isUnsafeLookupPath(error)) return undefined;
       throw error;
     }
+  }
+
+  /**
+   * Discards a publication claim left behind by a process that died, so the
+   * next publication can proceed. Returns whether one was actually reclaimed.
+   *
+   * Only a claim older than `maxAgeMs` is touched — see `STALE_CLAIM_AGE_MS`
+   * for why an hour is both safe and necessary. The reclaim itself is a single
+   * `rename` to a unique path, never a delete in place: two racing reclaimers
+   * mean one `rename` succeeds and the other gets ENOENT, and a publisher
+   * somehow still live finds its own paths gone and fails cleanly rather than
+   * racing anyone into a half-built ready entry. The rename is the commit
+   * point; removing the moved directory afterwards is only housekeeping, and a
+   * failure there is not allowed to unsay a reclaim that already happened.
+   */
+  async reclaimStaleClaim(
+    key: ContextCacheKey,
+    maxAgeMs: number = STALE_CLAIM_AGE_MS,
+    now: number = Date.now(),
+  ): Promise<boolean> {
+    let claimPath: string;
+    try {
+      claimPath = `${this.entryPath(key)}.publishing`;
+    } catch {
+      return false;
+    }
+
+    let info: Awaited<ReturnType<typeof lstat>>;
+    try {
+      info = await lstat(claimPath);
+    } catch (error) {
+      if (isMissing(error)) return false;
+      throw error;
+    }
+    // A symlink here is not a claim this cache wrote. Following it would move
+    // or delete something outside the root entirely.
+    if (!info.isDirectory() || info.isSymbolicLink()) return false;
+    if (now - info.mtimeMs < maxAgeMs) return false;
+
+    const quarantined = `${claimPath}.stale-${randomUUID()}`;
+    try {
+      await fsRename(claimPath, quarantined);
+    } catch (error) {
+      // Lost the race to another reclaimer, or the publisher woke and released
+      // it. Either way the claim is no longer ours to report on.
+      if (isMissing(error)) return false;
+      throw error;
+    }
+    await rm(quarantined, { recursive: true, force: true }).catch(() => undefined);
+    return true;
   }
 
   async promoteContext(stagingPath: string, input: ContextManifestInput): Promise<ContextManifest> {

@@ -77,8 +77,22 @@ export function validateDispatchContext(
     const packManifestHash = candidate.manifestHash;
     const truncated = candidate.truncated;
     const sources = candidate.sources;
+    const untrustedText = candidate.untrustedText;
     if (typeof text !== "string" || text.trim().length === 0) {
       return invalid(`context pack for ${JSON.stringify(rule.name)} must contain non-empty text`);
+    }
+    // Validated rather than ignored. This function rebuilds each pack from
+    // named fields, so an unhandled one is DROPPED — and dropping this one is
+    // not a cosmetic loss: the trusted half refers to its entries by label
+    // ("Entry 1"), and without the untrusted half those labels name nothing.
+    // A malformed value is a caller error for the same reason `text` is.
+    if (
+      untrustedText !== undefined &&
+      (typeof untrustedText !== "string" || untrustedText.trim().length === 0)
+    ) {
+      return invalid(
+        `context pack for ${JSON.stringify(rule.name)} must contain non-empty untrustedText when present`,
+      );
     }
     if (typeof packManifestHash !== "string" || !MANIFEST_HASH_RE.test(packManifestHash)) {
       return invalid(
@@ -94,6 +108,7 @@ export function validateDispatchContext(
       rule.name,
       Object.freeze({
         text,
+        ...(untrustedText === undefined ? {} : { untrustedText }),
         manifestHash: packManifestHash,
         truncated: truncated === true,
         sources: Array.isArray(sources)

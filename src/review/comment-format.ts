@@ -481,8 +481,8 @@ export interface SummaryInput {
   deferredClarificationCount?: number;
   /** Non-actionable discussion status. */
   disputed?: readonly Finding[];
-  /** Optional labels such as "discussion" or "memory". */
-  contextUnavailable?: readonly string[];
+  /** Which kinds of context this run went without. See `ContextUnavailableLabel`. */
+  contextUnavailable?: readonly ContextUnavailableLabel[];
 }
 
 function canonicalRelatedWorkReference(value: unknown): RelatedWorkReference | undefined {
@@ -778,6 +778,15 @@ function renderDiscussionMemorySection(input: SummaryInput): string | undefined 
   ].join("\n");
 }
 
+/**
+ * The kinds of context a review can go without, named once so the producer and
+ * this consumer cannot drift apart. They were two bare literals in two files
+ * before: a typo at either end silently dropped the note from the summary, and
+ * nothing failed — the operator simply never learned the review had run blind.
+ * As a union, the same typo is a compile error.
+ */
+export type ContextUnavailableLabel = "discussion" | "memory" | "repository";
+
 function renderContextUnavailable(input: SummaryInput): string | undefined {
   const labels = input.contextUnavailable ?? [];
   const notes = [
@@ -786,6 +795,9 @@ function renderContextUnavailable(input: SummaryInput): string | undefined {
       : undefined,
     labels.includes("memory")
       ? "> Memory context was unavailable for this run."
+      : undefined,
+    labels.includes("repository")
+      ? "> Repository context was unavailable for this run. The review used the diff and trusted rules only, without the trusted-base map of the surrounding code."
       : undefined,
   ].filter((note): note is string => note !== undefined);
   if (notes.length === 0) return undefined;
@@ -1229,7 +1241,13 @@ function renderSummaryCommentWithIncludedSuggestions(
     collapsed.push(
       detailsBlock(
         `📒 Files reviewed (${input.filesReviewed.length})`,
-        input.filesReviewed.map((f) => `* \`${f}\``),
+        // A path here is a PR AUTHOR's filename, and git writes a name
+        // containing a backtick bare (backtick is not one of the characters
+        // that force git's C-style quoting), so it arrives intact. Interpolated
+        // raw it closes this code span, and the rest of the line renders as
+        // markdown inside the published summary. Same sanitizer, and the same
+        // reason, as every other single-line field in this file.
+        input.filesReviewed.map((f) => `* \`${sanitizeInline(f)}\``),
       ),
     );
   }
@@ -1237,7 +1255,10 @@ function renderSummaryCommentWithIncludedSuggestions(
     collapsed.push(
       detailsBlock(
         `⚙️ Rules run (${input.rulesRun.length})`,
-        input.rulesRun.map((r) => `* \`${r}\``),
+        // Rule names come from the base branch and are trusted, but the escape
+        // is a property of the code span rather than of the source: sanitized
+        // for the same reason the finding table sanitizes `finding.ruleName`.
+        input.rulesRun.map((r) => `* \`${sanitizeInline(r)}\``),
       ),
     );
   }

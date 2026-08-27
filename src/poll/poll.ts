@@ -624,8 +624,12 @@ function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): Review
     dryRun: config.dryRun,
     trustLocalRules: config.trustLocalRules,
     dispatch: config.dispatch,
+    context: config.context,
+    allowDegradedContext: config.allowDegradedContext,
     ...(config.model === undefined ? {} : { model: config.model }),
     ...(config.maxDiffChars === undefined ? {} : { maxDiffChars: config.maxDiffChars }),
+    ...(config.contextMaxChars === undefined ? {} : { contextMaxChars: config.contextMaxChars }),
+    ...(config.contextDir === undefined ? {} : { contextDir: config.contextDir }),
     ...(config.stateDir === undefined ? {} : { stateDir: config.stateDir }),
   };
 }

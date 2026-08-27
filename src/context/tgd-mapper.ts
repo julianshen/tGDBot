@@ -19,6 +19,14 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { digestArtifactInputs, digestDegradedArtifactInputs } from "./artifact-validator.js";
+import {
+  CONTEXT_PATH,
+  DOMAIN_PATH,
+  GRAPH_ROOT,
+  KNOWLEDGE_PATH,
+  METADATA_PATH,
+  ZERO_DOMAINS_PATH,
+} from "./artifact-paths.js";
 import { contextCacheKeyForRepository, type ArtifactInput, type ContextCacheKey } from "./types.js";
 import type { RepositoryRef } from "../target/types.js";
 import type {
@@ -29,12 +37,6 @@ import type {
   MappingResult,
 } from "./mapper.js";
 
-const CONTEXT_PATH = "CONTEXT.md";
-const GRAPH_ROOT = ".understand-anything";
-const KNOWLEDGE_PATH = `${GRAPH_ROOT}/knowledge-graph.json`;
-const DOMAIN_PATH = `${GRAPH_ROOT}/domain-graph.json`;
-const ZERO_DOMAINS_PATH = `${GRAPH_ROOT}/zero-domains.json`;
-const METADATA_PATH = `${GRAPH_ROOT}/mapping-metadata.json`;
 const DEFAULT_MAPPING_TIMEOUT_MS = 30 * 60 * 1000;
 
 const EMBEDDED_MAPPING_CONTRACT = [

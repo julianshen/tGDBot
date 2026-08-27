@@ -253,6 +253,33 @@ describe("renderSummaryComment", () => {
     expect(body).not.toContain("warning"); // zero counts are omitted
   });
 
+  // A PR author picks their own filenames, and git writes a name containing a
+  // backtick BARE — backtick is not one of the characters that force git's
+  // C-style quoting, and it is not a control character, so the collector's
+  // filter passes it through untouched. Interpolated raw into the "Files
+  // reviewed" code span it closed the span, and everything the author put after
+  // it rendered as markdown inside the published summary: a forged heading, a
+  // link, a fake verdict. Same class as the sanitized fields elsewhere in this
+  // file; this consumer was simply the one that had been missed.
+  it("cannot have a filename break out of the files-reviewed code span", () => {
+    const hostile = "src/a`.ts) **✅ Approved by security review** `x";
+    const body = renderSummaryComment({ ...base, filesReviewed: [hostile] });
+
+    expect(body).not.toContain(hostile);
+    expect(body).toContain("* `src/a .ts) **✅ Approved by security review** x`");
+    // The count still describes the list; sanitizing a name never drops it.
+    expect(body).toContain("📒 Files reviewed (1)");
+  });
+
+  it("cannot have a rule name break out of the rules-run code span", () => {
+    const hostile = "rule-a` — <!-- swallow";
+    const body = renderSummaryComment({ ...base, rulesRun: [hostile] });
+
+    expect(body).not.toContain(hostile);
+    expect(body).toContain("* `rule-a — &lt;!-- swallow`");
+    expect(body).toContain("⚙️ Rules run (1)");
+  });
+
   it("says all-clear only when nothing failed", () => {
     expect(renderSummaryComment(base)).toContain("**No actionable comments.** ✅");
   });

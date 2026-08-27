@@ -7,6 +7,9 @@
 // and cannot carry a RIGHT-side comment.
 import { describe, expect, it } from "vitest";
 import {
+  changedFiles,
+  changedFilesWithRenameSources,
+  quoteGitPathOperand,
   commentableLines,
   diffPositionRange,
   parseDiffPositions,
@@ -475,5 +478,203 @@ describe("hunkSnippet", () => {
 
   it("returns undefined when the finding has no line at all", () => {
     expect(hunkSnippet(SIMPLE, "src/a.go", undefined)).toBeUndefined();
+  });
+});
+
+const RENAME = `diff --git a/src/old-name.ts b/src/new-name.ts
+similarity index 94%
+rename from src/old-name.ts
+rename to src/new-name.ts
+--- a/src/old-name.ts
++++ b/src/new-name.ts
+@@ -1,3 +1,3 @@
+ const a = 1;
+-const b = 2;
++const b = 3;
+ const c = 4;
+`;
+
+const EDIT_AND_RENAME = `diff --git a/src/kept.ts b/src/kept.ts
+--- a/src/kept.ts
++++ b/src/kept.ts
+@@ -1,1 +1,1 @@
+-const x = 1;
++const x = 2;
+diff --git a/src/moved.ts b/src/relocated.ts
+rename from src/moved.ts
+rename to src/relocated.ts
+--- a/src/moved.ts
++++ b/src/relocated.ts
+@@ -1,1 +1,1 @@
+-const y = 1;
++const y = 2;
+`;
+
+describe("changedFilesWithRenameSources", () => {
+  it("keeps both sides of a rename, head-side first", () => {
+    // The whole point: trusted-base context is mapped from the BASE commit,
+    // where this file is still `src/old-name.ts`. Matching only the new path
+    // finds no graph node and the pack comes back empty.
+    expect(changedFilesWithRenameSources(RENAME)).toEqual([
+      "src/new-name.ts",
+      "src/old-name.ts",
+    ]);
+  });
+
+  it("adds nothing for an ordinary edit, where both sides are the same path", () => {
+    expect(changedFilesWithRenameSources(SIMPLE)).toEqual(changedFiles(SIMPLE));
+  });
+
+  it("handles a rename alongside an ordinary edit in one diff", () => {
+    expect(changedFilesWithRenameSources(EDIT_AND_RENAME)).toEqual([
+      "src/kept.ts",
+      "src/relocated.ts",
+      "src/moved.ts",
+    ]);
+  });
+
+  it("parses the head side exactly as changedFiles does", () => {
+    // The regex gained a capture group on the a/ side; its greediness, and so
+    // the b/ side it yields, must be unchanged.
+    for (const diff of [SIMPLE, RENAME, EDIT_AND_RENAME]) {
+      for (const file of changedFiles(diff)) {
+        expect(changedFilesWithRenameSources(diff)).toContain(file);
+      }
+    }
+    expect(changedFiles(RENAME)).toEqual(["src/new-name.ts"]);
+  });
+});
+
+describe("changedFiles stays head-side only", () => {
+  it("does not gain the base-side path of a rename", () => {
+    // Its callers — the summary's "files reviewed" list and changed-line
+    // matching against review threads — describe the code as it is now.
+    expect(changedFiles(RENAME)).not.toContain("src/old-name.ts");
+    expect(changedFiles(EDIT_AND_RENAME)).toEqual(["src/kept.ts", "src/relocated.ts"]);
+  });
+});
+
+const QUOTED = `diff --git "a/src/caf\\303\\251.ts" "b/src/caf\\303\\251.ts"
+--- "a/src/caf\\303\\251.ts"
++++ "b/src/caf\\303\\251.ts"
+@@ -1,1 +1,1 @@
+-const a = 1;
++const a = 2;
+`;
+
+const QUOTED_RENAME = `diff --git "a/src/ol\\303\\251.ts" "b/src/nouve\\303\\241.ts"
+rename from "src/ol\\303\\251.ts"
+rename to "src/nouve\\303\\241.ts"
+@@ -1,1 +1,1 @@
+-const a = 1;
++const a = 2;
+`;
+
+describe("git-quoted paths in the diff header", () => {
+  it("decodes an octal-escaped UTF-8 name rather than dropping the file", () => {
+    // Git quotes any path with a non-ASCII byte under the default
+    // core.quotePath, so an unquoted-only regex loses the file entirely — it
+    // vanishes from the summary, from changed-line matching, and from context
+    // selection, where the pack then claims no graph nodes matched.
+    expect(changedFiles(QUOTED)).toEqual(["src/café.ts"]);
+    expect(changedFilesWithRenameSources(QUOTED)).toEqual(["src/café.ts"]);
+  });
+
+  it("keeps both sides of a quoted rename", () => {
+    expect(changedFiles(QUOTED_RENAME)).toEqual(["src/nouveá.ts"]);
+    expect(changedFilesWithRenameSources(QUOTED_RENAME))
+      .toEqual(["src/nouveá.ts", "src/olé.ts"]);
+  });
+
+  it("still parses ordinary unquoted headers, spaces included", () => {
+    expect(changedFiles("diff --git a/dir/a b.ts b/dir/a b.ts"))
+      .toEqual(["dir/a b.ts"]);
+    expect(changedFiles(SIMPLE)).toEqual(["src/a.go"]);
+  });
+
+  it("decodes the escaped quote and backslash forms", () => {
+    expect(changedFiles('diff --git "a/say \\"hi\\".ts" "b/say \\"hi\\".ts"'))
+      .toEqual(['say "hi".ts']);
+    expect(changedFiles('diff --git "a/back\\\\slash.ts" "b/back\\\\slash.ts"'))
+      .toEqual(["back\\slash.ts"]);
+  });
+
+  it("ignores a malformed header instead of emitting a broken path", () => {
+    expect(changedFiles('diff --git "a/unterminated.ts b/x.ts')).toEqual([]);
+    expect(changedFiles("diff --git nota/x b/y")).toEqual([]);
+  });
+});
+
+describe("mixed and pathological diff headers", () => {
+  it("parses a quoted head path after an unquoted base path", () => {
+    // Git quotes each operand independently, so renaming an ASCII name to one
+    // it must quote produces a mixed header. Requiring the FIRST path to be
+    // quoted before using the quoted parser dropped these entirely.
+    const mixed = 'diff --git a/old.ts "b/caf\\303\\251.ts"';
+    expect(changedFiles(mixed)).toEqual(["café.ts"]);
+    expect(changedFilesWithRenameSources(mixed)).toEqual(["café.ts", "old.ts"]);
+  });
+
+  it("parses an unquoted head path after a quoted base path", () => {
+    const mixed = 'diff --git "a/caf\\303\\251.ts" b/plain.ts';
+    expect(changedFiles(mixed)).toEqual(["plain.ts"]);
+    expect(changedFilesWithRenameSources(mixed)).toEqual(["plain.ts", "café.ts"]);
+  });
+
+  it("omits a path carrying a control character rather than passing it on", () => {
+    // `normalizeChangedFile` rejects controls, so letting one through would
+    // fail the whole context build — and under `--context require` abort the
+    // review — over a single filename. The summary also renders each path in a
+    // backtick span, which a newline would break out of.
+    expect(changedFiles('diff --git "a/we\\012ird.ts" "b/we\\012ird.ts"')).toEqual([]);
+    expect(changedFilesWithRenameSources('diff --git "a/tab\\011.ts" "b/tab\\011.ts"')).toEqual([]);
+  });
+
+  it("keeps a control-free file in the same diff as a rejected one", () => {
+    const diff = [
+      'diff --git "a/we\\012ird.ts" "b/we\\012ird.ts"',
+      "diff --git a/fine.ts b/fine.ts",
+    ].join("\n");
+    expect(changedFiles(diff)).toEqual(["fine.ts"]);
+  });
+
+  it("rejects a header whose quote does not follow the separating space", () => {
+    expect(changedFiles('diff --git a/x"b/y.ts"')).toEqual([]);
+  });
+
+  it("keeps a literal quote in an unquoted path from the oversized-diff fallback", () => {
+    // `reconstructDiffFromFiles` writes paths into the header without
+    // C-quoting them, so a name containing a quote arrives unquoted. Treating
+    // that quote as opening an operand dropped the file from context
+    // selection, thread matching and the reviewed-files list alike.
+    const reconstructed = 'diff --git a/foo"bar.ts b/foo"bar.ts';
+    expect(changedFiles(reconstructed)).toEqual(['foo"bar.ts']);
+    expect(changedFilesWithRenameSources(reconstructed)).toEqual(['foo"bar.ts']);
+  });
+});
+
+describe("quoteGitPathOperand", () => {
+  it("leaves an ordinary path bare, exactly as git would", () => {
+    expect(quoteGitPathOperand("a", "src/index.ts")).toBe("a/src/index.ts");
+    expect(quoteGitPathOperand("b", "dir/with space.ts")).toBe("b/dir/with space.ts");
+  });
+
+  it("quotes the two shapes that broke the parser", () => {
+    expect(quoteGitPathOperand("a", 'foo"bar.ts')).toBe('"a/foo\\"bar.ts"');
+    expect(quoteGitPathOperand("b", 'foo "bar.ts')).toBe('"b/foo \\"bar.ts"');
+  });
+
+  it("escapes backslashes and control characters octally", () => {
+    expect(quoteGitPathOperand("a", "back\\slash.ts")).toBe('"a/back\\\\slash.ts"');
+    expect(quoteGitPathOperand("a", "line\nbreak.ts")).toBe('"a/line\\nbreak.ts"');
+  });
+
+  it("round-trips through the header parser", () => {
+    // The point of fixing the producer: whatever it emits, the parser reads
+    // back unchanged — so no path shape needs its own parser special case.
+    for (const name of ['foo"bar.ts', 'foo "bar.ts', "plain.ts", "with space.ts", "caf\u00e9.ts"]) {
+      const header = `diff --git ${quoteGitPathOperand("a", name)} ${quoteGitPathOperand("b", name)}`;
+      expect(changedFiles(header)).toEqual([name]);
+    }
   });
 });
