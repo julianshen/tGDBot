@@ -1195,3 +1195,115 @@ describe("dependencyContextPack — the split follows provenance", () => {
     expect(pack?.untrustedText).toContain("Entry 1 = lodash@^4.17.21");
   });
 });
+
+// Issue #50, the advisory half. An advisory is host-established evidence, so it
+// belongs in the TRUSTED text beside the registry facts; the package it is
+// about stays an author's string in the untrusted half (#63).
+describe("dependencyContextPack — advisories", () => {
+  const change = {
+    name: "lodash",
+    version: "4.17.20",
+    spec: "4.17.20",
+    manifest: "package.json",
+    pinned: true,
+    section: "dependencies",
+  };
+  const advisoryFact = (over: Record<string, unknown> = {}) => ({
+    name: "lodash",
+    version: "4.17.20",
+    spec: "4.17.20",
+    advisories: [{ id: "GHSA-jf85-cpcp-j695", severity: "HIGH", fixed: "4.17.21" }],
+    ...over,
+  });
+
+  it("reports the advisory against its entry, in the trusted half", () => {
+    const pack = dependencyContextPack([change], [], [], [advisoryFact()]);
+
+    expect(pack?.text).toContain("GHSA-jf85-cpcp-j695");
+    expect(pack?.text).toMatch(/HIGH/);
+    expect(pack?.text).toMatch(/4\.17\.21/);
+    expect(pack?.text).toContain("Entry 1");
+    // Still no author strings in the trusted half.
+    expect(pack?.text).not.toContain("lodash");
+  });
+
+  it("says plainly when a package has none", () => {
+    const pack = dependencyContextPack([change], [], [], [advisoryFact({ advisories: [] })]);
+
+    expect(pack?.text).toMatch(/no known advisor/i);
+  });
+
+  // An unchecked package must never read as a clear one.
+  it("distinguishes not-checked from nothing-found", () => {
+    const pack = dependencyContextPack([change], [], [], [
+      advisoryFact({ advisories: undefined, unknown: "the advisory database could not be reached" }),
+    ]);
+
+    expect(pack?.text).toMatch(/could not be reached/i);
+    expect(pack?.text).not.toMatch(/no known advisor/i);
+  });
+
+  it("counts advisories it did not list", () => {
+    const pack = dependencyContextPack([change], [], [], [
+      advisoryFact({ furtherAdvisories: 7 }),
+    ]);
+
+    expect(pack?.text).toMatch(/7 (more|further)/i);
+  });
+
+  // Without the advisory pass, the closing paragraph must not imply one ran.
+  it("does not claim advisories were checked when none were", () => {
+    const pack = dependencyContextPack([change], [], [], []);
+
+    expect(pack?.text).not.toMatch(/no known advisor/i);
+    expect(pack?.text).toMatch(/advisor/i);
+  });
+});
+
+// PR #70 review: `advisoriesRan` was inferred from the advisory facts merely
+// EXISTING. A range-only diff produces a fact per package saying "not checked,
+// this is a range" without OSV ever being queried — so both closing branches
+// dropped the warning while no advisory data existed at all.
+describe("dependencyContextPack — the closing text tracks what was answered", () => {
+  const pin = {
+    name: "lodash", version: "4.17.20", spec: "4.17.20",
+    manifest: "package.json", pinned: true, section: "dependencies",
+  };
+  const range = { ...pin, spec: "^4.17.20", pinned: false };
+
+  // The registry pass SUCCEEDED, so the closing takes its "anything not stated
+  // was not established" branch — and that branch is where the advisory clause
+  // was going missing.
+  const registryAnswered = [{
+    name: "lodash", version: "4.17.20", spec: "4.17.20", published: true,
+  }];
+  const registryAnsweredRange = [{
+    name: "lodash", version: "4.17.20", spec: "^4.17.20", latest: "4.17.21",
+  }];
+
+  it("warns when every advisory fact is an unchecked range", () => {
+    const pack = dependencyContextPack([range], registryAnsweredRange, [], [{
+      name: "lodash", version: "4.17.20", spec: "^4.17.20",
+      unknown: "this is a range, so which release installs is not known here",
+    }]);
+
+    expect(pack?.text).toMatch(/no advisory answer was obtained/i);
+  });
+
+  it("warns when every advisory lookup failed", () => {
+    const pack = dependencyContextPack([pin], registryAnswered, [], [{
+      name: "lodash", version: "4.17.20", spec: "4.17.20",
+      unknown: "the advisory database could not be reached",
+    }]);
+
+    expect(pack?.text).toMatch(/no advisory answer was obtained/i);
+  });
+
+  it("does not warn once at least one package got an answer", () => {
+    const pack = dependencyContextPack([pin], registryAnswered, [], [{
+      name: "lodash", version: "4.17.20", spec: "4.17.20", advisories: [],
+    }]);
+
+    expect(pack?.text).not.toMatch(/no advisory answer was obtained/i);
+  });
+});

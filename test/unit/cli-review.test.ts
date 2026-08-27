@@ -4965,3 +4965,92 @@ describe("review — manifest reads are bounded", () => {
     expect(wholePackFor(h)).not.toMatch(/could NOT be read/i);
   });
 });
+
+// Issue #50, the advisory half: with --dependency-facts on, the host also asks
+// an advisory database about each pinned dependency and puts the answer in
+// front of every rule.
+describe("review — advisory lookups", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -3,7 +3,7 @@",
+    '+    "lodash": "4.17.21",',
+  ].join("\n");
+
+  const wholePackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
+      | undefined;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
+  };
+
+  const registryAnswer = { "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} } };
+  const osvAnswer = {
+    vulns: [{
+      id: "GHSA-jf85-cpcp-j695",
+      summary: "prose that must not travel",
+      database_specific: { severity: "HIGH" },
+      affected: [{ ranges: [{ events: [{ fixed: "4.17.22" }] }] }],
+    }],
+  };
+
+  const runWith = async (h: Harness) => {
+    const fetchJson = vi.fn(async (url: string) =>
+      url.includes("osv.dev") ? osvAnswer : registryAnswer);
+    await review(h.args, { ...depsFrom(h), fetchJson });
+    return fetchJson;
+  };
+
+  it("asks the advisory database about a pinned dependency", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    const fetchJson = await runWith(h);
+
+    expect(fetchJson).toHaveBeenCalledWith(
+      "https://api.osv.dev/v1/query",
+      expect.objectContaining({
+        body: { package: { name: "lodash", ecosystem: "npm" }, version: "4.17.21" },
+      }),
+    );
+  });
+
+  it("puts the advisory in front of the rules, without its prose", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await runWith(h);
+
+    expect(wholePackFor(h)).toContain("GHSA-jf85-cpcp-j695");
+    expect(wholePackFor(h)).not.toContain("prose that must not travel");
+  });
+
+  it("asks nothing of the advisory database when the feature is off", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn();
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(fetchJson).not.toHaveBeenCalled();
+  });
+
+  // An advisory outage must not read as a clean bill of health, and must not
+  // take the registry facts down with it.
+  it("keeps the registry facts when the advisory lookup fails", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn(async (url: string) => {
+      if (url.includes("osv.dev")) throw new Error("HTTP 503");
+      return registryAnswer;
+    });
+
+    const exitCode = await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(exitCode).toBe(0);
+    expect(wholePackFor(h)).toMatch(/advisories NOT checked/i);
+    expect(wholePackFor(h)).toMatch(/this is the latest/i);
+  });
+});

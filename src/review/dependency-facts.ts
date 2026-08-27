@@ -62,7 +62,18 @@ function errorText(error: unknown): string {
 }
 
 /** Parsed JSON, or a throw. Anything network-shaped belongs to the caller. */
-export type FetchJson = (url: string) => Promise<unknown>;
+export type FetchJson = (url: string, request?: FetchJsonRequest) => Promise<unknown>;
+
+/**
+ * What a lookup needs beyond the URL.
+ *
+ * `body` makes it a POST — OSV's package query has no GET form (#50). Absent,
+ * it stays the GET the registry half has always made.
+ */
+export interface FetchJsonRequest {
+  readonly body?: unknown;
+  readonly accept?: string;
+}
 
 /**
  * How many lookups run at once.

@@ -379,7 +379,13 @@ tgd-review-agent review \
                                   # answer in front of every rule as trusted context: the newest
                                   # release, whether an exact PIN is published (a range is not a
                                   # question the registry can answer), and whether the version is
-                                  # deprecated. Only the deprecation FLAG — never the publisher's
+                                  # deprecated. It also asks api.osv.dev whether the exact pinned
+                                  # version carries a known advisory, and passes on the identifier,
+                                  # severity and fixed release — never the advisory's own prose.
+                                  # Advisories are checked for an exact pin only: a range resolves
+                                  # to whatever the installer picks, so the context says it did not
+                                  # check rather than judging the lower bound.
+                                  # Only the deprecation FLAG — never the publisher's
                                   # notice, which is text the package owner writes and is not
                                   # trusted input; rules are told to send the reader to the registry
                                   # for it rather than paraphrase what they were not given.
