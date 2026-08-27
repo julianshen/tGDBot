@@ -41,6 +41,11 @@ export interface OrchestrationResult {
   rulesFailed: string[];
   findingByClientId: ReadonlyMap<string, Finding>;
   readonly summaryInput: import("./comment-format.js").SummaryInput;
+  /**
+   * Resolved `provider/model` specs the rules ran on, carried through so every
+   * comment this run publishes can name what produced it.
+   */
+  readonly modelsUsed?: readonly string[];
 }
 
 
@@ -307,6 +312,7 @@ export function orchestrate(
         suggestions: committable,
         ...(alsoReported.length > 0 ? { alsoReported } : {}),
         ...(rules.length > 1 ? { rules } : {}),
+        ...(dispatchResult.modelsUsed === undefined ? {} : { models: dispatchResult.modelsUsed }),
       },
     );
 
@@ -393,6 +399,7 @@ export function orchestrate(
     rulesFailed: dispatchResult.rulesFailed,
     findingByClientId,
     summaryInput,
+    ...(dispatchResult.modelsUsed === undefined ? {} : { modelsUsed: dispatchResult.modelsUsed }),
   };
 }
 

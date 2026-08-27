@@ -102,6 +102,16 @@ export interface DispatchResult {
   rulesRun: string[];
   rulesFailed: string[];
   /**
+   * The RESOLVED `provider/model` specs the rules actually ran on, distinct.
+   *
+   * Reported so a published comment can name what produced it: a reader who
+   * disagrees with a finding should not have to dig through CI logs to learn
+   * what wrote it. A run can pin different models per rule, hence a list.
+   * Absent when nothing resolved, which is honest — unpinned rules on a
+   * provider's own default leave the host genuinely not knowing.
+   */
+  modelsUsed?: string[];
+  /**
    * ruleName -> WHY it failed, as a short CLASSIFIED phrase safe to publish.
    *
    * Found by the zero-config smoke test: a rule could fail and the comment said

@@ -37,7 +37,7 @@ import {
   type InlineRecoveryState,
   type TerminalReviewResult,
 } from "./comment-marker.js";
-import { BOT_SIGNATURE_BLOCK } from "./comment-format.js";
+import { BOT_SIGNATURE_BLOCK_RE, botSignatureBlock } from "./comment-format.js";
 import { formatMarker } from "./dedup.js";
 import { orchestrate, type OrchestrationResult } from "./orchestrate.js";
 import type { Finding } from "./types.js";
@@ -103,6 +103,8 @@ export function composeFrozenSummary(
   action: PublicationAction,
   fallbackIds: ReadonlySet<string>,
   marker: string,
+  /** Resolved `provider/model` specs, named in the signature this composes. */
+  models?: readonly string[],
 ): string {
   const summary = action.children.find((child) => child.kind === "summary");
   if (summary === undefined) throw new Error("publication manifest is missing the summary child");
@@ -125,9 +127,10 @@ export function composeFrozenSummary(
   // the signature marks the end of the COMMENT, whatever this path assembled,
   // and the dedup marker stays last.
   const base = stripSignature(summary.body);
+  const signature = botSignatureBlock(models);
   const signed = marker.length === 0
-    ? BOT_SIGNATURE_BLOCK
-    : `${BOT_SIGNATURE_BLOCK}\n\n${marker}`;
+    ? signature
+    : `${signature}\n\n${marker}`;
   return [base, ...extras.map(stripSignature), signed].join("\n\n");
 }
 
@@ -150,9 +153,17 @@ export function stripSignature(body: string): string {
   // Markdown footer, say, including this repository's own README. Removing
   // every occurrence would silently delete that from the proposed fix (Codex
   // review). A body whose only copy sits inside a suggestion is left alone.
-  const index = body.lastIndexOf(BOT_SIGNATURE_BLOCK);
+  // Matched by SHAPE, not by fixed bytes: the signature now names the model
+  // that produced the review, so its length varies. The pattern is the same one
+  // the renderer composes from, so the two cannot drift apart.
+  let index = -1;
+  let length = 0;
+  for (const match of body.matchAll(BOT_SIGNATURE_BLOCK_RE)) {
+    index = match.index;
+    length = match[0].length;
+  }
   if (index === -1) return body.trimEnd();
-  const after = body.slice(index + BOT_SIGNATURE_BLOCK.length);
+  const after = body.slice(index + length);
   if (!ONLY_MARKERS_RE.test(after)) return body.trimEnd();
   // Newlines are normalized only where the block was, so nothing else in the
   // body — a fenced block's own blank lines, say — is reflowed.
@@ -402,7 +413,7 @@ export async function publishReviewFromManifest(options: {
     if (orchestration !== undefined && buildBody !== undefined) {
       return buildBody(orchestration, failedIds, marker, undefined, failureReasons(action));
     }
-    return composeFrozenSummary(action, failedIds, marker);
+    return composeFrozenSummary(action, failedIds, marker, orchestration?.modelsUsed);
   };
 
   const summaryIdentityOf = (comment: BotComment) => ({

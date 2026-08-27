@@ -88,11 +88,18 @@ export interface VcsAdapter {
    * flow falls back to putting every finding in the summary comment, so a
    * finding is only ever relocated, never lost.
    */
+  /**
+   * @param reviewBody - text for the surface the provider treats as THE REVIEW
+   * (issue #55). Optional so this contract stays satisfiable by providers with
+   * no review-level body: GitLab posts each finding as its own discussion and
+   * has none, so it ignores this. Absent, GitHub keeps its previous constant.
+   */
   createInlineReview(
     locator: ReviewLocator,
     headSha: string,
     comments: InlineReviewComment[],
     recovery?: import("../review/comment-marker.js").InlineRecoveryState,
+    reviewBody?: string,
   ): Promise<InlinePublishOutcome[]>;
   prepareInlineReviewRecovery?(
     locator: ReviewLocator,

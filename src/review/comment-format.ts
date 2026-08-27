@@ -59,6 +59,53 @@ export const BOT_SIGNATURE =
 /** The signature as its own block: a rule, then the line. */
 export const BOT_SIGNATURE_BLOCK = `---\n\n${BOT_SIGNATURE}`;
 
+/**
+ * The signature block, as a pattern.
+ *
+ * Naming the model made the block's bytes vary, and `stripSignature` had
+ * anchored on a constant. This is the single definition both sides use, so the
+ * renderer cannot emit a footer the stripper fails to recognise. Deliberately
+ * tight — the model list is a bracketed tail on one line — because the strip's
+ * safety rests on this matching only what a renderer wrote.
+ */
+export const BOT_SIGNATURE_BLOCK_RE =
+  /---\n\n_🤖 Posted by \[tGDBot\]\(https:\/\/github\.com\/julianshen\/tGDBot\)(?: using [^\n]*)?_/gu;
+
+/** How many distinct models the signature names before summarising the rest. */
+const MAX_SIGNED_MODELS = 3;
+
+/**
+ * The signature, naming the model or models that actually produced the review.
+ *
+ * A reader who disagrees with a finding should be able to tell what wrote it
+ * without digging through CI logs, and a repository that changes models should
+ * leave old comments attributable to the one that actually ran.
+ *
+ * A run can pin different models per rule, so this names every DISTINCT one —
+ * claiming a single model would be wrong about the others. When no model is
+ * known, which is the honest state for unpinned rules running on a provider's
+ * own default, it falls back to the unadorned line rather than guessing.
+ *
+ * The spec is configuration rather than diff content, but it reaches a
+ * world-readable comment, so it goes through the shared sanitizer like every
+ * other interpolated value (ADR-006).
+ */
+export function botSignature(models?: readonly string[]): string {
+  const distinct = [...new Set((models ?? []).map((model) => sanitizeInline(model).trim()))]
+    .filter((model) => model.length > 0);
+  if (distinct.length === 0) return BOT_SIGNATURE;
+  const shown = distinct.slice(0, MAX_SIGNED_MODELS);
+  const hidden = distinct.length - shown.length;
+  const named = shown.map((model) => `\`${model}\``).join(", ")
+    + (hidden > 0 ? ` +${hidden} more` : "");
+  return `_🤖 Posted by [tGDBot](https://github.com/julianshen/tGDBot) using ${named}_`;
+}
+
+/** The model-aware signature as its own block. */
+export function botSignatureBlock(models?: readonly string[]): string {
+  return `---\n\n${botSignature(models)}`;
+}
+
 export interface InlineComment {
   clientId: string;
   /** Repo-relative path, as it appears on the NEW side of the diff. */
@@ -275,7 +322,7 @@ export function renderInlineComment(
   }
 
   // ADR-007. Only ever from the structured field — never from `message`.
-  const suggestion = finding.suggestion?.trim() ? capSuggestion(finding.suggestion) : undefined;
+  const suggestion = emitsSuggestion(finding) ? capSuggestion(finding.suggestion!) : undefined;
   if (suggestion) {
     // `--suggestions off` DOWNGRADES to a plain, non-committable block. It must not
     // delete the fix: the reviewer who picked the safe mode is the last person who
@@ -283,7 +330,7 @@ export function renderInlineComment(
     parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
   }
 
-  const citations = renderReferences(finding);
+  const citations = emitsReferences(finding) ? renderReferences(finding) : undefined;
   if (citations) parts.push("", citations);
   if (options.alsoReported && options.alsoReported.length > 0) {
     parts.push("", renderAlsoReported(options.alsoReported));
@@ -303,10 +350,11 @@ export function renderInlineComment(
     "",
     "</details>",
     "",
-    // The visible half of "this was written by the tool". Before the machine
-    // marker, because the marker (and any finding marker after it) must stay
-    // the last line: recovery reads exactly that line back.
-    BOT_SIGNATURE_BLOCK,
+    // The visible half of "this was written by the tool", naming the model that
+    // wrote it. Before the machine marker, because the marker (and any finding
+    // marker after it) must stay the last line: recovery reads exactly that
+    // line back.
+    botSignatureBlock(options.models),
     "",
     // Appended AFTER all sanitized content, like the summary's dedup marker —
     // this is what lets resolveStaleReviewThreads recognize the tool's own
@@ -340,6 +388,14 @@ export interface RenderOptions {
   suggestions?: boolean;
   /** Versioned finding marker storing IDs and digests only. */
   findingMarker?: string;
+  /**
+   * Resolved `provider/model` specs the rules ran on.
+   *
+   * Named in the signature, so a reader can tell what produced a finding they
+   * disagree with without digging through CI logs. Absent when nothing
+   * resolved, which leaves the unadorned signature.
+   */
+  models?: readonly string[];
 }
 
 /**
@@ -573,6 +629,23 @@ function renderDiffExcerpt(snippet: HunkSnippet): string {
  * claim rather than take it. Already validated against the rule's own text on
  * parse, so nothing here can be a model invention.
  */
+/**
+ * Whether an inline comment for this finding carries a suggestion block.
+ *
+ * THE predicate, consulted by `renderInlineComment` and by the digest's legend
+ * alike (issue #55). A legend built from a separate prose list describes what
+ * someone remembered to write down; one built from this describes what the
+ * renderer actually emits, and stops describing it the moment that changes.
+ */
+export function emitsSuggestion(finding: Finding): boolean {
+  return Boolean(finding.suggestion?.trim());
+}
+
+/** Whether an inline comment for this finding carries a Reference block. */
+export function emitsReferences(finding: Finding): boolean {
+  return finding.references !== undefined && finding.references.length > 0;
+}
+
 function renderReferences(finding: Finding): string | undefined {
   if (!finding.references || finding.references.length === 0) return undefined;
   const items = finding.references
@@ -1265,4 +1338,186 @@ function renderSummaryCommentWithIncludedSuggestions(
   if (collapsed.length > 0) parts.push(collapsed.join("\n"));
 
   return parts.join("\n\n");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #55: the review BODY.
+//
+// GitHub treats this as the review ITSELF — it is what the timeline shows above
+// the batch of inline comments, what the notification email leads with, and
+// what any PR-summarising agent reads from the reviews API. It used to be the
+// four words "tGD inline review".
+//
+// The digest DESCRIBES and POINTS; it never restates a finding. The summary
+// comment stays the single place carrying finding text.
+// ---------------------------------------------------------------------------
+
+/**
+ * The digest's whole budget, signature and marker included.
+ *
+ * Far under GitHub's 65,536-character body limit, and small enough that the
+ * digest can never be the reason a review fails to post — it is charged against
+ * the run's atomic payload accounting like everything else.
+ */
+export const MAX_REVIEW_DIGEST_CHARS = 4_000;
+
+/** How many names a bounded list prints before it summarises the rest. */
+const MAX_LISTED_RULES = 8;
+
+/**
+ * A machine marker in its own namespace.
+ *
+ * Deliberately not `sha=` or `pending`, which is what `parseBotMarker` scans
+ * for on summary notes. A review body is not reachable by `findBotComment`
+ * today; this is defence against that changing.
+ */
+const REVIEW_DIGEST_MARKER = "tgd-review-agent:review-digest";
+
+export interface ReviewDigestInput {
+  readonly headSha: string;
+  readonly allFindings: readonly Finding[];
+  readonly inlineCount: number;
+  readonly unanchored: readonly Finding[];
+  readonly publishFailed?: readonly Finding[];
+  readonly filesReviewed: readonly string[];
+  readonly rulesRun: readonly string[];
+  readonly rulesFailed: readonly string[];
+  /** Provider URL of the summary comment this run wrote, when it wrote one. */
+  readonly summaryUrl?: string;
+  /** The bot's real login, so the tips name it rather than a placeholder. */
+  readonly botLogin?: string;
+  /** Set for a focused run, which must not present itself as a full review. */
+  readonly focusDirection?: string;
+  /** Whether suggestion blocks are committable this run. */
+  readonly suggestions?: boolean;
+  /** Resolved `provider/model` specs the rules ran on, for the signature. */
+  readonly models?: readonly string[];
+}
+
+/** `a1b2c3d4e5f6` → `a1b2c3d`, the length a reader recognises. */
+function shortSha(sha: string): string {
+  return sanitizeInline(sha).slice(0, 7);
+}
+
+/** A bounded, sanitized list of names with a `+N more` tail. */
+function nameList(names: readonly string[]): string {
+  const shown = names.slice(0, MAX_LISTED_RULES).map((name) => `\`${sanitizeInline(name)}\``);
+  const hidden = names.length - shown.length;
+  return hidden > 0 ? `${shown.join(", ")} +${hidden} more` : shown.join(", ");
+}
+
+/**
+ * The legend for the badges an inline comment carries.
+ *
+ * Built by mapping the SAME tables `renderInlineComment` renders from, so it
+ * cannot describe a badge the renderer no longer emits. Written as prose it
+ * would go stale the first time a severity was added, and nothing would fail.
+ */
+function badgeLegend(): string[] {
+  return [
+    `- Severity is one of ${Object.values(SEVERITY_BADGE).join(" · ")}.`,
+    `- Effort is ${Object.values(EFFORT_BADGE).join(" or ")} — the SIZE of the change, not its importance.`,
+  ];
+}
+
+/**
+ * A legend row per optional section the renderer can emit, driven by the same
+ * predicates `renderInlineComment` consults.
+ *
+ * The first draft of #55 hand-wrote this list and missed citations entirely,
+ * which had landed in #54 while the issue sat. A row appears only when this
+ * run's findings actually trigger its section.
+ */
+function sectionLegend(input: ReviewDigestInput): string[] {
+  const findings = input.allFindings;
+  const rows: string[] = [];
+  if (findings.some((finding) => emitsSuggestion(finding))) {
+    rows.push(input.suggestions === false
+      ? "- A fix block shows the proposed change; it is not committable this run."
+      : "- A suggestion block is committable, and applies verbatim — read it first, it is generated text.");
+  }
+  if (findings.some((finding) => emitsReferences(finding))) {
+    rows.push("- A **Reference** block lists sources the finding rests on; a rule may cite only URLs its own text declared.");
+  }
+  rows.push("- The collapsed 🤖 block is a ready-made prompt for handing that one finding to a coding agent.");
+  return rows;
+}
+
+/** The conversation commands, collapsed so repeated runs do not stack walls of text. */
+function tips(botLogin: string | undefined): string {
+  const bot = `@${sanitizeInline(botLogin ?? "tgdbot")}`;
+  return detailsBlock(`Replying to ${bot}`, [
+    `In a finding's own thread: \`${bot} explain\`, \`${bot} reconsider <reason>\`.`,
+    "",
+    `Anywhere on the pull request: \`${bot} check latest\`, \`${bot} review focus: <direction>\`,`,
+    `\`${bot} remember <lesson>\`, \`${bot} memories\`, \`${bot} forget <memory-id>\`.`,
+    "",
+    "One command per comment.",
+  ]);
+}
+
+/**
+ * The review body for one RUN.
+ *
+ * Every sentence stays true however many review events it ends up attached to:
+ * a bisected run reuses these exact bytes on each accepted subset, so the
+ * wording is run-scoped ("this run posted 6 findings inline"), never
+ * event-scoped ("the 6 comments below"). That is what removes the need for any
+ * per-attempt branch.
+ */
+export function renderReviewDigest(input: ReviewDigestInput): string {
+  const sha = shortSha(input.headSha);
+  const counts = { blocking: 0, warning: 0, suggestion: 0 };
+  for (const finding of input.allFindings) counts[finding.severity] += 1;
+  const severities = (Object.keys(counts) as Finding["severity"][])
+    .filter((severity) => counts[severity] > 0)
+    .map((severity) => `${counts[severity]} ${SEVERITY_BADGE[severity].toLowerCase()}`)
+    .join(" · ");
+
+  const relocated = input.unanchored.length + (input.publishFailed?.length ?? 0);
+  const fileCount = input.filesReviewed.length;
+  const total = input.allFindings.length;
+
+  const headline = input.focusDirection === undefined
+    ? `### tGDBot review of \`${sha}\` — ${total} finding${total === 1 ? "" : "s"} in ${fileCount} file${fileCount === 1 ? "" : "s"}`
+    : `### tGDBot focused review of \`${sha}\` — asked to look at: ${sanitizeInline(input.focusDirection)}`;
+
+  const placement = [
+    `This run posted ${input.inlineCount} finding${input.inlineCount === 1 ? "" : "s"} as inline comments`,
+    relocated > 0
+      ? `${relocated} could not be anchored${input.summaryUrl === undefined ? "" : ` — see the [review summary](${input.summaryUrl})`}.`
+      : input.summaryUrl === undefined ? "." : `full detail is in the [review summary](${input.summaryUrl}).`,
+  ].join(relocated > 0 ? " · " : " · ");
+
+  const rules = [
+    input.rulesRun.length > 0 ? `Rules: ${nameList(input.rulesRun)}` : undefined,
+    input.rulesFailed.length > 0
+      ? `${input.rulesFailed.length} rule${input.rulesFailed.length === 1 ? "" : "s"} failed (${nameList(input.rulesFailed)}) — reason in the summary.`
+      : undefined,
+  ].filter((part): part is string => part !== undefined).join(" · ");
+
+  const guide = detailsBlock("How to read an inline comment", [
+    "- Each one opens with `category | severity | effort | rule`.",
+    ...badgeLegend(),
+    ...sectionLegend(input),
+  ]);
+
+  const body = [
+    headline,
+    "",
+    severities,
+    placement,
+    ...(rules === "" ? [] : [rules]),
+    "",
+    guide,
+    "",
+    tips(input.botLogin),
+  ].join("\n");
+
+  const suffix = `\n\n${botSignatureBlock(input.models)}\n\n<!-- ${REVIEW_DIGEST_MARKER} sha=${sha} -->`;
+  // The signature and the marker are what make this body identifiable as ours,
+  // so truncation is charged against the DIGEST, never against them.
+  const room = MAX_REVIEW_DIGEST_CHARS - suffix.length;
+  const trimmed = body.length <= room ? body : `${body.slice(0, Math.max(0, room - 2))}…`;
+  return `${trimmed}${suffix}`;
 }

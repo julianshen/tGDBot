@@ -434,11 +434,20 @@ interface RuleOutcome {
       }
     }
 
+    // The specs the rules actually ran on, so the published signature can name
+    // them rather than the reader guessing.
+    const modelsUsed = [...new Set(
+      effective
+        .filter((rule) => rulesRun.includes(rule.name))
+        .map((rule) => `${rule.provider}/${rule.model}`),
+    )];
+
     return {
       findings,
       rulesRun,
       rulesFailed,
       ruleFailureReasons,
+      ...(modelsUsed.length === 0 ? {} : { modelsUsed }),
       ...(validatedContext.manifestHash === undefined
         ? {}
         : { contextManifestHash: validatedContext.manifestHash }),

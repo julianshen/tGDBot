@@ -1569,6 +1569,7 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     headSha: string,
     comments: InlineReviewComment[],
     recovery?: InlineRecoveryState,
+    reviewBody?: string,
   ): Promise<InlinePublishOutcome[]> {
     validateInlinePublishInputs(comments);
     if (comments.length === 0) return [];
@@ -1672,10 +1673,15 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       return comments.map((comment, index) => ({ clientId: comment.clientId, status: "posted", identity: existing[index]! }));
     }
     if (existing.some((identity) => identity !== null)) throw new AmbiguousInlinePublishError("Partial inline marker set exists before atomic review write");
+    // Composed ONCE, outside payloadFor, and reused byte-for-byte by every
+    // attempt including each subset bisectRejected tries. The digest describes
+    // the RUN, so the same bytes stay true on however many review events an
+    // accepted subset creates (issue #55).
+    const body = reviewBody ?? "tGD inline review";
     const payloadFor = (indices: readonly number[]): string => JSON.stringify({
       commit_id: headSha,
       event: "COMMENT",
-      body: "tGD inline review",
+      body,
       comments: indices.map((index) => {
         const comment = comments[index]!;
         return {
