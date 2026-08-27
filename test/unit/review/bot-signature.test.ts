@@ -160,7 +160,7 @@ describe("the model reaches the comments a run publishes", () => {
 
   it("leaves comments unadorned when no model resolved", async () => {
     const { orchestrate } = await import("../../../src/review/orchestrate.js");
-    const { modelsUsed: _dropped, ...withoutModels } = dispatchResult;
+    const withoutModels = { ...dispatchResult, modelsUsed: undefined };
 
     const result = orchestrate(withoutModels, anchoredDiff, { inline: true });
 
