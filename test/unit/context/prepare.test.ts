@@ -1,4 +1,4 @@
-import { chmod, chown, mkdir, mkdtemp, readdir, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -33,7 +33,13 @@ afterEach(async () => {
 });
 
 async function tempRoot(): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "prepare-context-test-"));
+  // Resolved, because macOS makes `os.tmpdir()` `/var/folders/...` and `/var`
+  // is a symlink to `private/var`. The code under test resolves the path it is
+  // given — deliberately, since a symlink in a cache or workspace path is a
+  // real hazard it refuses — so an unresolved root makes the test disagree
+  // with production about what the same directory is called. That reads as a
+  // product bug on macOS and passes on Linux, where /tmp is not a symlink.
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "prepare-context-test-")));
   roots.push(root);
   return root;
 }

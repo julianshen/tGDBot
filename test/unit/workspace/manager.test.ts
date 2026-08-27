@@ -26,7 +26,13 @@ const baseSha = "def4567890def4567890def4567890def4567890";
 const roots: string[] = [];
 
 async function tempRoot(): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "tgd-workspace-test-"));
+  // Resolved, because macOS makes `os.tmpdir()` `/var/folders/...` and `/var`
+  // is a symlink to `private/var`. The code under test resolves the path it is
+  // given — deliberately, since a symlink in a cache or workspace path is a
+  // real hazard it refuses — so an unresolved root makes the test disagree
+  // with production about what the same directory is called. That reads as a
+  // product bug on macOS and passes on Linux, where /tmp is not a symlink.
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "tgd-workspace-test-")));
   roots.push(root);
   return root;
 }
