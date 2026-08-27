@@ -37,7 +37,11 @@ import {
   type InlineRecoveryState,
   type TerminalReviewResult,
 } from "./comment-marker.js";
-import { BOT_SIGNATURE_BLOCK_RE, botSignatureBlock } from "./comment-format.js";
+import {
+  BOT_SIGNATURE_BLOCK_RE,
+  botSignatureBlock,
+  renderReviewDigest,
+} from "./comment-format.js";
 import { formatMarker } from "./dedup.js";
 import { orchestrate, type OrchestrationResult } from "./orchestrate.js";
 import type { Finding } from "./types.js";
@@ -440,6 +444,50 @@ export async function publishReviewFromManifest(options: {
     }
   }
 
+  /**
+   * The review body, composed ONCE per run.
+   *
+   * `payloadFor` runs for every attempt, including each subset the bisect
+   * tries, and an accepted subset creates its own review. The digest describes
+   * the RUN, so the same bytes stay true on all of them — and memoizing here is
+   * what guarantees they ARE the same bytes, with no timestamp or re-sorted set
+   * to make two attempts differ (issue #55).
+   */
+  let reviewDigest: string | undefined;
+  function reviewBody(): string | undefined {
+    const summary = orchestration?.summaryInput;
+    if (summary === undefined) return undefined;
+    try {
+      reviewDigest ??= composeDigest(summary);
+    } catch (error) {
+      // The digest is a nicety. It must never be the reason a review fails to
+      // post, so a composition failure degrades to the provider's default body
+      // rather than propagating into the publication path.
+      console.warn(
+        `tgd-review-agent: could not compose the review digest (${error instanceof Error ? error.message : String(error)})`,
+      );
+      return undefined;
+    }
+    return reviewDigest;
+  }
+
+  function composeDigest(summary: OrchestrationResult["summaryInput"]): string {
+    return renderReviewDigest({
+      headSha: pr.headSha,
+      allFindings: summary.allFindings,
+      inlineCount: summary.inlineCount,
+      unanchored: summary.unanchored,
+      ...(summary.publishFailed === undefined ? {} : { publishFailed: summary.publishFailed }),
+      filesReviewed: summary.filesReviewed,
+      rulesRun: summary.rulesRun,
+      rulesFailed: summary.rulesFailed,
+      // The summary is upserted before any inline write, so its provider-
+      // confirmed identity is available by the time this composes.
+      ...(botComment === null ? {} : { summaryUrl: summaryIdentityOf(botComment).url }),
+      ...(orchestration?.modelsUsed === undefined ? {} : { models: orchestration.modelsUsed }),
+    });
+  }
+
   async function publishInlines(
     action: PublicationAction,
     children: readonly PublicationChild[],
@@ -452,6 +500,7 @@ export async function publishReviewFromManifest(options: {
         pr.headSha,
         comments,
         inlineRecovery,
+        reviewBody(),
       );
       try {
         const shapesValid = (outcomes as readonly unknown[]).every((outcome) => {
@@ -972,6 +1021,29 @@ export async function publishFocusedReview(options: {
 
   let inlineOutcomes: readonly InlinePublishOutcome[] | undefined;
 
+  /**
+   * The review body for a FOCUSED run, composed once.
+   *
+   * A focused run looked where it was asked to look, so it must not present
+   * itself as a whole-PR review (issue #55). It carries no finding counts for
+   * the same reason: the reply already restates its findings, and the digest
+   * describes rather than repeats.
+   */
+  let focusedDigest: string | undefined;
+  function focusedReviewBody(): string {
+    focusedDigest ??= renderReviewDigest({
+      headSha: options.pr.headSha,
+      allFindings: [],
+      inlineCount: prepared.children.filter((entry) => entry.kind === "inline").length,
+      unanchored: [],
+      filesReviewed: [],
+      rulesRun: [],
+      rulesFailed: [],
+      focusDirection: options.direction,
+    });
+    return focusedDigest;
+  }
+
   const writer: PublicationWriter = {
     async lookupChild(pending) {
       const parsed = parseChildMarker((pending.body.split(/\r?\n/u).at(-1) ?? "").trim());
@@ -994,6 +1066,8 @@ export async function publishFocusedReview(options: {
             locator,
             options.pr.headSha,
             siblings.map((entry) => toInlineComment(entry, provider)),
+            undefined,
+            focusedReviewBody(),
           );
         }
         const mine = inlineOutcomes.find((outcome) => outcome.clientId === clientIdOf(pending));
