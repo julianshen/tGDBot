@@ -884,6 +884,169 @@ describe("GitHubAdapter", () => {
     });
   });
 
+  // --- getMergeBaseSha (PR #67 review) ---
+  //
+  // A GitHub pull request diff is a THREE-DOT comparison, against the point
+  // where the branches diverged. `baseRefOid` is the target branch's current
+  // tip, which is a different commit once the target advances.
+  describe("getMergeBaseSha", () => {
+    it("asks the compare API for the point the branches diverged", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({
+        merge_base_commit: { sha: "0b1c2d3e4f5a60718293a4b5c6d7e8f901234567" },
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha"))
+        .toBe("0b1c2d3e4f5a60718293a4b5c6d7e8f901234567");
+      expect(execGh).toHaveBeenCalledWith(
+        expect.arrayContaining(["repos/{owner}/{repo}/compare/basetip...headsha"]),
+      );
+    });
+
+    // Not knowing is an answer the caller can act on; guessing is not.
+    it("returns undefined when the comparison is unavailable", async () => {
+      const execGh = vi.fn(async () => {
+        throw new Error("gh: Not Found (HTTP 404)");
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBeUndefined();
+    });
+
+    // A value that is not a commit becomes a manifest REF, and a branch name
+    // resolves to that branch's tip — the very comparison this exists to avoid.
+    it("returns undefined for a value that is not a commit sha", async () => {
+      for (const sha of ["main", "", "refs/heads/main", "zzzz", 42]) {
+        const execGh = vi.fn(async () => JSON.stringify({ merge_base_commit: { sha } }));
+        const adapter = new GitHubAdapter(execGh);
+
+        expect(
+          await adapter.getMergeBaseSha(locator42, "basetip", "headsha"),
+          `${JSON.stringify(sha)} was accepted`,
+        ).toBeUndefined();
+      }
+    });
+
+    it("returns undefined when the response has no merge base", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({ status: "diverged" }));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBeUndefined();
+    });
+  });
+
+  // --- getFileAtRef (issue #56) ---
+  //
+  // The general form of the machinery getRuleFilesFromBase already used, so
+  // that a caller needing one file at one ref does not have to go through the
+  // rules-directory listing to get it.
+  describe("getFileAtRef", () => {
+    const b64 = (s: string): string => Buffer.from(s, "utf-8").toString("base64");
+
+    it("reads a file at the given ref and decodes it", async () => {
+      const execGh = vi.fn(async (args: string[]) => {
+        if (args[1] === "repos/{owner}/{repo}/contents/package.json?ref=headsha") {
+          return JSON.stringify({ content: b64('{"name":"x"}'), encoding: "base64" });
+        }
+        throw new Error(`unexpected execGh call: ${JSON.stringify(args)}`);
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "package.json")).toBe('{"name":"x"}');
+    });
+
+    it("encodes a path that needs it, without encoding the separators", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({ content: b64("{}"), encoding: "base64" }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await adapter.getFileAtRef(locator42, "headsha", "packages/@acme/w/package.json");
+
+      expect(execGh).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          "repos/{owner}/{repo}/contents/packages/%40acme/w/package.json?ref=headsha",
+        ]),
+      );
+    });
+
+    // A path that is not there is an answer, not a failure — the same
+    // semantics getRuleFilesFromBase already has for a missing directory.
+    it("returns undefined for a path that does not exist at that ref", async () => {
+      const execGh = vi.fn(async () => {
+        throw new Error("Command failed: gh api ...\ngh: Not Found (HTTP 404)");
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "nope.json")).toBeUndefined();
+    });
+
+    // An auth failure or an outage is NOT "the file is absent", and must not
+    // be quietly turned into one.
+    it("propagates a genuine error", async () => {
+      const execGh = vi.fn(async () => {
+        throw new Error("gh: Bad credentials (HTTP 401)");
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json")).rejects.toThrow(/401/);
+    });
+
+    // The Contents API answers a DIRECTORY with an array. Two guards catch it —
+    // the explicit array check and the missing `content` field — so this pins
+    // the OUTCOME, not either branch; neither can be isolated, because an array
+    // never carries a `content` property of its own.
+    // `undefined` MEANS absent-or-directory. A response that is neither — an
+    // object claiming to be a file but carrying no usable content — is a
+    // malformed answer, and returning `undefined` for it would tell the caller
+    // "this manifest is not in the repository", which is a different and wrong
+    // fact (PR #67 review).
+    it("throws on a file response with no string content", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({ type: "file", encoding: "base64" }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json"))
+        .rejects.toThrow(/unexpected|malformed|contents/i);
+    });
+
+    it("throws on an encoding it cannot decode", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({
+        type: "file", encoding: "none", content: "",
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json"))
+        .rejects.toThrow(/encoding/i);
+    });
+
+    // Buffer.from(..., "base64") silently accepts rubbish, so a corrupt payload
+    // would decode to something plausible rather than failing.
+    it("throws on content that is not base64", async () => {
+      const execGh = vi.fn(async () => JSON.stringify({
+        type: "file", encoding: "base64", content: "not base64 $$$",
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getFileAtRef(locator42, "headsha", "package.json"))
+        .rejects.toThrow(/base64/i);
+    });
+
+    it("accepts base64 split across lines, as the API returns it", async () => {
+      const wrapped = `${b64('{"name":"x"}').slice(0, 4)}\n${b64('{"name":"x"}').slice(4)}`;
+      const execGh = vi.fn(async () => JSON.stringify({
+        type: "file", encoding: "base64", content: wrapped,
+      }));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "package.json")).toBe('{"name":"x"}');
+    });
+
+    it("refuses a directory, which the Contents API answers with an array", async () => {
+      const execGh = vi.fn(async () => JSON.stringify([{ name: "a", type: "file" }]));
+      const adapter = new GitHubAdapter(execGh);
+
+      expect(await adapter.getFileAtRef(locator42, "headsha", "src")).toBeUndefined();
+    });
+  });
+
   // --- getRuleFilesFromBase (ADR-002 CLI-native fix) ---
   //
   // Uses GitHub's Contents API via `gh api repos/{owner}/{repo}/contents/{path}?ref={sha}`,

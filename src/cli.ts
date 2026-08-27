@@ -33,7 +33,11 @@ import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
 import { isTransientGhFailure } from "./vcs/gh-retry.js";
 import { isDiffIncompleteError } from "./vcs/github-large-diff.js";
-import { dependencyChangesFromDiff, dependencyContextPack } from "./review/dependency-changes.js";
+import {
+  changedManifests,
+  dependencyChanges as extractDependencyChanges,
+  dependencyContextPack,
+} from "./review/dependency-changes.js";
 import { fetchDependencyFacts } from "./review/dependency-facts.js";
 import type { FetchJson } from "./review/dependency-facts.js";
 import {
@@ -614,6 +618,14 @@ async function persistAndPublishReviewClarification(options: {
 // but something also failed — whether that's a rule failing to load, or
 // every loaded rule failing at dispatch time).
 const EXIT_OK = 0;
+/**
+ * How many changed manifests one review will read.
+ *
+ * Two provider requests each, so this is the ceiling on the outbound cost of
+ * the dependency feature before the registry is even reached.
+ */
+const MAX_MANIFESTS_READ = 25;
+
 const EXIT_FATAL = 1;
 const EXIT_PARTIAL = 2;
 
@@ -1178,7 +1190,6 @@ export async function review(
   // delivered as trusted context. Supplied for EVERY rule or for none — the
   // dispatch contract rejects a partial map — and omitted entirely when nothing
   // changed, so an ordinary review gains no empty section.
-  const dependencyChanges = dependencyChangesFromDiff(diff);
   // The guard that used to stand here suppressed dependency facts under
   // `--dispatch legacy`, because the legacy orchestrator's prompt builder never
   // received a context pack and the registry lookups would have been paid for
@@ -1187,6 +1198,116 @@ export async function review(
   // rule, and `dispatchRules` validates it exactly as the direct engine does.
   // Suppressing the feature on a stale premise would deny an operator the facts
   // they asked for, so both engines now carry them.
+  // Issue #56: the manifests themselves, read at the HEAD ref — the version
+  // this pull request proposes, since a dependency it adds does not exist on
+  // the base branch at all. Fetched only when the feature is on, so an ordinary
+  // review makes no extra request.
+  //
+  // A manifest that cannot be read contributes no changes and is named in the
+  // pack instead, because "we did not look" and "we looked and it was fine"
+  // must not render the same.
+  // Bounded before any provider request. A generated monorepo update can touch
+  // hundreds of manifests, and each costs up to two sequential reads BEFORE the
+  // extraction ceiling applies — enough to stall a review or exhaust an API
+  // quota, mostly on files with no relevant change (PR #67 review, round four).
+  // What is skipped is reported, not silently dropped.
+  const allChangedManifests = args.dependencyFacts === "on"
+    ? changedManifests(diff)
+    : [];
+  const manifestsToRead = allChangedManifests.slice(0, MAX_MANIFESTS_READ);
+  const skippedManifests = allChangedManifests
+    .slice(MAX_MANIFESTS_READ)
+    .map((manifest) => manifest.path);
+  // Read at BOTH ends. What a pull request CHANGED is the difference between
+  // the two dependency maps — an added diff line carries no structural
+  // location, so an entry added under `overrides` that happens to match an
+  // existing dependency read as a change to that dependency (PR #67 review).
+  //
+  // A read that fails is recorded, never treated as "the file declares
+  // nothing": that is the difference between "we did not look" and "we looked
+  // and it was fine".
+  // The point the branches DIVERGED, not the target's current tip. A pull
+  // request diff is a three-dot comparison, so once the target branch advances
+  // its own dependency updates would otherwise read as this pull request's
+  // (PR #67 review, round two). GitLab reports it on the merge request itself;
+  // GitHub needs asking. Resolved only when there is a manifest to read, so an
+  // ordinary review makes no extra call, and it falls back to the tip rather
+  // than guessing when the provider cannot say.
+  //
+  // When it cannot be resolved, the manifests are reported UNEXAMINED rather
+  // than compared against the tip. Falling back selects a known-wrong
+  // comparison — if the target advanced, its dependency updates are attributed
+  // to this pull request, which is the failure the merge base exists to prevent
+  // (PR #67 review, round three). An unexamined manifest is honest; a wrong
+  // comparison is not.
+  let comparisonBaseSha: string | undefined;
+  if (manifestsToRead.length > 0) {
+    // Only the adapter's own merge-base answer. `startSha` is NOT one: GitLab
+    // maps `diff_refs.start_sha` to it, which is the commit on the TARGET side,
+    // so preferring it reintroduced exactly the tip comparison this exists to
+    // avoid (PR #67 review, round four). GitLab's `base_sha` is the merge base,
+    // and its adapter answers from the merge-base endpoint.
+    try {
+      comparisonBaseSha = await config.vcsAdapter.getMergeBaseSha(
+        config.locator,
+        pr.baseSha,
+        pr.headSha,
+      );
+    } catch (error) {
+      console.warn(
+        `tgd-review-agent: could not resolve the merge base (${redactedMessage(error)})`,
+      );
+    }
+    if (comparisonBaseSha === undefined) {
+      console.warn(
+        "tgd-review-agent: the merge base could not be resolved, so no manifest was examined; " +
+          "comparing against the target branch tip would attribute its own dependency changes " +
+          "to this pull request",
+      );
+    }
+  }
+  const headManifests = new Map<string, string | undefined>();
+  const baseManifests = new Map<string, string | undefined>();
+  const unreachableManifests: string[] = [];
+  for (const { path, basePath } of manifestsToRead) {
+    // No comparison base means no honest comparison, so nothing is examined.
+    if (comparisonBaseSha === undefined && basePath !== undefined) {
+      unreachableManifests.push(path);
+      continue;
+    }
+    const read = async (ref: string, at: string): Promise<string | undefined> =>
+      config.vcsAdapter.getFileAtRef(config.locator, ref, at);
+    try {
+      headManifests.set(path, await read(pr.headSha, path));
+    } catch (error) {
+      console.warn(
+        `tgd-review-agent: could not read ${path} at ${pr.headSha} (${redactedMessage(error)})`,
+      );
+      unreachableManifests.push(path);
+      continue;
+    }
+    // A manifest this pull request ADDS has no base side to read.
+    if (basePath === undefined || comparisonBaseSha === undefined) continue;
+    try {
+      baseManifests.set(basePath, await read(comparisonBaseSha, basePath));
+    } catch (error) {
+      console.warn(
+        `tgd-review-agent: could not read ${basePath} at ${comparisonBaseSha} (${redactedMessage(error)})`,
+      );
+      unreachableManifests.push(path);
+    }
+  }
+  const extraction = extractDependencyChanges(
+    manifestsToRead.filter((manifest) => !unreachableManifests.includes(manifest.path)),
+    headManifests,
+    baseManifests,
+  );
+  const dependencyChanges = extraction.changes;
+  const unreadableManifests = [
+    ...unreachableManifests,
+    ...extraction.unreadable,
+    ...skippedManifests,
+  ];
   // Opt-in, and the only outbound request the tool makes. Without it the pack
   // still ships the parsed versions and says plainly that nothing was checked —
   // which is why leaving this unwired shipped a rule that could never see the
@@ -1205,7 +1326,7 @@ export async function review(
   // not. Without registry facts the pack was near-worthless anyway — a version
   // list plus a sentence saying nothing had been checked.
   const dependencyPack = args.dependencyFacts === "on"
-    ? dependencyContextPack(dependencyChanges, dependencyFacts)
+    ? dependencyContextPack(dependencyChanges, dependencyFacts, unreadableManifests)
     : undefined;
   // --context-max-chars is the operator's per-rule cost control, and the two
   // producers share one rule's pack — so the repository map is rendered against

@@ -272,6 +272,8 @@ interface Harness {
     findBotComment: ReturnType<typeof vi.fn>;
     upsertComment: ReturnType<typeof vi.fn>;
     getRuleFilesFromBase: ReturnType<typeof vi.fn>;
+    getFileAtRef: ReturnType<typeof vi.fn>;
+    getMergeBaseSha: ReturnType<typeof vi.fn>;
     createInlineReview: ReturnType<typeof vi.fn>;
     prepareInlineReviewRecovery: ReturnType<typeof vi.fn>;
     recoverInlineReview: ReturnType<typeof vi.fn>;
@@ -336,6 +338,29 @@ function makeHarness(options: {
       },
     ),
     getRuleFilesFromBase: vi.fn().mockResolvedValue(ruleFilesFromBase),
+    // Issue #56 / PR #67: extraction compares the manifest at BASE against the
+    // one at HEAD, so the double answers per ref. At base the packages the
+    // dependency tests bump are older or absent; at head they are what those
+    // tests expect to see reported.
+    // PR #67: the comparison base is the point the branches diverged, which the
+    // adapter resolves. The double answers with the base sha, so the base
+    // manifest below is what these tests compare against.
+    getMergeBaseSha: vi.fn().mockResolvedValue(pr.baseSha),
+    getFileAtRef: vi.fn(async (_locator: unknown, ref: string) => JSON.stringify(
+      ref === pr.baseSha
+        ? {
+            name: "app",
+            version: "1.0.0",
+            engines: { node: "20.0.0" },
+            dependencies: { "left-pad": "1.2.0", lodash: "4.17.20", react: "18.0.0" },
+          }
+        : {
+            name: "app",
+            version: "1.0.0",
+            engines: { node: "22.0.0" },
+            dependencies: { "left-pad": "1.3.1", lodash: "4.17.21", react: "18.0.0" },
+          },
+    )),
     createInlineReview: vi.fn().mockImplementation(
       (_locator, _headSha, comments: Array<{ clientId: string }>) =>
         Promise.resolve(comments.map(({ clientId }) => postedInline(clientId))),
@@ -4640,5 +4665,303 @@ describe("review — the dependency pack is part of the opt-in", () => {
 
     expect(untrustedPackFor(h)).toContain("lodash");
     expect(packFor(h)).not.toContain("lodash");
+  });
+});
+
+// Issue #56: the host reads the changed manifests at the HEAD ref and parses
+// them, instead of inferring their structure from three lines of diff context.
+describe("review — manifests are read at the head ref", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    // No section header in the hunk: under the old heuristic this was the case
+    // that had to be guessed at.
+    "@@ -40,7 +40,7 @@",
+    '+    "lodash": "4.17.21",',
+    '+    "node": "22.0.0",',
+  ].join("\n");
+
+  // Both halves. #63 moved the author's identifiers into `untrustedText`, so a
+  // test asking "did this package reach the rules" reads the whole pack; the
+  // tests that care WHICH half say so explicitly with `packFor`.
+  const wholePackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
+      | undefined;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
+  };
+
+  it("asks for each changed manifest at the head sha", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "cafef00d" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(),
+      "cafef00d",
+      "package.json",
+    );
+  });
+
+  // The engines entry rides in on the same hunk and is excluded because the
+  // FILE says it is not a dependency — no denylist involved.
+  it("takes what the manifest declares and leaves the rest", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(wholePackFor(h)).toContain("lodash");
+    expect(wholePackFor(h)).not.toMatch(/(^|\W)node@/);
+  });
+
+  // PR #67: extraction compares BASE against HEAD, so a dependency that did not
+  // move must not be reported. Without the base read every dependency in the
+  // manifest reads as new, which is how the old line-matching behaved and why
+  // nothing caught it.
+  it("reads the base ref too, and leaves unchanged dependencies out", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "cafef00d", baseSha: "deadbeef" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "deadbeef", "package.json",
+    );
+    // lodash moved 4.17.20 -> 4.17.21; react is 18.0.0 at both ends.
+    expect(wholePackFor(h)).toContain("lodash");
+    expect(wholePackFor(h)).not.toContain("react");
+  });
+
+  it("makes no manifest request when the feature is off", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalled();
+  });
+
+  // "We could not look" must not render as "we looked and it was fine".
+  it("says so when a manifest could not be read", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getFileAtRef.mockResolvedValue(undefined);
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
+    expect(wholePackFor(h)).toContain("package.json");
+  });
+
+  it("survives a manifest read that fails outright", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getFileAtRef.mockRejectedValue(new Error("HTTP 500"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(exitCode).toBe(0);
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
+    warn.mockRestore();
+  });
+});
+
+// PR #67 review, round two: a pull request diff is a THREE-DOT comparison, so
+// the base side is the point the branches diverged — not the target branch's
+// current tip. Once the target advances, reading the tip attributes the
+// TARGET's dependency updates to this pull request.
+describe("review — the comparison base is where the branches diverged", () => {
+  const MANIFEST_DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -3,7 +3,7 @@",
+    '+    "lodash": "4.17.21",',
+  ].join("\n");
+
+  // Both halves. #63 moved the author's identifiers into `untrustedText`, so a
+  // test asking "did this package reach the rules" reads the whole pack; the
+  // tests that care WHICH half say so explicitly with `packFor`.
+  const wholePackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
+      | undefined;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
+  };
+
+  const manifestAt = (versions: Record<string, string>) =>
+    JSON.stringify({ dependencies: versions });
+
+  it("reads the base manifest at the merge base, not the base tip", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockResolvedValue("ccccccc1");
+    // The target branch bumped lodash on its own after the branches diverged.
+    h.vcsAdapter.getFileAtRef.mockImplementation(async (_l: unknown, ref: string) => {
+      if (ref === "aaaaaaa1") return manifestAt({ lodash: "4.17.21" });
+      if (ref === "ccccccc1") return manifestAt({ lodash: "4.17.20" });
+      return manifestAt({ lodash: "4.17.21" }); // the tip, which must not be used
+    });
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "ccccccc1", "package.json",
+    );
+    // Read at the tip, lodash looks unchanged and nothing is reported at all.
+    expect(wholePackFor(h)).toContain("lodash");
+  });
+
+  // Round four: `startSha` is NOT a merge base. GitLab maps `diff_refs.start_sha`
+  // to it, which is the commit on the TARGET side — the tip comparison this
+  // exists to avoid. Only the adapter's own merge-base answer is used.
+  it("does not mistake the merge request's start sha for a merge base", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1", startSha: "ddddddd1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockResolvedValue("ccccccc1");
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(h.vcsAdapter.getMergeBaseSha).toHaveBeenCalled();
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalledWith(
+      expect.anything(), "ccccccc1", "package.json",
+    );
+    expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalledWith(
+      expect.anything(), "ddddddd1", "package.json",
+    );
+  });
+
+  // Round three changed this. Falling back to the base TIP selects a
+  // known-wrong comparison: if the target advanced, its dependency updates are
+  // attributed to this pull request — the exact failure the merge base exists
+  // to prevent. An unexamined manifest is honest; a wrong comparison is not.
+  it("marks manifests unexamined when the merge base cannot be resolved", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockResolvedValue(undefined);
+    const fetchJson = vi.fn();
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalledWith(
+      expect.anything(), "bbbbbbb1", "package.json",
+    );
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
+  });
+
+  it("says the same when the merge-base lookup fails outright", async () => {
+    const h = makeHarness({
+      pr: makePr({ headSha: "aaaaaaa1", baseSha: "bbbbbbb1" }),
+      args: makeArgs({ dependencyFacts: "on" }),
+    });
+    h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    h.vcsAdapter.getMergeBaseSha.mockRejectedValue(new Error("HTTP 403"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const exitCode = await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(exitCode).toBe(0);
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
+    warn.mockRestore();
+  });
+
+  it("asks for no merge base when there is no manifest to read", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+
+    expect(h.vcsAdapter.getMergeBaseSha).not.toHaveBeenCalled();
+  });
+});
+
+// PR #67 review, round four: a generated monorepo update can touch hundreds of
+// package.json files, and each one cost up to two sequential provider requests
+// BEFORE the 200-package extraction cap applied. That stalls the review and can
+// exhaust an API quota, mostly on manifests with no relevant change.
+describe("review — manifest reads are bounded", () => {
+  const manifestDiffFor = (count: number) =>
+    Array.from({ length: count }, (_, i) => [
+      `diff --git a/w${i}/package.json b/w${i}/package.json`,
+      `--- a/w${i}/package.json`,
+      `+++ b/w${i}/package.json`,
+      "@@ -3,7 +3,7 @@",
+      '+    "lodash": "4.17.21",',
+    ].join("\n")).join("\n");
+
+  // Both halves. #63 moved the author's identifiers into `untrustedText`, so a
+  // test asking "did this package reach the rules" reads the whole pack; the
+  // tests that care WHICH half say so explicitly with `packFor`.
+  const wholePackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
+      | undefined;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
+  };
+
+  it("stops reading after a bounded number of manifests", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(manifestDiffFor(300));
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    // Two reads per manifest at most, and far fewer than 600.
+    expect(h.vcsAdapter.getFileAtRef.mock.calls.length).toBeLessThanOrEqual(100);
+  });
+
+  // Bounded is not the same as silent: what was skipped has to be stated.
+  it("reports the manifests it did not read", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(manifestDiffFor(300));
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(wholePackFor(h)).toMatch(/could NOT be read/i);
+  });
+
+  it("reads every manifest when there are few", async () => {
+    const h = makeHarness({ args: makeArgs({ dependencyFacts: "on" }) });
+    h.vcsAdapter.getDiff.mockResolvedValue(manifestDiffFor(3));
+
+    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn().mockResolvedValue({
+      "dist-tags": { latest: "4.17.21" }, versions: { "4.17.21": {} },
+    }) });
+
+    expect(h.vcsAdapter.getFileAtRef.mock.calls.length).toBe(6);
+    expect(wholePackFor(h)).not.toMatch(/could NOT be read/i);
   });
 });

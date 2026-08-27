@@ -9,7 +9,7 @@ import {
   type InlineRecoveryChild,
   type InlineRecoveryState,
 } from "../review/comment-marker.js";
-import { compareOrderKeys, AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
+import { compareOrderKeys, isCommitSha, AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -428,6 +428,18 @@ interface GhContentsFileResponse {
 // getRuleFilesFromBase to distinguish "rulesDir doesn't exist on the base
 // branch" (return [], per ADR-002's existing "no rules dir = zero user
 // rules" semantics) from a genuine error, which must still propagate.
+/**
+ * Percent-encodes each path SEGMENT, leaving the separators alone.
+ *
+ * `encodeURIComponent` on the whole path would escape the slashes and ask for
+ * one oddly-named file; leaving it raw would let a segment like `@acme` or a
+ * space through unencoded. Scoped workspaces make this a real case rather than
+ * a theoretical one (issue #56).
+ */
+function encodePath(path: string): string {
+  return path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+}
+
 function isNotFoundError(err: unknown): boolean {
   return err instanceof Error && /HTTP 404/.test(err.message);
 }
@@ -1963,6 +1975,70 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
    * one extra `gh api` round trip per nested directory; neither is
    * necessary for v1's flat `.tgd-review/rules/*.md` layout.
    */
+  async getMergeBaseSha(
+    locator: ReviewLocator,
+    baseSha: string,
+    headSha: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolvePullLocator(locator);
+    try {
+      const out = await this.execGh([
+        "api", `${apiRepo(repo)}/compare/${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`,
+        ...apiHost(repo),
+      ]);
+      const parsed = JSON.parse(out) as { merge_base_commit?: { sha?: unknown } };
+      const sha = parsed.merge_base_commit?.sha;
+      return isCommitSha(sha) ? sha : undefined;
+    } catch {
+      // Not knowing is an answer the caller can act on. It falls back to the
+      // base tip, which is approximate rather than wrong-in-a-new-way.
+      return undefined;
+    }
+  }
+
+  async getFileAtRef(
+    locator: ReviewLocator,
+    ref: string,
+    path: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolvePullLocator(locator);
+    let parsed: unknown;
+    try {
+      const out = await this.execGh([
+        "api", `${apiRepo(repo)}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`,
+        ...apiHost(repo),
+      ]);
+      parsed = JSON.parse(out) as unknown;
+    } catch (err) {
+      // Absent is an answer; anything else is a failure the caller must see.
+      if (isNotFoundError(err)) return undefined;
+      throw err;
+    }
+    // The Contents API answers a directory with an ARRAY. The caller asked for
+    // a file, so that is a "no", not a shape to guess at. The `content` check
+    // below would also reject it — this states the intent rather than relying
+    // on that coincidence.
+    if (Array.isArray(parsed) || parsed === null || typeof parsed !== "object") return undefined;
+    // `undefined` MEANS absent-or-directory. Anything else that cannot be
+    // decoded is a MALFORMED answer, and returning `undefined` for it would
+    // tell the caller "not in the repository" — a different and wrong fact
+    // that would then be rendered as an unexamined manifest (PR #67 review).
+    const file = parsed as GhContentsFileResponse & { type?: unknown; encoding?: unknown };
+    if (typeof file.content !== "string") {
+      throw new Error(`Contents API returned a file response with no content for ${path}`);
+    }
+    if (file.encoding !== "base64") {
+      throw new Error(`Contents API returned unsupported encoding ${String(file.encoding)} for ${path}`);
+    }
+    // `Buffer.from(…, "base64")` discards anything it does not recognise rather
+    // than failing, so a corrupt payload would decode to something plausible.
+    const packed = file.content.replace(/\s+/gu, "");
+    if (!/^[A-Za-z0-9+/]*={0,2}$/u.test(packed) || packed.length % 4 !== 0) {
+      throw new Error(`Contents API returned content that is not base64 for ${path}`);
+    }
+    return Buffer.from(packed, "base64").toString("utf-8");
+  }
+
   async getRuleFilesFromBase(
     locator: ReviewLocator,
     baseSha: string,

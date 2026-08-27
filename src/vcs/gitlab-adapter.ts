@@ -12,7 +12,7 @@ import {
   validateInlinePublishOutcomes,
   validateConversationItemIdentity,
 } from "./adapter.js";
-import { compareOrderKeys } from "./adapter.js";
+import { compareOrderKeys, isCommitSha } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -1226,6 +1226,61 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       }
     }
     return resolved;
+  }
+
+  async getMergeBaseSha(
+    locator: ReviewLocator,
+    baseSha: string,
+    headSha: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolveMergeRequestLocator(locator);
+    try {
+      const out = await this.execGlab([
+        "api",
+        "--method",
+        "GET",
+        "--hostname",
+        repo.host,
+        projectEndpoint(repo, "repository/merge_base"),
+        "--raw-field",
+        `refs[]=${baseSha}`,
+        "--raw-field",
+        `refs[]=${headSha}`,
+      ]);
+      const parsed = JSON.parse(out) as { id?: unknown };
+      return isCommitSha(parsed.id) ? parsed.id : undefined;
+    } catch {
+      // GitLab also reports it as `diff_refs.start_sha` on the merge request
+      // itself, which the caller prefers; this is the fallback for callers that
+      // do not have it.
+      return undefined;
+    }
+  }
+
+  async getFileAtRef(
+    locator: ReviewLocator,
+    ref: string,
+    path: string,
+  ): Promise<string | undefined> {
+    const { repo } = resolveMergeRequestLocator(locator);
+    try {
+      // GitLab's files endpoint takes the path fully URL-encoded, separators
+      // included — unlike GitHub's, which keeps them as path structure.
+      return await this.execGlab([
+        "api",
+        "--method",
+        "GET",
+        "--hostname",
+        repo.host,
+        projectEndpoint(repo, `repository/files/${encodeURIComponent(path)}/raw`),
+        "--raw-field",
+        `ref=${ref}`,
+      ]);
+    } catch (error) {
+      // Absent is an answer; anything else is a failure the caller must see.
+      if (error instanceof GlabCommandError && error.httpStatus === 404) return undefined;
+      throw error;
+    }
   }
 
   async getRuleFilesFromBase(

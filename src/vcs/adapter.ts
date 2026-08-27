@@ -158,6 +158,47 @@ export interface VcsAdapter {
     baseSha: string,
     rulesDir: string,
   ): Promise<RuleFileContent[]>;
+
+  /**
+   * One file's contents at one ref, or `undefined` if it is not there.
+   *
+   * Issue #56: dependency extraction was inferring a manifest's STRUCTURE from
+   * three lines of diff context — which key encloses which entry — because
+   * nothing could read the file. `JSON.parse` answers that exactly, and this is
+   * the missing seam.
+   *
+   * A missing path resolves to `undefined` rather than throwing, matching
+   * `getRuleFilesFromBase`'s treatment of a missing rules directory: absence is
+   * an answer. A genuine failure — auth, network, a malformed response — still
+   * rejects, because "could not read" and "not there" lead to different
+   * decisions and must not be collapsed.
+   *
+   * A path that names a DIRECTORY resolves to `undefined` too: the caller asked
+   * for a file, and a directory is not one.
+   */
+  getFileAtRef(
+    locator: ReviewLocator,
+    ref: string,
+    path: string,
+  ): Promise<string | undefined>;
+
+  /**
+   * The commit the two branches diverged from, if it can be determined.
+   *
+   * A pull request diff is a THREE-DOT comparison — it shows what the head
+   * branch did, not what the target branch did meanwhile. `baseSha` is the
+   * target's current tip, so once the target advances the two are different
+   * commits, and reading a file at the tip attributes the TARGET's changes to
+   * this pull request (PR #67 review).
+   *
+   * `undefined` when the provider cannot say. The caller falls back rather than
+   * guessing, and a wrong merge base is worse than a known-approximate one.
+   */
+  getMergeBaseSha(
+    locator: ReviewLocator,
+    baseSha: string,
+    headSha: string,
+  ): Promise<string | undefined>;
 }
 
 export interface InlineReviewComment {
@@ -372,6 +413,17 @@ export function validateInlinePublishOutcomes(
   }
   if (seen.size !== expected.size) throw new Error("incomplete inline publish outcomes");
   return validated;
+}
+
+/**
+ * A commit object name, and nothing else.
+ *
+ * A merge-base response that says `"main"` would be used as a manifest REF, and
+ * a branch name resolves to that branch's tip — precisely the comparison the
+ * merge base exists to avoid (PR #67 review).
+ */
+export function isCommitSha(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{7,40}$/u.test(value);
 }
 
 export interface RuleFileContent {

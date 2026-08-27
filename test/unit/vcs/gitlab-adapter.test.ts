@@ -2054,3 +2054,63 @@ describe("GitLab conversation activity", () => {
     expect(gitlabPage.events.map((event) => event.url)).not.toEqual(githubPage.events.map((event) => event.url));
   });
 });
+
+// Issue #56: one file at one ref, the general form of the machinery
+// getRuleFilesFromBase already used for rule files.
+describe("GitLabAdapter.getFileAtRef", () => {
+  const repo = parseRepositoryRef("https://gitlab.com/acme/app") as GitLabRepositoryRef;
+  const at = { kind: "repository" as const, repo, number: 7 };
+
+  it("reads a file at the given ref", async () => {
+    const execGlab = vi.fn(async () => '{"name":"x"}');
+
+    const content = await new GitLabAdapter(execGlab as unknown as ExecGlab)
+      .getFileAtRef(at, "headsha", "package.json");
+
+    expect(content).toBe('{"name":"x"}');
+    expect(execGlab).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        projectEndpoint(repo, `repository/files/${encodeURIComponent("package.json")}/raw`),
+        "--raw-field",
+        "ref=headsha",
+      ]),
+    );
+  });
+
+  it("encodes the whole path, separators included, as the API requires", async () => {
+    const execGlab = vi.fn(async () => "{}");
+
+    await new GitLabAdapter(execGlab as unknown as ExecGlab)
+      .getFileAtRef(at, "headsha", "packages/@acme/w/package.json");
+
+    expect(execGlab).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        projectEndpoint(
+          repo,
+          `repository/files/${encodeURIComponent("packages/@acme/w/package.json")}/raw`,
+        ),
+      ]),
+    );
+  });
+
+  it("returns undefined for a path that is not there", async () => {
+    const execGlab = vi.fn(async () => {
+      throw new GlabCommandError("not found", { httpStatus: 404 } as never);
+    });
+
+    await expect(
+      new GitLabAdapter(execGlab as unknown as ExecGlab).getFileAtRef(at, "headsha", "nope.json"),
+    ).resolves.toBeUndefined();
+  });
+
+  // An outage or an auth failure is not "the file is absent".
+  it("propagates a genuine failure", async () => {
+    const execGlab = vi.fn(async () => {
+      throw new GlabCommandError("unauthorized", { httpStatus: 401 } as never);
+    });
+
+    await expect(
+      new GitLabAdapter(execGlab as unknown as ExecGlab).getFileAtRef(at, "headsha", "package.json"),
+    ).rejects.toThrow(/unauthorized/);
+  });
+});
