@@ -24,7 +24,26 @@ The existing `review` command remains a one-shot operation. A new one-shot `poll
 ## Non-goals
 
 - Training or fine-tuning a model from review conversations.
-- Automatically inferring persistent lessons from ordinary discussion.
+- Automatically inferring persistent lessons from ordinary discussion, or
+  writing any prose into a future review prompt without an explicit human
+  `remember`. **Amended by #57**, which draws the line more precisely than the
+  original wording did. Two classes are now distinguished:
+  - **Memories** — advisory PROSE injected into review prompts. Unchanged:
+    `@tGDBot remember` stays the only way text reaches a future model. Anything
+    auto-written here would turn replying to a bot comment into editing the
+    reviewer's instructions, which on a repository accepting outside
+    contributions is a prompt-injection channel with a persistence guarantee.
+  - **Outcome records** — mechanical, written automatically, and structurally
+    incapable of addressing a model: every field is an enumerated value, a
+    bounded identifier, a digest, a number or a timestamp, enforced by the
+    schema rather than by convention. They record what became of a finding so a
+    poll knows what it has already verified, and so calibration can be reported
+    to a maintainer.
+
+  The non-goal that remains, and is strengthened: no statistic derived from
+  outcome records may suppress or reweight a rule, and none may become prompt
+  text. A rule dismissed often may be miscalibrated, or may be a team ignoring
+  real problems, and counts cannot tell those apart.
 - Sharing memories, directions, or discussion state across repositories.
 - Committing knowledge files, opening knowledge PRs, or otherwise modifying the reviewed repository.
 - Running a resident watcher, webhook receiver, or scheduler.

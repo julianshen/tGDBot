@@ -3,7 +3,7 @@ import { computeContentDigest, parseChildMarker } from "./markers.js";
 
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{7,64}$/iu;
-const ID_RE = /^(?:action|output|finding|clarification|memory|direction)_[0-9a-f]{32}$/u;
+const ID_RE = /^(?:action|output|finding|clarification|memory|direction|outcome)_[0-9a-f]{32}$/u;
 const CLAR_PUBLIC_ID_RE = /^clar_[abcdefghijklmnopqrstuvwxyz234567]{12,32}$/u;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u;
 /**
@@ -268,7 +268,57 @@ export interface PreparedFindingInput {
   readonly at: string;
 }
 
-export type JournalKind = "events" | "memories" | "findings";
+export type JournalKind = "events" | "memories" | "findings" | "outcomes";
+
+/**
+ * How a verification ended, mirroring the reconsider action's own vocabulary.
+ *
+ * Reusing those three words is deliberate: verification IS the reconsider path
+ * reaching the same conclusion without being asked, and a second vocabulary
+ * would be a second thing to keep calibrated (#57).
+ */
+export type FindingVerdict = "confirmed" | "revised" | "withdrawn";
+
+/** What made a finding worth re-examining. */
+export type FindingVerificationTrigger =
+  | "thread-comment"
+  | "thread-resolution"
+  | "head-change"
+  | "reaction";
+
+/**
+ * What became of one finding, as a MECHANICAL record.
+ *
+ * The design document's non-goal — "automatically inferring persistent lessons
+ * from ordinary discussion" — protects a real thing: memories are advisory
+ * PROSE injected into future review prompts, so anything auto-written to them
+ * turns replying to a bot comment into editing the reviewer's instructions.
+ *
+ * This is the other class, and the amendment #57 asks for rests entirely on the
+ * distinction holding: every field here is an enumerated value, a bounded
+ * identifier, a digest, a number or a timestamp. There is no field that can
+ * carry a sentence, so an outcome record cannot say anything to a future model
+ * even if one were fed the whole journal. Memories stay explicit-only.
+ */
+export interface FindingOutcomeEntry {
+  readonly version: 1;
+  readonly repository: RepositoryBinding;
+  readonly id: string;
+  /** The ledger finding this verdict is about. */
+  readonly findingId: string;
+  readonly reviewNumber: number;
+  /** The head the verification ran against — one verdict per finding per head. */
+  readonly headSha: string;
+  readonly ruleName: string;
+  readonly category: string;
+  readonly severity: "blocking" | "warning" | "suggestion";
+  readonly effort?: "quick" | "heavy";
+  readonly verdict: FindingVerdict;
+  readonly trigger: FindingVerificationTrigger;
+  /** Whether the lines the finding was anchored to changed since it was raised. */
+  readonly anchorChanged: boolean;
+  readonly at: string;
+}
 export type ConversationStateTarget = string;
 
 export interface JournalFileReference {
@@ -296,6 +346,11 @@ export interface ConversationJournalHead {
   readonly events: JournalFileReference | null;
   readonly memories: JournalFileReference | null;
   readonly findings: JournalFileReference | null;
+  /**
+   * Optional: a head written before #57 has no outcomes journal, and an
+   * upgrade must not invalidate every repository's existing state.
+   */
+  readonly outcomes?: JournalFileReference | null;
   readonly checkpoint: {
     readonly events: readonly ConversationEventEntry[];
     readonly terminalActions: readonly TerminalActionSummary[];
@@ -304,6 +359,8 @@ export interface ConversationJournalHead {
     readonly memoryIndex: JournalFileReference | null;
     readonly findings: readonly FindingLedgerEntry[];
     readonly findingIndex: JournalFileReference | null;
+    readonly outcomes?: readonly FindingOutcomeEntry[];
+    readonly outcomeIndex?: JournalFileReference | null;
   };
 }
 
@@ -356,7 +413,8 @@ export function validateJournalManifestNode(
 ): ConversationJournalManifestNode {
   const object = exact(value, "journal manifest", ["version", "repository", "kind", "id", "segment", "previous"]);
   const repository = validateVersionAndBinding(object, expected, "journal manifest");
-  if (object.kind !== "events" && object.kind !== "memories" && object.kind !== "findings") {
+  if (object.kind !== "events" && object.kind !== "memories" && object.kind !== "findings"
+    && object.kind !== "outcomes") {
     throw new Error("journal manifest kind is invalid");
   }
   const kind = object.kind;
@@ -376,30 +434,45 @@ export function validateJournalManifestNode(
 }
 
 export function validateJournalHead(value: unknown, expected: RepositoryBinding): ConversationJournalHead {
-  const object = exact(value, "journal head", ["version", "repository", "events", "memories", "findings", "checkpoint"]);
+  // `outcomes` is OPTIONAL: a journal head written before #57 has no such key,
+  // and rejecting those would make an upgrade lose every repository's state.
+  const object = exact(value, "journal head",
+    ["version", "repository", "events", "memories", "findings", "checkpoint"], ["outcomes"]);
   const repository = validateVersionAndBinding(object, expected, "journal head");
   const reference = (kind: JournalKind): JournalFileReference | null =>
     object[kind] === null ? null : journalReference(object[kind], `journal head ${kind}`, kind);
   const checkpoint = exact(object.checkpoint, "journal checkpoint",
-    ["events", "terminalActions", "terminalActionIndex", "memories", "memoryIndex", "findings", "findingIndex"]);
+    ["events", "terminalActions", "terminalActionIndex", "memories", "memoryIndex", "findings", "findingIndex"],
+    ["outcomes", "outcomeIndex"]);
   const events = validateEventEntries(checkpoint.events, expected, 1_000);
   const terminalActions = array(checkpoint.terminalActions, "terminal action display", 200)
     .map((entry, index) => terminalActionSummary(entry, `terminal action display[${index}]`));
   const memories = validateMemoryEntries(checkpoint.memories, expected, 200);
   materializeMemories(memories);
   const findings = validateFindingEntries(checkpoint.findings, expected, 500);
+  const outcomes = checkpoint.outcomes === undefined
+    ? undefined
+    : validateFindingOutcomeEntries(checkpoint.outcomes, expected, 2_000);
   const indexReference = (candidate: unknown, name: string): JournalFileReference | null =>
     candidate === null ? null : indexNodeReference(candidate, name);
+  // `outcomes` is carried only when present, so a head written before #57
+  // round-trips byte-identically rather than gaining a null key.
   return { version: 1, repository, events: reference("events"), memories: reference("memories"),
-    findings: reference("findings"), checkpoint: { events, terminalActions,
+    findings: reference("findings"),
+    ...(object.outcomes === undefined ? {} : { outcomes: reference("outcomes") }),
+    checkpoint: { events, terminalActions,
       terminalActionIndex: indexReference(checkpoint.terminalActionIndex, "terminal action index"), memories,
       memoryIndex: indexReference(checkpoint.memoryIndex, "memory index"), findings,
-      findingIndex: indexReference(checkpoint.findingIndex, "finding index") } };
+      findingIndex: indexReference(checkpoint.findingIndex, "finding index"),
+      ...(outcomes === undefined ? {} : { outcomes }),
+      ...(checkpoint.outcomeIndex === undefined
+        ? {}
+        : { outcomeIndex: indexReference(checkpoint.outcomeIndex, "outcome index") }) } };
 }
 
 function indexNodeReference(value: unknown, name: string): JournalFileReference {
   const result = journalReference(value, name);
-  if (!/^index\.(?:terminal-actions|memories|findings)\.node\.[A-Za-z0-9_-]+\.json$/u.test(result.target)) {
+  if (!/^index\.(?:terminal-actions|memories|findings|outcomes)\.node\.[A-Za-z0-9_-]+\.json$/u.test(result.target)) {
     throw new Error(`${name} target is invalid`);
   }
   return result;
@@ -1291,4 +1364,74 @@ export function validateTransactionIntent(
 function pathLike(value: string): boolean {
   return value.includes("/") || value.includes("\\") || value === "." || value === ".." ||
     /[\u0000-\u001f\u007f]/u.test(value);
+}
+
+/**
+ * An identifier, never prose.
+ *
+ * Rule names and categories are chosen by rule authors, so they are the two
+ * fields in an outcome record that could carry text if left unconstrained.
+ * Bounding them to an identifier charset is what makes "no free-form prose" a
+ * property of the schema rather than a convention (#57).
+ */
+const OUTCOME_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
+
+function outcomeIdentifier(value: unknown, name: string): string {
+  if (typeof value !== "string" || !OUTCOME_IDENTIFIER_RE.test(value)) {
+    throw new Error(`${name} must be a bounded identifier`);
+  }
+  return value;
+}
+
+export function validateFindingOutcomeEntries(
+  value: unknown,
+  expected: RepositoryBinding,
+  maximum = MAX_COLLECTION,
+): readonly FindingOutcomeEntry[] {
+  return array(value, "outcomes", maximum).map((entry, index) => {
+    const object = exact(entry, `outcomes[${index}]`,
+      ["version", "repository", "id", "findingId", "reviewNumber", "headSha", "ruleName", "category",
+        "severity", "verdict", "trigger", "anchorChanged", "at"],
+      ["effort"]);
+    const repository = validateVersionAndBinding(object, expected, `outcomes[${index}]`);
+    if (typeof object.headSha !== "string" || !SHA_RE.test(object.headSha)) {
+      throw new Error(`outcomes[${index}].headSha is not a sha`);
+    }
+    const severity = object.severity;
+    if (severity !== "blocking" && severity !== "warning" && severity !== "suggestion") {
+      throw new Error(`outcomes[${index}].severity is not a known severity`);
+    }
+    const verdict = object.verdict;
+    if (verdict !== "confirmed" && verdict !== "revised" && verdict !== "withdrawn") {
+      throw new Error(`outcomes[${index}].verdict is not a known verdict`);
+    }
+    const trigger = object.trigger;
+    if (trigger !== "thread-comment" && trigger !== "thread-resolution"
+      && trigger !== "head-change" && trigger !== "reaction") {
+      throw new Error(`outcomes[${index}].trigger is not a known trigger`);
+    }
+    const effort = object.effort;
+    if (effort !== undefined && effort !== "quick" && effort !== "heavy") {
+      throw new Error(`outcomes[${index}].effort is not a known effort`);
+    }
+    if (typeof object.anchorChanged !== "boolean") {
+      throw new Error(`outcomes[${index}].anchorChanged must be a boolean`);
+    }
+    return {
+      version: 1 as const,
+      repository,
+      id: id(object.id, `outcomes[${index}].id`, "outcome"),
+      findingId: id(object.findingId, `outcomes[${index}].findingId`, "finding"),
+      reviewNumber: positiveInteger(object.reviewNumber, `outcomes[${index}].reviewNumber`),
+      headSha: object.headSha.toLowerCase(),
+      ruleName: outcomeIdentifier(object.ruleName, `outcomes[${index}] rule name`),
+      category: outcomeIdentifier(object.category, `outcomes[${index}] category`),
+      severity,
+      ...(effort === undefined ? {} : { effort }),
+      verdict,
+      trigger,
+      anchorChanged: object.anchorChanged,
+      at: date(object.at, `outcomes[${index}].at`),
+    };
+  });
 }
