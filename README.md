@@ -490,7 +490,7 @@ deprecated. Those strings are not host-established, so they are not rendered in
 `[TRUSTED_CONTEXT]`. They go to a separate `[UNTRUSTED_CONTEXT]` section placed
 beside the diff, and the two halves are joined by a host-assigned label:
 
-```
+```text
 [TRUSTED_CONTEXT]   - Entry 1
                       - the registry marks this version deprecated
 
