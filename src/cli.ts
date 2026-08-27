@@ -1221,7 +1221,8 @@ export async function review(
   // ceiling, which is the honest trade and is documented in the README.
   const repositoryContextBudget = Math.max(
     MIN_CONTEXT_MAX_CHARS,
-    (config.contextMaxChars ?? DEFAULT_CONTEXT_MAX_CHARS) - (dependencyPack?.text.length ?? 0),
+    (config.contextMaxChars ?? DEFAULT_CONTEXT_MAX_CHARS) -
+      ((dependencyPack?.text.length ?? 0) + (dependencyPack?.untrustedText?.length ?? 0)),
   );
   // Trusted-base repository context. Deliberately prepared HERE — after the
   // dedup skip above and after the rule set is known to be non-empty — because

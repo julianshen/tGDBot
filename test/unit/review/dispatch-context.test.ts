@@ -168,3 +168,51 @@ describe("validateDispatchContext", () => {
     );
   });
 });
+
+// #63: this function rebuilds each pack from named fields, so a field it does
+// not handle is DROPPED. Dropping this one is not cosmetic — the trusted half
+// refers to its entries by label, and without the untrusted half those labels
+// name nothing at all.
+describe("validateDispatchContext — untrusted half", () => {
+  const rules = [makeRule("alpha")];
+  const hash = HASH_A;
+
+  it("carries the untrusted half through to the dispatched pack", () => {
+    const validated = validateDispatchContext(rules, {
+      alpha: {
+        text: "Entry 1 is deprecated.",
+        untrustedText: "Entry 1 = lodash@4.17.21 (package.json)",
+        manifestHash: hash,
+        truncated: false,
+        sources: [],
+      },
+    });
+
+    expect(validated.packsByRule?.get("alpha")?.untrustedText).toBe(
+      "Entry 1 = lodash@4.17.21 (package.json)",
+    );
+  });
+
+  it("leaves the field absent when the caller supplied none", () => {
+    const validated = validateDispatchContext(rules, {
+      alpha: { text: "trusted only", manifestHash: hash, truncated: false, sources: [] },
+    });
+
+    expect(validated.packsByRule?.get("alpha")?.untrustedText).toBeUndefined();
+  });
+
+  // Rejected rather than coerced, for the same reason `text` is: a pack whose
+  // untrusted half is malformed would render entry labels that resolve to
+  // nothing, and silently degrading is how that reaches a reviewer unnoticed.
+  it.each([
+    ["a non-string", 42],
+    ["an empty string", ""],
+    ["whitespace only", "   \n  "],
+  ])("rejects %s untrusted half", (_label, untrustedText) => {
+    expect(() =>
+      validateDispatchContext(rules, {
+        alpha: { text: "trusted", untrustedText, manifestHash: hash, truncated: false, sources: [] },
+      } as never),
+    ).toThrow(DispatchInputError);
+  });
+});
