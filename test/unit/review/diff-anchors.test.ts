@@ -781,6 +781,42 @@ describe("removedLinesByFile", () => {
       .toBe("const gone = budget(1);");
   });
 
+  // Codex review, round 13. Round 12 fixed the ` b/` ambiguity for RENAME
+  // endpoints; an ordinary modification still took its key from the greedy
+  // header split. Verified against git, which writes an edit to `foo b/bar.ts`
+  // as `diff --git a/foo b/bar.ts b/foo b/bar.ts` and terminates the
+  // `---`/`+++` lines with a TAB when the path contains a space.
+  it("keys removals by the real path when the header is ambiguous", () => {
+    const diff = [
+      "diff --git a/foo b/bar.ts b/foo b/bar.ts",
+      "index 1eb743d..7898192 100644",
+      "--- a/foo b/bar.ts\t",
+      "+++ b/foo b/bar.ts\t",
+      "@@ -1,2 +1 @@",
+      " a",
+      "-budget(1);",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("foo b/bar.ts")?.byLine.get(2)).toBe("budget(1);");
+    expect(removed.has("bar.ts")).toBe(false);
+  });
+
+  // A deleted file has `+++ /dev/null`, so the base-side path is the only one.
+  it("keys a deleted file by its base-side path", () => {
+    const diff = [
+      "diff --git a/src/gone.ts b/src/gone.ts",
+      "--- a/src/gone.ts",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-const x = budget(1);",
+    ].join("\n");
+
+    expect(removedLinesByFile(diff).get("src/gone.ts")?.byLine.get(1))
+      .toBe("const x = budget(1);");
+  });
+
   // Codex review, round 8. A COPY diff also carries two different paths. Its
   // removed lines belong to the NEW file; recording them under the source path
   // would suppress occurrences in a file the diff never touched — and, through

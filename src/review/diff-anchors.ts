@@ -322,6 +322,8 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
   const renameSources = renameSourcesByHeadPath(diff);
   let keys: readonly string[] = [];
   let oldLine: number | undefined;
+  let minus: string | undefined;
+  let plus: string | undefined;
   // `---`/`+++` are FILE HEADERS only BEFORE the first hunk. Inside a hunk they
   // are content: a removed line whose text starts with `--` — a decrement, say
   // `--budget;` — is written `---budget;`, and skipping it both lost the
@@ -349,6 +351,8 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
       keys = (base === undefined ? [head] : [base, head]).filter((value) => value !== "");
       oldLine = undefined;
       inHunk = false;
+      minus = undefined;
+      plus = undefined;
       continue;
     }
     if (keys.length === 0) continue;
@@ -362,6 +366,40 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
         each((entry) => { entry.positioned = false; });
       } else {
         oldLine = Number(hunk[1]);
+      }
+      continue;
+    }
+    // The `---`/`+++` lines are the UNAMBIGUOUS source for this file's paths,
+    // and outside a hunk that is all they are. The `diff --git` header is not:
+    // a legal unquoted path containing ` b/` makes it unsplittable, and git
+    // writes an edit to `foo b/bar.ts` as
+    // `diff --git a/foo b/bar.ts b/foo b/bar.ts` — verified against git. A
+    // greedy split yields `bar.ts`, so removals were stored under a key nothing
+    // looks up, reconciliation kept the stale occurrence, and the host
+    // published an accusation against a correct finding (Codex, round 13).
+    //
+    // Round 12 fixed the same ambiguity for RENAME endpoints; this is the
+    // ordinary-modification route it did not cover.
+    if (!inHunk && (line.startsWith("--- ") || line.startsWith("+++ "))) {
+      const side = line.startsWith("--- ") ? "a/" : "b/";
+      const rest = line.slice(4);
+      // Git terminates these lines with a TAB when the path contains a space,
+      // which is exactly the case this fix is about.
+      const value = rest.split("\t")[0] ?? "";
+      // A quoted path needs unquoting, which `parseDiffGitHeader` already does
+      // correctly and unambiguously; leave those to the header operands rather
+      // than writing a second unquoter (the same split as round 12).
+      if (value !== "/dev/null" && !value.startsWith('"')) {
+        const bare = value.startsWith(side) ? value.slice(side.length) : value;
+        if (bare !== "") {
+          if (side === "b/") plus = bare;
+          else minus = bare;
+        }
+      }
+      const head = plus ?? minus;
+      if (head !== undefined) {
+        const base = renameSources.get(head);
+        keys = (base === undefined ? [head] : [base, head]).filter((value) => value !== "");
       }
       continue;
     }
