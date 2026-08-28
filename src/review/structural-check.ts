@@ -146,10 +146,23 @@ function toPosix(value: string): string {
   return value.split(path.sep).join("/");
 }
 
-/** Every source file under `root` this check knows how to parse. */
-async function collectSourceFiles(root: string, budget: number): Promise<string[]> {
+/**
+ * Every source file under `root` this check knows how to parse, and whether the
+ * walk stopped early.
+ *
+ * `truncated` is not bookkeeping. A walk that stops at the budget has not seen
+ * the whole tree, so "no reference found" would be a statement about the files
+ * it happened to reach — and if the only external reference sits in a file past
+ * the cap, a truncated walk reports `consistent` and CONFIRMS a false finding.
+ * The time budget already refuses for this reason; the file budget must too.
+ */
+async function collectSourceFiles(
+  root: string,
+  budget: number,
+): Promise<{ files: string[]; truncated: boolean }> {
   const found: string[] = [];
   const queue: string[] = [root];
+  let truncated = false;
   while (queue.length > 0 && found.length < budget) {
     const directory = queue.shift()!;
     let entries;
@@ -161,7 +174,10 @@ async function collectSourceFiles(root: string, budget: number): Promise<string[
       continue;
     }
     for (const entry of entries) {
-      if (found.length >= budget) break;
+      if (found.length >= budget) {
+        truncated = true;
+        break;
+      }
       const full = path.join(directory, entry.name);
       // Never follow a symlink out of the tree: the answer must be about the
       // worktree that was checked out, not about wherever a link points.
@@ -174,7 +190,9 @@ async function collectSourceFiles(root: string, budget: number): Promise<string[
       if (LANG_BY_EXTENSION.has(path.extname(entry.name).toLowerCase())) found.push(full);
     }
   }
-  return found;
+  // The loop can also exit with directories still queued, which is the same
+  // incompleteness by a different route.
+  return { files: found, truncated: truncated || queue.length > 0 };
 }
 
 /**
@@ -186,10 +204,22 @@ async function collectSourceFiles(root: string, budget: number): Promise<string[
  * cannot be told apart from the definition itself. The finding's line number is
  * deliberately not used — it counts lines in the PR head, and this searches the
  * base, so the two do not correspond.
+ *
+ * `findingFileAtBase` exists because that path asymmetry has a second edge. When
+ * the pull request RENAMES the file, `findingFile` is the head path and the base
+ * tree holds the same code under the old one — so the symbol's own declaration
+ * looks like a reference from another file, and the check publishes a
+ * contradiction that is purely an artefact of the rename. The caller passes the
+ * base-side path when it knows one, and both are treated as the finding's own.
  */
 export async function checkStructuralClaim(
   claim: StructuralClaim,
-  input: { readonly baseRoot: string; readonly findingFile: string },
+  input: {
+    readonly baseRoot: string;
+    readonly findingFile: string;
+    /** The same file's path at the base commit, when the PR renamed it. */
+    readonly findingFileAtBase?: string;
+  },
   options: StructuralCheckOptions = {},
 ): Promise<StructuralCheck> {
   const now = options.now ?? (() => Date.now());
@@ -208,15 +238,24 @@ export async function checkStructuralClaim(
     return { status: "not-checked", reason: "the base worktree is unavailable" };
   }
 
-  const files = await collectSourceFiles(input.baseRoot, fileBudget);
+  const { files, truncated } = await collectSourceFiles(input.baseRoot, fileBudget);
   if (files.length === 0) {
     return {
       status: "not-checked",
       reason: "no files in a language this check supports (TypeScript and JavaScript only)",
     };
   }
+  if (truncated) {
+    return {
+      status: "not-checked",
+      reason: `the base tree has more than ${fileBudget} supported source files, so a search of it would be incomplete`,
+    };
+  }
 
-  const findingFile = toPosix(input.findingFile);
+  const ownFiles = new Set([
+    toPosix(input.findingFile),
+    ...(input.findingFileAtBase === undefined ? [] : [toPosix(input.findingFileAtBase)]),
+  ]);
   const references: SymbolReference[] = [];
   let filesSearched = 0;
 
@@ -263,7 +302,7 @@ export async function checkStructuralClaim(
   references.sort((left, right) =>
     left.file === right.file ? left.line - right.line : left.file.localeCompare(right.file));
 
-  const elsewhere = references.some((reference) => reference.file !== findingFile);
+  const elsewhere = references.some((reference) => !ownFiles.has(reference.file));
   return elsewhere
     ? { status: "contradicted", references, filesSearched }
     : { status: "consistent", references, filesSearched };
@@ -329,6 +368,8 @@ export interface RunStructuralChecksInput {
   readonly findings: readonly Finding[];
   readonly baseRoot: string;
   readonly claimBudget?: number;
+  /** Head path -> base path for files this PR renames. See `checkStructuralClaim`. */
+  readonly renamedFrom?: ReadonlyMap<string, string>;
   readonly check?: typeof checkStructuralClaim;
 }
 
@@ -371,9 +412,14 @@ export async function runStructuralChecks(
       continue;
     }
     try {
+      const findingFileAtBase = input.renamedFrom?.get(entry.finding.file);
       checks.set(
         entry.index,
-        await check(claim, { baseRoot: input.baseRoot, findingFile: entry.finding.file }),
+        await check(claim, {
+          baseRoot: input.baseRoot,
+          findingFile: entry.finding.file,
+          ...(findingFileAtBase === undefined ? {} : { findingFileAtBase }),
+        }),
       );
     } catch (error) {
       checks.set(entry.index, {

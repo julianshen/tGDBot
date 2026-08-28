@@ -34,6 +34,14 @@ export interface ReviewConfigForDedup {
    * older two-field callers and their pinned hashes still typecheck.
    */
   dependencyFacts?: "on" | "off";
+  /**
+   * Issue #75: this decides whether a claimed finding is checked against the
+   * base tree at all, so flipping it must re-trigger on an unchanged head.
+   * Without it, turning the feature on after a review skips before dispatch and
+   * no check appears until some other commit moves the head. Optional, so
+   * older callers and their pinned hashes still typecheck.
+   */
+  structuralChecks?: "on" | "off";
 }
 
 /**
@@ -113,6 +121,7 @@ export function computeReviewConfigHash(
     // `dispatch` field above had to pay. Turning the flag on still changes the
     // hash, which is the whole point.
     ...(config.dependencyFacts === "on" ? ["dependency-facts"] : []),
+    ...(config.structuralChecks === "on" ? ["structural-checks"] : []),
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,

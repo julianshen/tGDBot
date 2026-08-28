@@ -795,6 +795,15 @@ function renderUnanchoredFinding(
         : "> Proposed fix omitted because the summary size budget was exhausted.",
     );
   }
+  // Issue #75, review round 1: a finding without a commentable line is
+  // RELOCATED here rather than posted inline, and rendering the check only in
+  // the inline path silently dropped it — publishing the reviewer's claim with
+  // the host's answer to it removed. A contradiction that goes missing is the
+  // worst version of that: the reader sees an unchallenged assertion the host
+  // had already disproved.
+  const hostCheck = renderHostCheck(finding);
+  if (hostCheck) parts.push("", hostCheck);
+
   const references = renderReferences(finding);
   if (references) parts.push("", references);
   if (context?.alsoReported && context.alsoReported.length > 0) {

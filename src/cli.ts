@@ -67,7 +67,7 @@ import {
   formatMarker,
   stateRootDomainIdentifier,
 } from "./review/dedup.js";
-import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
+import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions, renameSourcesByHeadPath } from "./review/diff-anchors.js";
 import {
   formatPendingMarker,
   replacePendingMarker,
@@ -1508,6 +1508,10 @@ export async function review(
       dispatchResult.findings = await runStructuralChecksFn({
         findings: dispatchResult.findings,
         baseRoot: prepared.baseWorktreePath,
+        // A finding names its HEAD path; the base tree holds a renamed file
+        // under the old one, and without this the symbol's own declaration
+        // reads as a reference from elsewhere.
+        renamedFrom: renameSourcesByHeadPath(diff),
       });
     } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the

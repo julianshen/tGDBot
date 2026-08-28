@@ -150,6 +150,26 @@ describe("checkStructuralClaim — what counts as a reference", () => {
       .resolves.toMatchObject({ status: "contradicted" });
   });
 
+  // Codex review, round 1. `findingFile` is a HEAD path; when the PR renames the
+  // file, the base tree holds the same code under the old name — so the
+  // symbol's own declaration looked like a reference from another file and the
+  // check published a contradiction that was purely an artefact of the rename.
+  it("does not call a renamed file's own declaration an external reference", async () => {
+    const root = await tree({
+      "src/old-name.ts": "export function budget(n: number) { return n; }\n",
+    });
+
+    // Without the base-side path this reads as "a reference in another file".
+    await expect(checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/new-name.ts" }))
+      .resolves.toMatchObject({ status: "contradicted" });
+
+    await expect(checkStructuralClaim(claim, {
+      baseRoot: root,
+      findingFile: "src/new-name.ts",
+      findingFileAtBase: "src/old-name.ts",
+    })).resolves.toMatchObject({ status: "consistent" });
+  });
+
   it("never follows a symlink out of the worktree", async () => {
     const outside = await tree({ "secret.ts": "export const budget = 1;\n" });
     const root = await tree({ "src/retry.ts": "export function budget(n: number) { return n; }\n" });
@@ -180,6 +200,27 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
   it("does not check against a relative root", async () => {
     await expect(checkStructuralClaim(claim, { baseRoot: "relative/root", findingFile: "a.ts" }))
       .resolves.toMatchObject({ status: "not-checked", reason: expect.stringContaining("absolute") });
+  });
+
+  // Codex review, round 1: the time budget refused correctly and the FILE budget
+  // did not — a truncated walk that found nothing reported `consistent`, which
+  // is the false confirmation this whole check exists to avoid. Same property,
+  // two code paths, and only one of them had it.
+  it("reports an exhausted file budget as not-checked, never as consistent", async () => {
+    const root = await tree({
+      "a.ts": "export const x = 1;\n",
+      "b.ts": "export const y = 2;\n",
+      "c.ts": "export const budget = 3;\n",
+    });
+
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "a.ts" }, {
+      fileBudget: 2,
+    });
+
+    expect(result.status).toBe("not-checked");
+    if (result.status !== "not-checked") throw new Error("unreachable");
+    expect(result.reason).toMatch(/more than 2 supported source files/);
+    expect(result.reason).toMatch(/incomplete/i);
   });
 
   // An exhausted budget must not read as a clean result: a partial search that
@@ -299,6 +340,36 @@ describe("runStructuralChecks", () => {
 
     expect(output[0]?.hostCheck).toMatchObject({ status: "not-checked" });
     expect((output[0]?.hostCheck as { reason: string }).reason).toContain("napi exploded");
+  });
+
+  it("passes a renamed finding's base-side path to the check", async () => {
+    const seen: { findingFile: string; findingFileAtBase?: string }[] = [];
+    await runStructuralChecks({
+      findings: [finding({ claim, file: "src/new-name.ts" })],
+      baseRoot: root,
+      renamedFrom: new Map([["src/new-name.ts", "src/old-name.ts"]]),
+      check: async (_claim, input) => {
+        seen.push({ findingFile: input.findingFile, ...(input.findingFileAtBase === undefined ? {} : { findingFileAtBase: input.findingFileAtBase }) });
+        return { status: "consistent", references: [], filesSearched: 1 };
+      },
+    });
+
+    expect(seen).toEqual([{ findingFile: "src/new-name.ts", findingFileAtBase: "src/old-name.ts" }]);
+  });
+
+  it("omits the base-side path when the file was not renamed", async () => {
+    const seen: (string | undefined)[] = [];
+    await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      renamedFrom: new Map([["src/other.ts", "src/was.ts"]]),
+      check: async (_claim, input) => {
+        seen.push(input.findingFileAtBase);
+        return { status: "consistent", references: [], filesSearched: 1 };
+      },
+    });
+
+    expect(seen).toEqual([undefined]);
   });
 
   it("checks blocking findings first when the budget binds, and says so on the rest", async () => {

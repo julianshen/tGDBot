@@ -603,7 +603,12 @@ Four properties worth knowing, because they are what make it trustworthy:
   Dynamic references, languages the check does not parse, and callers in other
   repositories are invisible to it. It reports coverage, not absence.
 - **It reads only the base branch**, never a PR checkout — the same rule
-  mapping follows, for the same reason.
+  mapping follows, for the same reason. When the pull request renames the file a
+  claim is about, the base-side path is passed too, so the symbol's own
+  declaration is not mistaken for a reference from somewhere else.
+- **An incomplete search is never reported as a clean one.** Exhausting either
+  the time budget or the file budget yields "not performed, with reason", not
+  "no references found".
 
 Nothing is inferred from prose: "never called", "no other caller" and "nothing
 else implements this" are one claim in three phrasings, and a matcher over them

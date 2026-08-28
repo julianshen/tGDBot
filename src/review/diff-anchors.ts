@@ -213,6 +213,24 @@ export function changedFilesWithRenameSources(diff: string): string[] {
   return collectChangedPaths(diff, (header) => [header.b, header.a]);
 }
 
+/**
+ * Head path -> base path, for the files this diff renames.
+ *
+ * Anything that compares a finding's file against the BASE tree needs this: the
+ * finding names the head path, and the base holds the same code under the old
+ * one. Only genuine renames are included — an unchanged path maps to itself and
+ * is left out, so the map is empty for the common case.
+ */
+export function renameSourcesByHeadPath(diff: string): Map<string, string> {
+  const renames = new Map<string, string>();
+  for (const line of diff.split("\n")) {
+    const header = parseDiffGitHeader(line);
+    if (header === undefined) continue;
+    if (header.a && header.b && header.a !== header.b) renames.set(header.b, header.a);
+  }
+  return renames;
+}
+
 function collectChangedPaths(
   diff: string,
   select: (header: { readonly a: string; readonly b: string }) => readonly string[],

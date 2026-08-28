@@ -1566,6 +1566,33 @@ describe("renderInlineComment — host structural check", () => {
     expect(renderInlineComment(makeFinding())).not.toContain("Host check");
   });
 
+  // Codex review, round 1. A finding with no commentable line is RELOCATED to
+  // the summary instead of posted inline, and the check was rendered only on
+  // the inline path — so the reviewer's claim was published with the host's
+  // answer to it stripped out. A contradiction going missing is the worst
+  // version: the reader sees an unchallenged assertion the host had disproved.
+  it("renders the check on a finding relocated to the summary", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [makeFinding({
+        claim,
+        hostCheck: {
+          status: "contradicted",
+          references: [{ file: "src/http.ts", line: 88 }],
+          filesSearched: 40,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    });
+
+    expect(body).toContain("Host check:");
+    expect(body).toContain("src/http.ts:88");
+    expect(body).toMatch(/contradicts/i);
+  });
+
   // A claim the host could not answer must not silently look unchallenged.
   it("states that a check was not performed, and why", () => {
     const body = renderInlineComment(makeFinding({
