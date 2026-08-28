@@ -118,6 +118,17 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
       .map((outcome) => outcome.findingId),
   );
 
+  // A thread REOPENED since the last verdict makes the next resolution a
+  // genuine new transition rather than a repeated snapshot. Both adapters emit
+  // `resolved: false` on reopen, and a maintainer may reopen and re-resolve
+  // without commenting or touching the code (PR #73 review).
+  const reopenedThreads = new Set(
+    input.events
+      .filter((event) => event.kind === "thread-resolution" && event.resolved === false)
+      .map((event) => event.threadId)
+      .filter((threadId): threadId is string => threadId !== undefined),
+  );
+
   const humanEventsByThread = new Map<string, FindingVerificationTrigger>();
   for (const event of input.events) {
     // The bot's own replies must not trigger verification, or a run answers
@@ -145,9 +156,10 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
 
     const threadId = candidate.identity?.threadId;
     const signalled = threadId === undefined ? undefined : humanEventsByThread.get(threadId);
-    const humanTrigger = signalled === "thread-resolution" && resolutionActedOn.has(candidate.id)
-      ? undefined
-      : signalled;
+    const suppressedRepeat = signalled === "thread-resolution"
+      && resolutionActedOn.has(candidate.id)
+      && !(threadId !== undefined && reopenedThreads.has(threadId));
+    const humanTrigger = suppressedRepeat ? undefined : signalled;
     // An unanchored finding cannot be matched against a diff, so a push tells
     // us nothing about it — and neither does a finding RAISED at this head,
     // which is commonly anchored to a line this head changed because that is

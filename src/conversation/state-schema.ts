@@ -613,8 +613,9 @@ function sameBinding(actual: RepositoryBinding, expected: RepositoryBinding): vo
 
 function placement(value: unknown, name: string): ConversationPlacement | null {
   if (value === null) return null;
-  const object = exact(value, name, ["file", "outdated"], ["side", "line", "originalHeadSha", "currentHeadSha"]);
-  const result: { file: string; outdated: boolean; side?: "old" | "new"; line?: number; originalHeadSha?: string; currentHeadSha?: string } = {
+  const object = exact(value, name, ["file", "outdated"],
+    ["side", "line", "startLine", "originalHeadSha", "currentHeadSha"]);
+  const result: { file: string; outdated: boolean; side?: "old" | "new"; line?: number; startLine?: number; originalHeadSha?: string; currentHeadSha?: string } = {
     file: text(object.file, `${name}.file`, 4_096), outdated: object.outdated as boolean,
   };
   if (typeof object.outdated !== "boolean") throw new Error(`${name}.outdated must be boolean`);
@@ -623,6 +624,12 @@ function placement(value: unknown, name: string): ConversationPlacement | null {
     result.side = object.side;
   }
   if (object.line !== undefined) result.line = positiveInteger(object.line, `${name}.line`);
+  if (object.startLine !== undefined) {
+    result.startLine = positiveInteger(object.startLine, `${name}.startLine`);
+    if (result.line !== undefined && result.startLine > result.line) {
+      throw new Error(`${name}.startLine is after ${name}.line`);
+    }
+  }
   for (const key of ["originalHeadSha", "currentHeadSha"] as const) {
     if (object[key] !== undefined) {
       if (typeof object[key] !== "string" || !SHA_RE.test(object[key] as string)) throw new Error(`${name}.${key} is invalid`);

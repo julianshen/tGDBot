@@ -269,6 +269,10 @@ export function prepareReviewFindingPublication(
         placement: {
           file: comment.path,
           line: comment.line,
+          // The range's first line, so a stored anchor is the whole anchor.
+          // Keeping only the endpoint meant a commit touching the start or
+          // middle never re-examined the finding (PR #73 review).
+          ...(comment.startLine === undefined ? {} : { startLine: comment.startLine }),
           side: "new",
           originalHeadSha: input.headSha,
           currentHeadSha: input.headSha,

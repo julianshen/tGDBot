@@ -9,6 +9,7 @@
 import { describe, expect, it } from "vitest";
 import {
   prepareFindingOutcome,
+  validateFindingEntries,
   validateFindingOutcomeEntries,
 } from "../../../src/conversation/state-schema.js";
 import type { RepositoryBinding } from "../../../src/conversation/types.js";
@@ -199,5 +200,60 @@ describe("prepareFindingOutcome", () => {
     const entry = prepareFindingOutcome({ ...source, repository });
 
     expect(() => validateFindingOutcomeEntries([entry], repository)).not.toThrow();
+  });
+});
+
+// PR #73 round two: the queue learned to check a whole anchor range, but the
+// stored placement kept only its endpoint — so the fix was complete in one
+// module and inert end to end. A reviewer pushed back on that answer, rightly.
+// Exercised through the finding ledger, which is where a placement is validated.
+describe("a stored anchor keeps the whole range", () => {
+  const entry = (placement: Record<string, unknown>) => ({
+    version: 1,
+    repository,
+    id: `finding_${"3".repeat(32)}`,
+    reviewNumber: 42,
+    reviewId: "PR_kwDOReview42",
+    baseSha: "b".repeat(40),
+    headSha: "c".repeat(40),
+    contentDigest: "d".repeat(64),
+    bodyDigest: "e".repeat(64),
+    ruleDigest: "f".repeat(64),
+    ruleSnapshot: "rule text",
+    finding: {
+      ruleName: "tgd-review",
+      file: "src/a.ts",
+      line: 12,
+      category: "correctness",
+      severity: "warning",
+      message: "m",
+      decision: "new",
+    },
+    reviewOptions: {
+      advisor: "on", suggestions: "on", disableBuiltinRule: false,
+      trustLocalRules: false, rulesDir: ".review/rules", dispatch: "direct",
+    },
+    placement,
+    at: "2026-08-28T00:00:00.000Z",
+  });
+  const anchor = { file: "src/a.ts", side: "new", line: 12, outdated: false };
+
+  it("accepts a range", () => {
+    const [parsed] = validateFindingEntries([entry({ ...anchor, startLine: 10 })], repository);
+
+    expect(parsed?.placement?.startLine).toBe(10);
+    expect(parsed?.placement?.line).toBe(12);
+  });
+
+  // Anchors written before this change have no such key.
+  it("accepts a placement without one", () => {
+    const [parsed] = validateFindingEntries([entry(anchor)], repository);
+
+    expect(parsed?.placement?.startLine).toBeUndefined();
+  });
+
+  it("refuses a range that starts after it ends", () => {
+    expect(() => validateFindingEntries([entry({ ...anchor, startLine: 20 })], repository))
+      .toThrow(/startLine/i);
   });
 });

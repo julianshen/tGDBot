@@ -311,3 +311,38 @@ describe("pendingVerifications — a multi-line anchor is a range", () => {
     expect(queue).toEqual([]);
   });
 });
+
+// PR #73 round two: suppressing a repeated resolution snapshot must not
+// suppress a GENUINE second resolution. Both adapters emit `resolved: false`
+// when a thread is reopened, so reopen-then-resolve is a real transition a
+// maintainer may make without commenting or touching the code.
+describe("pendingVerifications — a reopened thread can be resolved again", () => {
+  const resolved = event({ kind: "thread-resolution", resolved: true, authorIsBot: undefined });
+  const reopened = event({ kind: "thread-resolution", resolved: false, authorIsBot: undefined });
+  const alreadyActed = [{ findingId: ledger().id, headSha: OLD, trigger: "thread-resolution" as const }];
+
+  it("queues again when the thread was reopened in between", () => {
+    const queue = pendingVerifications(input({
+      events: [reopened, resolved],
+      outcomes: alreadyActed,
+    }));
+
+    expect(queue[0]?.trigger).toBe("thread-resolution");
+  });
+
+  it("still ignores a repeat with no reopen", () => {
+    const queue = pendingVerifications(input({
+      events: [resolved],
+      outcomes: alreadyActed,
+    }));
+
+    expect(queue).toEqual([]);
+  });
+
+  // A reopen on its own is not a request to re-verify.
+  it("does not queue on a reopen alone", () => {
+    const queue = pendingVerifications(input({ events: [reopened], outcomes: [] }));
+
+    expect(queue).toEqual([]);
+  });
+});

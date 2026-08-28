@@ -71,7 +71,16 @@ export type DiffSide = "old" | "new";
 export interface ConversationAnchor {
   readonly file: string;
   readonly side?: DiffSide;
+  /** The LAST line of the anchor, which is what a provider anchors a comment to. */
   readonly line?: number;
+  /**
+   * The FIRST line, when the finding spans a range.
+   *
+   * Without it a stored anchor keeps only its endpoint, so a later commit that
+   * changes the start or middle of the range leaves the finding unexamined —
+   * an addressed finding never re-checked (PR #73 review).
+   */
+  readonly startLine?: number;
   readonly originalHeadSha?: string;
   readonly currentHeadSha?: string;
   readonly outdated: boolean;
