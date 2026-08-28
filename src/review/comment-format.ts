@@ -7,6 +7,7 @@
 //      failed-rule reasons, and any finding that could NOT be anchored.
 //
 // Both are plain string builders: pure, synchronous, no I/O.
+import { describeCheck } from "./structural-check.js";
 import { crossFileGroups } from "./finding-clusters.js";
 import type { Finding } from "./types.js";
 import type { HunkSnippet } from "./diff-anchors.js";
@@ -343,6 +344,13 @@ export function renderInlineComment(
     parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
   }
 
+  // Issue #75. Rendered as a blockquote, immediately under the finding it
+  // qualifies, and worded so the HOST is the subject of every sentence: this is
+  // the one line in a finding a reader is invited to trust without re-deriving
+  // it, so it must be unmistakably not the reviewer talking about itself.
+  const hostCheck = renderHostCheck(finding);
+  if (hostCheck) parts.push("", hostCheck);
+
   const citations = emitsReferences(finding) ? renderReferences(finding) : undefined;
   if (citations) parts.push("", citations);
   if (options.alsoReported && options.alsoReported.length > 0) {
@@ -657,6 +665,20 @@ export function emitsSuggestion(finding: Finding): boolean {
 /** Whether an inline comment for this finding carries a Reference block. */
 export function emitsReferences(finding: Finding): boolean {
   return finding.references !== undefined && finding.references.length > 0;
+}
+
+/**
+ * The host's answer to a claim the reviewer made, or nothing.
+ *
+ * `describeCheck` owns the wording — in particular that a clean result says
+ * what was searched rather than "there are no callers". Sanitized like every
+ * other interpolated value: the symbol reaches here from reviewer output, and
+ * although `parseStructuralClaim` already constrains it to an identifier, the
+ * escape is a property of the container rather than of the source.
+ */
+function renderHostCheck(finding: Finding): string | undefined {
+  if (finding.claim === undefined || finding.hostCheck === undefined) return undefined;
+  return `> ${describeCheck(finding.claim, finding.hostCheck, sanitizeInline)}`;
 }
 
 function renderReferences(finding: Finding): string | undefined {

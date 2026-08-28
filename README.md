@@ -373,6 +373,14 @@ tgd-review-agent review \
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
+  --structural-checks on|off     # default: OFF. Checks a finding's structural claim against the
+                                  # BASE branch and publishes what the host found beside it —
+                                  # including when it contradicts the finding. Only claims a rule
+                                  # explicitly makes ("this symbol is referenced nowhere else") are
+                                  # checked; nothing is inferred from prose. TypeScript and
+                                  # JavaScript only. Needs a base worktree, so the first run on a
+                                  # cold workspace pays for a clone; it shares that workspace with
+                                  # --context, so a repository is mirrored once.
   --dependency-facts on|off      # default: OFF. The only outbound request this tool makes: when a
                                   # pull request changes a package.json, the host asks
                                   # registry.npmjs.org about each changed package and puts the
@@ -565,6 +573,42 @@ map can drop whole evidence entries and report the omission counts while a list
 of dependency facts cannot be cut mid-claim. The repository map keeps a floor of
 4000 characters, so a very large dependency section is the one case where the
 combined text exceeds the ceiling.
+
+### Checking a finding's structural claim
+
+The confident false positive this exists for is *"this function is never
+called"* — written about code the reviewer cannot see, because the only caller
+sits outside the diff. The context pack above helps the reviewer reason; it
+does not check the reviewer afterwards.
+
+With `--structural-checks on`, a rule may attach a claim to a finding, and the
+host answers it by parsing the base branch with
+[ast-grep](https://ast-grep.github.io/) in-process:
+
+```text
+- `src/retry.ts:41` — budget() is never called outside tests
+  > Host check: `budget` appears 3 time(s) across 214 file(s) of the base
+  > branch — `src/http.ts:88`, `src/queue.ts:12`. This contradicts the claim above.
+```
+
+Four properties worth knowing, because they are what make it trustworthy:
+
+- **The claim is the reviewer's; the check is the host's.** A reviewer cannot
+  fabricate a check result — findings are rebuilt field by field from an
+  allowlist, so a forged one is dropped like any other unknown key.
+- **A contradiction never suppresses the finding.** Both are published and a
+  human weighs them. Silently dropping a finding because a mechanical check
+  disagreed would trade one confident wrong answer for another.
+- **A clean result says what was searched, never "there are no callers."**
+  Dynamic references, languages the check does not parse, and callers in other
+  repositories are invisible to it. It reports coverage, not absence.
+- **It reads only the base branch**, never a PR checkout — the same rule
+  mapping follows, for the same reason.
+
+Nothing is inferred from prose: "never called", "no other caller" and "nothing
+else implements this" are one claim in three phrasings, and a matcher over them
+would both miss real claims and invent ones that were never made. A rule opts
+in per finding or not at all.
 
 `--dry-run` prepares context exactly as a real run would, so the preview it
 prints is the review you would actually get. That means a dry run on a cold

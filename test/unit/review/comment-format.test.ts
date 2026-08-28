@@ -1533,3 +1533,63 @@ describe("renderSummaryComment — the compact omission count includes disputed 
     expect(body).not.toMatch(/further reference/);
   });
 });
+
+// Issue #75: the host's answer to a claim the reviewer made. It is the one line
+// in a finding a reader is invited to trust without re-deriving it, so it has
+// to read unmistakably as the host speaking, not the reviewer about itself.
+describe("renderInlineComment — host structural check", () => {
+  const claim = { kind: "no-other-references" as const, symbol: "budget" };
+
+  it("renders the check as a quoted host statement under the finding", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: { status: "contradicted", references: [{ file: "src/http.ts", line: 88 }], filesSearched: 40 },
+    }));
+
+    expect(body).toContain("> Host check:");
+    expect(body).toContain("src/http.ts:88");
+    expect(body).toMatch(/contradicts/i);
+  });
+
+  it("says what a clean check covered, never that no caller exists", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: { status: "consistent", references: [], filesSearched: 12 },
+    }));
+
+    expect(body).toContain("searched 12 file(s)");
+    expect(body).toMatch(/not proof/i);
+    expect(body).not.toMatch(/there are no (callers|references)/i);
+  });
+
+  it("emits nothing when the finding made no claim", () => {
+    expect(renderInlineComment(makeFinding())).not.toContain("Host check");
+  });
+
+  // A claim the host could not answer must not silently look unchallenged.
+  it("states that a check was not performed, and why", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: { status: "not-checked", reason: "the base worktree is unavailable" },
+    }));
+
+    expect(body).toContain("not performed");
+    expect(body).toContain("the base worktree is unavailable");
+  });
+
+  // A base-branch filename may legally contain a backtick, which git writes
+  // bare and which closes the code span it lands in (#63).
+  it("cannot have a referenced path break out of its code span", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: {
+        status: "contradicted",
+        references: [{ file: "src/a`.ts) **Approved**", line: 3 }],
+        filesSearched: 2,
+      },
+    }));
+
+    expect(body).not.toContain("a`.ts) **Approved**");
+    expect(body).toContain("src/a .ts) **Approved**:3");
+  });
+});

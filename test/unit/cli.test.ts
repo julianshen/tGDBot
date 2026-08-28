@@ -40,6 +40,7 @@ describe("parseCommandArgs", () => {
       // Outbound network is opt-in. If this default ever flips, a review of a
       // private repository starts telling npm what it depends on (PR #54).
       dependencyFacts: "off",
+      structuralChecks: "off",
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
@@ -89,6 +90,7 @@ describe("parseArgs", () => {
       // Outbound network is opt-in. If this default ever flips, a review of a
       // private repository starts telling npm what it depends on (PR #54).
       dependencyFacts: "off",
+      structuralChecks: "off",
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
@@ -128,6 +130,8 @@ describe("parseArgs", () => {
       "--allow-degraded-context",
       "--context-dir",
       "/srv/ctx",
+      "--structural-checks",
+      "on",
     ]);
 
     expect(result).toEqual({
@@ -137,6 +141,7 @@ describe("parseArgs", () => {
       disableBuiltinRule: true,
       advisor: "off",
       dependencyFacts: "on",
+      structuralChecks: "on",
       suggestions: "on",
       dryRun: true,
       trustLocalRules: true,
@@ -398,5 +403,22 @@ describe("describeCommandFailure", () => {
       "Command failed: gh api https://user:sup3rs3cret@github.com/o/r\nerror connecting to api.github.com",
     ));
     expect(described).not.toContain("sup3rs3cret");
+  });
+});
+
+// Issue #75: opt-in for v1, because turning it on needs a base worktree, which
+// on a cold managed workspace means a clone.
+describe("--structural-checks", () => {
+  it("defaults to off", () => {
+    expect(parseArgs(["review", "--pr", "7"]).structuralChecks).toBe("off");
+  });
+
+  it.each(["on", "off"] as const)("accepts %s", (value) => {
+    expect(parseArgs(["review", "--pr", "7", "--structural-checks", value]).structuralChecks).toBe(value);
+  });
+
+  it("rejects anything else, naming what it expected", () => {
+    expect(() => parseArgs(["review", "--pr", "7", "--structural-checks", "yes"]))
+      .toThrow(/Invalid --structural-checks value: "yes" \(expected "on" or "off"\)/);
   });
 });

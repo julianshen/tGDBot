@@ -291,6 +291,8 @@ interface Harness {
   dispatchRules: ReturnType<typeof vi.fn>;
   orchestrate: ReturnType<typeof vi.fn>;
   prepareContext: ReturnType<typeof vi.fn>;
+  runStructuralChecks: ReturnType<typeof vi.fn>;
+  prepareStructuralWorkspace: ReturnType<typeof vi.fn>;
   publicationHooks?: ReviewDependencies["publicationHooks"];
 }
 
@@ -408,6 +410,12 @@ function makeHarness(options: {
     loadRules: vi.fn().mockResolvedValue(loadResult),
     dispatchRules: vi.fn().mockResolvedValue(dispatchResult),
     prepareContext: vi.fn().mockResolvedValue({ status: "off" }),
+    runStructuralChecks: vi.fn(async (input: { findings: unknown[] }) => input.findings),
+    prepareStructuralWorkspace: vi.fn().mockResolvedValue({
+      root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
+      worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
+      ownerMarkerPath: "/ws/repo/owner.json", baseSha: "deadbeef",
+    }),
     orchestrate: vi.fn().mockReturnValue(orchestrationResult),
   };
 }
@@ -422,6 +430,10 @@ function depsFrom(h: Harness) {
     // Belt and braces alongside `context: "off"` above: even if a test
     // overrides the mode, it must never reach a real worktree or mapper.
     prepareContext: h.prepareContext,
+    // Same stance for #75: a review test must never walk a real worktree with
+    // a real parser.
+    runStructuralChecks: h.runStructuralChecks,
+    prepareStructuralWorkspace: h.prepareStructuralWorkspace,
   };
 }
 
@@ -5098,6 +5110,94 @@ describe("review — the summary names the model too", () => {
 
     expect(summaryBodies(h)).toContain("Posted by");
     expect(summaryBodies(h)).not.toContain(" using ");
+    vi.restoreAllMocks();
+  });
+});
+
+// Issue #75: the checks are opt-in, read only the trusted base, and never cost
+// the review when they cannot run.
+describe("review — structural checks", () => {
+  const claimed = {
+    file: "src/retry.ts", line: 1, severity: "warning" as const, category: "correctness",
+    message: "budget() is never called.", ruleName: "rule-a",
+    claim: { kind: "no-other-references" as const, symbol: "budget" },
+  };
+
+  it("does nothing at all when the feature is off", async () => {
+    const h = makeHarness({ botComment: null });
+    h.dispatchRules.mockResolvedValue({ findings: [claimed], rulesRun: ["rule-a"], rulesFailed: [] });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.prepareStructuralWorkspace).not.toHaveBeenCalled();
+    expect(h.runStructuralChecks).not.toHaveBeenCalled();
+  });
+
+  // The worktree is the expensive part; a review whose findings make no claim
+  // must not pay for one.
+  it("prepares no worktree when no finding made a claim", async () => {
+    const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
+    h.dispatchRules.mockResolvedValue({
+      findings: [{ ...claimed, claim: undefined }], rulesRun: ["rule-a"], rulesFailed: [],
+    });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.prepareStructuralWorkspace).not.toHaveBeenCalled();
+    expect(h.runStructuralChecks).not.toHaveBeenCalled();
+  });
+
+  it("checks a claim against the base worktree when the feature is on", async () => {
+    const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
+    h.dispatchRules.mockResolvedValue({ findings: [claimed], rulesRun: ["rule-a"], rulesFailed: [] });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.prepareStructuralWorkspace).toHaveBeenCalledWith(
+      expect.objectContaining({ baseSha: "deadbeef", rejectPreviouslySharedRoot: true }),
+    );
+    expect(h.runStructuralChecks).toHaveBeenCalledWith(
+      expect.objectContaining({ baseRoot: "/ws/repo/base" }),
+    );
+  });
+
+  // The same refusal the mapper makes, for the same reason: everything this
+  // reads must come from the base commit, never a PR checkout.
+  it("refuses a worktree that is not at the requested base commit", async () => {
+    const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
+    h.dispatchRules.mockResolvedValue({ findings: [claimed], rulesRun: ["rule-a"], rulesFailed: [] });
+    h.prepareStructuralWorkspace.mockResolvedValue({
+      root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
+      worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
+      ownerMarkerPath: "/ws/repo/owner.json", baseSha: "not-the-base",
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.runStructuralChecks).not.toHaveBeenCalled();
+    const passed = h.orchestrate.mock.calls[0]?.[0] as { findings: { hostCheck?: { status: string } }[] };
+    expect(passed.findings[0]?.hostCheck).toMatchObject({ status: "not-checked" });
+    vi.restoreAllMocks();
+  });
+
+  // Degrading must be visible on the finding, not silent: a claim that reads
+  // unchallenged is exactly what this feature exists to stop.
+  it("marks the claim not-checked and still publishes when the worktree fails", async () => {
+    const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
+    h.dispatchRules.mockResolvedValue({ findings: [claimed], rulesRun: ["rule-a"], rulesFailed: [] });
+    h.prepareStructuralWorkspace.mockRejectedValue(new Error("no git here"));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const code = await review(h.args, depsFrom(h));
+
+    expect(code).not.toBe(1);
+    const passed = h.orchestrate.mock.calls[0]?.[0] as {
+      findings: { message: string; hostCheck?: { status: string; reason: string } }[];
+    };
+    expect(passed.findings).toHaveLength(1);
+    expect(passed.findings[0]?.hostCheck?.status).toBe("not-checked");
+    expect(passed.findings[0]?.hostCheck?.reason).toContain("could not be prepared");
     vi.restoreAllMocks();
   });
 });
