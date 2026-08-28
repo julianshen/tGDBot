@@ -591,6 +591,15 @@ host answers it by parsing the base branch with
   > branch — `src/http.ts:88`, `src/queue.ts:12`. This contradicts the claim above.
 ```
 
+**It reports contradictions, and nothing else.** There is deliberately no "clean"
+verdict. "No reference exists" is an assertion of *absence*, and absence is only
+sound with total coverage — which is unreachable: dynamic references,
+reflection, generated code, other repositories and every language outside the
+supported set are permanently invisible. A contradiction is the opposite: the
+host parsed a file and found the symbol, and no gap elsewhere makes that untrue.
+So the check keeps the half that is robust and drops the half that cannot be.
+A finding with no host check simply reads on its own merits, as it did before.
+
 Four properties worth knowing, because they are what make it trustworthy:
 
 - **The claim is the reviewer's; the check is the host's.** A reviewer cannot
@@ -599,18 +608,17 @@ Four properties worth knowing, because they are what make it trustworthy:
 - **A contradiction never suppresses the finding.** Both are published and a
   human weighs them. Silently dropping a finding because a mechanical check
   disagreed would trade one confident wrong answer for another.
-- **A clean result says what was searched, never "there are no callers."**
-  Dynamic references, languages the check does not parse, and callers in other
-  repositories are invisible to it. It reports coverage, not absence.
+- **Where it cannot establish a contradiction it says so, with what it covered.**
+  It never converts "I found nothing" into "there is nothing".
 - **It reads only the base branch**, never a PR checkout — the same rule
   mapping follows, for the same reason. When the pull request renames the file a
   claim is about, the base-side path is passed too, so the symbol's own
   declaration is not mistaken for a reference from somewhere else.
-- **An incomplete search is never reported as a clean one.** Any file the search
-  could not read or parse — oversized, unreadable, past a budget — makes a
-  clean result "not performed, with reason" instead. A gap only invalidates a
-  *negative* answer: finding a reference elsewhere is a fact no gap can undo, so
-  a contradiction still stands.
+- **The base/head gap is reconciled rather than ignored.** The search reads the
+  base commit while the finding is about the head, so a pull request that
+  deletes the last caller is *right* to call the symbol unused even though the
+  base still contains that caller. When the diff removes any line mentioning the
+  symbol, the contradiction is withheld.
 
 Nothing is inferred from prose: "never called", "no other caller" and "nothing
 else implements this" are one claim in three phrasings, and a matcher over them

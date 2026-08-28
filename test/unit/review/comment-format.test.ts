@@ -1551,14 +1551,17 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).toMatch(/contradicts/i);
   });
 
-  it("says what a clean check covered, never that no caller exists", () => {
+  it("says what a non-contradicting check covered, never that no caller exists", () => {
     const body = renderInlineComment(makeFinding({
       claim,
-      hostCheck: { status: "consistent", references: [], filesSearched: 12 },
+      hostCheck: {
+        status: "not-checked",
+        reason: "no reference outside its own file was found in 12 file(s) of the base branch, which is not evidence that none exists",
+      },
     }));
 
-    expect(body).toContain("searched 12 file(s)");
-    expect(body).toMatch(/not proof/i);
+    expect(body).toContain("12 file(s)");
+    expect(body).toMatch(/not evidence that none exists/);
     expect(body).not.toMatch(/there are no (callers|references)/i);
   });
 

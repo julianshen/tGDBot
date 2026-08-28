@@ -48,20 +48,42 @@ export interface SymbolReference {
   readonly line: number;
 }
 
+/**
+ * A check reports a CONTRADICTION or it reports nothing. There is deliberately
+ * no "clean" verdict.
+ *
+ * The first three review rounds on this PR each found another way a clean
+ * result could be wrong — an exhausted file budget, an oversized file, a parse
+ * failure, a skipped directory, a finding in a language this cannot parse, and
+ * finally the base/head gap: the search reads the base commit while the finding
+ * is about the head, so a pull request that deletes the last caller leaves that
+ * caller present in the tree being searched. Each was fixed and the next round
+ * found a sibling.
+ *
+ * That is not a run of unlucky bugs; it is the shape of the claim. "No
+ * reference exists" is an assertion of ABSENCE, and absence is only sound with
+ * total coverage — which is unreachable here. Dynamic references, reflection,
+ * generated code, other repositories and every language outside the table are
+ * permanently invisible, and no amount of skip-counting changes that.
+ *
+ * A contradiction has the opposite character. It is positive evidence: the host
+ * parsed a file and found the symbol. No gap elsewhere can make that untrue, so
+ * it stays sound however incomplete the rest of the search was.
+ *
+ * So the check keeps the half that is robust and drops the half that cannot be
+ * made so. That removes the entire class of "an incomplete search reported
+ * clean" rather than its current instance, and it costs little: the value of
+ * this feature is catching a finding that is WRONG, and a reader who sees no
+ * host check simply reads the finding on its own merits, as they did before.
+ */
 export type StructuralCheck =
-  /** References exist in a file other than the finding's own. */
+  /** References exist in a file other than the finding's own. Positive evidence. */
   | {
     readonly status: "contradicted";
     readonly references: readonly SymbolReference[];
     readonly filesSearched: number;
   }
-  /** No reference outside the finding's own file. NOT "there are no callers" — see `describeCheck`. */
-  | {
-    readonly status: "consistent";
-    readonly references: readonly SymbolReference[];
-    readonly filesSearched: number;
-  }
-  /** The check did not run. Always carries why. */
+  /** No contradiction was established. Always carries why, and never means "no callers exist". */
   | { readonly status: "not-checked"; readonly reason: string };
 
 /**
@@ -152,35 +174,29 @@ function toPosix(value: string): string {
  * Every source file under `root` this check knows how to parse, and whether the
  * walk stopped early.
  *
- * `truncated` is not bookkeeping. A walk that stops at the budget has not seen
- * the whole tree, so "no reference found" would be a statement about the files
- * it happened to reach — and if the only external reference sits in a file past
- * the cap, a truncated walk reports `consistent` and CONFIRMS a false finding.
- * The time budget already refuses for this reason; the file budget must too.
+ * Bounded by both a file cap and the shared deadline, because the walk itself
+ * can be long in a repository full of files this cannot parse. Stopping early
+ * costs only completeness, and completeness is no longer load-bearing: the one
+ * verdict this check issues is a contradiction, which a file left unvisited
+ * cannot make untrue. See `StructuralCheck`.
  */
 async function collectSourceFiles(
   root: string,
   budget: number,
-): Promise<{ files: string[]; truncated: boolean; unreadableDirectories: number }> {
+  expired: () => boolean,
+): Promise<string[]> {
   const found: string[] = [];
   const queue: string[] = [root];
-  let truncated = false;
-  let unreadableDirectories = 0;
-  while (queue.length > 0 && found.length < budget) {
+  while (queue.length > 0 && found.length < budget && !expired()) {
     const directory = queue.shift()!;
     let entries;
     try {
       entries = await readdir(directory, { withFileTypes: true });
     } catch {
-      // A gap in coverage, counted rather than shrugged off: see `skipped`.
-      unreadableDirectories += 1;
       continue;
     }
     for (const entry of entries) {
-      if (found.length >= budget) {
-        truncated = true;
-        break;
-      }
+      if (found.length >= budget) break;
       const full = path.join(directory, entry.name);
       // Never follow a symlink out of the tree: the answer must be about the
       // worktree that was checked out, not about wherever a link points.
@@ -193,9 +209,7 @@ async function collectSourceFiles(
       if (LANG_BY_EXTENSION.has(path.extname(entry.name).toLowerCase())) found.push(full);
     }
   }
-  // The loop can also exit with directories still queued, which is the same
-  // incompleteness by a different route.
-  return { files: found, truncated: truncated || queue.length > 0, unreadableDirectories };
+  return found;
 }
 
 /**
@@ -242,20 +256,23 @@ export async function checkStructuralClaim(
     return { status: "not-checked", reason: "the base worktree is unavailable" };
   }
 
-  const { files, truncated, unreadableDirectories } = await collectSourceFiles(
-    input.baseRoot,
-    fileBudget,
-  );
+  // The finding's OWN language decides whether this search is even about the
+  // right thing. A claim on a Go file in a mixed repository would otherwise
+  // walk the TypeScript files, find nothing, and report on a language where
+  // neither the symbol nor its callers live (Codex review, round 3).
+  if (!LANG_BY_EXTENSION.has(path.extname(input.findingFile).toLowerCase())) {
+    return {
+      status: "not-checked",
+      reason: `this check reads TypeScript and JavaScript only, and the finding is in ${path.extname(input.findingFile) || "a file with no extension"}`,
+    };
+  }
+
+  const expired = (): boolean => now() - started > timeBudgetMs;
+  const files = await collectSourceFiles(input.baseRoot, fileBudget, expired);
   if (files.length === 0) {
     return {
       status: "not-checked",
-      reason: "no files in a language this check supports (TypeScript and JavaScript only)",
-    };
-  }
-  if (truncated) {
-    return {
-      status: "not-checked",
-      reason: `the base tree has more than ${fileBudget} supported source files, so a search of it would be incomplete`,
+      reason: "no files in a language this check supports were found in the base branch",
     };
   }
 
@@ -265,49 +282,24 @@ export async function checkStructuralClaim(
   ]);
   const references: SymbolReference[] = [];
   let filesSearched = 0;
-  /**
-   * Supported files this search did not actually read.
-   *
-   * Counted at EVERY skip rather than enumerated case by case, because the
-   * property that matters is not which reason applied — it is whether the
-   * search saw the whole tree. Codex found the oversized-file skip; the
-   * unreadable-file and parse-failure skips beside it had the identical
-   * hazard, and a future one would inherit it too unless the counter sits at
-   * the `continue`.
-   *
-   * A skip invalidates only a NEGATIVE result. Finding a reference elsewhere is
-   * positive evidence that no gap can undo, so `contradicted` still stands;
-   * "I found nothing" is the claim that depends on having read everything.
-   */
-  let skipped = unreadableDirectories;
 
   for (const file of files) {
-    if (now() - started > timeBudgetMs) {
-      return {
-        status: "not-checked",
-        reason: `the search budget of ${timeBudgetMs}ms was reached after ${filesSearched} file(s), so the result would be incomplete`,
-      };
-    }
+    // Stop, but evaluate what was already found rather than discarding it: a
+    // reference read before the deadline is still a reference.
+    if (expired()) break;
     const language = LANG_BY_EXTENSION.get(path.extname(file).toLowerCase());
     const kinds = language === undefined ? undefined : REFERENCE_KINDS.get(language);
     const astLang = language === undefined ? undefined : AST_LANG.get(language);
-    if (kinds === undefined || astLang === undefined) {
-      skipped += 1;
-      continue;
-    }
+    if (kinds === undefined || astLang === undefined) continue;
 
     let source: string;
     try {
       const info = await stat(file);
       // A minified bundle is not review material, but it is still a file this
       // search did not read.
-      if (info.size > maxFileBytes) {
-        skipped += 1;
-        continue;
-      }
+      if (info.size > maxFileBytes) continue;
       source = await readFile(file, "utf8");
     } catch {
-      skipped += 1;
       continue;
     }
 
@@ -315,7 +307,6 @@ export async function checkStructuralClaim(
     try {
       root = (await parseAsync(astLang, source)).root();
     } catch {
-      skipped += 1;
       continue;
     }
     filesSearched += 1;
@@ -332,27 +323,28 @@ export async function checkStructuralClaim(
   references.sort((left, right) =>
     left.file === right.file ? left.line - right.line : left.file.localeCompare(right.file));
 
-  const elsewhere = references.some((reference) => !ownFiles.has(reference.file));
-  if (elsewhere) return { status: "contradicted", references, filesSearched };
-  // Only now does the gap matter. See `skipped`.
-  if (skipped > 0) {
-    return {
-      status: "not-checked",
-      reason: `${skipped} supported file(s) could not be read or parsed, so a clean result would not be trustworthy`,
-    };
+  const external = references.filter((reference) => !ownFiles.has(reference.file));
+  if (external.length > 0) {
+    // Positive evidence, and the only verdict this check issues. It survives
+    // every gap above: a file left unread cannot unmake a reference that was
+    // read. The base/head caveat is applied by the caller, which is the only
+    // layer that can see the diff.
+    return { status: "contradicted", references, filesSearched };
   }
-  return { status: "consistent", references, filesSearched };
+  return {
+    status: "not-checked",
+    reason: `no reference outside its own file was found in ${filesSearched} file(s) of the base branch, which is not evidence that none exists`,
+  };
 }
 
 /**
  * One line of prose for a check result, for rendering beside the finding.
  *
- * The wording of the `consistent` case is the whole point of the exercise. It
- * says what the host DID — searched N files and found nothing elsewhere — and
- * never says "there are no callers". A dynamic call, a file in a language this
- * check does not parse, a build artifact, reflection, or a caller in another
- * repository are all invisible here, and a reviewer who reads a gap as proof
- * has been misled by the check rather than helped by it.
+ * There is no clean verdict to word: see `StructuralCheck`. Everything that is
+ * not a contradiction reports what the host did and declines to conclude from
+ * it, because a dynamic call, an unparsed language, generated code, or a caller
+ * in another repository is invisible to this search and a reader who took a gap
+ * for proof would have been misled by the check rather than helped by it.
  */
 export function describeCheck(
   claim: StructuralClaim,
@@ -373,7 +365,7 @@ export function describeCheck(
     return `Host check: not performed — ${escape(check.reason)}.`;
   }
   const scope = `${check.filesSearched} file(s) of the base branch`;
-  if (check.status === "contradicted") {
+  {
     const shown = check.references.slice(0, 5);
     const rendered = shown.map((reference) => `\`${escape(`${reference.file}:${reference.line}`)}\``).join(", ");
     const more = check.references.length > shown.length
@@ -406,6 +398,20 @@ export interface RunStructuralChecksInput {
   readonly claimBudget?: number;
   /** Head path -> base path for files this PR renames. See `checkStructuralClaim`. */
   readonly renamedFrom?: ReadonlyMap<string, string>;
+  /**
+   * Every line this diff REMOVES, joined.
+   *
+   * The search reads the base commit while the finding is about the head, so a
+   * pull request that deletes the last caller leaves that caller present in the
+   * tree being searched — and the host would contradict a finding that was
+   * correct about the merged result (Codex review, round 3). When the diff
+   * removes any line mentioning the symbol, the base's references may be
+   * exactly the ones the PR deleted, so the contradiction is withheld.
+   *
+   * Deliberately a crude substring test. It errs toward refusing, which is the
+   * safe direction for a check whose only verdict is an accusation.
+   */
+  readonly removedLines?: string;
   readonly check?: typeof checkStructuralClaim;
 }
 
@@ -449,13 +455,21 @@ export async function runStructuralChecks(
     }
     try {
       const findingFileAtBase = input.renamedFrom?.get(entry.finding.file);
+      const result = await check(claim, {
+        baseRoot: input.baseRoot,
+        findingFile: entry.finding.file,
+        ...(findingFileAtBase === undefined ? {} : { findingFileAtBase }),
+      });
+      // The base/head reconciliation lives here because this is the only layer
+      // that can see the diff; `checkStructuralClaim` knows one tree.
       checks.set(
         entry.index,
-        await check(claim, {
-          baseRoot: input.baseRoot,
-          findingFile: entry.finding.file,
-          ...(findingFileAtBase === undefined ? {} : { findingFileAtBase }),
-        }),
+        result.status === "contradicted" && input.removedLines?.includes(claim.symbol) === true
+          ? {
+            status: "not-checked",
+            reason: `references to \`${claim.symbol}\` exist at the base commit, but this pull request removes lines mentioning it — the check reads the base, so it cannot tell whether those references are the ones being deleted`,
+          }
+          : result,
       );
     } catch (error) {
       checks.set(entry.index, {
@@ -478,18 +492,14 @@ export async function runStructuralChecks(
  * and dropping it there was the same defect as dropping it from the relocated
  * path: a claim published without the answer the host had already computed.
  * The `contradicted` case keeps a count and one location — enough for a reader
- * to see the assertion is disputed and where to look — and the `consistent`
- * case still refuses to say no callers exist.
+ * to see the assertion is disputed and where to look.
  */
 export function describeCheckCompact(
   check: StructuralCheck,
   escape: (value: string) => string = (value) => value,
 ): string {
   if (check.status === "not-checked") return "Host check: not performed";
-  if (check.status === "contradicted") {
-    const first = check.references[0];
-    const where = first === undefined ? "" : `, e.g. ${escape(`${first.file}:${first.line}`)}`;
-    return `Host check: CONTRADICTED — ${check.references.length} reference(s) found${where}`;
-  }
-  return `Host check: no reference found outside its own file in ${check.filesSearched} file(s) searched`;
+  const first = check.references[0];
+  const where = first === undefined ? "" : `, e.g. ${escape(`${first.file}:${first.line}`)}`;
+  return `Host check: CONTRADICTED — ${check.references.length} reference(s) found${where}`;
 }

@@ -112,9 +112,11 @@ describe("checkStructuralClaim — what counts as a reference", () => {
 
     const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" });
 
-    expect(result.status).toBe("consistent");
-    if (result.status === "not-checked") throw new Error("unreachable");
-    expect(result.references.every((reference) => reference.file === "src/retry.ts")).toBe(true);
+    // No contradiction: the noise file's matches are all textual, and a parser
+    // does not see them. That is a refusal, not a clean bill of health.
+    expect(result.status).toBe("not-checked");
+    if (result.status !== "not-checked") throw new Error("unreachable");
+    expect(result.reason).toMatch(/not evidence that none exists/);
   });
 
   it("does not search dependency or build directories", async () => {
@@ -127,9 +129,11 @@ describe("checkStructuralClaim — what counts as a reference", () => {
 
     const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" });
 
-    expect(result.status).toBe("consistent");
-    if (result.status === "not-checked") throw new Error("unreachable");
-    expect(result.filesSearched).toBe(1);
+    // Only src/retry.ts was searched — the other three live in directories a
+    // review has no business walking.
+    expect(result.status).toBe("not-checked");
+    if (result.status !== "not-checked") throw new Error("unreachable");
+    expect(result.reason).toMatch(/in 1 file\(s\)/);
   });
 
   // A same-file reference cannot be told apart from the definition itself: the
@@ -145,7 +149,7 @@ describe("checkStructuralClaim — what counts as a reference", () => {
     });
 
     await expect(checkStructuralClaim(claim, { baseRoot: sameFile, findingFile: "src/retry.ts" }))
-      .resolves.toMatchObject({ status: "consistent" });
+      .resolves.toMatchObject({ status: "not-checked" });
     await expect(checkStructuralClaim(claim, { baseRoot: otherFile, findingFile: "src/retry.ts" }))
       .resolves.toMatchObject({ status: "contradicted" });
   });
@@ -167,7 +171,7 @@ describe("checkStructuralClaim — what counts as a reference", () => {
       baseRoot: root,
       findingFile: "src/new-name.ts",
       findingFileAtBase: "src/old-name.ts",
-    })).resolves.toMatchObject({ status: "consistent" });
+    })).resolves.toMatchObject({ status: "not-checked" });
   });
 
   it("never follows a symlink out of the worktree", async () => {
@@ -177,9 +181,7 @@ describe("checkStructuralClaim — what counts as a reference", () => {
 
     const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" });
 
-    expect(result.status).toBe("consistent");
-    if (result.status === "not-checked") throw new Error("unreachable");
-    expect(result.references.every((reference) => !reference.file.includes("linked"))).toBe(true);
+    expect(result.status).toBe("not-checked");
   });
 });
 
@@ -187,24 +189,6 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
   // Codex found the oversized-file skip. The unreadable-file and parse-failure
   // skips beside it had the identical hazard, so the counter sits at every
   // `continue` rather than enumerating reasons — a future skip inherits it.
-  it("refuses a clean result when a supported file went unread", async () => {
-    const root = await tree({
-      "src/retry.ts": "export function budget(n: number) { return n; }\n",
-      // Skipped as oversized — the same `skipped` counter every other skip
-      // increments, exercised without needing permissions so it runs for every
-      // user rather than self-skipping for the one that matters.
-      "src/huge.ts": `export const pad = "${"x".repeat(400)}";\n`,
-    });
-
-    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" }, {
-      maxFileBytes: 200,
-    });
-
-    expect(result.status).toBe("not-checked");
-    if (result.status !== "not-checked") throw new Error("unreachable");
-    expect(result.reason).toMatch(/could not be read or parsed/);
-  });
-
   // A gap cannot undo positive evidence: finding a reference elsewhere is a
   // fact, and an unread file cannot make it untrue. Only "I found nothing"
   // depends on having read everything.
@@ -224,10 +208,11 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
   });
 
   it("does not check a tree with no language it supports", async () => {
-    const root = await tree({ "main.go": "package main\nfunc budget() {}\n" });
+    const root = await tree({ "a.ts": "export const x = 1;\n" });
+    await rm(path.join(root, "a.ts"));
 
-    await expect(checkStructuralClaim(claim, { baseRoot: root, findingFile: "main.go" }))
-      .resolves.toMatchObject({ status: "not-checked", reason: expect.stringContaining("supports") });
+    await expect(checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/a.ts" }))
+      .resolves.toMatchObject({ status: "not-checked" });
   });
 
   it("does not check when the base worktree is missing", async () => {
@@ -245,41 +230,22 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
   // did not — a truncated walk that found nothing reported `consistent`, which
   // is the false confirmation this whole check exists to avoid. Same property,
   // two code paths, and only one of them had it.
-  it("reports an exhausted file budget as not-checked, never as consistent", async () => {
-    const root = await tree({
-      "a.ts": "export const x = 1;\n",
-      "b.ts": "export const y = 2;\n",
-      "c.ts": "export const budget = 3;\n",
-    });
-
-    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "a.ts" }, {
-      fileBudget: 2,
-    });
-
-    expect(result.status).toBe("not-checked");
-    if (result.status !== "not-checked") throw new Error("unreachable");
-    expect(result.reason).toMatch(/more than 2 supported source files/);
-    expect(result.reason).toMatch(/incomplete/i);
-  });
-
   // An exhausted budget must not read as a clean result: a partial search that
   // reported "consistent" would be the false confirmation in another costume.
-  it("reports an exhausted time budget as not-checked, never as consistent", async () => {
+  // Codex review, round 3: a claim on a file in a language this cannot parse
+  // would otherwise walk the TypeScript files, find nothing, and report on a
+  // language where neither the symbol nor its callers live.
+  it("refuses a claim whose own file is in an unsupported language", async () => {
     const root = await tree({
-      "a.ts": "export const x = 1;\n",
-      "b.ts": "export const y = 2;\n",
-      "c.ts": "export const z = 3;\n",
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "main.go": "package main\nfunc budget() {}\n",
     });
-    let clock = 0;
-    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "a.ts" }, {
-      timeBudgetMs: 5,
-      now: () => (clock += 10),
-    });
+
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "main.go" });
 
     expect(result.status).toBe("not-checked");
     if (result.status !== "not-checked") throw new Error("unreachable");
-    expect(result.reason).toMatch(/budget/i);
-    expect(result.reason).toMatch(/incomplete/i);
+    expect(result.reason).toMatch(/TypeScript and JavaScript only/);
   });
 });
 
@@ -288,13 +254,18 @@ describe("describeCheck", () => {
   // describe what was searched, never assert that no caller exists: a dynamic
   // reference, an unparsed language, or a caller in another repository is
   // invisible here, and a reader who takes a gap for proof has been misled.
+  // There is no clean verdict to word any more (see `StructuralCheck`), so the
+  // property is that everything which is not a contradiction reports what the
+  // host did and declines to conclude from it.
   it("states what was searched, and does not claim there are no callers", () => {
-    const check: StructuralCheck = { status: "consistent", references: [], filesSearched: 12 };
+    const check: StructuralCheck = {
+      status: "not-checked",
+      reason: "no reference outside its own file was found in 12 file(s) of the base branch, which is not evidence that none exists",
+    };
     const text = describeCheck(claim, check);
 
-    expect(text).toContain("searched 12 file(s)");
-    expect(text).toMatch(/not proof/i);
-    expect(text).toMatch(/dynamic references/i);
+    expect(text).toContain("12 file(s)");
+    expect(text).toMatch(/not evidence that none exists/);
     expect(text).not.toMatch(/there are no (callers|references)/i);
   });
 
@@ -333,7 +304,7 @@ describe("describeCheck", () => {
 
 describe("runStructuralChecks", () => {
   const root = "/base";
-  const stub = (result: StructuralCheck) => async () => result;
+  const stub = (result: StructuralCheck) => async (): Promise<StructuralCheck> => result;
 
   it("leaves findings without a claim untouched", async () => {
     const input = [finding(), finding({ file: "src/b.ts" })];
@@ -409,6 +380,43 @@ describe("runStructuralChecks", () => {
     });
 
     expect(seen).toEqual([undefined]);
+  });
+
+  // Codex review, round 3, and the deepest finding on this PR: the search reads
+  // the BASE while the finding is about the HEAD. A pull request that deletes
+  // the last caller is CORRECT to say the symbol is now unused — and the base
+  // still contains that caller, so a naive check contradicts a right finding.
+  it("withholds a contradiction when the diff removes lines mentioning the symbol", async () => {
+    const contradiction: StructuralCheck = {
+      status: "contradicted",
+      references: [{ file: "src/http.ts", line: 88 }],
+      filesSearched: 40,
+    };
+
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLines: "-export const a = budget(1);",
+      check: stub(contradiction),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("not-checked");
+    expect((output[0]?.hostCheck as { reason: string }).reason).toMatch(/removes lines mentioning it/);
+  });
+
+  it("keeps a contradiction the diff cannot have invalidated", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLines: "-const unrelated = 1;",
+      check: stub({
+        status: "contradicted",
+        references: [{ file: "src/http.ts", line: 88 }],
+        filesSearched: 40,
+      }),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("contradicted");
   });
 
   it("checks blocking findings first when the budget binds, and says so on the rest", async () => {

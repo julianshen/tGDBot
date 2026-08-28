@@ -97,7 +97,7 @@ const COMPLETE: Required<Finding> = {
   effort: "heavy",
   references: ["https://docs.example.com/ttl"],
   claim: { kind: "no-other-references", symbol: "revalidate" },
-  hostCheck: { status: "consistent", references: [], filesSearched: 3 },
+  hostCheck: { status: "contradicted", references: [{ file: "src/other.go", line: 7 }], filesSearched: 3 },
 };
 
 const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
@@ -310,7 +310,7 @@ describe("every Finding field reaches the reader", () => {
     suggestion: COMPLETE.suggestion,
     references: COMPLETE.references[0],
     // The check is what a reader sees; the claim is only visible through it.
-    hostCheck: "Host check: searched 3 file(s)",
+    hostCheck: "Host check:",
   };
 
   /** Fields an inline comment deliberately does not print. */
