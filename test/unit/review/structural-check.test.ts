@@ -184,6 +184,45 @@ describe("checkStructuralClaim — what counts as a reference", () => {
 });
 
 describe("checkStructuralClaim — refusing rather than guessing", () => {
+  // Codex found the oversized-file skip. The unreadable-file and parse-failure
+  // skips beside it had the identical hazard, so the counter sits at every
+  // `continue` rather than enumerating reasons — a future skip inherits it.
+  it("refuses a clean result when a supported file went unread", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      // Skipped as oversized — the same `skipped` counter every other skip
+      // increments, exercised without needing permissions so it runs for every
+      // user rather than self-skipping for the one that matters.
+      "src/huge.ts": `export const pad = "${"x".repeat(400)}";\n`,
+    });
+
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" }, {
+      maxFileBytes: 200,
+    });
+
+    expect(result.status).toBe("not-checked");
+    if (result.status !== "not-checked") throw new Error("unreachable");
+    expect(result.reason).toMatch(/could not be read or parsed/);
+  });
+
+  // A gap cannot undo positive evidence: finding a reference elsewhere is a
+  // fact, and an unread file cannot make it untrue. Only "I found nothing"
+  // depends on having read everything.
+  it("still contradicts despite a skipped file, because a gap only invalidates a clean result", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "src/http.ts": "import { budget } from './retry.js';\nexport const a = budget(1);\n",
+      "src/huge.ts": `export const pad = "${"x".repeat(400)}";\n`,
+    });
+
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" }, {
+      // Large enough for the two real files, small enough to skip src/huge.ts.
+      maxFileBytes: 200,
+    });
+
+    expect(result.status).toBe("contradicted");
+  });
+
   it("does not check a tree with no language it supports", async () => {
     const root = await tree({ "main.go": "package main\nfunc budget() {}\n" });
 

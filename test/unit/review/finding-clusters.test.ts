@@ -484,3 +484,47 @@ describe("clusterFindings — receivers separate look-alike methods", () => {
     ])).toHaveLength(1);
   });
 });
+
+// Issue #75 (Codex review, round 2): byte-identical duplicates are collapsed by
+// SEVERITY alone, so a finding the host had checked could be discarded in
+// favour of a twin that carried no claim — taking a computed contradiction with
+// it and republishing the assertion unqualified.
+describe("clusterFindings — a host check survives duplicate collapsing", () => {
+  const shared = {
+    file: "src/retry.ts",
+    line: 41,
+    category: "correctness",
+    message: "budget() is never called.",
+  };
+  const hostCheck = {
+    status: "contradicted" as const,
+    references: [{ file: "src/http.ts", line: 88 }],
+    filesSearched: 40,
+  };
+
+  it("carries the check onto a more severe twin that had none", () => {
+    const clusters = clusterFindings([
+      // The checked one is LESS severe, so severity alone discards it.
+      { ...shared, severity: "warning", ruleName: "rule-a", claim: { kind: "no-other-references", symbol: "budget" }, hostCheck },
+      { ...shared, severity: "blocking", ruleName: "rule-b" },
+    ]);
+
+    expect(clusters).toHaveLength(1);
+    const representative = clusters[0]?.representative;
+    // The blocking finding is still the one published...
+    expect(representative?.severity).toBe("blocking");
+    expect(representative?.ruleName).toBe("rule-b");
+    // ...but it no longer publishes the assertion without the host's answer.
+    expect(representative?.hostCheck).toEqual(hostCheck);
+  });
+
+  it("leaves a winner that already carries its own check alone", () => {
+    const own = { ...hostCheck, filesSearched: 7 };
+    const clusters = clusterFindings([
+      { ...shared, severity: "blocking", ruleName: "rule-b", claim: { kind: "no-other-references", symbol: "budget" }, hostCheck: own },
+      { ...shared, severity: "warning", ruleName: "rule-a", claim: { kind: "no-other-references", symbol: "budget" }, hostCheck },
+    ]);
+
+    expect(clusters[0]?.representative?.hostCheck).toEqual(own);
+  });
+});

@@ -1604,6 +1604,54 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).toContain("the base worktree is unavailable");
   });
 
+  // Codex review, round 2. Compact mode is a SIZE fallback, not a TRUTH
+  // fallback: a claimed finding whose check went missing here would publish an
+  // unqualified assertion on exactly the large reviews where the reader has
+  // least context.
+  it("keeps a bounded host check when the summary is compacted", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [makeFinding({
+        message: "x".repeat(4000),
+        claim,
+        hostCheck: {
+          status: "contradicted",
+          references: [{ file: "src/http.ts", line: 88 }],
+          filesSearched: 40,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("Host check: CONTRADICTED");
+    expect(body).toContain("src/http.ts:88");
+  });
+
+  // A merged member's own assertion keeps its own answer; rendering only the
+  // representative's published every other member's claim unqualified.
+  it("keeps each merged member's host check in the also-reported block", () => {
+    const body = renderInlineComment(makeFinding(), {
+      alsoReported: [makeFinding({
+        ruleName: "rule-b",
+        message: "helper() is never called.",
+        claim: { kind: "no-other-references", symbol: "helper" },
+        hostCheck: {
+          status: "contradicted",
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })],
+    });
+
+    expect(body).toContain("Also reported by 1 other rule");
+    expect(body).toContain("Host check: CONTRADICTED");
+    expect(body).toContain("src/queue.ts:12");
+  });
+
   // A base-branch filename may legally contain a backtick, which git writes
   // bare and which closes the code span it lands in (#63).
   it("cannot have a referenced path break out of its code span", () => {

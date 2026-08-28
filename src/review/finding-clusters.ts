@@ -313,6 +313,19 @@ function collapseExactDuplicates(
       bestByKey.set(key, finding);
     }
   }
+  // Issue #75 (Codex review, round 2): the winner above is chosen by SEVERITY
+  // alone, so a finding the host had checked could be discarded in favour of a
+  // byte-identical twin that carried no claim — taking a computed contradiction
+  // with it and republishing the assertion unqualified. These are the same
+  // sentence at the same location by definition of `exactKey`, so a check that
+  // applied to one applies to the other; carry it rather than lose it.
+  for (const finding of findings) {
+    if (finding.claim === undefined || finding.hostCheck === undefined) continue;
+    const key = exactKey(finding);
+    const winner = bestByKey.get(key);
+    if (winner === undefined || winner === finding || winner.hostCheck !== undefined) continue;
+    bestByKey.set(key, { ...winner, claim: finding.claim, hostCheck: finding.hostCheck });
+  }
   const rulesByFinding = new Map<Finding, string[]>();
   for (const [key, finding] of bestByKey) rulesByFinding.set(finding, rulesByKey.get(key) ?? [finding.ruleName]);
   return { unique: [...bestByKey.values()], rulesByFinding };

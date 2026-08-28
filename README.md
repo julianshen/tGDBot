@@ -606,9 +606,11 @@ Four properties worth knowing, because they are what make it trustworthy:
   mapping follows, for the same reason. When the pull request renames the file a
   claim is about, the base-side path is passed too, so the symbol's own
   declaration is not mistaken for a reference from somewhere else.
-- **An incomplete search is never reported as a clean one.** Exhausting either
-  the time budget or the file budget yields "not performed, with reason", not
-  "no references found".
+- **An incomplete search is never reported as a clean one.** Any file the search
+  could not read or parse — oversized, unreadable, past a budget — makes a
+  clean result "not performed, with reason" instead. A gap only invalidates a
+  *negative* answer: finding a reference elsewhere is a fact no gap can undo, so
+  a contradiction still stands.
 
 Nothing is inferred from prose: "never called", "no other caller" and "nothing
 else implements this" are one claim in three phrasings, and a matcher over them

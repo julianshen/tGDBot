@@ -7,7 +7,7 @@
 //      failed-rule reasons, and any finding that could NOT be anchored.
 //
 // Both are plain string builders: pure, synchronous, no I/O.
-import { describeCheck } from "./structural-check.js";
+import { describeCheck, describeCheckCompact } from "./structural-check.js";
 import { crossFileGroups } from "./finding-clusters.js";
 import type { Finding } from "./types.js";
 import type { HunkSnippet } from "./diff-anchors.js";
@@ -746,9 +746,16 @@ function renderAlsoReported(members: readonly Finding[]): string {
     // and a one-click commit should never rest on one.
     const suggestion = member.suggestion?.trim() ? capSuggestion(member.suggestion) : undefined;
     const cited = referenceBullets(member, "  ");
+    // A merged member's own structural claim keeps its own answer. Rendering
+    // the representative's check alone published every other member's
+    // assertion unqualified — the same defect as the relocated path, one level
+    // down (Codex review, round 2).
+    const check = member.claim !== undefined && member.hostCheck !== undefined
+      ? [`  - ${describeCheckCompact(member.hostCheck, sanitizeInline)}`]
+      : [];
     return suggestion === undefined
-      ? [line, ...cited]
-      : [line, ...cited, "", renderSuggestionBlock(suggestion, false), ""];
+      ? [line, ...check, ...cited]
+      : [line, ...check, ...cited, "", renderSuggestionBlock(suggestion, false), ""];
   });
   return detailsBlock(
     `Also reported by ${members.length} other rule${members.length === 1 ? "" : "s"}`,
@@ -1154,10 +1161,19 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     // declared missing in the notice above rather than quietly discarded.
     const citation = compactShownReference(finding);
     const reference = citation === undefined ? "" : `\n  - Reference: ${sanitizeInline(citation)}`;
+    // Compact mode is a SIZE fallback, not a TRUTH fallback. A claimed finding
+    // whose check went missing here would publish an unqualified assertion on
+    // exactly the large reviews where a reader has least context — the same
+    // reasoning that keeps the first citation and the publication reason. It
+    // rides in the prefix, so it is charged against the fixed budget and
+    // shrinks the message allowance rather than overflowing the limit.
+    const check = finding.claim !== undefined && finding.hostCheck !== undefined
+      ? `\n  - ${describeCheckCompact(finding.hostCheck, sanitizeInline)}`
+      : "";
     return {
       prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `,
       message,
-      reference,
+      reference: `${check}${reference}`,
     };
   });
   const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]

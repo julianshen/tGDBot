@@ -123,6 +123,8 @@ const MAX_FILE_BYTES = 2 * 1024 * 1024;
 export interface StructuralCheckOptions {
   readonly fileBudget?: number;
   readonly timeBudgetMs?: number;
+  /** Overridable so a test can exercise the oversized-file skip without a 2 MiB fixture. */
+  readonly maxFileBytes?: number;
   readonly now?: () => number;
 }
 
@@ -159,18 +161,19 @@ function toPosix(value: string): string {
 async function collectSourceFiles(
   root: string,
   budget: number,
-): Promise<{ files: string[]; truncated: boolean }> {
+): Promise<{ files: string[]; truncated: boolean; unreadableDirectories: number }> {
   const found: string[] = [];
   const queue: string[] = [root];
   let truncated = false;
+  let unreadableDirectories = 0;
   while (queue.length > 0 && found.length < budget) {
     const directory = queue.shift()!;
     let entries;
     try {
       entries = await readdir(directory, { withFileTypes: true });
     } catch {
-      // An unreadable directory is a gap in coverage, not a failure of the
-      // review. `describeCheck` is what stops a gap reading as an absence.
+      // A gap in coverage, counted rather than shrugged off: see `skipped`.
+      unreadableDirectories += 1;
       continue;
     }
     for (const entry of entries) {
@@ -192,7 +195,7 @@ async function collectSourceFiles(
   }
   // The loop can also exit with directories still queued, which is the same
   // incompleteness by a different route.
-  return { files: found, truncated: truncated || queue.length > 0 };
+  return { files: found, truncated: truncated || queue.length > 0, unreadableDirectories };
 }
 
 /**
@@ -225,6 +228,7 @@ export async function checkStructuralClaim(
   const now = options.now ?? (() => Date.now());
   const fileBudget = options.fileBudget ?? DEFAULT_FILE_BUDGET;
   const timeBudgetMs = options.timeBudgetMs ?? DEFAULT_TIME_BUDGET_MS;
+  const maxFileBytes = options.maxFileBytes ?? MAX_FILE_BYTES;
   const started = now();
 
   if (!path.isAbsolute(input.baseRoot)) {
@@ -238,7 +242,10 @@ export async function checkStructuralClaim(
     return { status: "not-checked", reason: "the base worktree is unavailable" };
   }
 
-  const { files, truncated } = await collectSourceFiles(input.baseRoot, fileBudget);
+  const { files, truncated, unreadableDirectories } = await collectSourceFiles(
+    input.baseRoot,
+    fileBudget,
+  );
   if (files.length === 0) {
     return {
       status: "not-checked",
@@ -258,6 +265,21 @@ export async function checkStructuralClaim(
   ]);
   const references: SymbolReference[] = [];
   let filesSearched = 0;
+  /**
+   * Supported files this search did not actually read.
+   *
+   * Counted at EVERY skip rather than enumerated case by case, because the
+   * property that matters is not which reason applied — it is whether the
+   * search saw the whole tree. Codex found the oversized-file skip; the
+   * unreadable-file and parse-failure skips beside it had the identical
+   * hazard, and a future one would inherit it too unless the counter sits at
+   * the `continue`.
+   *
+   * A skip invalidates only a NEGATIVE result. Finding a reference elsewhere is
+   * positive evidence that no gap can undo, so `contradicted` still stands;
+   * "I found nothing" is the claim that depends on having read everything.
+   */
+  let skipped = unreadableDirectories;
 
   for (const file of files) {
     if (now() - started > timeBudgetMs) {
@@ -269,14 +291,23 @@ export async function checkStructuralClaim(
     const language = LANG_BY_EXTENSION.get(path.extname(file).toLowerCase());
     const kinds = language === undefined ? undefined : REFERENCE_KINDS.get(language);
     const astLang = language === undefined ? undefined : AST_LANG.get(language);
-    if (kinds === undefined || astLang === undefined) continue;
+    if (kinds === undefined || astLang === undefined) {
+      skipped += 1;
+      continue;
+    }
 
     let source: string;
     try {
       const info = await stat(file);
-      if (info.size > MAX_FILE_BYTES) continue;
+      // A minified bundle is not review material, but it is still a file this
+      // search did not read.
+      if (info.size > maxFileBytes) {
+        skipped += 1;
+        continue;
+      }
       source = await readFile(file, "utf8");
     } catch {
+      skipped += 1;
       continue;
     }
 
@@ -284,8 +315,7 @@ export async function checkStructuralClaim(
     try {
       root = (await parseAsync(astLang, source)).root();
     } catch {
-      // A file this parser cannot read is a gap, reported as such by the
-      // caller's rendering, never silently counted as "no references here".
+      skipped += 1;
       continue;
     }
     filesSearched += 1;
@@ -303,9 +333,15 @@ export async function checkStructuralClaim(
     left.file === right.file ? left.line - right.line : left.file.localeCompare(right.file));
 
   const elsewhere = references.some((reference) => !ownFiles.has(reference.file));
-  return elsewhere
-    ? { status: "contradicted", references, filesSearched }
-    : { status: "consistent", references, filesSearched };
+  if (elsewhere) return { status: "contradicted", references, filesSearched };
+  // Only now does the gap matter. See `skipped`.
+  if (skipped > 0) {
+    return {
+      status: "not-checked",
+      reason: `${skipped} supported file(s) could not be read or parsed, so a clean result would not be trustworthy`,
+    };
+  }
+  return { status: "consistent", references, filesSearched };
 }
 
 /**
@@ -433,4 +469,27 @@ export async function runStructuralChecks(
     const result = checks.get(index);
     return result === undefined ? finding : { ...finding, hostCheck: result };
   });
+}
+
+/**
+ * A one-line host check for the size-constrained renderers.
+ *
+ * Compact summaries and merged cluster members cannot carry the full sentence,
+ * and dropping it there was the same defect as dropping it from the relocated
+ * path: a claim published without the answer the host had already computed.
+ * The `contradicted` case keeps a count and one location — enough for a reader
+ * to see the assertion is disputed and where to look — and the `consistent`
+ * case still refuses to say no callers exist.
+ */
+export function describeCheckCompact(
+  check: StructuralCheck,
+  escape: (value: string) => string = (value) => value,
+): string {
+  if (check.status === "not-checked") return "Host check: not performed";
+  if (check.status === "contradicted") {
+    const first = check.references[0];
+    const where = first === undefined ? "" : `, e.g. ${escape(`${first.file}:${first.line}`)}`;
+    return `Host check: CONTRADICTED — ${check.references.length} reference(s) found${where}`;
+  }
+  return `Host check: no reference found outside its own file in ${check.filesSearched} file(s) searched`;
 }
