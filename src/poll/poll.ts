@@ -412,12 +412,22 @@ async function classifyOpenReviewEvents(options: {
     if (!options.dryRun && !haltTransient && !haltCursor) {
       for (const item of queued.items) {
         const verification = queued.context === undefined
-          ? undefined
+          ? ({ kind: "transient" } as const)
           : await verifyQueued({ item, context: queued.context, reviewNumber: review.reviewNumber, options });
         // A model call was spent whether or not it produced a verdict, so the
         // budget is charged for the attempt.
         verificationBudget -= 1;
-        if (verification === undefined) continue;
+        if (verification.kind === "settled") {
+          // Nothing more will ever come of it. Letting the page have the event
+          // is what keeps the cursor moving.
+          console.log(
+            `tgd-review-agent: no verification for a finding on review #${review.reviewNumber} ` +
+              `(${verification.reason})`,
+          );
+          outstanding.delete(item.event.eventId);
+          continue;
+        }
+        if (verification.kind === "transient") continue;
         const published = await publishReplyPlan({
           event: verification.event,
           identity: verification.identity,
@@ -1940,29 +1950,34 @@ async function queueVerifications(input: {
     readonly deps: PollDependencies;
   };
 }): Promise<VerificationQueue> {
-  if (input.budget <= 0) {
-    // Nothing may run, but everything still waiting must be NAMED, or the page
-    // consumes what this poll could not afford. Enumerating one candidate
-    // reported the rest as nothing to do (PR #74 review).
-    const probe = await queueVerifications({ ...input, budget: 1 });
-    const waiting = [...probe.items.map((item) => item.event), ...probe.deferredEvents];
-    return { items: [], deferred: waiting.length > 0, deferredEvents: waiting };
-  }
-  // Store reads FIRST. Loading metadata is a provider round-trip, and a page
-  // with no event in a published finding's own thread can never produce a
-  // verification — so establishing that costs nothing beyond local state.
+  // Store reads FIRST, and no provider call until there is something to ask
+  // about. Every EARLY RETURN below this point has to hand back the events it
+  // is walking away from: the caller has already taken them off the page, so a
+  // return of "nothing" is indistinguishable from "nothing is owed" and the
+  // page consumes the reply (PR #74 review).
   const snapshot = await input.options.store.readContextSnapshot();
   const findings = snapshot.findings.filter((entry) => entry.reviewNumber === input.reviewNumber);
-  const threads = new Set(input.events
-    .filter((item) => item.event.kind !== "general-comment")
-    .map((item) => item.event.threadId));
-  if (!findings.some((entry) => entry.identity?.threadId !== undefined &&
-    threads.has(entry.identity.threadId))) {
-    return { items: [], deferred: false, deferredEvents: [] };
-  }
+  const bound = new Set(findings
+    .map((entry) => entry.identity?.threadId)
+    .filter((threadId): threadId is string => threadId !== undefined));
+  // The cheap superset: a human event in a published finding's own thread.
+  // Costs nothing, needs no head, and is what every early return defers. A
+  // candidate the real queue would have dismissed is simply dismissed on the
+  // next poll instead, which terminates.
+  const waiting = input.events
+    .filter((item) => item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
+      item.event.threadId !== undefined && bound.has(item.event.threadId))
+    .map((item) => item.event);
+  if (waiting.length === 0) return { items: [], deferred: false, deferredEvents: [] };
+  const holdAll = { items: [], deferred: true, deferredEvents: waiting };
+
+  // Nothing may run, but everything waiting must still be NAMED. Enumerating
+  // through the full path spent a thread read per review on a poll that could
+  // not afford to verify anything (PR #74 review).
+  if (input.budget <= 0) return holdAll;
 
   const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
-  if (metadata === undefined) return { items: [], deferred: false, deferredEvents: [] };
+  if (metadata === undefined) return holdAll;
 
   const queue = pendingVerifications({
     headSha: metadata.headSha,
@@ -1995,8 +2010,9 @@ async function queueVerifications(input: {
 
   const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
   if (rules.error !== undefined) {
+    // A LOAD failure, not a verdict that the rules are gone.
     console.warn(`tgd-review-agent: verification rule loading failed (${rules.error.message})`);
-    return { items: [], deferred: false, deferredEvents: [] };
+    return holdAll;
   }
 
   // Resolved WITHOUT touching the provider: which finding, which event. This is
@@ -2078,14 +2094,25 @@ async function verifyQueued(input: {
     readonly config: ResolvedPollConfig;
     readonly deps: PollDependencies;
   };
-}): Promise<{
-  readonly event: ReviewActivityEvent;
-  readonly identity: { actionId: string; identityDigest: string };
-  readonly plan: ReplyPlan;
-} | undefined> {
+}): Promise<
+  | { readonly kind: "planned"; readonly event: ReviewActivityEvent;
+      readonly identity: { actionId: string; identityDigest: string }; readonly plan: ReplyPlan }
+  /** Try again next poll: the event stays owed and the cursor holds. */
+  | { readonly kind: "transient" }
+  /**
+   * Nothing more to do for this event, ever.
+   *
+   * Held open, these LIVELOCK: the cursor never advances, and the same
+   * candidate spends verification budget on every poll while later candidates
+   * starve behind it (PR #74 review). Verification is unsolicited, so an
+   * answer that can never be produced is dropped rather than allowed to block
+   * a review's ordinary event processing.
+   */
+  | { readonly kind: "settled"; readonly reason: string }
+> {
   const { item } = input;
   const metadata = input.context.metadata;
-  if (metadata === undefined) return undefined;
+  if (metadata === undefined) return { kind: "transient" };
   const ledger = item.ledger;
 
   // The same fallback the command path uses, and the same refusal: a review
@@ -2095,7 +2122,7 @@ async function verifyQueued(input: {
   const model = input.options.config.model ?? ledger.reviewOptions.model;
   if (model === undefined) {
     console.warn("tgd-review-agent: conversation model is not configured");
-    return undefined;
+    return { kind: "settled", reason: "no model is configured" };
   }
 
   const result = await verifyFinding({
@@ -2120,10 +2147,15 @@ async function verifyQueued(input: {
     console.warn(
       `tgd-review-agent: could not verify a finding (${result.skip.kind}) on review #${input.reviewNumber}`,
     );
-    return undefined;
+    // A rule that no longer exists and a history the tool cannot read are
+    // answers, not outages. Only `transient` earns a retry.
+    return result.skip.kind === "transient"
+      ? { kind: "transient" }
+      : { kind: "settled", reason: result.skip.kind };
   }
 
   return {
+    kind: "planned",
     event: item.event,
     identity: item.identity,
     plan: {

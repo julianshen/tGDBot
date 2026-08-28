@@ -644,6 +644,8 @@ async function bootstrapAndSeed(
     readonly bindThreadId?: string;
     /** A distinct finding id, so several can be seeded into one repository. */
     readonly findingId?: string;
+    /** Seed a finding whose review recorded no model, so none can be resolved. */
+    readonly withoutModel?: boolean;
   } = {},
 ): Promise<{ stateDir: string; ledger?: FindingLedgerEntry; findingMarker?: string }> {
   const stateDir = await tempStateDir();
@@ -683,7 +685,7 @@ async function seedFindingInto(
       disableBuiltinRule: false,
       trustLocalRules: false,
       rulesDir: ".review/rules",
-      model: "anthropic/claude-opus-4-5",
+      ...(options.withoutModel === true ? {} : { model: "anthropic/claude-opus-4-5" }),
       dispatch: "direct",
     },
     placement: {
@@ -2166,6 +2168,38 @@ describe("automatic verification", () => {
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
     expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
 
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // Metadata is a provider round-trip like any other, and failing it is an
+  // outage rather than an answer.
+  it("retries after review metadata fails to load", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    let failMetadata = true;
+    const base = executionDeps(adapter, { createSession: session });
+    const deps = {
+      ...base,
+      getReviewMetadata: async (reviewNumber: number) => {
+        if (failMetadata) throw new Error("the pull request is temporarily unavailable");
+        return base.getReviewMetadata(reviewNumber);
+      },
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    failMetadata = false;
     adapter.replaceEvents([reply]);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
     expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
