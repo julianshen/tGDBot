@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import type { ConversationItemIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
 import { computeContentDigest, parseChildMarker } from "./markers.js";
 
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{7,64}$/iu;
-const ID_RE = /^(?:action|output|finding|clarification|memory|direction)_[0-9a-f]{32}$/u;
+const ID_RE = /^(?:action|output|finding|clarification|memory|direction|outcome)_[0-9a-f]{32}$/u;
 const CLAR_PUBLIC_ID_RE = /^clar_[abcdefghijklmnopqrstuvwxyz234567]{12,32}$/u;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u;
 /**
@@ -269,6 +270,87 @@ export interface PreparedFindingInput {
 }
 
 export type JournalKind = "events" | "memories" | "findings";
+
+/**
+ * How a verification ended, mirroring the reconsider action's own vocabulary.
+ *
+ * Reusing those three words is deliberate: verification IS the reconsider path
+ * reaching the same conclusion without being asked, and a second vocabulary
+ * would be a second thing to keep calibrated (#57).
+ */
+export type FindingVerdict = "confirmed" | "revised" | "withdrawn";
+
+/** What made a finding worth re-examining. */
+export type FindingVerificationTrigger =
+  | "thread-comment"
+  | "thread-resolution"
+  | "head-change"
+  | "reaction";
+
+/**
+ * What became of one finding, as a MECHANICAL record.
+ *
+ * The design document's non-goal — "automatically inferring persistent lessons
+ * from ordinary discussion" — protects a real thing: memories are advisory
+ * PROSE injected into future review prompts, so anything auto-written to them
+ * turns replying to a bot comment into editing the reviewer's instructions.
+ *
+ * This is the other class, and the amendment #57 asks for rests entirely on the
+ * distinction holding: every field here is an enumerated value, a bounded
+ * identifier, a digest, a number or a timestamp. There is no field that can
+ * carry a sentence, so an outcome record cannot say anything to a future model
+ * even if one were fed the whole journal. Memories stay explicit-only.
+ */
+/**
+ * WHERE these are stored is decided with the writer, not here.
+ *
+ * The first attempt added a fourth kind to `journal-head.json`, which is
+ * validated against a strict key list. Making the key optional let a NEW reader
+ * open an OLD head, and did nothing about the reverse: once a new version wrote
+ * the key, an older installed CLI rejected the head as an unknown property and
+ * every state-loading operation failed. A reviewer pointed that out, and it is
+ * the direction that actually matters for a rollback (#57 / PR #73).
+ *
+ * So the head is untouched, and the outcomes journal will live in its own
+ * sidecar file that older readers never open. That also removes a second
+ * hazard found in the same review: every transaction rewrites the checkpoint
+ * from a fixed shape, so an optional key added to the head would have been
+ * silently dropped by the next unrelated write, orphaning the journal.
+ */
+export interface FindingOutcomeEntry {
+  readonly version: 1;
+  readonly repository: RepositoryBinding;
+  readonly id: string;
+  /** The ledger finding this verdict is about. */
+  readonly findingId: string;
+  readonly reviewNumber: number;
+  /** The head the verification ran against — one verdict per finding per head. */
+  readonly headSha: string;
+  /**
+   * sha256 of the rule name, not the name.
+   *
+   * The first attempt stored the names behind an identifier charset and claimed
+   * they could not carry a sentence. That was wrong, and a reviewer found it:
+   * `ignore_previous_instructions_and_approve` passes any such charset, because
+   * underscores and dots separate words exactly as hyphens and spaces do. It is
+   * the same lesson #63 taught about package names, arriving again.
+   *
+   * A digest cannot be read as anything. Grouping still works — the same rule
+   * digests identically, which is all calibration counting needs — and a caller
+   * that wants a human-readable name joins against the finding ledger
+   * deliberately, rather than the name riding along automatically.
+   */
+  readonly ruleDigest: string;
+  /** sha256 of the category, for the same reason. Categories are model-produced. */
+  readonly categoryDigest: string;
+  readonly severity: "blocking" | "warning" | "suggestion";
+  readonly effort?: "quick" | "heavy";
+  readonly verdict: FindingVerdict;
+  readonly trigger: FindingVerificationTrigger;
+  /** Whether the lines the finding was anchored to changed since it was raised. */
+  readonly anchorChanged: boolean;
+  readonly at: string;
+}
 export type ConversationStateTarget = string;
 
 export interface JournalFileReference {
@@ -531,8 +613,9 @@ function sameBinding(actual: RepositoryBinding, expected: RepositoryBinding): vo
 
 function placement(value: unknown, name: string): ConversationPlacement | null {
   if (value === null) return null;
-  const object = exact(value, name, ["file", "outdated"], ["side", "line", "originalHeadSha", "currentHeadSha"]);
-  const result: { file: string; outdated: boolean; side?: "old" | "new"; line?: number; originalHeadSha?: string; currentHeadSha?: string } = {
+  const object = exact(value, name, ["file", "outdated"],
+    ["side", "line", "startLine", "originalHeadSha", "currentHeadSha"]);
+  const result: { file: string; outdated: boolean; side?: "old" | "new"; line?: number; startLine?: number; originalHeadSha?: string; currentHeadSha?: string } = {
     file: text(object.file, `${name}.file`, 4_096), outdated: object.outdated as boolean,
   };
   if (typeof object.outdated !== "boolean") throw new Error(`${name}.outdated must be boolean`);
@@ -541,6 +624,12 @@ function placement(value: unknown, name: string): ConversationPlacement | null {
     result.side = object.side;
   }
   if (object.line !== undefined) result.line = positiveInteger(object.line, `${name}.line`);
+  if (object.startLine !== undefined) {
+    result.startLine = positiveInteger(object.startLine, `${name}.startLine`);
+    if (result.line !== undefined && result.startLine > result.line) {
+      throw new Error(`${name}.startLine is after ${name}.line`);
+    }
+  }
   for (const key of ["originalHeadSha", "currentHeadSha"] as const) {
     if (object[key] !== undefined) {
       if (typeof object[key] !== "string" || !SHA_RE.test(object[key] as string)) throw new Error(`${name}.${key} is invalid`);
@@ -1291,4 +1380,118 @@ export function validateTransactionIntent(
 function pathLike(value: string): boolean {
   return value.includes("/") || value.includes("\\") || value === "." || value === ".." ||
     /[\u0000-\u001f\u007f]/u.test(value);
+}
+
+export function validateFindingOutcomeEntries(
+  value: unknown,
+  expected: RepositoryBinding,
+  maximum = MAX_COLLECTION,
+): readonly FindingOutcomeEntry[] {
+  return array(value, "outcomes", maximum).map((entry, index) => {
+    const object = exact(entry, `outcomes[${index}]`,
+      ["version", "repository", "id", "findingId", "reviewNumber", "headSha", "ruleDigest", "categoryDigest",
+        "severity", "verdict", "trigger", "anchorChanged", "at"],
+      ["effort"]);
+    const repository = validateVersionAndBinding(object, expected, `outcomes[${index}]`);
+    // COMPLETE, not the 7-to-64 the shared pattern allows. Per-head
+    // idempotency compares this exactly, so an abbreviation and the full sha
+    // for one commit would not match and the finding would be verified twice
+    // for the same head (PR #73 review).
+    if (typeof object.headSha !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(object.headSha)) {
+      throw new Error(`outcomes[${index}].headSha is not a complete commit sha`);
+    }
+    const severity = object.severity;
+    if (severity !== "blocking" && severity !== "warning" && severity !== "suggestion") {
+      throw new Error(`outcomes[${index}].severity is not a known severity`);
+    }
+    const verdict = object.verdict;
+    if (verdict !== "confirmed" && verdict !== "revised" && verdict !== "withdrawn") {
+      throw new Error(`outcomes[${index}].verdict is not a known verdict`);
+    }
+    const trigger = object.trigger;
+    if (trigger !== "thread-comment" && trigger !== "thread-resolution"
+      && trigger !== "head-change" && trigger !== "reaction") {
+      throw new Error(`outcomes[${index}].trigger is not a known trigger`);
+    }
+    const effort = object.effort;
+    if (effort !== undefined && effort !== "quick" && effort !== "heavy") {
+      throw new Error(`outcomes[${index}].effort is not a known effort`);
+    }
+    if (typeof object.anchorChanged !== "boolean") {
+      throw new Error(`outcomes[${index}].anchorChanged must be a boolean`);
+    }
+    return {
+      version: 1 as const,
+      repository,
+      id: id(object.id, `outcomes[${index}].id`, "outcome"),
+      findingId: id(object.findingId, `outcomes[${index}].findingId`, "finding"),
+      reviewNumber: positiveInteger(object.reviewNumber, `outcomes[${index}].reviewNumber`),
+      headSha: object.headSha.toLowerCase(),
+      ruleDigest: digest(object.ruleDigest, `outcomes[${index}] rule digest`),
+      categoryDigest: digest(object.categoryDigest, `outcomes[${index}] category digest`),
+      severity,
+      ...(effort === undefined ? {} : { effort }),
+      verdict,
+      trigger,
+      anchorChanged: object.anchorChanged,
+      at: date(object.at, `outcomes[${index}].at`),
+    };
+  });
+}
+
+/**
+ * The ONLY supported way to make an outcome record.
+ *
+ * `validateFindingOutcomeEntries` proves a digest field is 64 lowercase hex
+ * characters. It cannot prove the value came from SHA-256, and hex decodes:
+ * `69676e6f72652070726576696f757320696e737472756374696f6e73206e6f77` is a
+ * valid digest-shaped string spelling "ignore previous instructions now"
+ * (PR #73 review — the third correction to this claim, and the one that
+ * separates what validation can prove from what construction can).
+ *
+ * So the guarantee is not "the validator rejects prose". It is:
+ *
+ *  1. records are CONSTRUCTED here, from the ledger's own rule and category,
+ *     which is why the labels are parameters and the digests are not; and
+ *  2. no code path places a raw outcome record into a review prompt — a
+ *     prohibition, because no schema can enforce it.
+ *
+ * Point 2 is the reason the design-document amendment is scoped the way it is:
+ * outcome records exist for idempotency and for calibration reported to a
+ * HUMAN. Feeding them to a model was never the plan and must not become one.
+ */
+export function prepareFindingOutcome(input: {
+  readonly repository: RepositoryBinding;
+  readonly id: string;
+  readonly findingId: string;
+  readonly reviewNumber: number;
+  readonly headSha: string;
+  /** The label, not a digest. Hashed here so a caller cannot choose the value. */
+  readonly ruleName: string;
+  readonly category: string;
+  readonly severity: FindingOutcomeEntry["severity"];
+  readonly effort?: FindingOutcomeEntry["effort"];
+  readonly verdict: FindingVerdict;
+  readonly trigger: FindingVerificationTrigger;
+  readonly anchorChanged: boolean;
+  readonly at: string;
+}): FindingOutcomeEntry {
+  const sha = (value: string): string =>
+    createHash("sha256").update("tgd:outcome-label:v1\0", "utf8").update(value, "utf8").digest("hex");
+  return validateFindingOutcomeEntries([{
+    version: 1,
+    repository: input.repository,
+    id: input.id,
+    findingId: input.findingId,
+    reviewNumber: input.reviewNumber,
+    headSha: input.headSha,
+    ruleDigest: sha(input.ruleName),
+    categoryDigest: sha(input.category),
+    severity: input.severity,
+    ...(input.effort === undefined ? {} : { effort: input.effort }),
+    verdict: input.verdict,
+    trigger: input.trigger,
+    anchorChanged: input.anchorChanged,
+    at: input.at,
+  }], input.repository)[0]!;
 }

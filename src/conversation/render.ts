@@ -188,6 +188,74 @@ export function renderReconsiderReply(
   ], marker);
 }
 
+/**
+ * The reply an AUTOMATIC verification posts (#57).
+ *
+ * Deliberately not `renderReconsiderReply`. That one answers a human who asked;
+ * this one speaks unprompted, so it says what made it look — a reader who finds
+ * a bot comment in their thread should not have to guess why it appeared.
+ *
+ * It never restates the finding. The original is directly above it in the same
+ * thread, and repeating it is noise the acceptance criteria explicitly forbid;
+ * what this carries is the reading of the code AS IT STANDS NOW, which is the
+ * part a reader cannot get anywhere else.
+ */
+/**
+ * How much of the model's reading of the code the reply carries.
+ *
+ * Generous for a paragraph and far short of the body limit, so the lines after
+ * it — the invitation to disagree — cannot be truncated away.
+ */
+const MAX_VERIFICATION_RATIONALE_CHARS = 4_000;
+
+export function renderVerificationReply(
+  input: {
+    readonly verdict: "confirmed" | "revised" | "withdrawn";
+    readonly trigger: "thread-comment" | "thread-resolution" | "head-change" | "reaction";
+    readonly rationale: string;
+    /** Named so the invitation to disagree is a command that actually works. */
+    readonly botLogin?: string;
+  },
+  marker: string,
+): RenderedConversationBody {
+  const because = input.trigger === "thread-comment"
+    ? "You replied in this thread, so I re-read the finding against the current code."
+    : input.trigger === "thread-resolution"
+      ? "This thread was resolved, so I re-read the finding against the current code."
+      : input.trigger === "reaction"
+        ? "This finding was acknowledged, so I re-read it against the current code."
+        : "A new commit changed the lines this finding was anchored to, so I re-read it.";
+
+  const verdict = input.verdict === "withdrawn"
+    ? "It no longer holds — treating this as addressed."
+    : input.verdict === "revised"
+      ? "Part of it is addressed; part still stands."
+      : "It still stands.";
+
+  // A LOGIN, not prose. `sanitizeMultiline` escapes Markdown, so a GitLab
+  // account like `acme_bot` rendered as `acme\_bot` — a command that copies to
+  // a mention matching no account (PR #73 review). Invisible characters,
+  // whitespace and backticks are still stripped; nothing else is touched.
+  const login = input.botLogin === undefined
+    ? undefined
+    : stripInvisible(input.botLogin).replace(/[\s`]/gu, "");
+  // Only when there is something left to disagree ABOUT.
+  const invitation = input.verdict === "withdrawn" || login === undefined || login.length === 0
+    ? undefined
+    : `If you read it differently: \`@${login} reconsider <why>\`.`;
+
+  // The rationale is capped BEFORE assembly, not after. The body is truncated
+  // from the end, so a verbose model could otherwise push the invitation off
+  // it — leaving a reader told they may disagree but not how (PR #73 review).
+  const rationale = sanitizeMultiline(input.rationale).slice(0, MAX_VERIFICATION_RATIONALE_CHARS);
+  return renderSections("## Verification", [
+    because,
+    verdict,
+    rationale,
+    invitation,
+  ], marker);
+}
+
 export function renderClarificationQuestion(
   input: { readonly question: string; readonly pendingId: string },
   marker: string,
