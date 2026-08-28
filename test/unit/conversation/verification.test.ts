@@ -1,7 +1,7 @@
 // Issue #57, stages 2 and 3. The model call is injected, so this exercises the
 // whole path — queue entry in, verdict and reply and record out — without a
 // provider.
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { verifyFinding } from "../../../src/conversation/verification.js";
 
 const repository = { provider: "github" as const, repositoryDigest: "a".repeat(64) };
