@@ -518,6 +518,48 @@ describe("clusterFindings — a host check survives duplicate collapsing", () =>
     expect(representative?.hostCheck).toEqual(hostCheck);
   });
 
+  // Codex review, round 11. Duplicates can now genuinely DISAGREE: a claim
+  // budget can run out between them, and a failed check is deliberately not
+  // shared with its retry. Carrying a result only onto a winner that had none
+  // then kept `not-checked` on the winner and discarded a twin's real answer —
+  // telling readers the check was not performed about a search that had found
+  // matches, which is worse than either input on its own.
+  it("prefers an established result over the winner's not-checked", () => {
+    const clusters = clusterFindings([
+      // The winner on severity is the one whose check failed or was skipped.
+      {
+        ...shared,
+        severity: "blocking",
+        ruleName: "rule-a",
+        claim: { kind: "no-other-references", symbol: "budget" },
+        hostCheck: { status: "not-checked" as const, reason: "the check failed" },
+      },
+      { ...shared, severity: "warning", ruleName: "rule-b", claim: { kind: "no-other-references", symbol: "budget" }, hostCheck },
+    ]);
+
+    expect(clusters).toHaveLength(1);
+    const representative = clusters[0]?.representative;
+    expect(representative?.severity).toBe("blocking");
+    expect(representative?.hostCheck).toEqual(hostCheck);
+  });
+
+  // The reverse must NOT happen: a real answer is never downgraded to an
+  // admission that the host did not look.
+  it("never replaces an established result with not-checked", () => {
+    const clusters = clusterFindings([
+      { ...shared, severity: "blocking", ruleName: "rule-a", claim: { kind: "no-other-references", symbol: "budget" }, hostCheck },
+      {
+        ...shared,
+        severity: "warning",
+        ruleName: "rule-b",
+        claim: { kind: "no-other-references", symbol: "budget" },
+        hostCheck: { status: "not-checked" as const, reason: "the check failed" },
+      },
+    ]);
+
+    expect(clusters[0]?.representative?.hostCheck).toEqual(hostCheck);
+  });
+
   it("leaves a winner that already carries its own check alone", () => {
     const own = { ...hostCheck, filesSearched: 7 };
     const clusters = clusterFindings([

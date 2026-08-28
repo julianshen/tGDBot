@@ -15,6 +15,7 @@
 // Pure and synchronous — no I/O, no LLM call. Deliberately: this runs after the
 // review has already been paid for, and a grouping pass that could fail, cost
 // money, or return something different on a retry is not worth the tidier list.
+import type { StructuralCheck } from "./structural-check.js";
 import type { Finding } from "./types.js";
 
 export interface FindingCluster {
@@ -295,6 +296,20 @@ function exactKey(finding: Finding): string {
  * sentence at the very same line is not a judgement call, and resolving it here
  * keeps the similarity pass from having to reason about exact ties.
  */
+/**
+ * How much a host check is worth keeping when two duplicates disagree.
+ *
+ * An ESTABLISHED result beats "not performed", which beats nothing at all.
+ * Everything this check emits is either an occurrence it actually read or an
+ * admission that it did not look, and an admission never carries information
+ * the reader could not get from the finding alone — so preferring the answer
+ * loses nothing and gains the search.
+ */
+function checkRank(check: StructuralCheck | undefined): number {
+  if (check === undefined) return 2;
+  return check.status === "not-checked" ? 1 : 0;
+}
+
 function collapseExactDuplicates(
   findings: readonly Finding[],
 ): { unique: Finding[]; rulesByFinding: Map<Finding, string[]> } {
@@ -315,15 +330,23 @@ function collapseExactDuplicates(
   }
   // Issue #75 (Codex review, round 2): the winner above is chosen by SEVERITY
   // alone, so a finding the host had checked could be discarded in favour of a
-  // byte-identical twin that carried no claim — taking a computed contradiction
-  // with it and republishing the assertion unqualified. These are the same
-  // sentence at the same location by definition of `exactKey`, so a check that
-  // applied to one applies to the other; carry it rather than lose it.
+  // byte-identical twin that carried no claim — taking a computed result with
+  // it and republishing the assertion unqualified. These are the same sentence
+  // at the same location by definition of `exactKey`, so a check that applied
+  // to one applies to the other; carry it rather than lose it.
+  //
+  // Round 11: carrying it only onto a winner that had NO check was not enough.
+  // Duplicates can now genuinely differ — a claim budget can run out between
+  // them, and a failed check is deliberately not shared with its retry — so the
+  // winner may hold `not-checked` while a twin holds a real answer. Keeping the
+  // winner's told readers "the check was not performed" about a search that had
+  // found matches, which is worse than either input.
   for (const finding of findings) {
     if (finding.claim === undefined || finding.hostCheck === undefined) continue;
     const key = exactKey(finding);
     const winner = bestByKey.get(key);
-    if (winner === undefined || winner === finding || winner.hostCheck !== undefined) continue;
+    if (winner === undefined || winner === finding) continue;
+    if (checkRank(winner.hostCheck) <= checkRank(finding.hostCheck)) continue;
     bestByKey.set(key, { ...winner, claim: finding.claim, hostCheck: finding.hostCheck });
   }
   const rulesByFinding = new Map<Finding, string[]>();
