@@ -296,6 +296,13 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
   const renameSources = renameSourcesByHeadPath(diff);
   let keys: readonly string[] = [];
   let oldLine: number | undefined;
+  // `---`/`+++` are FILE HEADERS only BEFORE the first hunk. Inside a hunk they
+  // are content: a removed line whose text starts with `--` — a decrement, say
+  // `--budget;` — is written `---budget;`, and skipping it both lost the
+  // removal AND slid every later base line number in that file by one (Codex
+  // review, round 7). Tracked separately from `oldLine`, which is undefined
+  // when a hunk header could not be parsed even though we are inside a hunk.
+  let inHunk = false;
 
   const each = (visit: (entry: Accumulator) => void): void => {
     for (const key of keys) {
@@ -315,11 +322,13 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
       const base = renameSources.get(head);
       keys = (base === undefined ? [head] : [base, head]).filter((value) => value !== "");
       oldLine = undefined;
+      inHunk = false;
       continue;
     }
     if (keys.length === 0) continue;
 
     if (line.startsWith("@@")) {
+      inHunk = true;
       const hunk = HUNK_RE.exec(line);
       if (hunk === null) {
         // Unparseable header: every later position in this file is a guess.
@@ -330,8 +339,7 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
       }
       continue;
     }
-    // `---`/`+++` are file headers, not content.
-    if (line.startsWith("---") || line.startsWith("+++")) continue;
+    if (!inHunk && (line.startsWith("---") || line.startsWith("+++"))) continue;
     // "\ No newline at end of file" belongs to the line before it.
     if (line.startsWith("\\")) continue;
 

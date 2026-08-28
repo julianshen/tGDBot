@@ -739,6 +739,48 @@ describe("removedLinesByFile", () => {
     expect(removedLinesByFile(diff).get("src/a.ts")?.text).not.toContain("a/src/a.ts");
   });
 
+  // Codex review, round 7. A removed line whose CONTENT begins with `--` — a
+  // decrement, say `--budget;` — is written `---budget;` in a unified diff.
+  // Treating every `---` as a file header lost the removal, so reconciliation
+  // kept the stale base occurrence and published a match against a correct
+  // finding; worse, it also failed to advance the base line counter, sliding
+  // every later removal in that file by one.
+  it("reads a triple-minus line inside a hunk as removed content", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -1,3 +1,1 @@",
+      " const keep = 1;",
+      "---budget;",
+      "-const after = 2;",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/http.ts")?.byLine.get(2)).toBe("--budget;");
+    // The counter advanced past the decrement, so the next removal is line 3.
+    expect(removed.get("src/http.ts")?.byLine.get(3)).toBe("const after = 2;");
+    expect(removed.get("src/http.ts")?.positioned).toBe(true);
+  });
+
+  // The mirror case: an added line whose content starts with `++` is `+++x;`,
+  // and must not advance the base counter the way a context line does.
+  it("does not let a triple-plus added line advance the base counter", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -1,2 +1,3 @@",
+      " const keep = 1;",
+      "+++counter;",
+      "-const gone = budget(1);",
+    ].join("\n");
+
+    expect(removedLinesByFile(diff).get("src/http.ts")?.byLine.get(2))
+      .toBe("const gone = budget(1);");
+  });
+
   // Codex review, round 8. A COPY diff also carries two different paths. Its
   // removed lines belong to the NEW file; recording them under the source path
   // would suppress occurrences in a file the diff never touched — and, through
