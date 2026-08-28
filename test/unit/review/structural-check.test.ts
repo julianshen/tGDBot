@@ -570,6 +570,76 @@ describe("runStructuralChecks", () => {
     expect((output[0]?.hostCheck as { reason: string }).reason).toMatch(/limit of 1/);
   });
 
+  // Codex review, round 10. Several rules routinely land on the same defect,
+  // and `clusterFindings` collapses the exact duplicates into ONE finding a
+  // reader sees. Charging each copy a budget slot let duplicates exhaust the
+  // budget and leave the next DISTINCT claim `not-checked` — a real answer
+  // replaced by "not checked" because of copies nobody is shown.
+  it("charges one budget slot per distinct claim, not per finding", async () => {
+    const checked: string[] = [];
+    const output = await runStructuralChecks({
+      findings: [
+        finding({ claim, file: "src/dup.ts", severity: "blocking", ruleName: "rule-a" }),
+        finding({ claim, file: "src/dup.ts", severity: "blocking", ruleName: "rule-b" }),
+        finding({ claim, file: "src/other.ts", severity: "blocking", ruleName: "rule-c" }),
+      ],
+      baseRoot: root,
+      claimBudget: 2,
+      check: async (_claim, checkInput) => {
+        checked.push(checkInput.findingFile);
+        return { status: "lexical-matches", references: [{ file: "src/o.ts", line: 1 }], filesSearched: 1 };
+      },
+    });
+
+    // The duplicate reuses the first answer instead of repeating the walk, so
+    // the distinct claim still fits inside a budget of two.
+    expect(checked).toEqual(["src/dup.ts", "src/other.ts"]);
+    for (const index of [0, 1, 2]) {
+      expect(output[index]?.hostCheck).toMatchObject({ status: "lexical-matches" });
+    }
+  });
+
+  // Sharing is by file AND symbol: a different symbol in the same file is a
+  // different question and must be asked separately.
+  it("does not share a result across different symbols in one file", async () => {
+    const checked: string[] = [];
+    await runStructuralChecks({
+      findings: [
+        finding({ claim, file: "src/a.ts" }),
+        finding({ claim: { kind: "no-other-references", symbol: "other" }, file: "src/a.ts" }),
+      ],
+      baseRoot: root,
+      check: async (askedClaim) => {
+        checked.push(askedClaim.symbol);
+        return { status: "lexical-matches", references: [{ file: "src/o.ts", line: 1 }], filesSearched: 1 };
+      },
+    });
+
+    expect(checked).toEqual(["budget", "other"]);
+  });
+
+  // A budget or failure outcome is circumstantial. Caching one would freeze a
+  // transient condition onto every later copy of the same claim.
+  it("does not share a failed check with a later duplicate", async () => {
+    let calls = 0;
+    const output = await runStructuralChecks({
+      findings: [
+        finding({ claim, file: "src/dup.ts", ruleName: "rule-a" }),
+        finding({ claim, file: "src/dup.ts", ruleName: "rule-b" }),
+      ],
+      baseRoot: root,
+      check: async () => {
+        calls += 1;
+        if (calls === 1) throw new Error("transient");
+        return { status: "lexical-matches", references: [{ file: "src/o.ts", line: 1 }], filesSearched: 1 };
+      },
+    });
+
+    expect(calls).toBe(2);
+    expect(output[0]?.hostCheck).toMatchObject({ status: "not-checked" });
+    expect(output[1]?.hostCheck).toMatchObject({ status: "lexical-matches" });
+  });
+
   // Codex review, round 6. `orchestrate` drops `addressed` and
   // `needs-clarification` findings entirely, so checking them spends a full
   // tree walk AND a slot in a budget of ten on a result nobody will ever see —

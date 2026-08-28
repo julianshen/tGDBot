@@ -596,10 +596,35 @@ export async function runStructuralChecks(
     });
 
   const checks = new Map<number, StructuralCheck>();
-  for (const [position, entry] of claimed.entries()) {
+  // One result per DISTINCT claim, not per finding.
+  //
+  // Several rules routinely land on the same defect, and `clusterFindings`
+  // collapses the exact duplicates into one finding a reader sees. Charging
+  // each copy a budget slot meant ten duplicates could exhaust a budget of ten
+  // and leave the next DISTINCT claim `not-checked` — a real answer replaced by
+  // "not checked" because of copies the reader never sees (Codex review, round
+  // 10). Each duplicate also repeated the whole base-tree walk.
+  //
+  // Sharing is sound because the result does not depend on the finding: the
+  // check reads the base tree by file and symbol, and reconciliation keys off
+  // the RESULT's own line numbers, not the finding's. So two findings with the
+  // same file and symbol have, by construction, the same answer.
+  const byClaim = new Map<string, StructuralCheck>();
+  // `\u0000` cannot occur in a path or an identifier, so the key is unambiguous.
+  const claimKey = (file: string, claim: StructuralClaim): string =>
+    `${file}\u0000${claim.kind}\u0000${claim.symbol}`;
+  let spent = 0;
+
+  for (const entry of claimed) {
     const claim = entry.finding.claim;
     if (claim === undefined) continue;
-    if (position >= budget) {
+    const key = claimKey(entry.finding.file, claim);
+    const shared = byClaim.get(key);
+    if (shared !== undefined) {
+      checks.set(entry.index, shared);
+      continue;
+    }
+    if (spent >= budget) {
       checks.set(entry.index, {
         status: "not-checked",
         reason: `this review's limit of ${budget} structural check(s) was already reached`,
@@ -628,7 +653,13 @@ export async function runStructuralChecks(
       });
       // The base/head reconciliation lives here because this is the only layer
       // that can see the diff; `checkStructuralClaim` knows one tree.
-      checks.set(entry.index, reconcileWithDiff(claim, result, input.removedLinesByFile));
+      spent += 1;
+      const reconciled = reconcileWithDiff(claim, result, input.removedLinesByFile);
+      // Only a real answer is shared. A budget or failure outcome is
+      // circumstantial, and caching one would freeze a transient condition
+      // onto every later copy of the claim.
+      byClaim.set(key, reconciled);
+      checks.set(entry.index, reconciled);
     } catch {
       // HOST-AUTHORED, not the caught error, for the same reason the worktree
       // failure in `cli.ts` is: this reason is rendered into a review comment,
