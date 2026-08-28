@@ -1385,8 +1385,12 @@ export function validateFindingOutcomeEntries(
         "severity", "verdict", "trigger", "anchorChanged", "at"],
       ["effort"]);
     const repository = validateVersionAndBinding(object, expected, `outcomes[${index}]`);
-    if (typeof object.headSha !== "string" || !SHA_RE.test(object.headSha)) {
-      throw new Error(`outcomes[${index}].headSha is not a sha`);
+    // COMPLETE, not the 7-to-64 the shared pattern allows. Per-head
+    // idempotency compares this exactly, so an abbreviation and the full sha
+    // for one commit would not match and the finding would be verified twice
+    // for the same head (PR #73 review).
+    if (typeof object.headSha !== "string" || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/iu.test(object.headSha)) {
+      throw new Error(`outcomes[${index}].headSha is not a complete commit sha`);
     }
     const severity = object.severity;
     if (severity !== "blocking" && severity !== "warning" && severity !== "suggestion") {

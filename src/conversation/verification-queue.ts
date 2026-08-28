@@ -17,7 +17,17 @@ export interface VerificationCandidate {
   readonly id: string;
   readonly headSha: string;
   readonly finding: { readonly severity: Finding["severity"] };
-  readonly placement: { readonly path: string; readonly line: number } | null;
+  /**
+   * `line` is the LAST line of the anchor; `startLine` the first, when the
+   * finding spans a range. Checking only the endpoint missed a commit that
+   * changed the start or middle of the range, so an addressed finding was
+   * never re-examined (PR #73 review).
+   */
+  readonly placement: {
+    readonly path: string;
+    readonly line: number;
+    readonly startLine?: number;
+  } | null;
   readonly identity?: { readonly threadId?: string } | undefined;
 }
 
@@ -33,6 +43,8 @@ export interface VerificationEvent {
 export interface VerificationOutcome {
   readonly findingId: string;
   readonly headSha: string;
+  /** What prompted the recorded verdict, for the resolution rule below. */
+  readonly trigger?: FindingVerificationTrigger;
 }
 
 export interface PendingVerification {
@@ -94,6 +106,18 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
       .map((outcome) => outcome.findingId),
   );
 
+  // A resolution is an EVENT, not a standing state. Both adapters timestamp
+  // each resolution snapshot with the pull request's update time, so an
+  // already-resolved thread emits `resolved: true` again on every later push.
+  // Acting on each of those would re-queue every previously resolved finding at
+  // every new head, bypassing the anchor filter entirely (PR #73 review). Once
+  // a resolution has been acted on for a finding, a repeat says nothing new.
+  const resolutionActedOn = new Set(
+    input.outcomes
+      .filter((outcome) => outcome.trigger === "thread-resolution")
+      .map((outcome) => outcome.findingId),
+  );
+
   const humanEventsByThread = new Map<string, FindingVerificationTrigger>();
   for (const event of input.events) {
     // The bot's own replies must not trigger verification, or a run answers
@@ -120,7 +144,10 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
     if (verified.has(candidate.id)) continue;
 
     const threadId = candidate.identity?.threadId;
-    const humanTrigger = threadId === undefined ? undefined : humanEventsByThread.get(threadId);
+    const signalled = threadId === undefined ? undefined : humanEventsByThread.get(threadId);
+    const humanTrigger = signalled === "thread-resolution" && resolutionActedOn.has(candidate.id)
+      ? undefined
+      : signalled;
     // An unanchored finding cannot be matched against a diff, so a push tells
     // us nothing about it — and neither does a finding RAISED at this head,
     // which is commonly anchored to a line this head changed because that is
@@ -129,7 +156,7 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
     // (PR #73 review).
     const touched = candidate.placement !== null
       && candidate.headSha.toLowerCase() !== input.headSha.toLowerCase()
-      && (input.changedLines.get(candidate.placement.path)?.has(candidate.placement.line) ?? false);
+      && anchorTouched(candidate.placement, input.changedLines);
 
     const trigger = humanTrigger ?? (touched ? "head-change" : undefined);
     if (trigger === undefined) continue;
@@ -146,4 +173,19 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
       SEVERITY_RANK[left.severity] - SEVERITY_RANK[right.severity]
       || TRIGGER_RANK[left.trigger] - TRIGGER_RANK[right.trigger])
     .slice(0, Math.max(0, input.ceiling));
+}
+
+/** Whether the new head changed ANY line of the anchor, not only its endpoint. */
+function anchorTouched(
+  placement: NonNullable<VerificationCandidate["placement"]>,
+  changedLines: ReadonlyMap<string, ReadonlySet<number>>,
+): boolean {
+  const changed = changedLines.get(placement.path);
+  if (changed === undefined) return false;
+  const last = placement.line;
+  const first = placement.startLine ?? last;
+  for (let line = Math.min(first, last); line <= Math.max(first, last); line += 1) {
+    if (changed.has(line)) return true;
+  }
+  return false;
 }

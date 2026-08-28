@@ -239,3 +239,75 @@ describe("pendingVerifications — a finding is not verified against its own hea
     expect(queue[0]?.trigger).toBe("thread-comment");
   });
 });
+
+// PR #73 round two: both adapters timestamp each resolution SNAPSHOT with the
+// pull request's update time, so an already-resolved thread emits
+// `resolved: true` again on a later push. Treating each of those as a fresh
+// human signal would re-queue every previously resolved finding at every new
+// head — bypassing the anchor filter entirely.
+describe("pendingVerifications — a resolution is an event, not a standing state", () => {
+  const resolution = event({ kind: "thread-resolution", resolved: true, authorIsBot: undefined });
+
+  it("queues a resolution the first time it is seen", () => {
+    const queue = pendingVerifications(input({ events: [resolution] }));
+
+    expect(queue[0]?.trigger).toBe("thread-resolution");
+  });
+
+  // Already acted on at an earlier head: a repeated snapshot says nothing new.
+  it("ignores a repeated resolution snapshot at a later head", () => {
+    const queue = pendingVerifications(input({
+      events: [resolution],
+      outcomes: [{ findingId: ledger().id, headSha: OLD, trigger: "thread-resolution" }],
+    }));
+
+    expect(queue).toEqual([]);
+  });
+
+  // A human REPLY is new information whatever happened before.
+  it("still queues a reply after a resolution was already acted on", () => {
+    const queue = pendingVerifications(input({
+      events: [event()],
+      outcomes: [{ findingId: ledger().id, headSha: OLD, trigger: "thread-resolution" }],
+    }));
+
+    expect(queue[0]?.trigger).toBe("thread-comment");
+  });
+});
+
+// PR #73 round two: a multi-line finding is anchored to a RANGE, and checking
+// only its last line misses a commit that changes the start or middle — so an
+// addressed finding is never re-examined.
+describe("pendingVerifications — a multi-line anchor is a range", () => {
+  const ranged = ledger({ placement: { path: "src/a.ts", line: 12, startLine: 10, side: "RIGHT" } });
+
+  it("queues when the start of the range changed", () => {
+    const queue = pendingVerifications(input({
+      findings: [ranged],
+      events: [],
+      changedLines: new Map([["src/a.ts", new Set([10])]]),
+    }));
+
+    expect(queue[0]?.trigger).toBe("head-change");
+  });
+
+  it("queues when the middle of the range changed", () => {
+    const queue = pendingVerifications(input({
+      findings: [ranged],
+      events: [],
+      changedLines: new Map([["src/a.ts", new Set([11])]]),
+    }));
+
+    expect(queue).toHaveLength(1);
+  });
+
+  it("still ignores a change outside the range", () => {
+    const queue = pendingVerifications(input({
+      findings: [ranged],
+      events: [],
+      changedLines: new Map([["src/a.ts", new Set([99])]]),
+    }));
+
+    expect(queue).toEqual([]);
+  });
+});

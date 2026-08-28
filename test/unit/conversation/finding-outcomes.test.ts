@@ -110,3 +110,24 @@ describe("validateFindingOutcomeEntries", () => {
       .toThrow(/sha/i);
   });
 });
+
+// PR #73 round two: the per-head idempotency check compares `headSha` exactly,
+// so an abbreviated sha and the full sha for the same commit would not match —
+// and the finding would be verified and replied to twice for one head.
+describe("validateFindingOutcomeEntries — the head must be a complete commit id", () => {
+  it("accepts a full sha", () => {
+    expect(() => validateFindingOutcomeEntries([outcome({ headSha: "a".repeat(40) })], repository))
+      .not.toThrow();
+    expect(() => validateFindingOutcomeEntries([outcome({ headSha: "b".repeat(64) })], repository))
+      .not.toThrow();
+  });
+
+  it("refuses an abbreviation", () => {
+    for (const headSha of ["a".repeat(7), "a".repeat(12), "a".repeat(39)]) {
+      expect(
+        () => validateFindingOutcomeEntries([outcome({ headSha })], repository),
+        `${headSha.length} characters was accepted`,
+      ).toThrow(/sha/i);
+    }
+  });
+});
