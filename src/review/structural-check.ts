@@ -22,6 +22,7 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { Lang, parseAsync } from "@ast-grep/napi";
+import type { RemovedLines } from "./diff-anchors.js";
 import type { Finding } from "./types.js";
 
 /**
@@ -439,25 +440,55 @@ function reachesAReader(finding: Finding): boolean {
 }
 
 /**
+ * Matches `symbol` as a whole JavaScript identifier.
+ *
+ * NOT `\b`, which is wrong here in two directions and was (Codex review,
+ * round 7). `$` is legal in an identifier and `SYMBOL_PATTERN` admits it, but
+ * it is a regex ANCHOR, so `\b$budget\b` never matched anything — a pull
+ * request deleting the last call to `$budget` had that deletion ignored and
+ * the stale base occurrence published against a correct finding. Escaping the
+ * `$` is not enough either: `\b` needs a WORD character adjacent, and `$` is
+ * not one, so `\b\$budget` fails on `x = $budget(1)` as well. Both verified.
+ *
+ * Explicit lookaround over the JavaScript identifier set is right in the other
+ * direction too: it still refuses `rebudget` for `budget`, and now also
+ * refuses `budget$x`, which `\b` would have accepted.
+ */
+function identifierMatcher(symbol: string): RegExp {
+  // Defence in depth: `parseStructuralClaim` already forbids everything a
+  // regular expression would read as syntax, `$` included.
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  return new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`, "u");
+}
+
+/**
  * Drops occurrences the diff may already have deleted, and reports what is left.
  *
- * Per file and on a word boundary: an occurrence only becomes doubtful when the
- * pull request removes a line mentioning that name FROM THAT FILE. Editing the
- * claimed function's own body no longer discards an untouched caller elsewhere,
- * and `rebudget` no longer counts as `budget`.
+ * An occurrence becomes doubtful when the pull request removes the line it sits
+ * on. Base line numbers and the diff's old-side numbers are the same
+ * coordinates by construction — both count the file at the base commit — so a
+ * file that loses one call site and keeps another now keeps the second. Whole-
+ * file granularity discarded both (Codex review, round 7); that was a
+ * deliberate over-suppression, and it turns out to cost exactly the case the
+ * check is most often about.
+ *
+ * Where the diff's hunk headers could not be parsed, the positions are not
+ * trustworthy and it falls back to the whole file. Over-suppressing is the safe
+ * direction for a check whose only output is an accusation.
  */
 function reconcileWithDiff(
   claim: StructuralClaim,
   result: StructuralCheck,
-  removedLinesByFile: ReadonlyMap<string, string> | undefined,
+  removedLinesByFile: ReadonlyMap<string, RemovedLines> | undefined,
 ): StructuralCheck {
   if (result.status !== "lexical-matches" || removedLinesByFile === undefined) return result;
-  // `claim.symbol` is identifier-constrained by `parseStructuralClaim`, so it
-  // carries nothing a regular expression would read as syntax.
-  const asWord = new RegExp(`\\b${claim.symbol}\\b`, "u");
+  const asIdentifier = identifierMatcher(claim.symbol);
   const surviving = result.references.filter((reference) => {
     const removed = removedLinesByFile.get(reference.file);
-    return removed === undefined || !asWord.test(removed);
+    if (removed === undefined) return true;
+    if (!removed.positioned) return !asIdentifier.test(removed.text);
+    const line = removed.byLine.get(reference.line);
+    return line === undefined || !asIdentifier.test(line);
   });
   if (surviving.length === result.references.length) return result;
   if (surviving.length === 0) {
@@ -495,7 +526,7 @@ export interface RunStructuralChecksInput {
    * `rebudget` (round 4). Only an occurrence in a file whose removed lines
    * mention the name is dropped, so an untouched external caller survives.
    */
-  readonly removedLinesByFile?: ReadonlyMap<string, string>;
+  readonly removedLinesByFile?: ReadonlyMap<string, RemovedLines>;
   readonly check?: typeof checkStructuralClaim;
   /** Wall-clock budget shared by every check in this review. */
   readonly reviewTimeBudgetMs?: number;

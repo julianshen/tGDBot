@@ -701,8 +701,11 @@ describe("removedLinesByFile", () => {
 
     const removed = removedLinesByFile(diff);
 
-    expect(removed.get("src/old.ts")).toContain("budget(1)");
-    expect(removed.get("src/new.ts")).toContain("budget(1)");
+    expect(removed.get("src/old.ts")?.text).toContain("budget(1)");
+    expect(removed.get("src/new.ts")?.text).toContain("budget(1)");
+    // The removed line is the second of the hunk, which starts at old line 1.
+    expect(removed.get("src/old.ts")?.byLine.get(2)).toContain("budget(1)");
+    expect(removed.get("src/old.ts")?.positioned).toBe(true);
   });
 
   it("keys an ordinary edit once, by its single path", () => {
@@ -718,7 +721,7 @@ describe("removedLinesByFile", () => {
     const removed = removedLinesByFile(diff);
 
     expect([...removed.keys()]).toEqual(["src/http.ts"]);
-    expect(removed.get("src/http.ts")).toContain("budget(1)");
+    expect(removed.get("src/http.ts")?.byLine.get(1)).toContain("budget(1)");
   });
 
   // `---` opens the file header and would otherwise read as a removed line
@@ -732,6 +735,47 @@ describe("removedLinesByFile", () => {
       "-const x = 1;",
     ].join("\n");
 
-    expect(removedLinesByFile(diff).get("src/a.ts")).not.toContain("a/src/a.ts");
+    expect(removedLinesByFile(diff).get("src/a.ts")?.text).not.toContain("a/src/a.ts");
+  });
+
+  // Base line numbers only advance on removed and CONTEXT lines. Counting an
+  // added line would slide every later position, and a position that is off by
+  // one suppresses the wrong occurrence — or none.
+  it("numbers removals by their base-side line, ignoring additions", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -10,4 +10,4 @@",
+      " const before = 1;",
+      "+const added = 2;",
+      "-const gone = budget(1);",
+      " const after = 3;",
+      "-const alsoGone = 4;",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/http.ts")?.byLine.get(11)).toBe("const gone = budget(1);");
+    expect(removed.get("src/http.ts")?.byLine.get(13)).toBe("const alsoGone = 4;");
+    expect(removed.get("src/http.ts")?.positioned).toBe(true);
+  });
+
+  // An unparseable hunk header makes every later position a guess, and a wrong
+  // position is worse than none: it would fail to suppress an occurrence the
+  // diff really deleted. The whole-file text stays usable as a fallback.
+  it("marks a file unpositioned when a hunk header cannot be parsed", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ nonsense @@",
+      "-const gone = budget(1);",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/http.ts")?.positioned).toBe(false);
+    expect(removed.get("src/http.ts")?.text).toContain("budget(1)");
   });
 });

@@ -328,6 +328,18 @@ describe("describeCheck", () => {
 
 describe("runStructuralChecks", () => {
   const root = "/base";
+  /** Removals at known base-side line numbers, the trustworthy-diff case. */
+  const removedAt = (...lines: [number, string][]) => ({
+    byLine: new Map(lines),
+    text: lines.map(([, text]) => text).join("\n"),
+    positioned: true,
+  });
+  /** Removals whose positions could not be parsed, so only the text is usable. */
+  const removedAnywhere = (text: string) => ({
+    byLine: new Map<number, string>(),
+    text,
+    positioned: false,
+  });
   const stub = (result: StructuralCheck) => async (): Promise<StructuralCheck> => result;
 
   it("leaves findings without a claim untouched", async () => {
@@ -418,7 +430,7 @@ describe("runStructuralChecks", () => {
     const output = await runStructuralChecks({
       findings: [finding({ claim })],
       baseRoot: root,
-      removedLinesByFile: new Map([["src/http.ts", "export const a = budget(1);"]]),
+      removedLinesByFile: new Map([["src/http.ts", removedAt([88, "export const a = budget(1);"])]]),
       check: stub({
         status: "lexical-matches",
         references: [{ file: "src/http.ts", line: 88 }],
@@ -438,7 +450,83 @@ describe("runStructuralChecks", () => {
       baseRoot: root,
       // The claimed function's own body changed, so its file's removed lines
       // mention the name — but src/http.ts was not touched.
-      removedLinesByFile: new Map([["src/retry.ts", "export function budget(n) { return n; }"]]),
+      removedLinesByFile: new Map([["src/retry.ts", removedAt([12, "export function budget(n) { return n; }"])]]),
+      check: stub({
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }],
+        filesSearched: 40,
+      }),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("lexical-matches");
+  });
+
+  // Codex review, round 7. Whole-file granularity discarded every occurrence in
+  // a file that lost any one of them — the single most common shape of a
+  // `no-other-references` finding, since the PR usually touches the file it is
+  // about. Base line numbers and the diff's old-side numbers are the same
+  // coordinates, so the surviving caller can be kept.
+  it("keeps an untouched caller in a file that also loses one", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLinesByFile: new Map([["src/http.ts", removedAt([88, "export const a = budget(1);"])]]),
+      check: stub({
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }, { file: "src/http.ts", line: 120 }],
+        filesSearched: 40,
+      }),
+    });
+
+    expect(output[0]?.hostCheck).toMatchObject({
+      status: "lexical-matches",
+      references: [{ file: "src/http.ts", line: 120 }],
+    });
+  });
+
+  // Where the hunk headers could not be parsed the positions are guesses, so it
+  // falls back to the whole file: over-suppressing beats publishing an
+  // accusation about a line the pull request deleted.
+  it("falls back to whole-file matching when positions are untrustworthy", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLinesByFile: new Map([["src/http.ts", removedAnywhere("export const a = budget(1);")]]),
+      check: stub({
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }, { file: "src/http.ts", line: 120 }],
+        filesSearched: 40,
+      }),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("not-checked");
+  });
+
+  // Codex review, round 7. `$` is legal in an identifier AND a regex anchor, so
+  // `\b$budget\b` matched nothing: the deletion was ignored and the stale base
+  // occurrence published against a correct finding. Escaping alone does not fix
+  // it either — `\b` needs a word character adjacent, and `$` is not one.
+  it("matches a symbol containing a dollar sign", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim: { kind: "no-other-references", symbol: "$budget" } })],
+      baseRoot: root,
+      removedLinesByFile: new Map([["src/http.ts", removedAt([88, "export const a = $budget(1);"])]]),
+      check: stub({
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }],
+        filesSearched: 40,
+      }),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("not-checked");
+  });
+
+  // The other direction of the same fix: `\b` would have accepted `budget$x`.
+  it("does not treat a dollar-suffixed identifier as the symbol", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLinesByFile: new Map([["src/http.ts", removedAt([88, "const budget$x = 1;"])]]),
       check: stub({
         status: "lexical-matches",
         references: [{ file: "src/http.ts", line: 88 }],
@@ -453,7 +541,7 @@ describe("runStructuralChecks", () => {
     const output = await runStructuralChecks({
       findings: [finding({ claim })],
       baseRoot: root,
-      removedLinesByFile: new Map([["src/http.ts", "const rebudget = 1;"]]),
+      removedLinesByFile: new Map([["src/http.ts", removedAt([88, "const rebudget = 1;"])]]),
       check: stub({
         status: "lexical-matches",
         references: [{ file: "src/http.ts", line: 88 }],

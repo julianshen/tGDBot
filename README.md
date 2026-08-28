@@ -631,9 +631,13 @@ Four properties worth knowing, because they are what make it trustworthy:
 - **The base/head gap is reconciled rather than ignored.** The search reads the
   base commit while the finding is about the head, so a pull request that
   deletes the last caller is *right* to call the symbol unused even though the
-  base still contains that caller. An occurrence in a file whose removed lines
-  mention the symbol is dropped, per file and on a word boundary, so editing the
-  claimed function's own body does not discard evidence from elsewhere.
+  base still contains that caller. An occurrence is dropped when the diff removes
+  *the line it sits on* — base line numbers and the diff's old-side numbers are
+  the same coordinates — so a file that loses one call site and keeps another
+  keeps the second, and editing the claimed function's own body discards nothing
+  elsewhere. Where a hunk header cannot be parsed the positions are not
+  trustworthy, and it falls back to the whole file: over-suppressing beats
+  accusing a line the pull request already deleted.
 
 Nothing is inferred from prose: "never called", "no other caller" and "nothing
 else implements this" are one claim in three phrasings, and a matcher over them

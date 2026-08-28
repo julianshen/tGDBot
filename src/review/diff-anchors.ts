@@ -232,46 +232,110 @@ export function renameSourcesByHeadPath(diff: string): Map<string, string> {
 }
 
 /**
- * Removed-line text per HEAD path, for reconciling a base-tree search against
- * what this pull request deletes.
+ * What a reviewed diff DELETES from each file, positioned where it can be.
  *
- * Keyed by the `b/` path so it lines up with the paths a finding names. A
- * deletion in a renamed file lands under the new name, which is the side the
- * caller compares against.
+ * The structural check reads the BASE commit while the finding is about the
+ * head, so an occurrence it found may be one of the very lines this pull
+ * request removes. This is the evidence for deciding that.
+ *
+ * Keyed by BOTH sides of the `diff --git` header, because a rename makes them
+ * differ and a caller may hold either. `checkStructuralClaim` reports
+ * BASE-relative paths while the header's right-hand side is the HEAD path, so
+ * keying by one alone silently missed every renamed file — the reconciliation
+ * failing on a superset of its own motivating case (CodeRabbit review).
  */
-export function removedLinesByFile(diff: string): Map<string, string> {
-  const removed = new Map<string, string>();
-  // Keyed by BOTH sides of the header, because a rename makes them differ and a
-  // caller may hold either one. This keyed only the head path, while
-  // `checkStructuralClaim` reports BASE-relative paths — so for every file a
-  // pull request renamed, the lookup missed and its removed lines were never
-  // considered. That is the reconciliation's own failure case one step removed:
-  // a PR that renames a caller's file AND deletes the last call site left the
-  // call site standing in the base tree, unmatched, and the host published a
-  // match against a finding that was right (CodeRabbit review).
-  //
-  // Removed lines are base-side content, so the base key is the correct one;
-  // the head key is kept so a caller working in head paths still finds them.
-  // Double-keying can only ever over-suppress, which is the safe direction for
-  // a check whose output is an accusation.
+export interface RemovedLines {
+  /**
+   * Base-side line number -> the text removed from it.
+   *
+   * Base line numbers and the diff's old-side numbers are the same coordinates
+   * by construction: both count lines in the file at the base commit. That is
+   * what lets a single untouched caller survive in a file that also loses one.
+   */
+  readonly byLine: ReadonlyMap<number, string>;
+  /** Every removed line in the file, joined. The fallback when `positioned` is false. */
+  readonly text: string;
+  /**
+   * False when a hunk header could not be parsed, so `byLine` is incomplete.
+   *
+   * The oversized-diff path reconstructs headers itself, so untrustworthy
+   * positions are a real possibility rather than a theoretical one. Callers
+   * fall back to the whole-file text there, which over-suppresses instead of
+   * publishing an accusation about a line the pull request deleted.
+   */
+  readonly positioned: boolean;
+}
+
+export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
+  interface Accumulator {
+    readonly byLine: Map<number, string>;
+    text: string;
+    positioned: boolean;
+  }
+  const removed = new Map<string, Accumulator>();
   let keys: readonly string[] = [];
+  let oldLine: number | undefined;
+
+  const each = (visit: (entry: Accumulator) => void): void => {
+    for (const key of keys) {
+      let entry = removed.get(key);
+      if (entry === undefined) {
+        entry = { byLine: new Map(), text: "", positioned: true };
+        removed.set(key, entry);
+      }
+      visit(entry);
+    }
+  };
+
   for (const line of diff.split("\n")) {
     const header = parseDiffGitHeader(line);
     if (header !== undefined) {
       keys = header.a === header.b
         ? [header.b || header.a].filter((value) => value !== "")
         : [header.a, header.b].filter((value) => value !== "");
+      oldLine = undefined;
       continue;
     }
     if (keys.length === 0) continue;
-    // `---` is a file header, not a removed line.
-    if (line.startsWith("-") && !line.startsWith("---")) {
-      for (const key of keys) {
-        removed.set(key, `${removed.get(key) ?? ""}\n${line.slice(1)}`);
+
+    if (line.startsWith("@@")) {
+      const hunk = HUNK_RE.exec(line);
+      if (hunk === null) {
+        // Unparseable header: every later position in this file is a guess.
+        oldLine = undefined;
+        each((entry) => { entry.positioned = false; });
+      } else {
+        oldLine = Number(hunk[1]);
       }
+      continue;
     }
+    // `---`/`+++` are file headers, not content.
+    if (line.startsWith("---") || line.startsWith("+++")) continue;
+    // "\ No newline at end of file" belongs to the line before it.
+    if (line.startsWith("\\")) continue;
+
+    if (line.startsWith("-")) {
+      const text = line.slice(1);
+      const at = oldLine;
+      each((entry) => {
+        entry.text = `${entry.text}\n${text}`;
+        if (at === undefined) entry.positioned = false;
+        else entry.byLine.set(at, text);
+      });
+      if (oldLine !== undefined) oldLine += 1;
+      continue;
+    }
+    if (line.startsWith("+")) continue;
+    // A context line advances the base side; so does the blank line git writes
+    // for an empty context line.
+    if (oldLine !== undefined) oldLine += 1;
   }
-  return removed;
+
+  return new Map([...removed].map(([key, entry]) => [key, {
+    byLine: entry.byLine,
+    text: entry.text,
+    positioned: entry.positioned,
+  }]));
 }
 
 function collectChangedPaths(
