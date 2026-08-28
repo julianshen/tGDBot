@@ -587,29 +587,41 @@ host answers it by parsing the base branch with
 
 ```text
 - `src/retry.ts:41` — budget() is never called outside tests
-  > Host check: `budget` appears 3 time(s) across 214 file(s) of the base
-  > branch — `src/http.ts:88`, `src/queue.ts:12`. This contradicts the claim above.
+  > Host check: the name `budget` occurs 2 time(s) outside this file, across
+  > 214 file(s) of the base branch — `src/http.ts:88`, `src/queue.ts:12`. These
+  > are LEXICAL matches: the host did not resolve whether they refer to this
+  > `budget`. Worth checking before relying on the claim above.
 ```
 
-**It reports contradictions, and nothing else.** There is deliberately no "clean"
-verdict. "No reference exists" is an assertion of *absence*, and absence is only
-sound with total coverage — which is unreachable: dynamic references,
-reflection, generated code, other repositories and every language outside the
-supported set are permanently invisible. A contradiction is the opposite: the
-host parsed a file and found the symbol, and no gap elsewhere makes that untrue.
-So the check keeps the half that is robust and drops the half that cannot be.
-A finding with no host check simply reads on its own merits, as it did before.
+**It reports occurrences, and nothing else.** Two halves of the obvious feature
+are deliberately missing, and both absences are the point.
+
+There is no "clean" verdict. "No reference exists" is an assertion of *absence*,
+and absence is only sound with total coverage — which is unreachable: dynamic
+references, reflection, generated code, other repositories and every language
+outside the supported set are permanently invisible. An occurrence is the
+opposite: the host parsed a file and found the name, and no gap elsewhere makes
+that untrue. So the check keeps the half that is robust and drops the half that
+cannot be.
+
+And it never calls an occurrence a *reference*. ast-grep matches syntax, not
+meaning: it has no symbol resolution, so `wallet.budget()` on an unrelated class
+and `{ budget: 1 }` in a config object are indistinguishable from a real caller.
+Reporting either as a resolved contradiction would manufacture exactly the
+confident false fact this whole design exists to prevent. The wording therefore
+says what was actually established — this name occurs here — and leaves the
+identity question to the reader, who can answer it in one click. Real resolution
+needs a type checker, which is a much larger dependency than a parser.
 
 Four properties worth knowing, because they are what make it trustworthy:
 
 - **The claim is the reviewer's; the check is the host's.** A reviewer cannot
   fabricate a check result — findings are rebuilt field by field from an
   allowlist, so a forged one is dropped like any other unknown key.
-- **A contradiction never suppresses the finding.** Both are published and a
+- **A host check never suppresses the finding.** Both are published and a
   human weighs them. Silently dropping a finding because a mechanical check
   disagreed would trade one confident wrong answer for another.
-- **Where it cannot establish a contradiction it says so, with what it covered.**
-  It never converts "I found nothing" into "there is nothing".
+- **Where it found nothing it says what it covered**, never "there is nothing".
 - **It reads only the base branch**, never a PR checkout — the same rule
   mapping follows, for the same reason. When the pull request renames the file a
   claim is about, the base-side path is passed too, so the symbol's own
@@ -617,8 +629,9 @@ Four properties worth knowing, because they are what make it trustworthy:
 - **The base/head gap is reconciled rather than ignored.** The search reads the
   base commit while the finding is about the head, so a pull request that
   deletes the last caller is *right* to call the symbol unused even though the
-  base still contains that caller. When the diff removes any line mentioning the
-  symbol, the contradiction is withheld.
+  base still contains that caller. An occurrence in a file whose removed lines
+  mention the symbol is dropped, per file and on a word boundary, so editing the
+  claimed function's own body does not discard evidence from elsewhere.
 
 Nothing is inferred from prose: "never called", "no other caller" and "nothing
 else implements this" are one claim in three phrasings, and a matcher over them

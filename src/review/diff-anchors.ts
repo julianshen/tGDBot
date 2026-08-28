@@ -231,6 +231,32 @@ export function renameSourcesByHeadPath(diff: string): Map<string, string> {
   return renames;
 }
 
+/**
+ * Removed-line text per HEAD path, for reconciling a base-tree search against
+ * what this pull request deletes.
+ *
+ * Keyed by the `b/` path so it lines up with the paths a finding names. A
+ * deletion in a renamed file lands under the new name, which is the side the
+ * caller compares against.
+ */
+export function removedLinesByFile(diff: string): Map<string, string> {
+  const removed = new Map<string, string>();
+  let current: string | undefined;
+  for (const line of diff.split("\n")) {
+    const header = parseDiffGitHeader(line);
+    if (header !== undefined) {
+      current = header.b || header.a;
+      continue;
+    }
+    if (current === undefined) continue;
+    // `---` is a file header, not a removed line.
+    if (line.startsWith("-") && !line.startsWith("---")) {
+      removed.set(current, `${removed.get(current) ?? ""}\n${line.slice(1)}`);
+    }
+  }
+  return removed;
+}
+
 function collectChangedPaths(
   diff: string,
   select: (header: { readonly a: string; readonly b: string }) => readonly string[],

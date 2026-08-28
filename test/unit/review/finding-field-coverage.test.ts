@@ -97,7 +97,7 @@ const COMPLETE: Required<Finding> = {
   effort: "heavy",
   references: ["https://docs.example.com/ttl"],
   claim: { kind: "no-other-references", symbol: "revalidate" },
-  hostCheck: { status: "contradicted", references: [{ file: "src/other.go", line: 7 }], filesSearched: 3 },
+  hostCheck: { status: "lexical-matches", references: [{ file: "src/other.go", line: 7 }], filesSearched: 3 },
 };
 
 const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
@@ -347,7 +347,10 @@ describe("every Finding field reaches the reader", () => {
         rulesRun: [COMPLETE.ruleName],
         rulesFailed: [],
       },
-      400,
+      // Large enough that every field has room: this test is about field
+      // COVERAGE, and a budget so tight that the finding is elided entirely
+      // would pass vacuously on nothing rather than fail on a dropped field.
+      700,
     );
 
     expect(body).toContain("compacted to fit the provider limit");

@@ -67,7 +67,7 @@ import {
   formatMarker,
   stateRootDomainIdentifier,
 } from "./review/dedup.js";
-import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions, renameSourcesByHeadPath } from "./review/diff-anchors.js";
+import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions, removedLinesByFile, renameSourcesByHeadPath } from "./review/diff-anchors.js";
 import {
   formatPendingMarker,
   replacePendingMarker,
@@ -1512,12 +1512,10 @@ export async function review(
         // under the old one, and without this the symbol's own declaration
         // reads as a reference from elsewhere.
         renamedFrom: renameSourcesByHeadPath(diff),
-        // Lets the checker withhold a contradiction whose base-side references
-        // may be precisely the ones this PR deletes.
-        removedLines: diff
-          .split("\n")
-          .filter((line) => line.startsWith("-") && !line.startsWith("---"))
-          .join("\n"),
+        // Lets the checker drop occurrences whose base-side lines may be
+        // precisely the ones this PR deletes — per file, so an untouched
+        // caller elsewhere survives.
+        removedLinesByFile: removedLinesByFile(diff),
       });
     } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the

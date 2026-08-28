@@ -497,7 +497,7 @@ describe("clusterFindings — a host check survives duplicate collapsing", () =>
     message: "budget() is never called.",
   };
   const hostCheck = {
-    status: "contradicted" as const,
+    status: "lexical-matches" as const,
     references: [{ file: "src/http.ts", line: 88 }],
     filesSearched: 40,
   };

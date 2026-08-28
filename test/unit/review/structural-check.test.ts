@@ -72,26 +72,49 @@ describe("checkStructuralClaim — what counts as a reference", () => {
   // latter finds the import and misses every member access, then reports "no
   // other references" — CONFIRMING a false finding, which is worse than not
   // checking at all. Each line below is a distinct reference form.
-  it("finds every reference form, not just bare identifiers", async () => {
+  it("finds every occurrence form, not just bare identifiers", async () => {
     const root = await tree({
       "src/retry.ts": "export function budget(n: number) { return n; }\n",
       "src/member.ts": "import * as r from './retry.js';\nexport const a = r.budget(1);\n",
-      "src/object.ts": "export const o = { budget: 1 };\n",
       "src/optional.ts": "declare const obj: any;\nexport const b = obj?.budget;\n",
-      "src/klass.ts": "export class C { budget() { return 1; } }\n",
-      "src/type.ts": "export type T = { budget: string };\n",
       "src/named.ts": "import { budget } from './retry.js';\nexport const c = budget(2);\n",
     });
 
     const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" });
 
-    expect(result.status).toBe("contradicted");
+    expect(result.status).toBe("lexical-matches");
     if (result.status === "not-checked") throw new Error("unreachable");
     const files = new Set(result.references.map((reference) => reference.file));
-    // Every one of these would be lost by an identifier-only search.
-    for (const file of ["src/member.ts", "src/object.ts", "src/optional.ts", "src/klass.ts", "src/type.ts"]) {
+    // `r.budget(1)` and `obj?.budget` are `property_identifier`, so an
+    // identifier-only search would miss both.
+    for (const file of ["src/member.ts", "src/optional.ts", "src/named.ts"]) {
       expect(files).toContain(file);
     }
+  });
+
+  // Codex review, round 4, and my own earlier fixture pinned the WRONG
+  // behaviour here: it listed `{ budget: 1 }` — an object key with no relation
+  // to the function — as a reference the check should find. ast-grep matches
+  // syntax, not meaning, so an unrelated same-named member is indistinguishable
+  // from a real caller. The result must therefore never be reported as a
+  // resolved reference, and the wording is what carries that.
+  it("cannot tell an unrelated same-named member from a real caller", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "src/unrelated.ts": "export class Wallet { budget() { return 0; } }\nexport const cfg = { budget: 1 };\n",
+    });
+
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" });
+
+    // It DOES match them — that is the limitation, stated rather than hidden.
+    expect(result.status).toBe("lexical-matches");
+    if (result.status === "not-checked") throw new Error("unreachable");
+    expect(result.references.some((reference) => reference.file === "src/unrelated.ts")).toBe(true);
+    // So the prose must not present them as references to this symbol.
+    const text = describeCheck(claim, result);
+    expect(text).toMatch(/LEXICAL matches/);
+    expect(text).toMatch(/did not resolve/);
+    expect(text).not.toMatch(/contradicts/i);
   });
 
   // The reason to prefer a parser over `grep` at all: these are the false
@@ -116,7 +139,7 @@ describe("checkStructuralClaim — what counts as a reference", () => {
     // does not see them. That is a refusal, not a clean bill of health.
     expect(result.status).toBe("not-checked");
     if (result.status !== "not-checked") throw new Error("unreachable");
-    expect(result.reason).toMatch(/not evidence that none exists/);
+    expect(result.reason).toMatch(/not evidence that no reference exists/);
   });
 
   it("does not search dependency or build directories", async () => {
@@ -151,7 +174,7 @@ describe("checkStructuralClaim — what counts as a reference", () => {
     await expect(checkStructuralClaim(claim, { baseRoot: sameFile, findingFile: "src/retry.ts" }))
       .resolves.toMatchObject({ status: "not-checked" });
     await expect(checkStructuralClaim(claim, { baseRoot: otherFile, findingFile: "src/retry.ts" }))
-      .resolves.toMatchObject({ status: "contradicted" });
+      .resolves.toMatchObject({ status: "lexical-matches" });
   });
 
   // Codex review, round 1. `findingFile` is a HEAD path; when the PR renames the
@@ -165,7 +188,7 @@ describe("checkStructuralClaim — what counts as a reference", () => {
 
     // Without the base-side path this reads as "a reference in another file".
     await expect(checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/new-name.ts" }))
-      .resolves.toMatchObject({ status: "contradicted" });
+      .resolves.toMatchObject({ status: "lexical-matches" });
 
     await expect(checkStructuralClaim(claim, {
       baseRoot: root,
@@ -204,7 +227,7 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
       maxFileBytes: 200,
     });
 
-    expect(result.status).toBe("contradicted");
+    expect(result.status).toBe("lexical-matches");
   });
 
   it("does not check a tree with no language it supports", async () => {
@@ -269,9 +292,9 @@ describe("describeCheck", () => {
     expect(text).not.toMatch(/there are no (callers|references)/i);
   });
 
-  it("names the contradicting locations and says it contradicts", () => {
+  it("names the locations and calls them unresolved lexical matches", () => {
     const check: StructuralCheck = {
-      status: "contradicted",
+      status: "lexical-matches",
       references: [{ file: "src/http.ts", line: 88 }, { file: "src/queue.ts", line: 12 }],
       filesSearched: 40,
     };
@@ -279,7 +302,8 @@ describe("describeCheck", () => {
 
     expect(text).toContain("src/http.ts:88");
     expect(text).toContain("src/queue.ts:12");
-    expect(text).toMatch(/contradicts/i);
+    expect(text).toMatch(/LEXICAL matches/);
+    expect(text).not.toMatch(/contradicts/i);
   });
 
   it("always says why a check was not performed", () => {
@@ -291,7 +315,7 @@ describe("describeCheck", () => {
   // bare and which closes the code span it lands in (#63).
   it("escapes interpolated paths through the caller's escaper", () => {
     const check: StructuralCheck = {
-      status: "contradicted",
+      status: "lexical-matches",
       references: [{ file: "src/a`.ts", line: 1 }],
       filesSearched: 1,
     };
@@ -319,10 +343,10 @@ describe("runStructuralChecks", () => {
     const output = await runStructuralChecks({
       findings: input,
       baseRoot: root,
-      check: stub({ status: "contradicted", references: [{ file: "src/http.ts", line: 8 }], filesSearched: 3 }),
+      check: stub({ status: "lexical-matches", references: [{ file: "src/http.ts", line: 8 }], filesSearched: 3 }),
     });
 
-    expect(output[0]?.hostCheck).toMatchObject({ status: "contradicted" });
+    expect(output[0]?.hostCheck).toMatchObject({ status: "lexical-matches" });
     expect(input[0]?.hostCheck).toBeUndefined();
   });
 
@@ -333,7 +357,7 @@ describe("runStructuralChecks", () => {
     const output = await runStructuralChecks({
       findings: input,
       baseRoot: root,
-      check: stub({ status: "contradicted", references: [{ file: "x.ts", line: 1 }], filesSearched: 1 }),
+      check: stub({ status: "lexical-matches", references: [{ file: "x.ts", line: 1 }], filesSearched: 1 }),
     });
 
     expect(output).toHaveLength(2);
@@ -386,37 +410,54 @@ describe("runStructuralChecks", () => {
   // the BASE while the finding is about the HEAD. A pull request that deletes
   // the last caller is CORRECT to say the symbol is now unused — and the base
   // still contains that caller, so a naive check contradicts a right finding.
-  it("withholds a contradiction when the diff removes lines mentioning the symbol", async () => {
-    const contradiction: StructuralCheck = {
-      status: "contradicted",
-      references: [{ file: "src/http.ts", line: 88 }],
-      filesSearched: 40,
-    };
-
+  it("drops an occurrence the diff removes from that same file", async () => {
     const output = await runStructuralChecks({
       findings: [finding({ claim })],
       baseRoot: root,
-      removedLines: "-export const a = budget(1);",
-      check: stub(contradiction),
-    });
-
-    expect(output[0]?.hostCheck?.status).toBe("not-checked");
-    expect((output[0]?.hostCheck as { reason: string }).reason).toMatch(/removes lines mentioning it/);
-  });
-
-  it("keeps a contradiction the diff cannot have invalidated", async () => {
-    const output = await runStructuralChecks({
-      findings: [finding({ claim })],
-      baseRoot: root,
-      removedLines: "-const unrelated = 1;",
+      removedLinesByFile: new Map([["src/http.ts", "export const a = budget(1);"]]),
       check: stub({
-        status: "contradicted",
+        status: "lexical-matches",
         references: [{ file: "src/http.ts", line: 88 }],
         filesSearched: 40,
       }),
     });
 
-    expect(output[0]?.hostCheck?.status).toBe("contradicted");
+    expect(output[0]?.hostCheck?.status).toBe("not-checked");
+    expect((output[0]?.hostCheck as { reason: string }).reason).toMatch(/every file where it was found/);
+  });
+
+  // Round 4: the first version tested the whole diff as one string, so editing
+  // the claimed function's OWN body discarded an untouched caller elsewhere.
+  it("keeps an untouched caller when the PR only edits the symbol's own file", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      // The claimed function's own body changed, so its file's removed lines
+      // mention the name — but src/http.ts was not touched.
+      removedLinesByFile: new Map([["src/retry.ts", "export function budget(n) { return n; }"]]),
+      check: stub({
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }],
+        filesSearched: 40,
+      }),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("lexical-matches");
+  });
+
+  it("does not treat a longer identifier as the symbol", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLinesByFile: new Map([["src/http.ts", "const rebudget = 1;"]]),
+      check: stub({
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }],
+        filesSearched: 40,
+      }),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("lexical-matches");
   });
 
   it("checks blocking findings first when the budget binds, and says so on the rest", async () => {

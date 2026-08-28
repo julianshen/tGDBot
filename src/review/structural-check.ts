@@ -41,6 +41,21 @@ export interface StructuralClaim {
   readonly symbol: string;
 }
 
+/**
+ * One place the symbol's NAME occurs as an identifier. Not a resolved reference.
+ *
+ * ast-grep matches syntax. It has no notion of which declaration a name binds
+ * to, so an unrelated class with a method of the same name, an object key, or
+ * another module's own `budget` all look identical to the real callers. For a
+ * common identifier — `run`, `get`, `id`, `value` — that is not an edge case
+ * but the normal result (Codex review, round 4: a three-line fixture with no
+ * relationship to the symbol produced three matches).
+ *
+ * Resolving names to declarations needs a type checker, which is a materially
+ * larger piece of work than this issue scoped. Until then the honest thing is
+ * to report what was actually computed and let the reader judge, rather than
+ * dress a lexical hit as a resolved contradiction.
+ */
 export interface SymbolReference {
   /** Repository-relative, POSIX-separated. */
   readonly file: string;
@@ -77,13 +92,20 @@ export interface SymbolReference {
  * host check simply reads the finding on its own merits, as they did before.
  */
 export type StructuralCheck =
-  /** References exist in a file other than the finding's own. Positive evidence. */
+  /**
+   * The symbol's name occurs, as an identifier, in a file other than the
+   * finding's own.
+   *
+   * NOT "these are references to that symbol" — see `SymbolReference`. ast-grep
+   * matches syntax, not meaning, so this is a lexical result and the wording
+   * everywhere says so.
+   */
   | {
-    readonly status: "contradicted";
+    readonly status: "lexical-matches";
     readonly references: readonly SymbolReference[];
     readonly filesSearched: number;
   }
-  /** No contradiction was established. Always carries why, and never means "no callers exist". */
+  /** Nothing was established. Always carries why, and never means "no callers exist". */
   | { readonly status: "not-checked"; readonly reason: string };
 
 /**
@@ -216,8 +238,8 @@ async function collectSourceFiles(
  * Counts references to `claim.symbol` in the base worktree.
  *
  * `findingFile` is the file the finding is anchored to, and its only role is to
- * decide `contradicted` vs `consistent`: a reference in ANOTHER file
- * unambiguously contradicts "no other references", while a same-file reference
+ * decide whether there is anything to report at all: a reference in ANOTHER
+ * file is evidence against "no other references", while a same-file reference
  * cannot be told apart from the definition itself. The finding's line number is
  * deliberately not used — it counts lines in the PR head, and this searches the
  * base, so the two do not correspond.
@@ -325,26 +347,27 @@ export async function checkStructuralClaim(
 
   const external = references.filter((reference) => !ownFiles.has(reference.file));
   if (external.length > 0) {
-    // Positive evidence, and the only verdict this check issues. It survives
-    // every gap above: a file left unread cannot unmake a reference that was
-    // read. The base/head caveat is applied by the caller, which is the only
-    // layer that can see the diff.
-    return { status: "contradicted", references, filesSearched };
+    // Survives every gap above: a file left unread cannot unmake an occurrence
+    // that was read. What it does NOT survive is name collision, which is why
+    // the status and its wording claim only a lexical match.
+    return { status: "lexical-matches", references: external, filesSearched };
   }
   return {
     status: "not-checked",
-    reason: `no reference outside its own file was found in ${filesSearched} file(s) of the base branch, which is not evidence that none exists`,
+    reason: `the name did not occur outside its own file in ${filesSearched} file(s) of the base branch, which is not evidence that no reference exists`,
   };
 }
 
 /**
  * One line of prose for a check result, for rendering beside the finding.
  *
- * There is no clean verdict to word: see `StructuralCheck`. Everything that is
- * not a contradiction reports what the host did and declines to conclude from
- * it, because a dynamic call, an unparsed language, generated code, or a caller
- * in another repository is invisible to this search and a reader who took a gap
- * for proof would have been misled by the check rather than helped by it.
+ * Two things it must never say, both learned the hard way on this PR. It never
+ * reports an absence as proof — a dynamic call, an unparsed language, generated
+ * code or a caller in another repository is invisible to this search. And it
+ * never calls a match a reference: ast-grep matches syntax, so an unrelated
+ * type's same-named member is indistinguishable from a real caller here, and
+ * presenting one as a resolved contradiction would be the trusted-fact problem
+ * this whole design exists to avoid.
  */
 export function describeCheck(
   claim: StructuralClaim,
@@ -365,15 +388,12 @@ export function describeCheck(
     return `Host check: not performed — ${escape(check.reason)}.`;
   }
   const scope = `${check.filesSearched} file(s) of the base branch`;
-  {
-    const shown = check.references.slice(0, 5);
-    const rendered = shown.map((reference) => `\`${escape(`${reference.file}:${reference.line}`)}\``).join(", ");
-    const more = check.references.length > shown.length
-      ? `, and ${check.references.length - shown.length} more`
-      : "";
-    return `Host check: \`${escape(claim.symbol)}\` appears ${check.references.length} time(s) across ${scope} — ${rendered}${more}. This contradicts the claim above.`;
-  }
-  return `Host check: searched ${scope} and found no reference to \`${escape(claim.symbol)}\` outside its own file. This is what the search covered, not proof that none exists — dynamic references, unparsed languages and callers outside this repository are invisible to it.`;
+  const shown = check.references.slice(0, 5);
+  const rendered = shown.map((reference) => `\`${escape(`${reference.file}:${reference.line}`)}\``).join(", ");
+  const more = check.references.length > shown.length
+    ? `, and ${check.references.length - shown.length} more`
+    : "";
+  return `Host check: the name \`${escape(claim.symbol)}\` occurs ${check.references.length} time(s) outside this file, across ${scope} — ${rendered}${more}. These are LEXICAL matches: the host did not resolve whether they refer to this \`${escape(claim.symbol)}\`, and a same-named member of an unrelated type looks identical here. Worth checking before relying on the claim above.`;
 }
 
 /**
@@ -385,6 +405,37 @@ export function describeCheck(
  * called" is most expensive there.
  */
 export const DEFAULT_CLAIM_BUDGET = 10;
+
+/**
+ * Drops occurrences the diff may already have deleted, and reports what is left.
+ *
+ * Per file and on a word boundary: an occurrence only becomes doubtful when the
+ * pull request removes a line mentioning that name FROM THAT FILE. Editing the
+ * claimed function's own body no longer discards an untouched caller elsewhere,
+ * and `rebudget` no longer counts as `budget`.
+ */
+function reconcileWithDiff(
+  claim: StructuralClaim,
+  result: StructuralCheck,
+  removedLinesByFile: ReadonlyMap<string, string> | undefined,
+): StructuralCheck {
+  if (result.status !== "lexical-matches" || removedLinesByFile === undefined) return result;
+  // `claim.symbol` is identifier-constrained by `parseStructuralClaim`, so it
+  // carries nothing a regular expression would read as syntax.
+  const asWord = new RegExp(`\\b${claim.symbol}\\b`, "u");
+  const surviving = result.references.filter((reference) => {
+    const removed = removedLinesByFile.get(reference.file);
+    return removed === undefined || !asWord.test(removed);
+  });
+  if (surviving.length === result.references.length) return result;
+  if (surviving.length === 0) {
+    return {
+      status: "not-checked",
+      reason: `the name occurs at the base commit, but this pull request removes lines mentioning it from every file where it was found — the check reads the base, so it cannot tell whether those are the occurrences being deleted`,
+    };
+  }
+  return { ...result, references: surviving };
+}
 
 const SEVERITY_ORDER: Readonly<Record<string, number>> = {
   blocking: 0,
@@ -399,19 +450,20 @@ export interface RunStructuralChecksInput {
   /** Head path -> base path for files this PR renames. See `checkStructuralClaim`. */
   readonly renamedFrom?: ReadonlyMap<string, string>;
   /**
-   * Every line this diff REMOVES, joined.
+   * Lines this diff REMOVES, keyed by the file they were removed from.
    *
    * The search reads the base commit while the finding is about the head, so a
    * pull request that deletes the last caller leaves that caller present in the
-   * tree being searched — and the host would contradict a finding that was
-   * correct about the merged result (Codex review, round 3). When the diff
-   * removes any line mentioning the symbol, the base's references may be
-   * exactly the ones the PR deleted, so the contradiction is withheld.
+   * tree being searched (Codex review, round 3).
    *
-   * Deliberately a crude substring test. It errs toward refusing, which is the
-   * safe direction for a check whose only verdict is an accusation.
+   * Reconciled PER FILE and on a word boundary, because the first version of
+   * this was a substring test over the whole diff and discarded a valid result
+   * whenever the PR merely edited the claimed function's own body — the removed
+   * version of that line contains the symbol too — and also matched
+   * `rebudget` (round 4). Only an occurrence in a file whose removed lines
+   * mention the name is dropped, so an untouched external caller survives.
    */
-  readonly removedLines?: string;
+  readonly removedLinesByFile?: ReadonlyMap<string, string>;
   readonly check?: typeof checkStructuralClaim;
 }
 
@@ -462,15 +514,7 @@ export async function runStructuralChecks(
       });
       // The base/head reconciliation lives here because this is the only layer
       // that can see the diff; `checkStructuralClaim` knows one tree.
-      checks.set(
-        entry.index,
-        result.status === "contradicted" && input.removedLines?.includes(claim.symbol) === true
-          ? {
-            status: "not-checked",
-            reason: `references to \`${claim.symbol}\` exist at the base commit, but this pull request removes lines mentioning it — the check reads the base, so it cannot tell whether those references are the ones being deleted`,
-          }
-          : result,
-      );
+      checks.set(entry.index, reconcileWithDiff(claim, result, input.removedLinesByFile));
     } catch (error) {
       checks.set(entry.index, {
         status: "not-checked",
@@ -491,8 +535,10 @@ export async function runStructuralChecks(
  * Compact summaries and merged cluster members cannot carry the full sentence,
  * and dropping it there was the same defect as dropping it from the relocated
  * path: a claim published without the answer the host had already computed.
- * The `contradicted` case keeps a count and one location — enough for a reader
- * to see the assertion is disputed and where to look.
+ * It keeps a count and one location — enough for a reader to see the assertion
+ * is disputed and where to look — and the word `unresolved`, which is the part
+ * that must not be dropped for length: a compact rendering that read as a
+ * resolved reference would be a stronger claim than the full one makes.
  */
 export function describeCheckCompact(
   check: StructuralCheck,
@@ -501,5 +547,5 @@ export function describeCheckCompact(
   if (check.status === "not-checked") return "Host check: not performed";
   const first = check.references[0];
   const where = first === undefined ? "" : `, e.g. ${escape(`${first.file}:${first.line}`)}`;
-  return `Host check: CONTRADICTED — ${check.references.length} reference(s) found${where}`;
+  return `Host check: the name occurs ${check.references.length} time(s) elsewhere${where} — unresolved lexical matches`;
 }

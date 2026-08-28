@@ -1543,12 +1543,15 @@ describe("renderInlineComment — host structural check", () => {
   it("renders the check as a quoted host statement under the finding", () => {
     const body = renderInlineComment(makeFinding({
       claim,
-      hostCheck: { status: "contradicted", references: [{ file: "src/http.ts", line: 88 }], filesSearched: 40 },
+      hostCheck: { status: "lexical-matches", references: [{ file: "src/http.ts", line: 88 }], filesSearched: 40 },
     }));
 
     expect(body).toContain("> Host check:");
     expect(body).toContain("src/http.ts:88");
-    expect(body).toMatch(/contradicts/i);
+    // Codex review, round 4: ast-grep matches syntax, so this line must not
+    // read as a resolved reference. It says the name occurs, and says so.
+    expect(body).toContain("LEXICAL matches");
+    expect(body).not.toMatch(/contradicts/i);
   });
 
   it("says what a non-contradicting check covered, never that no caller exists", () => {
@@ -1581,7 +1584,7 @@ describe("renderInlineComment — host structural check", () => {
       unanchored: [makeFinding({
         claim,
         hostCheck: {
-          status: "contradicted",
+          status: "lexical-matches",
           references: [{ file: "src/http.ts", line: 88 }],
           filesSearched: 40,
         },
@@ -1593,7 +1596,7 @@ describe("renderInlineComment — host structural check", () => {
 
     expect(body).toContain("Host check:");
     expect(body).toContain("src/http.ts:88");
-    expect(body).toMatch(/contradicts/i);
+    expect(body).toContain("LEXICAL matches");
   });
 
   // A claim the host could not answer must not silently look unchallenged.
@@ -1619,7 +1622,7 @@ describe("renderInlineComment — host structural check", () => {
         message: "x".repeat(4000),
         claim,
         hostCheck: {
-          status: "contradicted",
+          status: "lexical-matches",
           references: [{ file: "src/http.ts", line: 88 }],
           filesSearched: 40,
         },
@@ -1630,7 +1633,7 @@ describe("renderInlineComment — host structural check", () => {
     }, 1200);
 
     expect(body).toContain("compacted to fit the provider limit");
-    expect(body).toContain("Host check: CONTRADICTED");
+    expect(body).toContain("unresolved lexical matches");
     expect(body).toContain("src/http.ts:88");
   });
 
@@ -1643,7 +1646,7 @@ describe("renderInlineComment — host structural check", () => {
         message: "helper() is never called.",
         claim: { kind: "no-other-references", symbol: "helper" },
         hostCheck: {
-          status: "contradicted",
+          status: "lexical-matches",
           references: [{ file: "src/queue.ts", line: 12 }],
           filesSearched: 9,
         },
@@ -1651,7 +1654,7 @@ describe("renderInlineComment — host structural check", () => {
     });
 
     expect(body).toContain("Also reported by 1 other rule");
-    expect(body).toContain("Host check: CONTRADICTED");
+    expect(body).toContain("unresolved lexical matches");
     expect(body).toContain("src/queue.ts:12");
   });
 
@@ -1661,7 +1664,7 @@ describe("renderInlineComment — host structural check", () => {
     const body = renderInlineComment(makeFinding({
       claim,
       hostCheck: {
-        status: "contradicted",
+        status: "lexical-matches",
         references: [{ file: "src/a`.ts) **Approved**", line: 3 }],
         filesSearched: 2,
       },
