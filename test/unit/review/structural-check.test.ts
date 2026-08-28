@@ -177,6 +177,34 @@ describe("checkStructuralClaim — what counts as a reference", () => {
       .resolves.toMatchObject({ status: "lexical-matches" });
   });
 
+  // Codex review, round 14. The deadline was consulted once per DIRECTORY, so a
+  // directory full of files this cannot parse ran past it — nothing there
+  // increments the file count, so the budget check could not stop it either.
+  //
+  // The tree is deliberately almost all UNSUPPORTED files: they are walked by
+  // the collector but never reach the parse loop, so the clock consultations
+  // counted here come from collection alone. (A first version of this test used
+  // supported files and passed against the unfixed code, because the parse
+  // loop's own `expired()` calls masked the difference.)
+  it("consults the deadline for each directory entry, not once per directory", async () => {
+    const names = Array.from({ length: 40 }, (_, index) => `src/noise-${index}.txt`);
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      ...Object.fromEntries(names.map((name) => [name, "not source\n"])),
+    });
+    let calls = 0;
+    const now = (): number => {
+      calls += 1;
+      return 0; // Never expires, so the walk completes and only the COUNT varies.
+    };
+
+    await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" }, { now });
+
+    // 41 entries in one directory, one of them parseable. Checking per
+    // directory consults the clock a handful of times; per entry cannot.
+    expect(calls).toBeGreaterThan(20);
+  });
+
   // Codex review, round 12. A finding's path is reviewer output, which
   // `normalizeUnknownFinding` accepts as any string, while the scan reports
   // `path.relative` output. An equivalent spelling like `./src/retry.ts` did

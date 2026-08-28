@@ -257,7 +257,12 @@ async function collectSourceFiles(
       continue;
     }
     for (const entry of entries) {
-      if (found.length >= budget) break;
+      // Per ENTRY, not per directory. The outer `while` alone left one
+      // directory of unsupported files running past the deadline, because
+      // nothing there increments `found` — and I had already told a reviewer
+      // this was "checked on every iteration of the walk", which it was not
+      // (Codex review, round 14).
+      if (found.length >= budget || expired()) break;
       const full = path.join(directory, entry.name);
       // Never follow a symlink out of the tree: the answer must be about the
       // worktree that was checked out, not about wherever a link points.
