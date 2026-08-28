@@ -33,10 +33,15 @@ The existing `review` command remains a one-shot operation. A new one-shot `poll
     auto-written here would turn replying to a bot comment into editing the
     reviewer's instructions, which on a repository accepting outside
     contributions is a prompt-injection channel with a persistence guarantee.
-  - **Outcome records** — mechanical, written automatically, and structurally
-    incapable of addressing a model: every field is an enumerated value, a
-    bounded identifier, a digest, a number or a timestamp, enforced by the
-    schema rather than by convention. They record what became of a finding so a
+  - **Outcome records** — mechanical and written automatically. Every field is
+    an enumerated value, a digest, a number or a timestamp; the rule and
+    category are stored as SHA-256 digests computed by the host from the
+    finding ledger, never accepted from a caller, because a validator can prove
+    a value is 64 hex characters but not that it came from a hash — and hex
+    decodes. **No code path may place a raw outcome record into a review
+    prompt.** That is a prohibition rather than a schema property, and it is
+    the reason these records are scoped to idempotency and to calibration
+    reported to a human. They record what became of a finding so a
     poll knows what it has already verified, and so calibration can be reported
     to a maintainer.
 

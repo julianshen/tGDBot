@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ConversationItemIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
 import { computeContentDigest, parseChildMarker } from "./markers.js";
 
@@ -1429,4 +1430,61 @@ export function validateFindingOutcomeEntries(
       at: date(object.at, `outcomes[${index}].at`),
     };
   });
+}
+
+/**
+ * The ONLY supported way to make an outcome record.
+ *
+ * `validateFindingOutcomeEntries` proves a digest field is 64 lowercase hex
+ * characters. It cannot prove the value came from SHA-256, and hex decodes:
+ * `69676e6f72652070726576696f757320696e737472756374696f6e73206e6f77` is a
+ * valid digest-shaped string spelling "ignore previous instructions now"
+ * (PR #73 review — the third correction to this claim, and the one that
+ * separates what validation can prove from what construction can).
+ *
+ * So the guarantee is not "the validator rejects prose". It is:
+ *
+ *  1. records are CONSTRUCTED here, from the ledger's own rule and category,
+ *     which is why the labels are parameters and the digests are not; and
+ *  2. no code path places a raw outcome record into a review prompt — a
+ *     prohibition, because no schema can enforce it.
+ *
+ * Point 2 is the reason the design-document amendment is scoped the way it is:
+ * outcome records exist for idempotency and for calibration reported to a
+ * HUMAN. Feeding them to a model was never the plan and must not become one.
+ */
+export function prepareFindingOutcome(input: {
+  readonly repository: RepositoryBinding;
+  readonly id: string;
+  readonly findingId: string;
+  readonly reviewNumber: number;
+  readonly headSha: string;
+  /** The label, not a digest. Hashed here so a caller cannot choose the value. */
+  readonly ruleName: string;
+  readonly category: string;
+  readonly severity: FindingOutcomeEntry["severity"];
+  readonly effort?: FindingOutcomeEntry["effort"];
+  readonly verdict: FindingVerdict;
+  readonly trigger: FindingVerificationTrigger;
+  readonly anchorChanged: boolean;
+  readonly at: string;
+}): FindingOutcomeEntry {
+  const sha = (value: string): string =>
+    createHash("sha256").update("tgd:outcome-label:v1\0", "utf8").update(value, "utf8").digest("hex");
+  return validateFindingOutcomeEntries([{
+    version: 1,
+    repository: input.repository,
+    id: input.id,
+    findingId: input.findingId,
+    reviewNumber: input.reviewNumber,
+    headSha: input.headSha,
+    ruleDigest: sha(input.ruleName),
+    categoryDigest: sha(input.category),
+    severity: input.severity,
+    ...(input.effort === undefined ? {} : { effort: input.effort }),
+    verdict: input.verdict,
+    trigger: input.trigger,
+    anchorChanged: input.anchorChanged,
+    at: input.at,
+  }], input.repository)[0]!;
 }
