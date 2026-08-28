@@ -592,7 +592,13 @@ class ExecutionAdapter extends ClassificationAdapter {
     return this.publishedByMarker.get(key) ?? null;
   }
 
+  failNextThreadRead = false;
+
   override async getReviewThread(_review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
+    if (this.failNextThreadRead) {
+      this.failNextThreadRead = false;
+      throw new Error("thread read is temporarily unavailable");
+    }
     const thread = this.threads.get(threadId);
     if (thread === undefined) throw new Error(`thread not found: ${threadId}`);
     return thread;
@@ -2115,6 +2121,56 @@ describe("automatic verification", () => {
       .readFindingOutcomes()).toHaveLength(1);
   });
 
+  // A provider READ outage is not an answer. The event has already been taken
+  // off the page by then, so dropping it consumed the reply for good.
+  it("retries after a thread read fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    adapter.failNextThreadRead = true;
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // A transient VERDICT failure, as opposed to a transient publication.
+  it("retries after the verifier fails transiently", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let attempts = 0;
+    const session: ConversationSessionFactory = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("the model is temporarily unavailable");
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
   // The cost ceiling is ONE allowance for the poll. It was passed fresh into
   // every loop iteration, so a busy repository could spend five model calls per
   // iteration against a documented five per poll.
@@ -2122,7 +2178,10 @@ describe("automatic verification", () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);
     const replies: ReviewActivityEvent[] = [];
-    for (let index = 0; index < 6; index += 1) {
+    // SEVEN, not six. Six is exactly the old one-past-the-budget lookahead, so
+    // a fixture of six passed against an implementation that could not name the
+    // seventh candidate at all (PR #74 review).
+    for (let index = 0; index < 7; index += 1) {
       const { findingMarker } = await seedFindingInto(stateDir, {
         findingId: `finding_${String(index).repeat(32)}`,
         bindThreadId: `T${index}`,
@@ -2144,12 +2203,12 @@ describe("automatic verification", () => {
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
     expect(sessions).toBe(5);
 
-    // The sixth is not lost. Nothing persists "this reply is still owed", so
-    // the poll held the cursor back rather than advancing past the event.
+    // The remaining two are not lost. Nothing persists "this reply is still
+    // owed", so the poll takes them off the page and holds the cursor.
     adapter.replaceEvents(replies);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
-    expect(sessions).toBe(6);
-    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(6);
+    expect(sessions).toBe(7);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(7);
   });
 
   // A dry run previews; it does not buy anything. Reporting the VERDICT meant

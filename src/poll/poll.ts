@@ -295,26 +295,30 @@ async function classifyOpenReviewEvents(options: {
       console.warn(`tgd-review-agent: could not queue verifications (${redactedMessage(error)})`);
       return { items: [], deferred: false, deferredEvents: [] } as VerificationQueue;
     });
-    // A HOLD, not a halt: the commands and the verifications this page can
-    // still afford must run. It only keeps the cursor from moving past the
-    // events taken off the page below.
-    const deferredHold = queued.deferred;
-    if (deferredHold) deferredReviews.add(review.reviewNumber);
-    // Every event the queue is using comes OFF the page, deferred or not. The
-    // block below marks an ordinary comment classified-and-ignored, which is
-    // terminal — so an event left in place is consumed whether or not its
-    // verification ever posted, and a transient failure lost the reply for good
-    // (PR #74 review). Left unmarked, a held-back cursor shows them again; on
+    // THE INVARIANT: an event taken off the page must either complete its
+    // verification this poll or hold the cursor. Removal and the cursor
+    // decision were independent, so a thread-read outage, a transient verdict,
+    // or a candidate past the budget left the event neither answered nor
+    // retried — the page had already consumed it (PR #74 review). Ids are
+    // struck off below as each reply lands; whatever remains holds the cursor.
+    const outstanding = new Set([...queued.items.map((item) => item.event), ...queued.deferredEvents]
+      .map((event) => event.eventId));
+    // The block below marks an ordinary comment classified-and-ignored, which is
+    // terminal, so every named candidate comes OFF the page until its
+    // verification completes. Left unmarked, a held cursor shows them again; on
     // success the recorded outcome keeps the second sighting from re-verifying.
     //
     // Only events with nothing else to do. A command in a finding thread can
     // trigger a verification too, and taking it off the page would drop the
     // command the author actually asked for.
-    const held = new Set([...queued.items.map((item) => item.event), ...queued.deferredEvents]
-      .map((event) => event.eventId));
     for (let at = classified.length - 1; at >= 0; at -= 1) {
       const item = classified[at]!;
-      if (held.has(item.event.eventId) && item.parsed.kind === "irrelevant") classified.splice(at, 1);
+      if (outstanding.has(item.event.eventId) && item.parsed.kind === "irrelevant") {
+        classified.splice(at, 1);
+      } else {
+        // Still on the page, so the page is answerable for it.
+        outstanding.delete(item.event.eventId);
+      }
     }
 
     if (options.dryRun) {
@@ -434,8 +438,12 @@ async function classifyOpenReviewEvents(options: {
         if (settled.kind === "verification") {
           await options.store.transact((tx) => { tx.appendOutcome(settled.outcome); });
         }
+        // Answered, and the outcome recorded. Nothing is owed for this event.
+        outstanding.delete(verification.event.eventId);
       }
     }
+    const deferredHold = outstanding.size > 0;
+    if (deferredHold) deferredReviews.add(review.reviewNumber);
 
     const completedPage = !stoppedEarly && !haltCursor && !deferredHold;
     const listingComplete = page.nextPageToken === undefined;
@@ -649,10 +657,13 @@ type ReplyPlan =
       readonly headSha: string;
     }
   /**
-   * An AUTOMATIC verification (#57). Carries its own rendered body, because the
-   * planner already rendered it, and the outcome record that must land in the
-   * same transaction as the action — a reply posted without its record would be
-   * verified and replied to again on the next poll.
+   * An AUTOMATIC verification (#57).
+   *
+   * Carries the fields the reply is rendered FROM, not a rendered body: a
+   * conversation body is branded so only a renderer can produce one, and
+   * `buildReplyChild` owns the marker. The outcome record travels with the plan
+   * but is appended in its own transaction after the reply is published, so a
+   * crash between the two loses the record rather than the reply.
    */
   | {
       readonly kind: "verification";
@@ -1850,6 +1861,17 @@ async function executeClarificationAnswer(input: {
 export const MAX_POLL_VERIFICATIONS = 5;
 
 /**
+ * How many candidates the queue will ENUMERATE, as opposed to verify.
+ *
+ * Enumeration is a pure function over state already in hand, so it is not what
+ * the cost budget protects. Sizing it to the budget was the bug: the queue
+ * stopped one past what it could afford, and every candidate beyond that was
+ * never named — so retention could not hold it and the page consumed it
+ * (PR #74 review). Only what is AFFORDABLE gets a thread fetch and a model call.
+ */
+const MAX_VERIFICATION_CANDIDATES = 200;
+
+/**
  * Plans the automatic verifications this poll should perform for one review.
  *
  * Ordered cheapest-first on purpose: the QUEUE runs on data already in hand —
@@ -1919,10 +1941,12 @@ async function queueVerifications(input: {
   };
 }): Promise<VerificationQueue> {
   if (input.budget <= 0) {
-    // Nothing may run, but something may still be waiting. Ask for one item to
-    // find out, and report it as deferred rather than as nothing to do.
+    // Nothing may run, but everything still waiting must be NAMED, or the page
+    // consumes what this poll could not afford. Enumerating one candidate
+    // reported the rest as nothing to do (PR #74 review).
     const probe = await queueVerifications({ ...input, budget: 1 });
-    return { items: [], deferred: probe.items.length > 0, deferredEvents: probe.items.map((item) => item.event) };
+    const waiting = [...probe.items.map((item) => item.event), ...probe.deferredEvents];
+    return { items: [], deferred: waiting.length > 0, deferredEvents: waiting };
   }
   // Store reads FIRST. Loading metadata is a provider round-trip, and a page
   // with no event in a published finding's own thread can never produce a
@@ -1940,8 +1964,6 @@ async function queueVerifications(input: {
   const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
   if (metadata === undefined) return { items: [], deferred: false, deferredEvents: [] };
 
-  // One MORE than the budget, so the caller can tell "exactly full" from
-  // "there was more". The queue still bounds what it builds.
   const queue = pendingVerifications({
     headSha: metadata.headSha,
     findings: findings.map((entry) => ({
@@ -1967,7 +1989,7 @@ async function queueVerifications(input: {
     // Event-driven only until head-change lands: an empty map means the anchor
     // trigger can never fire, rather than firing on stale information.
     changedLines: new Map(),
-    ceiling: input.budget + 1,
+    ceiling: MAX_VERIFICATION_CANDIDATES,
   });
   if (queue.length === 0) return { items: [], deferred: false, deferredEvents: [] };
 
@@ -1977,24 +1999,36 @@ async function queueVerifications(input: {
     return { items: [], deferred: false, deferredEvents: [] };
   }
 
-  const items: QueuedVerification[] = [];
-  const deferredEvents: ReviewActivityEvent[] = [];
-  let deferred = false;
-  for (const pending of queue) {
+  // Resolved WITHOUT touching the provider: which finding, which event. This is
+  // the full set the page must not consume, so it is computed before anything
+  // is spent and independently of what this poll can afford.
+  const candidates = queue.flatMap((pending) => {
     const ledger = findings.find((entry) => entry.id === pending.findingId);
     const threadId = ledger?.identity?.threadId;
-    if (ledger === undefined || threadId === undefined) continue;
+    if (ledger === undefined || threadId === undefined) return [];
     // The event that prompted it, so the reply lands in the right thread and
     // the action carries a real provenance.
     const trigger = input.events.find((item) =>
       item.event.kind !== "general-comment" && item.event.threadId === threadId);
-    if (trigger === undefined) continue;
+    if (trigger === undefined) return [];
+    return [{ pending, ledger, threadId, event: trigger.event }];
+  });
 
+  const items: QueuedVerification[] = [];
+  // Everything past the budget, named so the caller can hold it back.
+  const deferredEvents: ReviewActivityEvent[] = candidates.slice(input.budget)
+    .map((candidate) => candidate.event);
+  let deferred = deferredEvents.length > 0;
+  for (const { pending, ledger, threadId, event } of candidates.slice(0, input.budget)) {
     let thread: ReviewThreadSnapshot | undefined;
     try {
       thread = await input.options.adapter.getReviewThread(input.reviewIdentity, threadId);
     } catch (error) {
+      // A READ OUTAGE, not an answer. Deferring retries it next poll; dropping
+      // it let the page consume the reply for good (PR #74 review).
       console.warn(`tgd-review-agent: could not load a thread to verify (${redactedMessage(error)})`);
+      deferredEvents.push(event);
+      deferred = true;
       continue;
     }
 
@@ -2007,14 +2041,14 @@ async function queueVerifications(input: {
     const root = thread?.events.find((event) => event.commentId === thread?.rootCommentId);
     if (root === undefined || root.authorIsBot !== true) continue;
 
-    const entry = {
+    items.push({
       pending,
       ledger,
       thread,
-      event: trigger.event,
+      event,
       identity: conversationActionIdentity({
-        provider: trigger.event.provider,
-        repositoryDigest: trigger.event.repositoryDigest,
+        provider: event.provider,
+        repositoryDigest: event.repositoryDigest,
         reviewNumber: input.reviewNumber,
         // Keyed on the FINDING and the HEAD, not the event: three replies in
         // one thread must produce one verification, and a resumed poll must not
@@ -2022,14 +2056,7 @@ async function queueVerifications(input: {
         eventId: ledger.id,
         commandKey: `verify:${metadata.headSha}`,
       }),
-    };
-    // Over budget: the event is handed back rather than dropped.
-    if (items.length >= input.budget) {
-      deferred = true;
-      deferredEvents.push(entry.event);
-      continue;
-    }
-    items.push(entry);
+    });
   }
   return { items, deferred, deferredEvents, context: { metadata, rules } };
 }
