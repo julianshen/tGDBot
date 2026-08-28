@@ -122,8 +122,13 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
     const threadId = candidate.identity?.threadId;
     const humanTrigger = threadId === undefined ? undefined : humanEventsByThread.get(threadId);
     // An unanchored finding cannot be matched against a diff, so a push tells
-    // us nothing about it.
+    // us nothing about it — and neither does a finding RAISED at this head,
+    // which is commonly anchored to a line this head changed because that is
+    // what the review was reading. Verifying it against the commit that
+    // produced it spends the ceiling and posts a reply nobody prompted
+    // (PR #73 review).
     const touched = candidate.placement !== null
+      && candidate.headSha.toLowerCase() !== input.headSha.toLowerCase()
       && (input.changedLines.get(candidate.placement.path)?.has(candidate.placement.line) ?? false);
 
     const trigger = humanTrigger ?? (touched ? "head-change" : undefined);

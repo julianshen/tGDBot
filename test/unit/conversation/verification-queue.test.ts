@@ -203,3 +203,39 @@ describe("pendingVerifications — one entry per finding", () => {
     expect(queue[0]?.trigger).toBe("thread-comment");
   });
 });
+
+// PR #73 review: a finding RAISED by the review of head X is commonly anchored
+// to a line that head X changed — that is what the review was reading. Queuing
+// it as a head-change verification at that same head means re-reading a finding
+// against the commit that produced it, spending the ceiling and eventually
+// posting an unsolicited reply to a thread nobody has answered.
+describe("pendingVerifications — a finding is not verified against its own head", () => {
+  it("ignores a head change for a finding raised at that head", () => {
+    const queue = pendingVerifications(input({
+      findings: [ledger({ headSha: HEAD })],
+      events: [],
+      changedLines: new Map([["src/a.ts", new Set([10])]]),
+    }));
+
+    expect(queue).toEqual([]);
+  });
+
+  it("still queues it once a later head touches the anchor", () => {
+    const queue = pendingVerifications(input({
+      findings: [ledger({ headSha: OLD })],
+      events: [],
+      changedLines: new Map([["src/a.ts", new Set([10])]]),
+    }));
+
+    expect(queue[0]?.trigger).toBe("head-change");
+  });
+
+  // A human replying is a signal regardless of which head raised the finding.
+  it("still queues a reply on a finding raised at the current head", () => {
+    const queue = pendingVerifications(input({
+      findings: [ledger({ headSha: HEAD })],
+    }));
+
+    expect(queue[0]?.trigger).toBe("thread-comment");
+  });
+});
