@@ -75,7 +75,7 @@ import {
 import type { InlineRecoveryState } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
-import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
+import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, ReviewDispatchInput } from "./review/types.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
@@ -1492,6 +1492,11 @@ export async function review(
   // property than paying for the worktree.
   if (config.structuralChecks === "on" && dispatchResult.findings.some((f) => f.claim !== undefined)) {
     try {
+      const addressedKeys = new Set(
+        dispatchResult.findings
+          .filter((finding) => finding.decision === "addressed")
+          .map(dedupeKey),
+      );
       const prepared = await prepareStructuralWorkspaceFn({
         // The SAME managed workspace context mapping uses, so a repository
         // is mirrored once whichever feature asked for it first.
@@ -1516,6 +1521,13 @@ export async function review(
         // precisely the ones this PR deletes — per file, so an untouched
         // caller elsewhere survives.
         removedLinesByFile: removedLinesByFile(diff),
+        // `orchestrate` drops an actionable finding whose dedup key matches an
+        // `addressed` one, so checking those spends budget on results no reader
+        // sees. Wired HERE, at the composition root, using orchestrate's own
+        // `dedupeKey` — the checker stays independent of the orchestrator and
+        // there is only one definition of the rule.
+        isSuppressed: (finding) => addressedKeys.has(dedupeKey(finding))
+          && (finding.decision ?? "new") !== "addressed",
       });
     } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the

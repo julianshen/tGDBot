@@ -177,6 +177,22 @@ describe("checkStructuralClaim — what counts as a reference", () => {
       .resolves.toMatchObject({ status: "lexical-matches" });
   });
 
+  // Codex review, round 12. A finding's path is reviewer output, which
+  // `normalizeUnknownFinding` accepts as any string, while the scan reports
+  // `path.relative` output. An equivalent spelling like `./src/retry.ts` did
+  // not match, so the symbol's OWN declaration was published as an external
+  // lexical match even with nothing else in the repository using the name.
+  it("treats an equivalently spelled finding path as the same file", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\nexport const local = budget(1);\n",
+    });
+
+    for (const spelling of ["src/retry.ts", "./src/retry.ts", "src//retry.ts", "/src/retry.ts"]) {
+      await expect(checkStructuralClaim(claim, { baseRoot: root, findingFile: spelling }))
+        .resolves.toMatchObject({ status: "not-checked" });
+    }
+  });
+
   // Codex review, round 1. `findingFile` is a HEAD path; when the PR renames the
   // file, the base tree holds the same code under the old name — so the
   // symbol's own declaration looked like a reference from another file and the
@@ -666,6 +682,34 @@ describe("runStructuralChecks", () => {
     expect(output[2]?.hostCheck).toMatchObject({ status: "lexical-matches" });
     expect(output[0]?.hostCheck).toBeUndefined();
     expect(output[1]?.hostCheck).toBeUndefined();
+  });
+
+  // Codex review, round 12. `orchestrate` also drops an ACTIONABLE finding whose
+  // dedup key matches an `addressed` one. Its own decision looks publishable,
+  // so the round-6 filter let it through and it could spend the whole budget on
+  // a result no reader sees. The rule belongs to the orchestrator, so it is
+  // injected rather than reimplemented here.
+  it("skips a finding the orchestrator will suppress", async () => {
+    const checked: string[] = [];
+    const output = await runStructuralChecks({
+      findings: [
+        finding({ claim, file: "src/suppressed.ts", severity: "blocking" }),
+        finding({ claim, file: "src/published.ts", severity: "suggestion" }),
+      ],
+      baseRoot: root,
+      claimBudget: 1,
+      isSuppressed: (candidate) => candidate.file === "src/suppressed.ts",
+      check: async (_claim, checkInput) => {
+        checked.push(checkInput.findingFile);
+        return { status: "lexical-matches", references: [{ file: "src/o.ts", line: 1 }], filesSearched: 1 };
+      },
+    });
+
+    // The suppressed one outranks it on severity, so without the predicate it
+    // would take the only slot.
+    expect(checked).toEqual(["src/published.ts"]);
+    expect(output[1]?.hostCheck).toMatchObject({ status: "lexical-matches" });
+    expect(output[0]?.hostCheck).toBeUndefined();
   });
 
   // A disputed finding DOES reach a reader, through its own summary section.

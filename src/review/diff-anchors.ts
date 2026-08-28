@@ -224,12 +224,17 @@ export function changedFilesWithRenameSources(diff: string): string[] {
 export function renameSourcesByHeadPath(diff: string): Map<string, string> {
   const renames = new Map<string, string>();
   let pending: { readonly a: string; readonly b: string } | undefined;
+  let from: string | undefined;
+
   for (const line of diff.split("\n")) {
     const header = parseDiffGitHeader(line);
     if (header !== undefined) {
       pending = header.a && header.b && header.a !== header.b ? header : undefined;
+      from = undefined;
       continue;
     }
+    if (pending === undefined) continue;
+
     // Differing paths are NOT enough. A COPY diff also has two paths, and
     // treating the source as "this file at the base commit" excludes the
     // original — still present, still referencing the symbol — from external
@@ -240,9 +245,30 @@ export function renameSourcesByHeadPath(diff: string): Map<string, string> {
     // Safe on the oversized-diff path too: `reconstructDiffFromFiles` emits
     // `rename`/`copy` metadata from GitHub's own file status, so a real rename
     // is still recognised there.
-    if (pending !== undefined && line.startsWith("rename from ")) {
-      renames.set(pending.b, pending.a);
+    if (line.startsWith("rename from ")) {
+      from = line.slice("rename from ".length);
+      continue;
+    }
+    if (line.startsWith("rename to ")) {
+      const to = line.slice("rename to ".length);
+      // The ENDPOINTS come from the metadata, not the header, because the
+      // header is genuinely ambiguous for a legal path containing ` b/`.
+      // `git diff` writes a rename to `foo b/bar.ts` as
+      // `diff --git a/old.ts b/foo b/bar.ts` — verified against git — and a
+      // greedy split yields `bar.ts` as the head path. The mapping then does
+      // not match the finding's file, and the base file's OWN declaration is
+      // published as an external match: a false accusation (Codex, round 12).
+      //
+      // Each metadata line holds exactly one path to end of line, so it cannot
+      // be misread the same way. The one case it does not cover is a path git
+      // C-quotes (non-ASCII, a quote, a backslash) — there the header operands
+      // are already parsed correctly by `parseDiffGitHeader`, which handles
+      // quoting, so fall back to them rather than mis-unquoting here.
+      const quoted = from?.startsWith('"') === true || to.startsWith('"');
+      if (from !== undefined && !quoted && from !== to) renames.set(to, from);
+      else if (quoted) renames.set(pending.b, pending.a);
       pending = undefined;
+      from = undefined;
     }
   }
   return renames;

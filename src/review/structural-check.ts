@@ -211,6 +211,27 @@ function toPosix(value: string): string {
 }
 
 /**
+ * One canonical repo-relative spelling, so two names for one file compare equal.
+ *
+ * The scan reports `path.relative(baseRoot, file)` — always `src/a.ts`. A
+ * finding's path comes from reviewer output, which `normalizeUnknownFinding`
+ * accepts as any string, so an equivalent spelling like `./src/a.ts` or
+ * `src//a.ts` reached the comparison unchanged and did not match. The symbol's
+ * OWN declaration was then published as an external lexical match, even with
+ * nothing else in the repository using the name — a false accusation produced
+ * by a cosmetic difference (Codex review, round 12).
+ *
+ * Leading `./` and `/` are stripped after normalising, so an absolute or
+ * dot-relative spelling of a repo-relative path lands on the same key. A path
+ * that escapes the root (`../x`) is left as-is: it matches nothing the scan can
+ * report, which is the correct outcome rather than a silent reinterpretation.
+ */
+function canonicalRelative(value: string): string {
+  const normalized = path.posix.normalize(toPosix(value));
+  return normalized.replace(/^\.\//u, "").replace(/^\/+/u, "");
+}
+
+/**
  * Every source file under `root` this check knows how to parse, and whether the
  * walk stopped early.
  *
@@ -330,8 +351,8 @@ export async function checkStructuralClaim(
   }
 
   const ownFiles = new Set([
-    toPosix(input.findingFile),
-    ...(input.findingFileAtBase === undefined ? [] : [toPosix(input.findingFileAtBase)]),
+    canonicalRelative(input.findingFile),
+    ...(input.findingFileAtBase === undefined ? [] : [canonicalRelative(input.findingFileAtBase)]),
   ]);
   const references: SymbolReference[] = [];
   let filesSearched = 0;
@@ -365,7 +386,7 @@ export async function checkStructuralClaim(
     }
     filesSearched += 1;
 
-    const relative = toPosix(path.relative(input.baseRoot, file));
+    const relative = canonicalRelative(path.relative(input.baseRoot, file));
     for (const kind of kinds) {
       for (const node of root.findAll({ rule: { kind } })) {
         if (node.text() !== claim.symbol) continue;
@@ -559,6 +580,18 @@ export interface RunStructuralChecksInput {
    */
   readonly removedLinesByFile?: ReadonlyMap<string, RemovedLines>;
   readonly check?: typeof checkStructuralClaim;
+  /**
+   * Findings the orchestrator will drop even though their own decision looks
+   * publishable — today, an actionable copy of an `addressed` finding.
+   *
+   * INJECTED rather than recomputed, because the rule belongs to `orchestrate`:
+   * it suppresses a `new` finding whose dedup key matches an `addressed` one,
+   * and a second definition here would be free to drift from it. Without this,
+   * ten suppressed higher-severity copies could spend the whole claim budget
+   * and leave a finding that IS published unchecked — the round-6 starvation
+   * bug through the one route that filter did not cover (Codex, round 12).
+   */
+  readonly isSuppressed?: (finding: Finding) => boolean;
   /** Wall-clock budget shared by every check in this review. */
   readonly reviewTimeBudgetMs?: number;
   /** Injectable clock, so the shared deadline is testable without waiting. */
@@ -587,7 +620,9 @@ export async function runStructuralChecks(
 
   const claimed = input.findings
     .map((finding, index) => ({ finding, index }))
-    .filter((entry) => entry.finding.claim !== undefined && reachesAReader(entry.finding))
+    .filter((entry) => entry.finding.claim !== undefined
+      && reachesAReader(entry.finding)
+      && !(input.isSuppressed?.(entry.finding) ?? false))
     .sort((left, right) => {
       const bySeverity = (SEVERITY_ORDER[left.finding.severity] ?? 3)
         - (SEVERITY_ORDER[right.finding.severity] ?? 3);
@@ -618,7 +653,7 @@ export async function runStructuralChecks(
   for (const entry of claimed) {
     const claim = entry.finding.claim;
     if (claim === undefined) continue;
-    const key = claimKey(entry.finding.file, claim);
+    const key = claimKey(canonicalRelative(entry.finding.file), claim);
     const shared = byClaim.get(key);
     if (shared !== undefined) {
       checks.set(entry.index, shared);
@@ -640,7 +675,9 @@ export async function runStructuralChecks(
       continue;
     }
     try {
-      const findingFileAtBase = input.renamedFrom?.get(entry.finding.file);
+      // Canonical on BOTH sides: the map is keyed by diff paths, and a
+      // finding's path is reviewer output that may be spelled differently.
+      const findingFileAtBase = input.renamedFrom?.get(canonicalRelative(entry.finding.file));
       const result = await check(claim, {
         baseRoot: input.baseRoot,
         findingFile: entry.finding.file,

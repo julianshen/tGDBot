@@ -805,6 +805,41 @@ describe("removedLinesByFile", () => {
     expect(removed.has("src/original.ts")).toBe(false);
   });
 
+  // Codex review, round 12. A path may legally contain ` b/`, and git does NOT
+  // quote it — verified against git, which writes a rename to `foo b/bar.ts` as
+  // `diff --git a/old.ts b/foo b/bar.ts`. A greedy split yields `bar.ts` as the
+  // head path, so the mapping never matches the finding's file and the base
+  // file's own declaration is published as an external match.
+  it("takes rename endpoints from the metadata, not the ambiguous header", () => {
+    const diff = [
+      "diff --git a/src/old.ts b/src/foo b/bar.ts",
+      "similarity index 100%",
+      "rename from src/old.ts",
+      "rename to src/foo b/bar.ts",
+    ].join("\n");
+
+    const renames = renameSourcesByHeadPath(diff);
+
+    expect(renames.get("src/foo b/bar.ts")).toBe("src/old.ts");
+    expect(renames.has("bar.ts")).toBe(false);
+  });
+
+  // A C-quoted path is the one case the metadata lines cannot be read verbatim,
+  // and it is exactly the case `parseDiffGitHeader` already handles — so the
+  // header operands stay the source of truth there.
+  it("falls back to the header operands for a quoted rename", () => {
+    const diff = [
+      'diff --git a/src/old.ts "b/src/caf\\303\\251.ts"',
+      "rename from src/old.ts",
+      'rename to "src/caf\\303\\251.ts"',
+    ].join("\n");
+
+    const renames = renameSourcesByHeadPath(diff);
+
+    expect([...renames.values()]).toEqual(["src/old.ts"]);
+    expect([...renames.keys()][0]).toContain("caf");
+  });
+
   // The rename case still works, and now rests on the metadata rather than on
   // the paths merely differing.
   it("requires rename metadata, not just differing paths", () => {
