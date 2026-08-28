@@ -279,6 +279,17 @@ export interface PreparedFindingInput {
 export type JournalKind = "events" | "memories" | "findings" | "outcomes";
 
 /**
+ * The journals `readAuditPage` can actually traverse.
+ *
+ * NOT `JournalKind`. `outcomes` is a sidecar with its own head, unreachable
+ * from the journal head the audit reader walks — so accepting it type-checked
+ * and then threw, and a caller had no way to know which kinds were real
+ * (PR #74 review). Calibration reporting is the slice that will need to read
+ * outcomes; this widens when that lands, rather than promising it now.
+ */
+export type AuditJournalKind = Exclude<JournalKind, "outcomes">;
+
+/**
  * How a verification ended, mirroring the reconsider action's own vocabulary.
  *
  * Reusing those three words is deliberate: verification IS the reconsider path

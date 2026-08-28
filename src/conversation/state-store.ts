@@ -39,6 +39,7 @@ import {
   type ConversationTransactionIntent,
   type FindingLedgerEntry,
   type JournalFileReference,
+  type AuditJournalKind,
   type JournalKind,
   type MemoryCreateEntry,
   type MemoryEntry,
@@ -108,7 +109,7 @@ export interface ConversationStateStore {
   readFindingOutcomes(): Promise<readonly FindingOutcomeEntry[]>;
   readonly repositoryBinding: Readonly<RepositoryBinding>;
   readContextSnapshot(): Promise<ConversationContextSnapshot>;
-  readAuditPage(journal: JournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{
+  readAuditPage(journal: AuditJournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{
     readonly entries: readonly unknown[];
     readonly nextCursor: ConversationAuditCursor | null;
   }>;
@@ -1308,7 +1309,7 @@ class FileConversationStateStore implements ConversationStateStore {
     });
   }
 
-  async readAuditPage(journal: JournalKind, cursor: ConversationAuditCursor | null = null, limit = 100): Promise<{
+  async readAuditPage(journal: AuditJournalKind, cursor: ConversationAuditCursor | null = null, limit = 100): Promise<{
     readonly entries: readonly unknown[]; readonly nextCursor: ConversationAuditCursor | null;
   }> {
     if (!["events", "memories", "findings"].includes(journal) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
@@ -1321,9 +1322,7 @@ class FileConversationStateStore implements ConversationStateStore {
       if (cursor !== null && (!Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || cursor.offset >= 100)) {
         throw new Error("Conversation audit cursor offset is invalid");
       }
-      // `outcomes` is a sidecar and is not reachable from this head, which is
-      // why the guard above excludes it from the audit journals.
-      const reference = cursor?.manifest ?? head[journal as "events" | "memories" | "findings"];
+      const reference = cursor?.manifest ?? head[journal];
       if (reference === null) return { entries: [], nextCursor: null };
       const manifestPath = this.targetPath(reference.target);
       const manifestContents = await this.readOptional(manifestPath, parentIdentity, 64 * 1024);
