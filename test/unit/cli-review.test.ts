@@ -223,6 +223,11 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",
+    // Off, matching the CLI default. `structuralChecks` is REQUIRED on
+    // `SharedReviewOptions`, so omitting it made this factory stop satisfying
+    // its own declared return type — invisibly, because this file is not in
+    // the type-test program (CodeRabbit review).
+    structuralChecks: "off",
     // Off by default in this harness: mapping is the one review step that
     // needs a real git mirror and a model session, and no test here is about
     // that. `contextFingerprint` returns undefined for "off", so every config

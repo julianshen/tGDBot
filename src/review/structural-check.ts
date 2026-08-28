@@ -407,6 +407,38 @@ export function describeCheck(
 export const DEFAULT_CLAIM_BUDGET = 10;
 
 /**
+ * The most wall-clock time ALL of a review's checks may take, together.
+ *
+ * `DEFAULT_TIME_BUDGET_MS` bounds one check, and was being restarted for each
+ * claim — so the advertised 10 seconds was really 10 seconds times the claim
+ * budget, up to about 100 (CodeRabbit review). Each claim re-walks and
+ * re-parses the whole base tree, so that is a real cost, and it arrives on a
+ * feature whose entire pitch is that it is bounded.
+ *
+ * The shared deadline is what makes the number honest. A claim that finds the
+ * budget already spent is `not-checked` with a reason, which costs coverage
+ * and cannot cost correctness — the same trade as every other bound here.
+ */
+export const DEFAULT_REVIEW_TIME_BUDGET_MS = 30_000;
+
+/**
+ * Decisions whose findings can still reach a reader.
+ *
+ * `orchestrate` publishes the actionable findings plus the disputed ones, and
+ * drops `addressed` and `needs-clarification` entirely. Checking those spends
+ * a full tree walk — and a slot in a budget of ten — on a result nobody will
+ * ever see, and can push a finding that IS published into `not-checked`
+ * (Codex review, round 6).
+ *
+ * `disputed` is deliberately included: those findings do reach a reader,
+ * through their own summary section.
+ */
+function reachesAReader(finding: Finding): boolean {
+  const decision = finding.decision ?? "new";
+  return decision === "new" || decision === "still-valid" || decision === "disputed";
+}
+
+/**
  * Drops occurrences the diff may already have deleted, and reports what is left.
  *
  * Per file and on a word boundary: an occurrence only becomes doubtful when the
@@ -465,6 +497,10 @@ export interface RunStructuralChecksInput {
    */
   readonly removedLinesByFile?: ReadonlyMap<string, string>;
   readonly check?: typeof checkStructuralClaim;
+  /** Wall-clock budget shared by every check in this review. */
+  readonly reviewTimeBudgetMs?: number;
+  /** Injectable clock, so the shared deadline is testable without waiting. */
+  readonly now?: () => number;
 }
 
 /**
@@ -483,10 +519,13 @@ export async function runStructuralChecks(
 ): Promise<Finding[]> {
   const check = input.check ?? checkStructuralClaim;
   const budget = input.claimBudget ?? DEFAULT_CLAIM_BUDGET;
+  const now = input.now ?? (() => Date.now());
+  const startedAt = now();
+  const reviewBudgetMs = input.reviewTimeBudgetMs ?? DEFAULT_REVIEW_TIME_BUDGET_MS;
 
   const claimed = input.findings
     .map((finding, index) => ({ finding, index }))
-    .filter((entry) => entry.finding.claim !== undefined)
+    .filter((entry) => entry.finding.claim !== undefined && reachesAReader(entry.finding))
     .sort((left, right) => {
       const bySeverity = (SEVERITY_ORDER[left.finding.severity] ?? 3)
         - (SEVERITY_ORDER[right.finding.severity] ?? 3);
@@ -505,21 +544,35 @@ export async function runStructuralChecks(
       });
       continue;
     }
+    const remainingMs = reviewBudgetMs - (now() - startedAt);
+    if (remainingMs <= 0) {
+      checks.set(entry.index, {
+        status: "not-checked",
+        reason: `this review's ${reviewBudgetMs}ms budget for structural checks was already spent`,
+      });
+      continue;
+    }
     try {
       const findingFileAtBase = input.renamedFrom?.get(entry.finding.file);
       const result = await check(claim, {
         baseRoot: input.baseRoot,
         findingFile: entry.finding.file,
         ...(findingFileAtBase === undefined ? {} : { findingFileAtBase }),
+      }, {
+        // Never more than what the review has left, so the per-check bound
+        // cannot multiply itself by the claim budget.
+        timeBudgetMs: Math.min(DEFAULT_TIME_BUDGET_MS, remainingMs),
+        now,
       });
       // The base/head reconciliation lives here because this is the only layer
       // that can see the diff; `checkStructuralClaim` knows one tree.
       checks.set(entry.index, reconcileWithDiff(claim, result, input.removedLinesByFile));
-    } catch (error) {
-      checks.set(entry.index, {
-        status: "not-checked",
-        reason: `the check failed: ${error instanceof Error ? error.message : String(error)}`,
-      });
+    } catch {
+      // HOST-AUTHORED, not the caught error, for the same reason the worktree
+      // failure in `cli.ts` is: this reason is rendered into a review comment,
+      // which is world-readable on a public repository, and a filesystem error
+      // quotes the absolute path it failed on.
+      checks.set(entry.index, { status: "not-checked", reason: "the check failed" });
     }
   }
 

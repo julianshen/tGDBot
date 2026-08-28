@@ -372,8 +372,12 @@ describe("runStructuralChecks", () => {
       check: () => Promise.reject(new Error("napi exploded")),
     });
 
+    // The reason is HOST-AUTHORED: it used to carry the caught error's text,
+    // which is world-readable once published and would quote whatever absolute
+    // path a filesystem failure named. The raw error is a stderr concern.
     expect(output[0]?.hostCheck).toMatchObject({ status: "not-checked" });
-    expect((output[0]?.hostCheck as { reason: string }).reason).toContain("napi exploded");
+    expect((output[0]?.hostCheck as { reason: string }).reason).not.toContain("napi exploded");
+    expect((output[0]?.hostCheck as { reason: string }).reason).toBe("the check failed");
   });
 
   it("passes a renamed finding's base-side path to the check", async () => {
@@ -476,5 +480,89 @@ describe("runStructuralChecks", () => {
     expect(output[1]?.hostCheck).toMatchObject({ status: "lexical-matches" });
     expect(output[0]?.hostCheck).toMatchObject({ status: "not-checked" });
     expect((output[0]?.hostCheck as { reason: string }).reason).toMatch(/limit of 1/);
+  });
+
+  // Codex review, round 6. `orchestrate` drops `addressed` and
+  // `needs-clarification` findings entirely, so checking them spends a full
+  // tree walk AND a slot in a budget of ten on a result nobody will ever see —
+  // and can push a finding that IS published into `not-checked`.
+  it("spends the budget only on findings that can reach a reader", async () => {
+    const checked: string[] = [];
+    const output = await runStructuralChecks({
+      findings: [
+        finding({ claim, file: "src/addressed.ts", severity: "blocking", decision: "addressed" }),
+        finding({ claim, file: "src/asked.ts", severity: "blocking", decision: "needs-clarification" }),
+        finding({ claim, file: "src/published.ts", severity: "suggestion" }),
+      ],
+      baseRoot: root,
+      claimBudget: 1,
+      check: async (_claim, input) => {
+        checked.push(input.findingFile);
+        return { status: "lexical-matches", references: [{ file: "src/o.ts", line: 1 }], filesSearched: 1 };
+      },
+    });
+
+    // Both unpublishable findings outrank the published one on severity, so
+    // without the filter they would take the single slot between them.
+    expect(checked).toEqual(["src/published.ts"]);
+    expect(output[2]?.hostCheck).toMatchObject({ status: "lexical-matches" });
+    expect(output[0]?.hostCheck).toBeUndefined();
+    expect(output[1]?.hostCheck).toBeUndefined();
+  });
+
+  // A disputed finding DOES reach a reader, through its own summary section.
+  it("still checks a disputed finding", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim, decision: "disputed" })],
+      baseRoot: root,
+      check: stub({ status: "lexical-matches", references: [{ file: "src/o.ts", line: 1 }], filesSearched: 1 }),
+    });
+
+    expect(output[0]?.hostCheck).toMatchObject({ status: "lexical-matches" });
+  });
+
+  // CodeRabbit review: the per-check time budget was restarted for every claim,
+  // so the advertised 10s bound was really 10s x the claim budget. Each claim
+  // re-walks the whole base tree, so that is real wall-clock time on a feature
+  // whose pitch is that it is bounded.
+  it("shares one wall-clock budget across every claim in the review", async () => {
+    let clock = 0;
+    const checked: string[] = [];
+    const output = await runStructuralChecks({
+      findings: [
+        finding({ claim, file: "src/a.ts", severity: "blocking" }),
+        finding({ claim, file: "src/b.ts", severity: "warning" }),
+        finding({ claim, file: "src/c.ts", severity: "suggestion" }),
+      ],
+      baseRoot: root,
+      reviewTimeBudgetMs: 100,
+      now: () => clock,
+      check: async (_claim, input) => {
+        checked.push(input.findingFile);
+        clock += 60; // Each check eats more than half the review's budget.
+        return { status: "lexical-matches", references: [{ file: "src/o.ts", line: 1 }], filesSearched: 1 };
+      },
+    });
+
+    // Two fit; the third finds the shared budget spent and is told so.
+    expect(checked).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(output[2]?.hostCheck).toMatchObject({ status: "not-checked" });
+    expect((output[2]?.hostCheck as { reason: string }).reason).toMatch(/budget for structural checks/);
+  });
+
+  // The reason is rendered into a world-readable comment, and a filesystem
+  // error quotes the absolute path it failed on.
+  it("never publishes the raw error when a check throws", async () => {
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      check: async () => {
+        throw new Error("EACCES: permission denied, open '/home/runner/.cache/tgd/base/x.ts'");
+      },
+    });
+
+    const reason = (output[0]?.hostCheck as { reason: string }).reason;
+    expect(reason).not.toContain("/home/runner");
+    expect(reason).toBe("the check failed");
   });
 });
