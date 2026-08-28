@@ -19,7 +19,12 @@ import {
   validateCursorSnapshot,
   validateEventEntries,
   validateEventEntry,
+  emptyOutcomeHead,
+  MAX_OUTCOME_CHECKPOINT,
   validateFindingEntries,
+  validateFindingOutcomeEntries,
+  validateOutcomeHead,
+  type ConversationOutcomeHead,
   validateJournalHead,
   validateJournalManifestNode,
   validateMemoryEntries,
@@ -44,6 +49,7 @@ import {
   type MemoryIndexSummary,
   type FindingIndexSummary,
 } from "./state-schema.js";
+import type { FindingOutcomeEntry } from "./state-schema.js";
 import type { RepositoryBinding } from "./types.js";
 import {
   createDefaultProcessInspector,
@@ -79,6 +85,14 @@ export interface ConversationStateTransaction {
   appendEvent(entry: ConversationEventEntry): void;
   appendMemory(entry: MemoryEntry): void;
   appendFinding(entry: FindingLedgerEntry): void;
+  /**
+   * Records what became of one finding (#57).
+   *
+   * In the SAME transaction as the action record that posted the reply, so a
+   * crash between the two cannot leave a reply posted with no outcome — which
+   * would make the next poll verify and reply again.
+   */
+  appendOutcome(entry: FindingOutcomeEntry): void;
   replaceCursor(snapshot: ConversationCursorSnapshot): void;
   replacePending(snapshot: ConversationPendingSnapshot): void;
 }
@@ -1112,7 +1126,10 @@ class FileConversationStateStore implements ConversationStateStore {
     let committed = false;
     try {
       for (const replacement of sorted) {
-        if (!new Set(["cursor.json", "pending.json", "journal-head.json"]).has(replacement.target) &&
+        // Head files are REPLACED; journal segments and manifests are
+        // immutable and content-addressed. The outcome sidecar is a head, so it
+        // belongs in the first group (#57).
+        if (!new Set(["cursor.json", "pending.json", "journal-head.json", "outcomes-head.json"]).has(replacement.target) &&
           await this.pathExists(replacement.targetPath)) {
           throw new Error(`Immutable conversation journal target already exists: ${replacement.target}`);
         }
@@ -1220,6 +1237,27 @@ class FileConversationStateStore implements ConversationStateStore {
     return found.get(identity.actionId);
   }
 
+  /**
+   * The outcome head, or an empty one when the sidecar does not exist yet.
+   *
+   * A missing file is the normal state for every repository that has not
+   * verified a finding, so it is an answer rather than an error.
+   */
+  private async readOutcomeHead(parentIdentity: unknown): Promise<ConversationOutcomeHead> {
+    const contents = await this.readOptional(this.paths.outcomeHeadPath, parentIdentity as never);
+    return contents === undefined
+      ? emptyOutcomeHead(this.binding)
+      : validateOutcomeHead(parseJson(contents, this.paths.outcomeHeadPath), this.binding);
+  }
+
+  /** Every outcome the head keeps inline, for the per-head idempotency check. */
+  async readFindingOutcomes(): Promise<readonly FindingOutcomeEntry[]> {
+    return this.withLock(async (parentIdentity) => {
+      const head = await this.readOutcomeHead(parentIdentity);
+      return head.checkpoint.map((entry) => clone(entry));
+    });
+  }
+
   async findTerminalActionById(actionId: string): Promise<TerminalActionSummary | undefined> {
     return this.withLock(async (parentIdentity) => {
       const loaded = await this.loadState(parentIdentity);
@@ -1275,7 +1313,9 @@ class FileConversationStateStore implements ConversationStateStore {
       if (cursor !== null && (!Number.isSafeInteger(cursor.offset) || cursor.offset < 0 || cursor.offset >= 100)) {
         throw new Error("Conversation audit cursor offset is invalid");
       }
-      const reference = cursor?.manifest ?? head[journal];
+      // `outcomes` is a sidecar and is not reachable from this head, which is
+      // why the guard above excludes it from the audit journals.
+      const reference = cursor?.manifest ?? head[journal as "events" | "memories" | "findings"];
       if (reference === null) return { entries: [], nextCursor: null };
       const manifestPath = this.targetPath(reference.target);
       const manifestContents = await this.readOptional(manifestPath, parentIdentity, 64 * 1024);
@@ -1349,6 +1389,7 @@ class FileConversationStateStore implements ConversationStateStore {
       const addedEvents: ConversationEventEntry[] = [];
       const addedMemories: MemoryEntry[] = [];
       const addedFindings: FindingLedgerEntry[] = [];
+      const addedOutcomes: FindingOutcomeEntry[] = [];
       let initialized = loaded.cursorExists && loaded.pendingExists;
 
       const tx: ConversationStateTransaction = {
@@ -1379,6 +1420,11 @@ class FileConversationStateStore implements ConversationStateStore {
           const validated = validateFindingEntries(candidate, this.binding, candidate.length);
           addedFindings.push(validated[validated.length - 1]!);
         },
+        appendOutcome: (entry) => {
+          const candidate = [...addedOutcomes, entry];
+          const validated = validateFindingOutcomeEntries(candidate, this.binding, candidate.length);
+          addedOutcomes.push(validated[validated.length - 1]!);
+        },
         replaceCursor: (value) => { cursor = validateCursorSnapshot(value, this.binding); writeCursor = true; },
         replacePending: (value) => { pending = validatePendingSnapshot(value, this.binding); writePending = true; },
       };
@@ -1397,6 +1443,11 @@ class FileConversationStateStore implements ConversationStateStore {
       const findings = validateFindingEntries(findingCandidates, this.binding, findingCandidates.length);
       cursor = validateCursorSnapshot(cursor, this.binding);
       pending = validatePendingSnapshot(pending, this.binding);
+      // Read only when something was appended: an ordinary transaction never
+      // opens the sidecar, so the cost of the feature is zero when unused.
+      const loadedOutcomeHead = addedOutcomes.length === 0
+        ? emptyOutcomeHead(this.binding)
+        : await this.readOutcomeHead(parentIdentity);
       const transactionId = this.randomId();
       const replacements: PreparedReplacement[] = [];
       if (writeCursor) replacements.push(this.replacement("cursor.json", serializeSnapshot(cursor), transactionId));
@@ -1408,6 +1459,20 @@ class FileConversationStateStore implements ConversationStateStore {
       }
       if (addedFindings.length > 0) {
         findingsHead = this.stageJournal("findings", addedFindings, findingsHead, transactionId, replacements);
+      }
+      if (addedOutcomes.length > 0) {
+        // Its own head file, staged in the SAME replacement set, so the outcome
+        // and the action that produced it land together or not at all.
+        const outcomeHead = this.stageJournal(
+          "outcomes", addedOutcomes, loadedOutcomeHead.outcomes, transactionId, replacements,
+        );
+        const checkpoint = [...loadedOutcomeHead.checkpoint, ...addedOutcomes]
+          .slice(-MAX_OUTCOME_CHECKPOINT);
+        replacements.push(this.replacement(
+          "outcomes-head.json",
+          serializeSnapshot({ version: 1, repository: this.binding, outcomes: outcomeHead, checkpoint }),
+          transactionId,
+        ));
       }
       if (addedMemories.length > 0) {
         memoriesHead = this.stageJournal("memories", addedMemories, memoriesHead, transactionId, replacements);

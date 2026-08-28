@@ -846,3 +846,105 @@ describe("conversation state store", () => {
     await expect(observed.readAuditPage("findings", newest.nextCursor, 1)).rejects.toThrow(/audit|segment|corrupt/i);
   });
 });
+
+// Issue #57: outcome records live in a SIDECAR — their own head file, written
+// in the same transaction as the action that produced them, and never
+// mentioned in `journal-head.json`. Adding a key there let a new reader open an
+// old head and did nothing for the reverse: an older installed CLI would reject
+// the unknown key and fail every state load (PR #73 review).
+describe("finding outcomes", () => {
+  const outcome = (binding: { provider: "github" | "gitlab"; repositoryDigest: string }, index: number) => ({
+    version: 1 as const,
+    repository: binding,
+    id: `outcome_${index.toString(16).padStart(32, "0")}`,
+    findingId: `finding_${index.toString(16).padStart(32, "0")}`,
+    reviewNumber: 1,
+    headSha: "b".repeat(40),
+    ruleDigest: "d".repeat(64),
+    categoryDigest: "e".repeat(64),
+    severity: "warning" as const,
+    verdict: "confirmed" as const,
+    trigger: "thread-comment" as const,
+    anchorChanged: false,
+    at: "2026-08-28T00:00:00.000Z",
+  });
+
+  test("round-trips an outcome through its own head file", async () => {
+    const stateRoot = await root();
+    const paths = deriveConversationStatePaths(stateRoot, repo);
+    const store = createStore({ root: stateRoot, repository: repo });
+    const binding = store.repositoryBinding;
+
+    await store.transact((tx) => {
+      tx.initializeIfAbsent();
+      tx.appendOutcome(outcome(binding, 1));
+    });
+
+    const stored = await store.readFindingOutcomes();
+    expect(stored).toHaveLength(1);
+    expect(stored[0]?.findingId).toBe(`finding_${"1".padStart(32, "0")}`);
+    // In the sidecar, and nowhere near the main head — which this transaction
+    // does not even write, since no ordinary journal changed.
+    expect(JSON.parse(await readFile(paths.outcomeHeadPath, "utf8"))).toMatchObject({ version: 1 });
+    expect((await readdir(paths.repositoryRoot))).toContain("outcomes-head.json");
+  });
+
+  test("reads as empty before anything is recorded", async () => {
+    const stateRoot = await root();
+    const store = createStore({ root: stateRoot, repository: repo });
+    await store.transact((tx) => { tx.initializeIfAbsent(); });
+
+    expect(await store.readFindingOutcomes()).toEqual([]);
+  });
+
+  // An ordinary transaction must not pay for a feature it does not use.
+  test("writes no sidecar when nothing was recorded", async () => {
+    const stateRoot = await root();
+    const paths = deriveConversationStatePaths(stateRoot, repo);
+    const store = createStore({ root: stateRoot, repository: repo });
+
+    await store.transact((tx) => { tx.initializeIfAbsent(); });
+
+    expect((await readdir(paths.repositoryRoot))).not.toContain("outcomes-head.json");
+  });
+
+  test("accumulates across transactions", async () => {
+    const stateRoot = await root();
+    const store = createStore({ root: stateRoot, repository: repo });
+    const binding = store.repositoryBinding;
+    await store.transact((tx) => { tx.initializeIfAbsent(); tx.appendOutcome(outcome(binding, 1)); });
+    await store.transact((tx) => { tx.appendOutcome(outcome(binding, 2)); });
+
+    expect((await store.readFindingOutcomes()).map((entry) => entry.id)).toEqual([
+      `outcome_${"1".padStart(32, "0")}`,
+      `outcome_${"2".padStart(32, "0")}`,
+    ]);
+  });
+
+  // The whole point of writing it in the same transaction: a reply posted with
+  // no outcome would be verified and replied to again on the next poll.
+  test("lands with the action record, not separately", async () => {
+    const stateRoot = await root();
+    const store = createStore({ root: stateRoot, repository: repo });
+    const binding = store.repositoryBinding;
+
+    await expect(store.transact((tx) => {
+      tx.initializeIfAbsent();
+      tx.appendOutcome(outcome(binding, 1));
+      throw new Error("the transaction failed after appending");
+    })).rejects.toThrow(/failed after appending/);
+
+    expect(await store.readFindingOutcomes()).toEqual([]);
+  });
+
+  test("refuses a record bound to another repository", async () => {
+    const stateRoot = await root();
+    const store = createStore({ root: stateRoot, repository: repo });
+    const binding = store.repositoryBinding;
+
+    await expect(store.transact((tx) => {
+      tx.initializeIfAbsent();
+      tx.appendOutcome({ ...outcome(binding, 1), repository: { ...binding, repositoryDigest: "f".repeat(64) } });
+    })).rejects.toThrow();
+  });
+});

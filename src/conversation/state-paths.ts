@@ -25,6 +25,13 @@ export interface ConversationStatePaths {
   readonly transactionIntentPath: string;
   readonly transactionRetiredPath: string;
   readonly journalHeadPath: string;
+  /**
+   * The outcome journal's head, beside the main one rather than in it.
+   *
+   * A file older readers never open, so a repository written by a newer CLI
+   * still loads under an older one (#57 / PR #73 review).
+   */
+  readonly outcomeHeadPath: string;
 }
 
 export interface ConversationPathFileSystem {
@@ -166,9 +173,11 @@ export function deriveConversationStatePaths(
     transactionIntentPath: implementation.join(repositoryRoot, ".conversation-transaction.json"),
     transactionRetiredPath: implementation.join(repositoryRoot, ".conversation-transaction.retired.json"),
     journalHeadPath: implementation.join(repositoryRoot, "journal-head.json"),
+    outcomeHeadPath: implementation.join(repositoryRoot, "outcomes-head.json"),
   };
   for (const candidate of [result.cursorPath, result.eventsPath, result.memoriesPath, result.findingsPath,
-    result.pendingPath, result.lockPath, result.transactionIntentPath, result.transactionRetiredPath, result.journalHeadPath]) {
+    result.pendingPath, result.lockPath, result.transactionIntentPath, result.transactionRetiredPath,
+    result.journalHeadPath, result.outcomeHeadPath]) {
     assertInside(repositoryRoot, candidate, implementation);
   }
   const rootRelative = implementation.relative(resolvedRoot, repositoryRoot);

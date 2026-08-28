@@ -269,7 +269,14 @@ export interface PreparedFindingInput {
   readonly at: string;
 }
 
-export type JournalKind = "events" | "memories" | "findings";
+/**
+ * `outcomes` names journal FILES; it is deliberately absent from the journal
+ * head, which keeps its own explicit key list. That separation is what makes
+ * the outcome journal a sidecar: an older reader never opens
+ * `outcomes-head.json`, so a repository written by a newer CLI still loads
+ * (PR #73 review — optional keys solved the wrong direction).
+ */
+export type JournalKind = "events" | "memories" | "findings" | "outcomes";
 
 /**
  * How a verification ended, mirroring the reconsider action's own vocabulary.
@@ -438,7 +445,8 @@ export function validateJournalManifestNode(
 ): ConversationJournalManifestNode {
   const object = exact(value, "journal manifest", ["version", "repository", "kind", "id", "segment", "previous"]);
   const repository = validateVersionAndBinding(object, expected, "journal manifest");
-  if (object.kind !== "events" && object.kind !== "memories" && object.kind !== "findings") {
+  if (object.kind !== "events" && object.kind !== "memories" && object.kind !== "findings"
+    && object.kind !== "outcomes") {
     throw new Error("journal manifest kind is invalid");
   }
   const kind = object.kind;
@@ -1342,9 +1350,12 @@ export function validateTransactionIntent(
   const repository = validateVersionAndBinding(object, expected, "transaction intent");
   const transactionId = text(object.transactionId, "transaction intent ID", 128);
   if (!/^[A-Za-z0-9_-]+$/u.test(transactionId)) throw new Error("transaction intent ID is invalid");
-  const fixedTargets = new Set(["cursor.json", "pending.json", "journal-head.json"]);
+  // `outcomes-head.json` is the sidecar (#57): its own head file, replaced in
+  // the same transaction as the action that produced the record, and never
+  // referenced from `journal-head.json`.
+  const fixedTargets = new Set(["cursor.json", "pending.json", "journal-head.json", "outcomes-head.json"]);
   const validTarget = (target: string): boolean => fixedTargets.has(target) ||
-    /^(?:events|memories|findings)\.(?:segment\.[A-Za-z0-9_-]+\.jsonl|manifest\.[A-Za-z0-9_-]+\.json)$/u.test(target) ||
+    /^(?:events|memories|findings|outcomes)\.(?:segment\.[A-Za-z0-9_-]+\.jsonl|manifest\.[A-Za-z0-9_-]+\.json)$/u.test(target) ||
     /^index\.(?:terminal-actions|memories|findings)\.node\.[A-Za-z0-9_-]+\.json$/u.test(target);
   const replacements = array(object.replacements, "transaction replacements", 1_000)
     .map((entry, index) => {
@@ -1494,4 +1505,45 @@ export function prepareFindingOutcome(input: {
     anchorChanged: input.anchorChanged,
     at: input.at,
   }], input.repository)[0]!;
+}
+
+/**
+ * The outcome journal's own head, kept beside the main one rather than in it.
+ *
+ * Deliberately a separate file. Adding a key to `journal-head.json` let a new
+ * reader open an old head and did nothing for the reverse — an older installed
+ * CLI would reject the new key and fail every state load. A file older readers
+ * never open has no such problem, and the checkpoint rewrite cannot drop a key
+ * that was never in the checkpoint.
+ */
+export interface ConversationOutcomeHead {
+  readonly version: 1;
+  readonly repository: RepositoryBinding;
+  readonly outcomes: JournalFileReference | null;
+  /** The most recent records, for the idempotency check without a full scan. */
+  readonly checkpoint: readonly FindingOutcomeEntry[];
+}
+
+/** How many recent outcomes the head keeps inline. */
+export const MAX_OUTCOME_CHECKPOINT = 500;
+
+export function emptyOutcomeHead(repository: RepositoryBinding): ConversationOutcomeHead {
+  return { version: 1, repository, outcomes: null, checkpoint: [] };
+}
+
+export function validateOutcomeHead(
+  value: unknown,
+  expected: RepositoryBinding,
+): ConversationOutcomeHead {
+  const object = exact(value, "outcome head", ["version", "repository", "outcomes", "checkpoint"]);
+  const repository = validateVersionAndBinding(object, expected, "outcome head");
+  const outcomes = object.outcomes === null
+    ? null
+    : journalReference(object.outcomes, "outcome head outcomes", "outcomes");
+  return {
+    version: 1,
+    repository,
+    outcomes,
+    checkpoint: validateFindingOutcomeEntries(object.checkpoint, expected, MAX_OUTCOME_CHECKPOINT),
+  };
 }
