@@ -908,6 +908,26 @@ describe("finding outcomes", () => {
     expect((await readdir(paths.repositoryRoot))).not.toContain("outcomes-head.json");
   });
 
+  // The sidecar is not a lesser record. Validating only its head accepted a
+  // corrupt manifest and let the next append extend the chain from it, leaving
+  // damage in a durable audit trail with nothing ever noticing.
+  test("refuses a corrupt outcome journal rather than extending it", async () => {
+    const stateRoot = await root();
+    const store = createStore({ root: stateRoot, repository: repo });
+    const binding = store.repositoryBinding;
+    const paths = deriveConversationStatePaths(stateRoot, repo);
+    await store.transact((tx) => { tx.initializeIfAbsent(); tx.appendOutcome(outcome(binding, 1)); });
+
+    const manifest = (await readdir(paths.repositoryRoot))
+      .find((name) => name.startsWith("outcomes.manifest."));
+    expect(manifest).toBeDefined();
+    await writeFile(path.join(paths.repositoryRoot, manifest!), "corrupt\n");
+
+    await expect(store.readFindingOutcomes()).rejects.toThrow(/missing|corrupt/i);
+    await expect(store.transact((tx) => { tx.appendOutcome(outcome(binding, 2)); }))
+      .rejects.toThrow(/missing|corrupt/i);
+  });
+
   test("accumulates across transactions", async () => {
     const stateRoot = await root();
     const store = createStore({ root: stateRoot, repository: repo });

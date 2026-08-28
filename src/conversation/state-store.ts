@@ -1247,9 +1247,15 @@ class FileConversationStateStore implements ConversationStateStore {
    */
   private async readOutcomeHead(parentIdentity: unknown): Promise<ConversationOutcomeHead> {
     const contents = await this.readOptional(this.paths.outcomeHeadPath, parentIdentity as never);
-    return contents === undefined
-      ? emptyOutcomeHead(this.binding)
-      : validateOutcomeHead(parseJson(contents, this.paths.outcomeHeadPath), this.binding);
+    if (contents === undefined) return emptyOutcomeHead(this.binding);
+    const head = validateOutcomeHead(parseJson(contents, this.paths.outcomeHeadPath), this.binding);
+    // The SAME check `loadState` makes for every main journal. Validating only
+    // the head accepted a corrupt manifest or segment and let the next append
+    // extend the chain from the broken reference, so the damage stayed in a
+    // durable audit trail with nothing ever noticing (PR #74 review). A sidecar
+    // is not a lesser record.
+    await this.validateCurrentJournal("outcomes", head.outcomes, parentIdentity as { dev: number; ino: number });
+    return head;
   }
 
   /** Every outcome the head keeps inline, for the per-head idempotency check. */

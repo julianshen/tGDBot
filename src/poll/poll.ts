@@ -288,14 +288,22 @@ async function classifyOpenReviewEvents(options: {
       .filter((entry) => entry.reviewNumber === review.reviewNumber)
       .map((entry) => entry.identity?.threadId)
       .filter((threadId): threadId is string => threadId !== undefined));
+    // COMMANDS ARE NOT CANDIDATES. An author who writes `explain` or
+    // `reconsider` in a finding thread is asking for one specific answer, and
+    // they get it on the command path — verifying on top of that is a second
+    // reply to one request. It also removes a contradiction that lost work: the
+    // event had to stay on the page for its command to run, which meant it
+    // could not be held back for a verification, so a deferred one was silently
+    // dropped (PR #74 review). Not being a candidate, it cannot be deferred.
     const candidateEvents = classified
-      .filter((item) => item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
+      .filter((item) => item.parsed.kind === "irrelevant" &&
+        item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
         item.event.threadId !== undefined && boundThreads.has(item.event.threadId))
       .map((item) => item.event);
     const queued = candidateEvents.length === 0
       ? { items: [], deferred: false, deferredEvents: [] } as VerificationQueue
       : await queueVerifications({
-      events: classified,
+      events: classified.filter((item) => item.parsed.kind === "irrelevant"),
       reviewNumber: review.reviewNumber,
       reviewIdentity: identity,
       budget: verificationBudget,
@@ -324,12 +332,7 @@ async function classifyOpenReviewEvents(options: {
     // command the author actually asked for.
     for (let at = classified.length - 1; at >= 0; at -= 1) {
       const item = classified[at]!;
-      if (outstanding.has(item.event.eventId) && item.parsed.kind === "irrelevant") {
-        classified.splice(at, 1);
-      } else {
-        // Still on the page, so the page is answerable for it.
-        outstanding.delete(item.event.eventId);
-      }
+      if (outstanding.has(item.event.eventId)) classified.splice(at, 1);
     }
 
     if (options.dryRun) {
@@ -457,6 +460,9 @@ async function classifyOpenReviewEvents(options: {
           identity: verification.identity,
           plan: verification.plan,
           ...(botIdentity.login === undefined ? {} : { botLogin: botIdentity.login }),
+          ...(verification.parentCommentId === undefined
+            ? {}
+            : { parentCommentId: verification.parentCommentId }),
           reviewIdentity: identity,
           options,
         });
@@ -1115,6 +1121,8 @@ async function publishReplyPlan(input: {
    * about how to disagree (PR #74 review).
    */
   readonly botLogin?: string;
+  /** Used when the triggering event has no comment of its own — see the writer. */
+  readonly parentCommentId?: string;
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
   readonly options: {
     readonly adapter: ConversationAdapter;
@@ -1181,7 +1189,8 @@ async function publishReplyPlan(input: {
       const published = await executePublication({
         store: input.options.store,
         action,
-        writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event),
+        writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event,
+          input.parentCommentId),
         now: input.options.now,
         hooks: {
           beforeFreeze: capturedHead === undefined && memoryOperation === undefined
@@ -1284,6 +1293,14 @@ function conversationWriter(
   adapter: ConversationAdapter,
   reviewIdentity: ReturnType<typeof reviewIdentityFrom>,
   event: ReviewActivityEvent,
+  /**
+   * The parent to reply under when the triggering event has no comment of its
+   * own. A `thread-resolution` event carries no `commentId` — resolving is not
+   * a comment — and both adapters REJECT a thread reply without a parent, so a
+   * resolution-triggered verification spent a model call, failed publication as
+   * transient, and was retried on every poll forever (PR #74 review).
+   */
+  fallbackParentCommentId?: string,
 ): PublicationWriter {
   return {
     async lookupChild(child) {
@@ -1311,7 +1328,9 @@ function conversationWriter(
         const identity = await adapter.postThreadReply(reviewIdentity, {
           ...input,
           threadId: child.placement.threadId,
-          ...(event.commentId === undefined ? {} : { parentCommentId: event.commentId }),
+          ...(event.commentId ?? fallbackParentCommentId) === undefined
+            ? {}
+            : { parentCommentId: (event.commentId ?? fallbackParentCommentId)! },
         });
         return { status: "posted", identity };
       }
@@ -2120,7 +2139,8 @@ async function verifyQueued(input: {
   };
 }): Promise<
   | { readonly kind: "planned"; readonly event: ReviewActivityEvent;
-      readonly identity: { actionId: string; identityDigest: string }; readonly plan: ReplyPlan }
+      readonly identity: { actionId: string; identityDigest: string }; readonly plan: ReplyPlan;
+      readonly parentCommentId?: string }
   /** Try again next poll: the event stays owed and the cursor holds. */
   | { readonly kind: "transient" }
   /**
@@ -2182,6 +2202,11 @@ async function verifyQueued(input: {
     kind: "planned",
     event: item.event,
     identity: item.identity,
+    // A resolution is not a comment, so it cannot be replied UNDER. The thread's
+    // root is the bot's own finding comment, which is where the reply belongs.
+    ...(item.event.commentId === undefined && item.thread?.rootCommentId !== undefined
+      ? { parentCommentId: item.thread.rootCommentId }
+      : {}),
     plan: {
       kind: "verification",
       verdict: result.plan.verdict,

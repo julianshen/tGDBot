@@ -584,6 +584,12 @@ class ExecutionAdapter extends ClassificationAdapter {
   }
 
   override async postThreadReply(_review: ReviewIdentity, input: ThreadReplyInput): Promise<ConversationItemIdentity> {
+    // BOTH real adapters refuse this, so a stub that accepts it hides a class
+    // of failure: a reply with no parent fails publication as transient and is
+    // retried on every poll forever.
+    if (input.parentCommentId === undefined || input.parentCommentId === "") {
+      throw new Error("thread replies require parentCommentId");
+    }
     return this.recordWrite("thread", input.body, input.threadId);
   }
 
@@ -2123,6 +2129,45 @@ describe("automatic verification", () => {
     expect(posted).toHaveLength(1);
     expect(await createConversationStateStore({ root: stateDir, repository: repo })
       .readFindingOutcomes()).toHaveLength(1);
+  });
+
+  // Resolving a thread is not a COMMENT, so the event carries no `commentId`
+  // and there is nothing to reply under. Both adapters refuse a thread reply
+  // without a parent, so this failed publication as transient and was retried
+  // on every poll forever, spending a model call each time.
+  it("replies under the thread root when a resolution triggers it", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    // Install the thread, then resolve it.
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    const resolution = {
+      kind: "thread-resolution" as const,
+      provider: "github" as const,
+      repositoryDigest,
+      reviewNumber: 1,
+      eventId: "thread-resolution:T1",
+      revisionId: "thread-resolution:T1:1",
+      orderKey: "2026-08-14T00:00:02.000Z|thread-resolution:T1",
+      createdAt: "2026-08-14T00:00:02.000Z",
+      updatedAt: "2026-08-14T00:00:02.000Z",
+      body: "",
+      url: "https://github.com/owner/repo/pull/1#discussion_rroot",
+      threadId: "T1",
+      resolved: true,
+      outdated: false,
+    } as unknown as ReviewActivityEvent;
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([resolution]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    // It landed. Without a parent the provider refuses it outright.
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
   });
 
   // A provider READ outage is not an answer. The event has already been taken
