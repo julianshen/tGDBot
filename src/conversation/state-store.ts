@@ -104,6 +104,8 @@ export interface ConversationExclusiveSession {
 }
 
 export interface ConversationStateStore {
+  /** Recorded verification outcomes, for the per-head idempotency check (#57). */
+  readFindingOutcomes(): Promise<readonly FindingOutcomeEntry[]>;
   readonly repositoryBinding: Readonly<RepositoryBinding>;
   readContextSnapshot(): Promise<ConversationContextSnapshot>;
   readAuditPage(journal: JournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{

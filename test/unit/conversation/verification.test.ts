@@ -70,7 +70,6 @@ const input = (over: Record<string, unknown> = {}) => ({
   addressedThread: "alice: fixed in the latest push",
   headSha: "e".repeat(40),
   repository,
-  marker: "<!-- tgd-verification -->",
   outcomeId: `outcome_${HEX32}`,
   at: "2026-08-28T01:00:00.000Z",
   anchorChanged: true,
@@ -89,7 +88,8 @@ describe("verifyFinding", () => {
     expect("plan" in result).toBe(true);
     if (!("plan" in result)) return;
     expect(result.plan.verdict).toBe("withdrawn");
-    expect(result.plan.replyBody).toContain("redacted before logging");
+    expect(result.plan.reply.rationale).toContain("redacted before logging");
+    expect(result.plan.reply.trigger).toBe("thread-comment");
     expect(result.plan.outcome.verdict).toBe("withdrawn");
   });
 

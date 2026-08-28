@@ -10,7 +10,6 @@
 // returns is a PLAN: the caller owns posting, resolving and persisting, because
 // those need poll's exactly-once machinery.
 import { reconsiderFinding } from "./actions.js";
-import { renderVerificationReply } from "./render.js";
 import { prepareFindingOutcome } from "./state-schema.js";
 import type {
   FindingLedgerEntry,
@@ -26,8 +25,16 @@ import type { RuleDefinition } from "../rules/types.js";
 export interface VerificationPlan {
   readonly findingId: string;
   readonly verdict: FindingVerdict;
-  /** The rendered reply, ready to post into the finding's thread. */
-  readonly replyBody: string;
+  /**
+   * What the reply must say. NOT a rendered body: a conversation body carries a
+   * private brand so it can only be produced by a renderer, and the caller owns
+   * the marker anyway.
+   */
+  readonly reply: {
+    readonly verdict: FindingVerdict;
+    readonly trigger: FindingVerificationTrigger;
+    readonly rationale: string;
+  };
   /**
    * Whether the tool may resolve the thread it started.
    *
@@ -55,8 +62,6 @@ export interface VerificationInput {
   readonly addressedThread: string;
   readonly headSha: string;
   readonly repository: RepositoryBinding;
-  readonly botLogin?: string;
-  readonly marker: string;
   readonly outcomeId: string;
   readonly at: string;
   readonly anchorChanged: boolean;
@@ -113,18 +118,11 @@ export async function verifyFinding(input: VerificationInput): Promise<Verificat
   }
 
   const verdict = result.result.outcome;
-  const reply = renderVerificationReply({
-    verdict,
-    trigger: input.pending.trigger,
-    rationale: result.result.rationale,
-    ...(input.botLogin === undefined ? {} : { botLogin: input.botLogin }),
-  }, input.marker);
-
   return {
     plan: {
       findingId: input.pending.findingId,
       verdict,
-      replyBody: reply.text,
+      reply: { verdict, trigger: input.pending.trigger, rationale: result.result.rationale },
       // Only a concern the tool has DROPPED, and only its own thread.
       resolveOwnThread: verdict === "withdrawn",
       outcome: prepareFindingOutcome({

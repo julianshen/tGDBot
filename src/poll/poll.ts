@@ -62,6 +62,7 @@ import {
   renderInactiveRuleReply,
   renderMemoryReply,
   renderReconsiderReply,
+  renderVerificationReply,
   renderScopeErrorReply,
   renderUnsupportedHistoryReply,
   renderUsageReply,
@@ -85,6 +86,9 @@ import type {
   ConversationCommand,
   RepositoryBinding,
 } from "../conversation/types.js";
+import { pendingVerifications } from "../conversation/verification-queue.js";
+import { verifyFinding } from "../conversation/verification.js";
+import type { FindingOutcomeEntry, FindingVerificationTrigger } from "../conversation/state-schema.js";
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
 import type {
@@ -328,6 +332,55 @@ async function classifyOpenReviewEvents(options: {
       if (outcome === "completed") knownActionIds.add(item.identity.actionId);
     }
 
+    // #57: after the commands, the verifications this page's events call for.
+    // Runs only when nothing halted — a transient failure means the page will
+    // be seen again, and verifying now would spend model calls on work about to
+    // be repeated.
+    if (!options.dryRun && !haltTransient && !haltCursor) {
+      const verifications = await planVerifications({
+        events: classified,
+        reviewNumber: review.reviewNumber,
+        reviewIdentity: identity,
+        options,
+      });
+      for (const verification of verifications) {
+        const published = await publishReplyPlan({
+          event: verification.event,
+          identity: verification.identity,
+          plan: verification.plan,
+          reviewIdentity: identity,
+          options,
+        });
+        if (published === "transient") { haltTransient = true; haltCursor = true; break; }
+        if (published === "stale") { haltCursor = true; break; }
+        knownActionIds.add(verification.identity.actionId);
+        // AFTER the reply, not before: publication is already exactly-once on
+        // this action identity, so the ordering cannot produce two replies. It
+        // can lose the record if the process dies in between — and a missing
+        // record costs the learning ledger one row, where a missing reply would
+        // cost the maintainer an answer they were owed.
+        const settled = verification.plan;
+        if (settled.kind === "verification") {
+          await options.store.transact((tx) => { tx.appendOutcome(settled.outcome); });
+        }
+      }
+    } else if (options.dryRun) {
+      // The dry-run contract: say what would happen, write nothing anywhere.
+      const verifications = await planVerifications({
+        events: classified,
+        reviewNumber: review.reviewNumber,
+        reviewIdentity: identity,
+        options,
+      }).catch(() => []);
+      for (const verification of verifications) {
+        if (verification.plan.kind !== "verification") continue;
+        console.log(
+          `tgd-review-agent: would verify a finding on review #${review.reviewNumber} ` +
+            `(${verification.plan.verdict})`,
+        );
+      }
+    }
+
     const completedPage = !stoppedEarly && !haltCursor;
     const listingComplete = page.nextPageToken === undefined;
     const nextRoundRobinKey = stoppedEarly || haltCursor
@@ -537,6 +590,20 @@ type ReplyPlan =
       readonly kind: "reconsider";
       readonly outcome: "confirmed" | "revised" | "withdrawn";
       readonly rationale: string;
+      readonly headSha: string;
+    }
+  /**
+   * An AUTOMATIC verification (#57). Carries its own rendered body, because the
+   * planner already rendered it, and the outcome record that must land in the
+   * same transaction as the action — a reply posted without its record would be
+   * verified and replied to again on the next poll.
+   */
+  | {
+      readonly kind: "verification";
+      readonly verdict: "confirmed" | "revised" | "withdrawn";
+      readonly trigger: FindingVerificationTrigger;
+      readonly rationale: string;
+      readonly outcome: FindingOutcomeEntry;
       readonly headSha: string;
     }
   | {
@@ -1152,6 +1219,8 @@ function buildReplyChild(input: {
   readonly repository: RepositoryBinding;
   readonly publicDigest: string;
   readonly plan: ReplyPlan;
+  /** The authenticated account, so a reply's commands name one that works. */
+  readonly botLogin?: string;
   readonly renderBinding: {
     readonly provider: "github" | "gitlab";
     readonly repository: ResolvedPollConfig["repository"];
@@ -1163,6 +1232,14 @@ function buildReplyChild(input: {
   const markerChildId = `out_${childHex}`;
   const parentId = `act_${input.actionId.slice("action_".length)}`;
   const render = (marker: string): RenderedConversationBody => {
+    if (input.plan.kind === "verification") {
+      return renderVerificationReply({
+        verdict: input.plan.verdict,
+        trigger: input.plan.trigger,
+        rationale: input.plan.rationale,
+        ...(input.botLogin === undefined ? {} : { botLogin: input.botLogin }),
+      }, marker);
+    }
     if (input.plan.kind === "usage") return renderUsageReply(marker);
     if (input.plan.kind === "clarification-unavailable") return renderClarificationUnavailableReply(marker);
     if (input.plan.kind === "memory") return renderMemoryReply(input.plan.reply, marker);
@@ -1697,6 +1774,167 @@ async function executeClarificationAnswer(input: {
     }
   }
   return published;
+}
+
+/**
+ * How many findings one poll will verify.
+ *
+ * Each is a model call, so an unbounded loop over every open finding on a busy
+ * repository is a cost incident rather than a feature (#57). Deliberately far
+ * below MAX_POLL_EVENTS: events are cheap to classify, verifications are not.
+ */
+export const MAX_POLL_VERIFICATIONS = 5;
+
+/**
+ * Plans the automatic verifications this poll should perform for one review.
+ *
+ * Ordered cheapest-first on purpose: the QUEUE runs on data already in hand —
+ * this page's events, the finding ledger, the recorded outcomes — and only what
+ * survives it costs a thread fetch and a model call.
+ *
+ * Event-driven triggers only for now. `head-change` needs the review's diff to
+ * know which lines moved, and the identity of a verification with no triggering
+ * event needs deciding; both belong with that trigger rather than smuggled in
+ * here.
+ */
+async function planVerifications(input: {
+  readonly events: readonly { readonly event: ReviewActivityEvent }[];
+  readonly reviewNumber: number;
+  readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  readonly options: {
+    readonly adapter: ConversationAdapter;
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  };
+}): Promise<Array<{
+  readonly event: ReviewActivityEvent;
+  readonly identity: { actionId: string; identityDigest: string };
+  readonly plan: ReplyPlan;
+}>> {
+  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
+  if (metadata === undefined) return [];
+
+  const snapshot = await input.options.store.readContextSnapshot();
+  const findings = snapshot.findings.filter((entry) => entry.reviewNumber === input.reviewNumber);
+  if (findings.length === 0) return [];
+
+  const queue = pendingVerifications({
+    headSha: metadata.headSha,
+    findings: findings.map((entry) => ({
+      id: entry.id,
+      headSha: entry.headSha,
+      finding: { severity: entry.finding.severity },
+      placement: entry.placement === null || entry.placement.line === undefined
+        ? null
+        : {
+            path: entry.placement.file,
+            line: entry.placement.line,
+            ...(entry.placement.startLine === undefined ? {} : { startLine: entry.placement.startLine }),
+          },
+      ...(entry.identity?.threadId === undefined ? {} : { identity: { threadId: entry.identity.threadId } }),
+    })),
+    events: input.events.map((item) => ({
+      kind: item.event.kind,
+      threadId: item.event.kind === "general-comment" ? undefined : item.event.threadId,
+      authorIsBot: item.event.authorIsBot,
+      resolved: item.event.kind === "thread-resolution" ? item.event.resolved : undefined,
+    })),
+    outcomes: await input.options.store.readFindingOutcomes(),
+    // Event-driven only until head-change lands: an empty map means the anchor
+    // trigger can never fire, rather than firing on stale information.
+    changedLines: new Map(),
+    ceiling: MAX_POLL_VERIFICATIONS,
+  });
+  if (queue.length === 0) return [];
+
+  const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
+  if (rules.error !== undefined) {
+    console.warn(`tgd-review-agent: verification rule loading failed (${rules.error.message})`);
+    return [];
+  }
+
+  const planned: Array<{
+    readonly event: ReviewActivityEvent;
+    readonly identity: { actionId: string; identityDigest: string };
+    readonly plan: ReplyPlan;
+  }> = [];
+
+  for (const pending of queue) {
+    const ledger = findings.find((entry) => entry.id === pending.findingId);
+    const threadId = ledger?.identity?.threadId;
+    if (ledger === undefined || threadId === undefined) continue;
+    // The event that prompted it, so the reply lands in the right thread and
+    // the action carries a real provenance.
+    const trigger = input.events.find((item) =>
+      item.event.kind !== "general-comment" && item.event.threadId === threadId);
+    if (trigger === undefined) continue;
+
+    let thread: ReviewThreadSnapshot | undefined;
+    try {
+      thread = await input.options.adapter.getReviewThread(input.reviewIdentity, threadId);
+    } catch (error) {
+      console.warn(`tgd-review-agent: could not load a thread to verify (${redactedMessage(error)})`);
+      continue;
+    }
+
+    // The thread must be the bot's OWN. A published finding's identity is bound
+    // from the bot's successful inline write, so a thread carrying that id is
+    // normally the bot's — but the command path already refuses to act in a
+    // thread it did not root, and verification needs no command to be parsed
+    // before it acts. Answering inside a thread rooted by someone else is the
+    // same spoof with the parser removed from the path.
+    const root = thread?.events.find((event) => event.commentId === thread?.rootCommentId);
+    if (root === undefined || root.authorIsBot !== true) continue;
+
+    const identity = conversationActionIdentity({
+      provider: trigger.event.provider,
+      repositoryDigest: trigger.event.repositoryDigest,
+      reviewNumber: input.reviewNumber,
+      // Keyed on the FINDING and the HEAD, not the event: three replies in one
+      // thread must produce one verification, and a resumed poll must not
+      // repeat one it already published.
+      eventId: ledger.id,
+      commandKey: `verify:${metadata.headSha}`,
+    });
+    const result = await verifyFinding({
+      pending,
+      ledger,
+      currentRule: rules.rules.find((rule) => rule.name === ledger.finding.ruleName),
+      currentCodeHunk: extractFileHunk(metadata.diff, ledger.finding.file),
+      addressedThread: formatAddressedThread(thread),
+      headSha: metadata.headSha,
+      repository: input.options.store.repositoryBinding,
+      outcomeId: `outcome_${createHash("sha256")
+        .update(`${ledger.id}\0${metadata.headSha}`, "utf8").digest("hex").slice(0, 32)}`,
+      at: input.options.now(),
+      anchorChanged: pending.trigger === "head-change",
+      ...(input.options.config.model === undefined ? {} : { model: input.options.config.model }),
+      createSession: input.options.deps.createSession,
+    } as never);
+
+    if ("skip" in result) {
+      console.warn(
+        `tgd-review-agent: could not verify a finding (${result.skip.kind}) on review #${input.reviewNumber}`,
+      );
+      continue;
+    }
+
+    planned.push({
+      event: trigger.event,
+      identity,
+      plan: {
+        kind: "verification",
+        verdict: result.plan.verdict,
+        trigger: result.plan.reply.trigger,
+        rationale: result.plan.reply.rationale,
+        outcome: result.plan.outcome,
+        headSha: metadata.headSha,
+      },
+    });
+  }
+  return planned;
 }
 
 function formatAddressedThread(thread: ReviewThreadSnapshot | undefined): string {

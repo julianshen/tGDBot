@@ -32,6 +32,7 @@ import type {
 } from "../../../src/vcs/conversation-adapter.js";
 import type { ConversationItemIdentity, ReviewIdentity } from "../../../src/conversation/types.js";
 import {
+  bindFindingLedgerIdentity,
   prepareFindingLedgerEntry,
   type ConversationEventEntry,
   type FindingLedgerEntry,
@@ -628,7 +629,11 @@ class ExecutionAdapter extends ClassificationAdapter {
 
 async function bootstrapAndSeed(
   adapter: ExecutionAdapter,
-  options: { readonly seedFinding?: boolean } = {},
+  // `bindThreadId` seeds the finding WITH its published thread identity, as
+  // `bindFindingLedgerIdentity` gives it after a successful inline write.
+  // Automatic verification (#57) matches a thread event to a finding through
+  // that identity, so a ledger without one is a shape production never has.
+  options: { readonly seedFinding?: boolean; readonly bindThreadId?: string } = {},
 ): Promise<{ stateDir: string; ledger?: FindingLedgerEntry; findingMarker?: string }> {
   const stateDir = await tempStateDir();
   await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
@@ -672,7 +677,15 @@ async function bootstrapAndSeed(
     body: visibleFindingBody,
     at: "2026-08-14T00:00:00.000Z",
   });
-  await store.transact((tx) => tx.appendFinding(ledger));
+  const seeded = options.bindThreadId === undefined
+    ? ledger
+    : bindFindingLedgerIdentity(ledger, {
+        provider: "github",
+        commentId: "900",
+        threadId: options.bindThreadId,
+        url: "https://github.com/octo-org/octo-repo/pull/1#discussion_r900",
+      });
+  await store.transact((tx) => tx.appendFinding(seeded));
   const findingMarker = formatChildMarker({
     kind: "finding",
     parentId: `act_${"2".repeat(32)}`,
@@ -681,7 +694,7 @@ async function bootstrapAndSeed(
     reviewNumber: 1,
     contentDigest: ledger.contentDigest,
   });
-  return { stateDir, ledger, findingMarker };
+  return { stateDir, ledger: seeded, findingMarker };
 }
 
 function installFindingThread(
@@ -1060,9 +1073,14 @@ describe("event-to-action poll", () => {
     expect(adapter.postedBodies).toHaveLength(2);
   });
 
+  // Seeded WITH the thread identity, so this covers automatic verification (#57)
+  // too: that path acts without a command to parse, so the thread being rooted
+  // by someone other than the bot is the only thing left to refuse on.
   it("treats a spoofed finding marker as a scope error without model work", async () => {
     const adapter = new ExecutionAdapter([]);
-    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
     const spoofed = installFindingThread(
       adapter,
       findingMarker!,
@@ -1103,7 +1121,9 @@ describe("event-to-action poll", () => {
 
   it("re-executes a material edit and ignores a formatting-only edit", async () => {
     const adapter = new ExecutionAdapter([]);
-    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
     const original = installFindingThread(adapter, findingMarker!, threadComment("cmd", "@tgdbot explain"));
     adapter.replaceEvents([original]);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
@@ -1159,7 +1179,9 @@ describe("event-to-action poll", () => {
 
   it("treats a model transient failure as incomplete and exits nonzero", async () => {
     const adapter = new ExecutionAdapter([]);
-    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
     const command = installFindingThread(adapter, findingMarker!, threadComment("fail", "@tgdbot explain"));
     adapter.replaceEvents([command]);
     const createSession = vi.fn(sessionFor(undefined));
@@ -1932,5 +1954,135 @@ describe("clarification answer lifecycle", () => {
     expect(changedSession).not.toHaveBeenCalled();
     expect(adapter.postedBodies.at(-1)).toMatch(/Confirmed/);
     expect(adapter.postedBodies.at(-1)).not.toMatch(/Withdrawn/);
+  });
+});
+
+// Issue #57: a human reply in a finding's thread produces exactly one
+// automatic verification and exactly one bot reply — with no command issued.
+describe("automatic verification", () => {
+  // These seed with `bindThreadId`, because a published finding carries the
+  // thread identity `bindFindingLedgerIdentity` gives it after a successful
+  // inline write — and automatic verification finds the finding behind a
+  // thread event through exactly that identity.
+
+  const verdict = (outcome: "confirmed" | "withdrawn") => JSON.stringify(
+    outcome === "withdrawn"
+      ? { outcome, rationale: "The logger redacts the token now." }
+      : {
+          outcome,
+          rationale: "The token is still written on line 14.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+          },
+        },
+  );
+
+  it("verifies once when a human replies, without being asked", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    // Ordinary prose: not a command, and nobody mentioned the bot.
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    // The record itself is the deliverable: calibration has nothing to read
+    // from if the reply lands and the outcome does not.
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("withdrawn");
+    expect(outcomes[0]!.trigger).toBe("thread-comment");
+    expect(outcomes[0]!.headSha).toBe("c".repeat(40));
+    // Labels are never stored — only digests of them (#57 design).
+    expect(JSON.stringify(outcomes[0])).not.toContain("no-token-logs");
+  });
+
+  // THE idempotency criterion: the same page seen twice must not verify twice.
+  it("does not verify the same finding again at the same head", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    // A SECOND, distinct reply in the same thread. Replaying the first one
+    // proves nothing here: the poll's event cursor drops it before the queue
+    // ever sees it, so only a genuinely fresh event reaches the layer under
+    // test. Recorded outcomes are what make this one verification, not two.
+    const again = installFindingThread(
+      adapter, findingMarker!, threadComment("human-2", "and here is why", {
+        updatedAt: "2026-08-14T00:00:05.000Z",
+      }),
+    );
+    adapter.replaceEvents([again]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  it("says the finding still stands when it does", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "I think this one is wrong"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("confirmed")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    const body = adapter.postedBodies.find((entry) => /## Verification/.test(entry)) ?? "";
+    expect(body).toMatch(/still stands/i);
+    expect(body).toContain("still written on line 14");
+    // Never restates the finding the thread already carries above it.
+    expect(body).not.toContain("Tokens must not be logged");
+  });
+
+  // The bot's own replies must not trigger it, or a run answers itself forever.
+  it("is not triggered by its own reply", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const own = installFindingThread(
+      adapter, findingMarker!,
+      threadComment("self", "## Verification", { authorLogin: "tgdbot", authorIsBot: true }),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([own]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(0);
   });
 });
