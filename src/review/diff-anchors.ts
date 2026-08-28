@@ -223,10 +223,27 @@ export function changedFilesWithRenameSources(diff: string): string[] {
  */
 export function renameSourcesByHeadPath(diff: string): Map<string, string> {
   const renames = new Map<string, string>();
+  let pending: { readonly a: string; readonly b: string } | undefined;
   for (const line of diff.split("\n")) {
     const header = parseDiffGitHeader(line);
-    if (header === undefined) continue;
-    if (header.a && header.b && header.a !== header.b) renames.set(header.b, header.a);
+    if (header !== undefined) {
+      pending = header.a && header.b && header.a !== header.b ? header : undefined;
+      continue;
+    }
+    // Differing paths are NOT enough. A COPY diff also has two paths, and
+    // treating the source as "this file at the base commit" excludes the
+    // original — still present, still referencing the symbol — from external
+    // matches, hiding the clearest evidence against a "no other references"
+    // claim (Codex review, round 8). Only `rename from`/`rename to` means the
+    // base tree holds this same file under the other name.
+    //
+    // Safe on the oversized-diff path too: `reconstructDiffFromFiles` emits
+    // `rename`/`copy` metadata from GitHub's own file status, so a real rename
+    // is still recognised there.
+    if (pending !== undefined && line.startsWith("rename from ")) {
+      renames.set(pending.b, pending.a);
+      pending = undefined;
+    }
   }
   return renames;
 }
@@ -273,6 +290,10 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
     positioned: boolean;
   }
   const removed = new Map<string, Accumulator>();
+  // Aliasing is gated on real rename metadata, not merely differing paths: a
+  // COPY's removed lines belong to the new file, and recording them under the
+  // source path would suppress occurrences in a file the diff never touched.
+  const renameSources = renameSourcesByHeadPath(diff);
   let keys: readonly string[] = [];
   let oldLine: number | undefined;
 
@@ -290,9 +311,9 @@ export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
   for (const line of diff.split("\n")) {
     const header = parseDiffGitHeader(line);
     if (header !== undefined) {
-      keys = header.a === header.b
-        ? [header.b || header.a].filter((value) => value !== "")
-        : [header.a, header.b].filter((value) => value !== "");
+      const head = header.b || header.a;
+      const base = renameSources.get(head);
+      keys = (base === undefined ? [head] : [base, head]).filter((value) => value !== "");
       oldLine = undefined;
       continue;
     }

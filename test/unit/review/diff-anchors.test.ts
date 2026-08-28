@@ -10,6 +10,7 @@ import {
   changedFiles,
   changedFilesWithRenameSources,
   removedLinesByFile,
+  renameSourcesByHeadPath,
   quoteGitPathOperand,
   commentableLines,
   diffPositionRange,
@@ -736,6 +737,44 @@ describe("removedLinesByFile", () => {
     ].join("\n");
 
     expect(removedLinesByFile(diff).get("src/a.ts")?.text).not.toContain("a/src/a.ts");
+  });
+
+  // Codex review, round 8. A COPY diff also carries two different paths. Its
+  // removed lines belong to the NEW file; recording them under the source path
+  // would suppress occurrences in a file the diff never touched — and, through
+  // `renameSourcesByHeadPath`, would exclude the still-existing original from
+  // external matches entirely, hiding the best evidence against the claim.
+  it("does not treat a copy's source as the same file", () => {
+    const diff = [
+      "diff --git a/src/original.ts b/src/copy.ts",
+      "similarity index 95%",
+      "copy from src/original.ts",
+      "copy to src/copy.ts",
+      "--- a/src/original.ts",
+      "+++ b/src/copy.ts",
+      "@@ -1,2 +1,1 @@",
+      " const keep = 1;",
+      "-const gone = budget(1);",
+    ].join("\n");
+
+    expect(renameSourcesByHeadPath(diff).has("src/copy.ts")).toBe(false);
+    const removed = removedLinesByFile(diff);
+    expect(removed.get("src/copy.ts")?.text).toContain("budget(1)");
+    expect(removed.has("src/original.ts")).toBe(false);
+  });
+
+  // The rename case still works, and now rests on the metadata rather than on
+  // the paths merely differing.
+  it("requires rename metadata, not just differing paths", () => {
+    const withMeta = [
+      "diff --git a/src/old.ts b/src/new.ts",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+    ].join("\n");
+    const withoutMeta = "diff --git a/src/old.ts b/src/new.ts";
+
+    expect(renameSourcesByHeadPath(withMeta).get("src/new.ts")).toBe("src/old.ts");
+    expect(renameSourcesByHeadPath(withoutMeta).has("src/new.ts")).toBe(false);
   });
 
   // Base line numbers only advance on removed and CONTEXT lines. Counting an

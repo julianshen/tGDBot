@@ -21,7 +21,7 @@
 // another.
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { Lang, parseAsync } from "@ast-grep/napi";
+import type { Lang, parseAsync } from "@ast-grep/napi";
 import type { RemovedLines } from "./diff-anchors.js";
 import type { Finding } from "./types.js";
 
@@ -136,12 +136,29 @@ const LANG_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
   [".jsx", "jsx"],
 ]);
 
-const AST_LANG: ReadonlyMap<string, Lang> = new Map([
-  ["ts", Lang.TypeScript],
-  ["tsx", Lang.Tsx],
-  ["js", Lang.JavaScript],
-  ["jsx", Lang.JavaScript],
+/**
+ * Language key -> the `Lang` MEMBER NAME, deliberately not the value.
+ *
+ * Reading `Lang.TypeScript` here would evaluate the native binding at module
+ * load, and `cli.ts` imports this module unconditionally — so on any platform
+ * `@ast-grep/napi` ships no prebuilt binary for (Linux ppc64/s390x, FreeBSD,
+ * and anywhere its nine optional packages do not cover), EVERY command would
+ * die at startup over a feature that defaults to off (Codex review, round 8).
+ * A flag nobody enabled must not be able to break `--help`.
+ */
+const AST_LANG: ReadonlyMap<string, "TypeScript" | "Tsx" | "JavaScript"> = new Map([
+  ["ts", "TypeScript"],
+  ["tsx", "Tsx"],
+  ["js", "JavaScript"],
+  ["jsx", "JavaScript"],
 ]);
+
+/** The native parser, loaded on first use and remembered — including a failure. */
+let parserModule: Promise<{ Lang: typeof Lang; parseAsync: typeof parseAsync }> | undefined;
+function loadParser(): Promise<{ Lang: typeof Lang; parseAsync: typeof parseAsync }> {
+  parserModule ??= import("@ast-grep/napi");
+  return parserModule;
+}
 
 /** Directories never worth walking, and expensive to walk by mistake. */
 const SKIP_DIRECTORIES = new Set([
@@ -290,6 +307,19 @@ export async function checkStructuralClaim(
     };
   }
 
+  // Loaded HERE rather than at module scope: see `AST_LANG`. A platform with no
+  // prebuilt binary degrades to an unperformed check instead of taking the CLI
+  // down with it.
+  let parser;
+  try {
+    parser = await loadParser();
+  } catch {
+    return {
+      status: "not-checked",
+      reason: "the structural parser is not available on this platform",
+    };
+  }
+
   const expired = (): boolean => now() - started > timeBudgetMs;
   const files = await collectSourceFiles(input.baseRoot, fileBudget, expired);
   if (files.length === 0) {
@@ -312,7 +342,8 @@ export async function checkStructuralClaim(
     if (expired()) break;
     const language = LANG_BY_EXTENSION.get(path.extname(file).toLowerCase());
     const kinds = language === undefined ? undefined : REFERENCE_KINDS.get(language);
-    const astLang = language === undefined ? undefined : AST_LANG.get(language);
+    const astLangName = language === undefined ? undefined : AST_LANG.get(language);
+    const astLang = astLangName === undefined ? undefined : parser.Lang[astLangName];
     if (kinds === undefined || astLang === undefined) continue;
 
     let source: string;
@@ -328,7 +359,7 @@ export async function checkStructuralClaim(
 
     let root;
     try {
-      root = (await parseAsync(astLang, source)).root();
+      root = (await parser.parseAsync(astLang, source)).root();
     } catch {
       continue;
     }
