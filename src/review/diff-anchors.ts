@@ -241,17 +241,34 @@ export function renameSourcesByHeadPath(diff: string): Map<string, string> {
  */
 export function removedLinesByFile(diff: string): Map<string, string> {
   const removed = new Map<string, string>();
-  let current: string | undefined;
+  // Keyed by BOTH sides of the header, because a rename makes them differ and a
+  // caller may hold either one. This keyed only the head path, while
+  // `checkStructuralClaim` reports BASE-relative paths — so for every file a
+  // pull request renamed, the lookup missed and its removed lines were never
+  // considered. That is the reconciliation's own failure case one step removed:
+  // a PR that renames a caller's file AND deletes the last call site left the
+  // call site standing in the base tree, unmatched, and the host published a
+  // match against a finding that was right (CodeRabbit review).
+  //
+  // Removed lines are base-side content, so the base key is the correct one;
+  // the head key is kept so a caller working in head paths still finds them.
+  // Double-keying can only ever over-suppress, which is the safe direction for
+  // a check whose output is an accusation.
+  let keys: readonly string[] = [];
   for (const line of diff.split("\n")) {
     const header = parseDiffGitHeader(line);
     if (header !== undefined) {
-      current = header.b || header.a;
+      keys = header.a === header.b
+        ? [header.b || header.a].filter((value) => value !== "")
+        : [header.a, header.b].filter((value) => value !== "");
       continue;
     }
-    if (current === undefined) continue;
+    if (keys.length === 0) continue;
     // `---` is a file header, not a removed line.
     if (line.startsWith("-") && !line.startsWith("---")) {
-      removed.set(current, `${removed.get(current) ?? ""}\n${line.slice(1)}`);
+      for (const key of keys) {
+        removed.set(key, `${removed.get(key) ?? ""}\n${line.slice(1)}`);
+      }
     }
   }
   return removed;

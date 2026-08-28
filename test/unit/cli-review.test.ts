@@ -5200,4 +5200,33 @@ describe("review — structural checks", () => {
     expect(passed.findings[0]?.hostCheck?.reason).toContain("could not be prepared");
     vi.restoreAllMocks();
   });
+
+  // CodeRabbit review. The reason is rendered into a review comment, which is
+  // world-readable on a public repository, and a workspace failure quotes the
+  // absolute path it failed on — publishing the CI runner's filesystem layout
+  // to anyone reading the pull request. The same rule `ruleFailureReasons`
+  // already follows: a host-authored classification is published, and the raw
+  // error goes to stderr, which is private CI logs.
+  it("never publishes the raw workspace error, and still logs it", async () => {
+    const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
+    h.dispatchRules.mockResolvedValue({ findings: [claimed], rulesRun: ["rule-a"], rulesFailed: [] });
+    h.prepareStructuralWorkspace.mockRejectedValue(
+      new Error("EACCES: permission denied, mkdir '/home/runner/.cache/tgd/workspaces/deadbeef/base'"),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await review(h.args, depsFrom(h));
+
+    const passed = h.orchestrate.mock.calls[0]?.[0] as {
+      findings: { hostCheck?: { status: string; reason: string } }[];
+    };
+    const reason = passed.findings[0]?.hostCheck?.reason ?? "";
+    expect(reason).not.toContain("/home/runner");
+    expect(reason).not.toContain("EACCES");
+    expect(reason).toBe("the base worktree could not be prepared");
+
+    // Diagnosable where it is safe to be: stderr, not the published comment.
+    expect(warn.mock.calls.flat().join(" ")).toContain("/home/runner");
+    vi.restoreAllMocks();
+  });
 });

@@ -332,7 +332,7 @@ describe("runStructuralChecks", () => {
 
   it("leaves findings without a claim untouched", async () => {
     const input = [finding(), finding({ file: "src/b.ts" })];
-    const output = await runStructuralChecks({ findings: input, baseRoot: root, check: stub({ status: "consistent", references: [], filesSearched: 1 }) });
+    const output = await runStructuralChecks({ findings: input, baseRoot: root, check: stub({ status: "lexical-matches", references: [{ file: "src/other.ts", line: 3 }], filesSearched: 1 }) });
 
     expect(output).toEqual(input);
     expect(output.every((f) => f.hostCheck === undefined)).toBe(true);
@@ -384,7 +384,7 @@ describe("runStructuralChecks", () => {
       renamedFrom: new Map([["src/new-name.ts", "src/old-name.ts"]]),
       check: async (_claim, input) => {
         seen.push({ findingFile: input.findingFile, ...(input.findingFileAtBase === undefined ? {} : { findingFileAtBase: input.findingFileAtBase }) });
-        return { status: "consistent", references: [], filesSearched: 1 };
+        return { status: "lexical-matches", references: [{ file: "src/other.ts", line: 3 }], filesSearched: 1 };
       },
     });
 
@@ -399,7 +399,7 @@ describe("runStructuralChecks", () => {
       renamedFrom: new Map([["src/other.ts", "src/was.ts"]]),
       check: async (_claim, input) => {
         seen.push(input.findingFileAtBase);
-        return { status: "consistent", references: [], filesSearched: 1 };
+        return { status: "lexical-matches", references: [{ file: "src/other.ts", line: 3 }], filesSearched: 1 };
       },
     });
 
@@ -469,11 +469,11 @@ describe("runStructuralChecks", () => {
       findings: input,
       baseRoot: root,
       claimBudget: 1,
-      check: stub({ status: "consistent", references: [], filesSearched: 2 }),
+      check: stub({ status: "lexical-matches", references: [{ file: "src/other.ts", line: 3 }], filesSearched: 2 }),
     });
 
     // The blocking one was spent the budget; the suggestion is told why not.
-    expect(output[1]?.hostCheck).toMatchObject({ status: "consistent" });
+    expect(output[1]?.hostCheck).toMatchObject({ status: "lexical-matches" });
     expect(output[0]?.hostCheck).toMatchObject({ status: "not-checked" });
     expect((output[0]?.hostCheck as { reason: string }).reason).toMatch(/limit of 1/);
   });

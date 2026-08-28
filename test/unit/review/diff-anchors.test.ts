@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import {
   changedFiles,
   changedFilesWithRenameSources,
+  removedLinesByFile,
   quoteGitPathOperand,
   commentableLines,
   diffPositionRange,
@@ -676,5 +677,61 @@ describe("quoteGitPathOperand", () => {
       const header = `diff --git ${quoteGitPathOperand("a", name)} ${quoteGitPathOperand("b", name)}`;
       expect(changedFiles(header)).toEqual([name]);
     }
+  });
+});
+
+// Issue #75. The structural check reports BASE-relative paths, so a map keyed
+// only by the head side silently misses every file the pull request renames —
+// and the reconciliation this feeds exists precisely to catch a PR that deletes
+// a call site. Renaming that file too made it invisible again (CodeRabbit
+// review).
+describe("removedLinesByFile", () => {
+  it("finds a renamed file's removed lines under either path", () => {
+    const diff = [
+      "diff --git a/src/old.ts b/src/new.ts",
+      "similarity index 90%",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+      "--- a/src/old.ts",
+      "+++ b/src/new.ts",
+      "@@ -1,2 +1,1 @@",
+      " import { budget } from './retry.js';",
+      "-export const a = budget(1);",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/old.ts")).toContain("budget(1)");
+    expect(removed.get("src/new.ts")).toContain("budget(1)");
+  });
+
+  it("keys an ordinary edit once, by its single path", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -1,2 +1,1 @@",
+      "-export const a = budget(1);",
+      "+export const a = 1;",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect([...removed.keys()]).toEqual(["src/http.ts"]);
+    expect(removed.get("src/http.ts")).toContain("budget(1)");
+  });
+
+  // `---` opens the file header and would otherwise read as a removed line
+  // beginning with `--`, putting the base path itself into the removed text.
+  it("does not mistake the file header for a removed line", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1 +1 @@",
+      "-const x = 1;",
+    ].join("\n");
+
+    expect(removedLinesByFile(diff).get("src/a.ts")).not.toContain("a/src/a.ts");
   });
 });

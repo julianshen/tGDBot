@@ -1520,10 +1520,17 @@ export async function review(
     } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the
       // claim went unverified rather than silently reading it as unchallenged.
-      const reason = `the base worktree could not be prepared: ${redactedMessage(error)}`;
+      //
+      // HOST-AUTHORED, not the caught error. This string is rendered into a
+      // review comment, which is world-readable on a public repository, and a
+      // workspace failure quotes the absolute path it failed on — leaking the
+      // CI runner's filesystem layout to anyone reading the PR (CodeRabbit
+      // review). Same rule `ruleFailureReasons` already follows, arrived at the
+      // same way; the raw error goes to stderr, which is private CI logs.
+      const reason = "the base worktree could not be prepared";
       dispatchResult.findings = dispatchResult.findings.map((finding) =>
         finding.claim === undefined ? finding : { ...finding, hostCheck: { status: "not-checked" as const, reason } });
-      console.warn(`tgd-review-agent: structural checks skipped (${reason})`);
+      console.warn(`tgd-review-agent: structural checks skipped (${reason}: ${redactedMessage(error)})`);
     }
   }
 

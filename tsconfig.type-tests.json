@@ -4,10 +4,23 @@
     "noEmit": true,
     "rootDir": "."
   },
+  // An explicit ALLOWLIST, not the whole test tree. `test/**/*.ts` currently
+  // reports ~530 errors, nearly all loose mock typing that predates this file;
+  // fixing those is real work and unrelated to any one change, so the program
+  // grows one file at a time instead of being switched on and immediately
+  // suppressed.
+  //
+  // A file listed here is one whose TYPES are load-bearing. Both current
+  // entries earned it: `finding-field-coverage` breaks at compile time when a
+  // `Finding` field gains no rendering decision, and `structural-check` was
+  // added after five fixtures kept asserting a `StructuralCheck` status that
+  // had been deleted three rounds earlier — green, because nothing type-checked
+  // them (CodeRabbit review).
   "include": [
     "src/**/*.ts",
     "test/**/*.test-d.ts",
-    "test/unit/review/finding-field-coverage.test.ts"
+    "test/unit/review/finding-field-coverage.test.ts",
+    "test/unit/review/structural-check.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

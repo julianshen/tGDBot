@@ -374,10 +374,12 @@ tgd-review-agent review \
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
   --structural-checks on|off     # default: OFF. Checks a finding's structural claim against the
-                                  # BASE branch and publishes what the host found beside it —
-                                  # including when it contradicts the finding. Only claims a rule
+                                  # BASE branch and publishes the host result beside it. Results are
+                                  # unresolved LEXICAL matches, not resolved references: ast-grep
+                                  # has no symbol resolution, so a same-named member of an unrelated
+                                  # type is indistinguishable from a real caller. Only claims a rule
                                   # explicitly makes ("this symbol is referenced nowhere else") are
-                                  # checked; nothing is inferred from prose. TypeScript and
+                                  # checked; nothing is inferred from prose. TypeScript, TSX and
                                   # JavaScript only. Needs a base worktree, so the first run on a
                                   # cold workspace pays for a clone; it shares that workspace with
                                   # --context, so a repository is mirrored once.
