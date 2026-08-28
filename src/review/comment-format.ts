@@ -729,6 +729,27 @@ function compactReferenceBullets(finding: Finding, indent: string): string[] {
   return shown === undefined ? [] : [`${indent}- Reference: ${sanitizeInline(shown)}`];
 }
 
+/**
+ * The host's answer to a claim, as an indented bullet for a list-shaped section.
+ *
+ * This is the SIXTH rendering path to need it (Codex review, round 5 — the
+ * disputed section). Each earlier fix patched the site that had been named, and
+ * a new one surfaced next round; enumerating them is evidently not how this
+ * converges. So it is a shared helper rather than a sixth inline copy: a
+ * bulleted section that renders a finding gets the check by calling one
+ * function, and the wording cannot drift between them.
+ *
+ * Empty unless BOTH halves are present. A claim without the host's answer
+ * renders nothing at all — publishing the reviewer's raw assertion beside
+ * host-authored prose is the confusion the reviewer/host split exists to avoid.
+ */
+function hostCheckBullets(finding: Finding, indent: string, compact: boolean): string[] {
+  if (finding.claim === undefined || finding.hostCheck === undefined) return [];
+  return [`${indent}- ${compact
+    ? describeCheckCompact(finding.hostCheck, sanitizeInline)
+    : describeCheck(finding.claim, finding.hostCheck, sanitizeInline)}`];
+}
+
 function referenceBullets(finding: Finding, indent: string): string[] {
   if (!finding.references || finding.references.length === 0) return [];
   return finding.references
@@ -750,9 +771,7 @@ function renderAlsoReported(members: readonly Finding[]): string {
     // the representative's check alone published every other member's
     // assertion unqualified — the same defect as the relocated path, one level
     // down (Codex review, round 2).
-    const check = member.claim !== undefined && member.hostCheck !== undefined
-      ? [`  - ${describeCheckCompact(member.hostCheck, sanitizeInline)}`]
-      : [];
+    const check = hostCheckBullets(member, "  ", true);
     return suggestion === undefined
       ? [line, ...check, ...cited]
       : [line, ...check, ...cited, "", renderSuggestionBlock(suggestion, false), ""];
@@ -982,9 +1001,13 @@ function renderDisputedSection(input: SummaryInput, compact = false): string | u
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const message = sanitizeText(finding.message);
-    // A disputed finding is precisely the one whose evidence a reader needs.
+    // A disputed finding is precisely the one whose evidence a reader needs —
+    // which is why the host check belongs here most of all. A finding the
+    // reviewer itself marked disputed, published with the host's answer to its
+    // structural claim removed, leaves the reader the weakest version of both.
     return [
       `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`,
+      ...hostCheckBullets(finding, "  ", compact),
       ...(compact
         ? compactReferenceBullets(finding, "  ")
         : referenceBullets(finding, "  ")),

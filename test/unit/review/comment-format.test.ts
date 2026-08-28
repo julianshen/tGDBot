@@ -1658,6 +1658,104 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).toContain("src/queue.ts:12");
   });
 
+  // Codex review, round 5. `orchestrate` routes a `disputed` finding out of the
+  // inline AND unanchored paths and into its own section, which rendered only
+  // the message and references — so the sixth way a finding can reach a reader
+  // published its claim with the host's answer removed. The disputed section is
+  // the worst place for that: it is the one section whose entire purpose is
+  // showing the reader the evidence on both sides.
+  it("keeps the host check on a disputed finding", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/http.ts", line: 88 }],
+          filesSearched: 40,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    });
+
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("Host check:");
+    expect(body).toContain("src/http.ts:88");
+    expect(body).toContain("LEXICAL matches");
+  });
+
+  // Compact mode is a SIZE fallback, not a TRUTH fallback — the same property
+  // the relocated and summary paths already assert, on the path that was added
+  // last and therefore never had it.
+  it("keeps a bounded host check on a disputed finding when compacted", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [makeFinding({ message: "x".repeat(4000) })],
+      // Compaction is driven by an oversized UNANCHORED finding, whose message
+      // is budgeted. A disputed message is not budgeted, so making this one
+      // huge would overflow into the last-resort status line, which drops the
+      // disputed section wholesale — a different (pre-existing) path than the
+      // one under test.
+      disputed: [makeFinding({
+        decision: "disputed",
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("unresolved lexical matches");
+    expect(body).toContain("src/queue.ts:12");
+  });
+
+  // Five review rounds produced five separate "this path drops the check"
+  // findings, each fixed at the site that was named. Patching named sites is
+  // evidently not how this converges, so the invariant gets asserted over the
+  // ROUTES a finding can take out of `orchestrate` — which, unlike rendering
+  // functions, are enumerable from `SummaryInput` itself.
+  //
+  // A route added later still needs a case here; what this buys is that the
+  // list is short, visible, and next to the type it mirrors.
+  it.each([
+    ["unanchored", (finding: Finding) => ({ unanchored: [finding] })],
+    ["publish-failed", (finding: Finding) => ({ unanchored: [] as Finding[], publishFailed: [finding] })],
+    ["disputed", (finding: Finding) => ({ unanchored: [] as Finding[], disputed: [finding] })],
+  ])("renders the host check for a %s finding", (_route, route) => {
+    const finding = makeFinding({
+      claim,
+      hostCheck: {
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }],
+        filesSearched: 40,
+      },
+    });
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      ...route(finding),
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    });
+
+    expect(body).toContain("Host check:");
+    expect(body).toContain("src/http.ts:88");
+  });
+
   // A base-branch filename may legally contain a backtick, which git writes
   // bare and which closes the code span it lands in (#63).
   it("cannot have a referenced path break out of its code span", () => {
