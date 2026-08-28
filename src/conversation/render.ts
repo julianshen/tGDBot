@@ -188,6 +188,55 @@ export function renderReconsiderReply(
   ], marker);
 }
 
+/**
+ * The reply an AUTOMATIC verification posts (#57).
+ *
+ * Deliberately not `renderReconsiderReply`. That one answers a human who asked;
+ * this one speaks unprompted, so it says what made it look — a reader who finds
+ * a bot comment in their thread should not have to guess why it appeared.
+ *
+ * It never restates the finding. The original is directly above it in the same
+ * thread, and repeating it is noise the acceptance criteria explicitly forbid;
+ * what this carries is the reading of the code AS IT STANDS NOW, which is the
+ * part a reader cannot get anywhere else.
+ */
+export function renderVerificationReply(
+  input: {
+    readonly verdict: "confirmed" | "revised" | "withdrawn";
+    readonly trigger: "thread-comment" | "thread-resolution" | "head-change" | "reaction";
+    readonly rationale: string;
+    /** Named so the invitation to disagree is a command that actually works. */
+    readonly botLogin?: string;
+  },
+  marker: string,
+): RenderedConversationBody {
+  const because = input.trigger === "thread-comment"
+    ? "You replied in this thread, so I re-read the finding against the current code."
+    : input.trigger === "thread-resolution"
+      ? "This thread was resolved, so I re-read the finding against the current code."
+      : input.trigger === "reaction"
+        ? "This finding was acknowledged, so I re-read it against the current code."
+        : "A new commit changed the lines this finding was anchored to, so I re-read it.";
+
+  const verdict = input.verdict === "withdrawn"
+    ? "It no longer holds — treating this as addressed."
+    : input.verdict === "revised"
+      ? "Part of it is addressed; part still stands."
+      : "It still stands.";
+
+  // Only when there is something left to disagree ABOUT.
+  const invitation = input.verdict === "withdrawn" || input.botLogin === undefined
+    ? []
+    : [`If you read it differently: \`@${sanitizeMultiline(input.botLogin).replace(/\s+/gu, "")} reconsider <why>\`.`];
+
+  return renderSections("## Verification", [
+    because,
+    verdict,
+    sanitizeMultiline(input.rationale),
+    ...invitation,
+  ], marker);
+}
+
 export function renderClarificationQuestion(
   input: { readonly question: string; readonly pendingId: string },
   marker: string,
