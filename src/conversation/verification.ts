@@ -10,6 +10,7 @@
 // returns is a PLAN: the caller owns posting, resolving and persisting, because
 // those need poll's exactly-once machinery.
 import { reconsiderFinding } from "./actions.js";
+import type { ConversationSessionFactory } from "./session.js";
 import { prepareFindingOutcome } from "./state-schema.js";
 import type {
   FindingLedgerEntry,
@@ -65,8 +66,14 @@ export interface VerificationInput {
   readonly outcomeId: string;
   readonly at: string;
   readonly anchorChanged: boolean;
-  readonly model?: string;
-  readonly createSession: unknown;
+  /**
+   * REQUIRED, as the action contract requires it. It was optional here, and an
+   * `as never` cast at the call site hid the mismatch: an unconfigured model
+   * reached `reconsiderFinding` as `undefined` instead of being refused as
+   * transient the way the command path refuses it (PR #74 review).
+   */
+  readonly model: string;
+  readonly createSession?: ConversationSessionFactory;
 }
 
 /**

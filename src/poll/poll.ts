@@ -87,8 +87,13 @@ import type {
   RepositoryBinding,
 } from "../conversation/types.js";
 import { pendingVerifications } from "../conversation/verification-queue.js";
+import type { PendingVerification } from "../conversation/verification-queue.js";
 import { verifyFinding } from "../conversation/verification.js";
-import type { FindingOutcomeEntry, FindingVerificationTrigger } from "../conversation/state-schema.js";
+import type {
+  FindingLedgerEntry,
+  FindingOutcomeEntry,
+  FindingVerificationTrigger,
+} from "../conversation/state-schema.js";
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
 import type {
@@ -204,8 +209,18 @@ async function classifyOpenReviewEvents(options: {
   let index = nextRoundRobinIndex(snapshot.cursor.reviews, snapshot.cursor.nextRoundRobinKey);
   let processed = 0;
   let idleTurns = 0;
+  // ONE allowance for the whole poll, not one per page or per review. It was
+  // passed fresh into every loop iteration, so a repository with several active
+  // reviews could spend five model calls per iteration against a documented
+  // ceiling of five per poll (PR #74 review).
+  let verificationBudget = MAX_POLL_VERIFICATIONS;
   const pageTokens = new Map<number, ReviewEventPageToken>();
   const seenEventKeys = new Set<string>();
+  // Reviews that deferred a verification this poll. `haltCursor` is per
+  // ITERATION, so the next pass over the same review saw a page emptied by the
+  // in-memory seen set, called it complete, and advanced the cursor straight
+  // past the events it had just deferred (PR #74 review).
+  const deferredReviews = new Set<number>();
 
   while (processed < MAX_POLL_EVENTS && idleTurns < active.length) {
     snapshot = options.dryRun ? snapshot : await options.store.readContextSnapshot();
@@ -213,6 +228,11 @@ async function classifyOpenReviewEvents(options: {
     if (currentActive.length === 0) return EXIT_OK;
     index = index % currentActive.length;
     const review = currentActive[index]!;
+    if (deferredReviews.has(review.reviewNumber)) {
+      idleTurns += 1;
+      index = (index + 1) % currentActive.length;
+      continue;
+    }
     const progress = decodeReviewProgress(review.cursor);
     if (progress === null) throw new Error(`Review ${review.reviewNumber} is missing stored progress`);
     const identity = reviewIdentityFrom(options.binding, review.reviewNumber, progress);
@@ -254,7 +274,56 @@ async function classifyOpenReviewEvents(options: {
       classified.push(item);
     }
 
+    // BEFORE the page is recorded. The block below marks an ordinary comment
+    // classified-and-ignored, which is terminal: an event left in place is an
+    // event consumed, so a verification the budget cannot reach this poll must
+    // be taken off the page rather than deferred in place (PR #74 review).
+    // Everything here is a read, which is also what makes it dry-run safe.
+    // Nothing to verify without a human acting in a thread, and asking costs a
+    // metadata read. The queue's own filters would reach the same answer.
+    const mayVerify = classified.some((item) =>
+      item.event.kind !== "general-comment" && item.event.authorIsBot !== true);
+    const queued = !mayVerify
+      ? { items: [], deferred: false, deferredEvents: [] } as VerificationQueue
+      : await queueVerifications({
+      events: classified,
+      reviewNumber: review.reviewNumber,
+      reviewIdentity: identity,
+      budget: verificationBudget,
+      options,
+    }).catch((error: unknown) => {
+      console.warn(`tgd-review-agent: could not queue verifications (${redactedMessage(error)})`);
+      return { items: [], deferred: false, deferredEvents: [] } as VerificationQueue;
+    });
+    // A HOLD, not a halt: the commands and the verifications this page can
+    // still afford must run. It only keeps the cursor from moving past the
+    // events taken off the page below.
+    const deferredHold = queued.deferred;
+    if (deferredHold) deferredReviews.add(review.reviewNumber);
+    // Every event the queue is using comes OFF the page, deferred or not. The
+    // block below marks an ordinary comment classified-and-ignored, which is
+    // terminal — so an event left in place is consumed whether or not its
+    // verification ever posted, and a transient failure lost the reply for good
+    // (PR #74 review). Left unmarked, a held-back cursor shows them again; on
+    // success the recorded outcome keeps the second sighting from re-verifying.
+    //
+    // Only events with nothing else to do. A command in a finding thread can
+    // trigger a verification too, and taking it off the page would drop the
+    // command the author actually asked for.
+    const held = new Set([...queued.items.map((item) => item.event), ...queued.deferredEvents]
+      .map((event) => event.eventId));
+    for (let at = classified.length - 1; at >= 0; at -= 1) {
+      const item = classified[at]!;
+      if (held.has(item.event.eventId) && item.parsed.kind === "irrelevant") classified.splice(at, 1);
+    }
+
     if (options.dryRun) {
+      for (const item of queued.items) {
+        console.log(
+          `tgd-review-agent: would verify a finding on review #${review.reviewNumber} ` +
+            `(${item.pending.trigger})`,
+        );
+      }
       for (const item of classified) {
         if (item.parsed.kind === "command") {
           console.log(
@@ -337,17 +406,19 @@ async function classifyOpenReviewEvents(options: {
     // be seen again, and verifying now would spend model calls on work about to
     // be repeated.
     if (!options.dryRun && !haltTransient && !haltCursor) {
-      const verifications = await planVerifications({
-        events: classified,
-        reviewNumber: review.reviewNumber,
-        reviewIdentity: identity,
-        options,
-      });
-      for (const verification of verifications) {
+      for (const item of queued.items) {
+        const verification = queued.context === undefined
+          ? undefined
+          : await verifyQueued({ item, context: queued.context, reviewNumber: review.reviewNumber, options });
+        // A model call was spent whether or not it produced a verdict, so the
+        // budget is charged for the attempt.
+        verificationBudget -= 1;
+        if (verification === undefined) continue;
         const published = await publishReplyPlan({
           event: verification.event,
           identity: verification.identity,
           plan: verification.plan,
+          ...(botIdentity.login === undefined ? {} : { botLogin: botIdentity.login }),
           reviewIdentity: identity,
           options,
         });
@@ -364,29 +435,14 @@ async function classifyOpenReviewEvents(options: {
           await options.store.transact((tx) => { tx.appendOutcome(settled.outcome); });
         }
       }
-    } else if (options.dryRun) {
-      // The dry-run contract: say what would happen, write nothing anywhere.
-      const verifications = await planVerifications({
-        events: classified,
-        reviewNumber: review.reviewNumber,
-        reviewIdentity: identity,
-        options,
-      }).catch(() => []);
-      for (const verification of verifications) {
-        if (verification.plan.kind !== "verification") continue;
-        console.log(
-          `tgd-review-agent: would verify a finding on review #${review.reviewNumber} ` +
-            `(${verification.plan.verdict})`,
-        );
-      }
     }
 
-    const completedPage = !stoppedEarly && !haltCursor;
+    const completedPage = !stoppedEarly && !haltCursor && !deferredHold;
     const listingComplete = page.nextPageToken === undefined;
-    const nextRoundRobinKey = stoppedEarly || haltCursor
+    const nextRoundRobinKey = stoppedEarly || haltCursor || deferredHold
       ? String(review.reviewNumber)
       : nextKey(currentActive, index);
-    const advancedProgress = listingComplete && page.events.length > 0 && !haltCursor
+    const advancedProgress = listingComplete && page.events.length > 0 && !haltCursor && !deferredHold
       ? {
           ...progress,
           eventOpaque: page.nextCursor.opaque,
@@ -1007,6 +1063,13 @@ async function publishReplyPlan(input: {
   readonly event: ReviewActivityEvent;
   readonly identity: { actionId: string; identityDigest: string };
   readonly plan: ReplyPlan;
+  /**
+   * The authenticated account, so a verification reply can name a mention that
+   * actually works. Absent, `renderVerificationReply` drops the invitation
+   * entirely — every confirmed verdict told the reader it stood and nothing
+   * about how to disagree (PR #74 review).
+   */
+  readonly botLogin?: string;
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
   readonly options: {
     readonly adapter: ConversationAdapter;
@@ -1053,6 +1116,7 @@ async function publishReplyPlan(input: {
         input.options.config.repository.canonicalUrl,
       ),
       plan,
+      ...(input.botLogin === undefined ? {} : { botLogin: input.botLogin }),
       renderBinding: {
         provider: input.options.config.repository.provider,
         repository: input.options.config.repository,
@@ -1797,10 +1861,55 @@ export const MAX_POLL_VERIFICATIONS = 5;
  * event needs deciding; both belong with that trigger rather than smuggled in
  * here.
  */
-async function planVerifications(input: {
+/** One verification the queue selected, with everything the verdict needs. */
+interface QueuedVerification {
+  readonly pending: PendingVerification;
+  readonly ledger: FindingLedgerEntry;
+  readonly thread: ReviewThreadSnapshot | undefined;
+  readonly event: ReviewActivityEvent;
+  readonly identity: { actionId: string; identityDigest: string };
+}
+
+interface VerificationQueue {
+  readonly items: readonly QueuedVerification[];
+  /**
+   * Whether the queue had more than the budget allowed.
+   *
+   * The caller holds the page cursor back when this is set. Sliced signals live
+   * nowhere: nothing persists "this reply is still owed", so advancing past
+   * them left every human reply after the fifth permanently unanswered (PR #74
+   * review). Holding the cursor cannot loop, because each verification that
+   * does run records an outcome and drops out of the next queue.
+   */
+  readonly deferred: boolean;
+  /**
+   * The trigger events the budget could not reach.
+   *
+   * They are excluded from this page's processing entirely, because the poll
+   * marks an ordinary comment as classified-and-ignored the moment it reads it
+   * — so an event left in place is an event permanently consumed, and the reply
+   * it asked for is never given (PR #74 review).
+   */
+  readonly deferredEvents: readonly ReviewActivityEvent[];
+  readonly context?: {
+    readonly metadata: Awaited<ReturnType<typeof loadReviewMetadata>>;
+    readonly rules: Awaited<ReturnType<typeof loadActiveRules>>;
+  };
+}
+
+/**
+ * Selects the verifications this page calls for, WITHOUT running any.
+ *
+ * Split from the verdict deliberately. Everything here is a read — the finding
+ * ledger, recorded outcomes, the thread — so a dry run can report exactly what
+ * would happen without spending a model call on a preview (PR #74 review).
+ */
+async function queueVerifications(input: {
   readonly events: readonly { readonly event: ReviewActivityEvent }[];
   readonly reviewNumber: number;
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  /** What is left of this POLL's allowance, not this page's. */
+  readonly budget: number;
   readonly options: {
     readonly adapter: ConversationAdapter;
     readonly store: ConversationStateStore;
@@ -1808,18 +1917,31 @@ async function planVerifications(input: {
     readonly config: ResolvedPollConfig;
     readonly deps: PollDependencies;
   };
-}): Promise<Array<{
-  readonly event: ReviewActivityEvent;
-  readonly identity: { actionId: string; identityDigest: string };
-  readonly plan: ReplyPlan;
-}>> {
-  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
-  if (metadata === undefined) return [];
-
+}): Promise<VerificationQueue> {
+  if (input.budget <= 0) {
+    // Nothing may run, but something may still be waiting. Ask for one item to
+    // find out, and report it as deferred rather than as nothing to do.
+    const probe = await queueVerifications({ ...input, budget: 1 });
+    return { items: [], deferred: probe.items.length > 0, deferredEvents: probe.items.map((item) => item.event) };
+  }
+  // Store reads FIRST. Loading metadata is a provider round-trip, and a page
+  // with no event in a published finding's own thread can never produce a
+  // verification — so establishing that costs nothing beyond local state.
   const snapshot = await input.options.store.readContextSnapshot();
   const findings = snapshot.findings.filter((entry) => entry.reviewNumber === input.reviewNumber);
-  if (findings.length === 0) return [];
+  const threads = new Set(input.events
+    .filter((item) => item.event.kind !== "general-comment")
+    .map((item) => item.event.threadId));
+  if (!findings.some((entry) => entry.identity?.threadId !== undefined &&
+    threads.has(entry.identity.threadId))) {
+    return { items: [], deferred: false, deferredEvents: [] };
+  }
 
+  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
+  if (metadata === undefined) return { items: [], deferred: false, deferredEvents: [] };
+
+  // One MORE than the budget, so the caller can tell "exactly full" from
+  // "there was more". The queue still bounds what it builds.
   const queue = pendingVerifications({
     headSha: metadata.headSha,
     findings: findings.map((entry) => ({
@@ -1845,22 +1967,19 @@ async function planVerifications(input: {
     // Event-driven only until head-change lands: an empty map means the anchor
     // trigger can never fire, rather than firing on stale information.
     changedLines: new Map(),
-    ceiling: MAX_POLL_VERIFICATIONS,
+    ceiling: input.budget + 1,
   });
-  if (queue.length === 0) return [];
+  if (queue.length === 0) return { items: [], deferred: false, deferredEvents: [] };
 
   const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
   if (rules.error !== undefined) {
     console.warn(`tgd-review-agent: verification rule loading failed (${rules.error.message})`);
-    return [];
+    return { items: [], deferred: false, deferredEvents: [] };
   }
 
-  const planned: Array<{
-    readonly event: ReviewActivityEvent;
-    readonly identity: { actionId: string; identityDigest: string };
-    readonly plan: ReplyPlan;
-  }> = [];
-
+  const items: QueuedVerification[] = [];
+  const deferredEvents: ReviewActivityEvent[] = [];
+  let deferred = false;
   for (const pending of queue) {
     const ledger = findings.find((entry) => entry.id === pending.findingId);
     const threadId = ledger?.identity?.threadId;
@@ -1888,53 +2007,107 @@ async function planVerifications(input: {
     const root = thread?.events.find((event) => event.commentId === thread?.rootCommentId);
     if (root === undefined || root.authorIsBot !== true) continue;
 
-    const identity = conversationActionIdentity({
-      provider: trigger.event.provider,
-      repositoryDigest: trigger.event.repositoryDigest,
-      reviewNumber: input.reviewNumber,
-      // Keyed on the FINDING and the HEAD, not the event: three replies in one
-      // thread must produce one verification, and a resumed poll must not
-      // repeat one it already published.
-      eventId: ledger.id,
-      commandKey: `verify:${metadata.headSha}`,
-    });
-    const result = await verifyFinding({
+    const entry = {
       pending,
       ledger,
-      currentRule: rules.rules.find((rule) => rule.name === ledger.finding.ruleName),
-      currentCodeHunk: extractFileHunk(metadata.diff, ledger.finding.file),
-      addressedThread: formatAddressedThread(thread),
-      headSha: metadata.headSha,
-      repository: input.options.store.repositoryBinding,
-      outcomeId: `outcome_${createHash("sha256")
-        .update(`${ledger.id}\0${metadata.headSha}`, "utf8").digest("hex").slice(0, 32)}`,
-      at: input.options.now(),
-      anchorChanged: pending.trigger === "head-change",
-      ...(input.options.config.model === undefined ? {} : { model: input.options.config.model }),
-      createSession: input.options.deps.createSession,
-    } as never);
-
-    if ("skip" in result) {
-      console.warn(
-        `tgd-review-agent: could not verify a finding (${result.skip.kind}) on review #${input.reviewNumber}`,
-      );
+      thread,
+      event: trigger.event,
+      identity: conversationActionIdentity({
+        provider: trigger.event.provider,
+        repositoryDigest: trigger.event.repositoryDigest,
+        reviewNumber: input.reviewNumber,
+        // Keyed on the FINDING and the HEAD, not the event: three replies in
+        // one thread must produce one verification, and a resumed poll must not
+        // repeat one it already published.
+        eventId: ledger.id,
+        commandKey: `verify:${metadata.headSha}`,
+      }),
+    };
+    // Over budget: the event is handed back rather than dropped.
+    if (items.length >= input.budget) {
+      deferred = true;
+      deferredEvents.push(entry.event);
       continue;
     }
-
-    planned.push({
-      event: trigger.event,
-      identity,
-      plan: {
-        kind: "verification",
-        verdict: result.plan.verdict,
-        trigger: result.plan.reply.trigger,
-        rationale: result.plan.reply.rationale,
-        outcome: result.plan.outcome,
-        headSha: metadata.headSha,
-      },
-    });
+    items.push(entry);
   }
-  return planned;
+  return { items, deferred, deferredEvents, context: { metadata, rules } };
+}
+
+/**
+ * Turns one queued verification into a verdict, a reply and a record.
+ *
+ * This is the only step that costs a model call, which is why it is the only
+ * step a dry run skips.
+ */
+async function verifyQueued(input: {
+  readonly item: QueuedVerification;
+  readonly context: NonNullable<VerificationQueue["context"]>;
+  readonly reviewNumber: number;
+  readonly options: {
+    readonly adapter: ConversationAdapter;
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  };
+}): Promise<{
+  readonly event: ReviewActivityEvent;
+  readonly identity: { actionId: string; identityDigest: string };
+  readonly plan: ReplyPlan;
+} | undefined> {
+  const { item } = input;
+  const metadata = input.context.metadata;
+  if (metadata === undefined) return undefined;
+  const ledger = item.ledger;
+
+  // The same fallback the command path uses, and the same refusal: a review
+  // records the model it ran under, so a finding raised by a configured run
+  // stays verifiable after the operator drops the flag. Unresolvable means not
+  // verified, never verified against a default nobody chose.
+  const model = input.options.config.model ?? ledger.reviewOptions.model;
+  if (model === undefined) {
+    console.warn("tgd-review-agent: conversation model is not configured");
+    return undefined;
+  }
+
+  const result = await verifyFinding({
+    pending: item.pending,
+    ledger,
+    currentRule: input.context.rules.rules.find((rule) => rule.name === ledger.finding.ruleName),
+    currentCodeHunk: extractFileHunk(metadata.diff, ledger.finding.file),
+    addressedThread: formatAddressedThread(item.thread),
+    headSha: metadata.headSha,
+    repository: input.options.store.repositoryBinding,
+    outcomeId: `outcome_${createHash("sha256")
+      .update(`${ledger.id}\0${metadata.headSha}`, "utf8").digest("hex").slice(0, 32)}`,
+    at: input.options.now(),
+    anchorChanged: item.pending.trigger === "head-change",
+    model,
+    ...(input.options.deps.createSession === undefined
+      ? {}
+      : { createSession: input.options.deps.createSession }),
+  });
+
+  if ("skip" in result) {
+    console.warn(
+      `tgd-review-agent: could not verify a finding (${result.skip.kind}) on review #${input.reviewNumber}`,
+    );
+    return undefined;
+  }
+
+  return {
+    event: item.event,
+    identity: item.identity,
+    plan: {
+      kind: "verification",
+      verdict: result.plan.verdict,
+      trigger: result.plan.reply.trigger,
+      rationale: result.plan.reply.rationale,
+      outcome: result.plan.outcome,
+      headSha: metadata.headSha,
+    },
+  };
 }
 
 function formatAddressedThread(thread: ReviewThreadSnapshot | undefined): string {

@@ -633,16 +633,30 @@ async function bootstrapAndSeed(
   // `bindFindingLedgerIdentity` gives it after a successful inline write.
   // Automatic verification (#57) matches a thread event to a finding through
   // that identity, so a ledger without one is a shape production never has.
-  options: { readonly seedFinding?: boolean; readonly bindThreadId?: string } = {},
+  options: {
+    readonly seedFinding?: boolean;
+    readonly bindThreadId?: string;
+    /** A distinct finding id, so several can be seeded into one repository. */
+    readonly findingId?: string;
+  } = {},
 ): Promise<{ stateDir: string; ledger?: FindingLedgerEntry; findingMarker?: string }> {
   const stateDir = await tempStateDir();
   await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
   if (options.seedFinding !== true) return { stateDir };
+  const { ledger: seeded, findingMarker } = await seedFindingInto(stateDir, options);
+  return { stateDir, ledger: seeded, findingMarker };
+}
+
+/** Places one published finding into an ALREADY bootstrapped repository. */
+async function seedFindingInto(
+  stateDir: string,
+  options: { readonly bindThreadId?: string; readonly findingId?: string } = {},
+): Promise<{ ledger: FindingLedgerEntry; findingMarker: string }> {
   const store = createConversationStateStore({ root: stateDir, repository: repo });
   const binding = store.repositoryBinding;
   const ledger = prepareFindingLedgerEntry({
     repository: binding,
-    id: FINDING_ID,
+    id: options.findingId ?? FINDING_ID,
     reviewNumber: 1,
     reviewId: "PR_1",
     baseSha: "b".repeat(40),
@@ -694,7 +708,7 @@ async function bootstrapAndSeed(
     reviewNumber: 1,
     contentDigest: ledger.contentDigest,
   });
-  return { stateDir, ledger: seeded, findingMarker };
+  return { ledger: seeded, findingMarker };
 }
 
 function installFindingThread(
@@ -2062,6 +2076,106 @@ describe("automatic verification", () => {
     expect(body).toContain("still written on line 14");
     // Never restates the finding the thread already carries above it.
     expect(body).not.toContain("Tokens must not be logged");
+    // A verdict the reader cannot argue with is worse than no verdict. The
+    // invitation names the AUTHENTICATED account, so the mention resolves.
+    expect(body).toContain("`@tgdbot reconsider <why>`");
+  });
+
+  // A transient provider failure must not consume the reply. The poll marks an
+  // ordinary comment classified-and-ignored as soon as it reads it, so an event
+  // left on the page is spent whether or not the verification it asked for ever
+  // posted.
+  it("still answers after a transient failure eats the first attempt", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    // Accepted by the provider, then failed before the local record: the
+    // orphan case. The reply IS live in the thread.
+    adapter.failNextWrite = "accept-then-fail";
+    // A transient failure is a non-zero exit: the run did not finish its work.
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(1);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    // Exactly one reply reaches the thread. The event survived the first poll,
+    // so the second could finish the work rather than skip it as spent.
+    const posted = [...adapter.postedBodies, ...adapter.acceptedBodies]
+      .filter((body) => /## Verification/.test(body));
+    expect(posted).toHaveLength(1);
+    expect(await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes()).toHaveLength(1);
+  });
+
+  // The cost ceiling is ONE allowance for the poll. It was passed fresh into
+  // every loop iteration, so a busy repository could spend five model calls per
+  // iteration against a documented five per poll.
+  it("spends at most five model calls per poll, and answers the rest next poll", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const replies: ReviewActivityEvent[] = [];
+    for (let index = 0; index < 6; index += 1) {
+      const { findingMarker } = await seedFindingInto(stateDir, {
+        findingId: `finding_${String(index).repeat(32)}`,
+        bindThreadId: `T${index}`,
+      });
+      replies.push(installFindingThread(
+        adapter,
+        findingMarker,
+        threadComment(`human-${index}`, "fixed this in the latest push", { threadId: `T${index}` }),
+      ));
+    }
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents(replies);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(5);
+
+    // The sixth is not lost. Nothing persists "this reply is still owed", so
+    // the poll held the cursor back rather than advancing past the event.
+    adapter.replaceEvents(replies);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(6);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(6);
+  });
+
+  // A dry run previews; it does not buy anything. Reporting the VERDICT meant
+  // asking the model for it, which is a provider charge for a preview the
+  // operator asked to be free.
+  it("costs no model call in a dry run", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([reply]);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const before = await store.readContextSnapshot();
+
+    await expect(poll(pollArgs(stateDir, { dryRun: true, model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toEqual([]);
+    expect(await store.readFindingOutcomes()).toEqual([]);
+    expect((await store.readContextSnapshot()).events).toEqual(before.events);
   });
 
   // The bot's own replies must not trigger it, or a run answers itself forever.
