@@ -593,8 +593,10 @@ class ExecutionAdapter extends ClassificationAdapter {
   }
 
   failNextThreadRead = false;
+  threadReads = 0;
 
   override async getReviewThread(_review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
+    this.threadReads += 1;
     if (this.failNextThreadRead) {
       this.failNextThreadRead = false;
       throw new Error("thread read is temporarily unavailable");
@@ -2171,6 +2173,42 @@ describe("automatic verification", () => {
     adapter.replaceEvents([reply]);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
     expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // A verification that can NEVER succeed must be spent DURABLY. Released from
+  // memory only, the next poll re-queues it, and with the budget full of such
+  // findings everything behind them starves forever.
+  it("spends a finding whose rule is gone, so it never queues again", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    adapter.replaceEvents([reply]);
+    // Rules load fine, but the one this finding was raised under is gone. An
+    // EMPTY set is a load error, which defers rather than settling — a
+    // distinction that made an earlier version of this test vacuous.
+    const deps = executionDeps(adapter, {
+      rules: [{ ...currentRule, name: "some-other-rule", sourcePath: "/rules/some-other-rule.md" }],
+    });
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    expect(await store.readFindingOutcomes()).toEqual([]);
+    expect(adapter.threadReads).toBe(1);
+
+    // Seen again, as a held cursor would show it.
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    // THE point: no second look. The event was taken off the page, so the
+    // record the page would have written had to be written when it settled.
+    // Without it the finding is queued again on every poll — forever, taking
+    // budget from everything behind it.
+    expect(adapter.threadReads).toBe(1);
   });
 
   // Metadata is a provider round-trip like any other, and failing it is an

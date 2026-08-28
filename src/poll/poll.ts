@@ -279,11 +279,20 @@ async function classifyOpenReviewEvents(options: {
     // event consumed, so a verification the budget cannot reach this poll must
     // be taken off the page rather than deferred in place (PR #74 review).
     // Everything here is a read, which is also what makes it dry-run safe.
-    // Nothing to verify without a human acting in a thread, and asking costs a
-    // metadata read. The queue's own filters would reach the same answer.
-    const mayVerify = classified.some((item) =>
-      item.event.kind !== "general-comment" && item.event.authorIsBot !== true);
-    const queued = !mayVerify
+    // The candidate superset, computed HERE rather than inside the queue. The
+    // caller is what takes events off the page, so the caller must be able to
+    // name them without the queue's help — a queue that throws (a failed
+    // outcome read, say) otherwise returned "nothing owed" and the page
+    // consumed the reply (PR #74 review).
+    const boundThreads = new Set(snapshot.findings
+      .filter((entry) => entry.reviewNumber === review.reviewNumber)
+      .map((entry) => entry.identity?.threadId)
+      .filter((threadId): threadId is string => threadId !== undefined));
+    const candidateEvents = classified
+      .filter((item) => item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
+        item.event.threadId !== undefined && boundThreads.has(item.event.threadId))
+      .map((item) => item.event);
+    const queued = candidateEvents.length === 0
       ? { items: [], deferred: false, deferredEvents: [] } as VerificationQueue
       : await queueVerifications({
       events: classified,
@@ -292,8 +301,10 @@ async function classifyOpenReviewEvents(options: {
       budget: verificationBudget,
       options,
     }).catch((error: unknown) => {
+      // Hold everything: which of these were really owed is exactly what the
+      // failed call was going to tell us.
       console.warn(`tgd-review-agent: could not queue verifications (${redactedMessage(error)})`);
-      return { items: [], deferred: false, deferredEvents: [] } as VerificationQueue;
+      return { items: [], deferred: true, deferredEvents: candidateEvents } as VerificationQueue;
     });
     // THE INVARIANT: an event taken off the page must either complete its
     // verification this poll or hold the cursor. Removal and the cursor
@@ -418,13 +429,26 @@ async function classifyOpenReviewEvents(options: {
         // budget is charged for the attempt.
         verificationBudget -= 1;
         if (verification.kind === "settled") {
-          // Nothing more will ever come of it. Letting the page have the event
-          // is what keeps the cursor moving.
+          // Nothing more will ever come of it, so the event is SPENT — and
+          // spending it has to be durable. Dropping it from the in-memory set
+          // alone consumed nothing: another candidate holding the cursor meant
+          // the next poll re-queued the same settled findings, which took the
+          // whole budget every time and starved everything behind them
+          // (PR #74 review). It was taken off the page, so the record the page
+          // would have written has to be written here instead.
           console.log(
             `tgd-review-agent: no verification for a finding on review #${review.reviewNumber} ` +
               `(${verification.reason})`,
           );
           outstanding.delete(item.event.eventId);
+          const spent = pageIdentities.find((entry) => entry.event.eventId === item.event.eventId);
+          if (spent !== undefined && !knownActionIds.has(spent.identity.actionId)) {
+            await options.store.transact((tx) => {
+              appendObservation(tx, spent.identity, item.event.reviewNumber, options.now());
+              appendClassifiedAndIgnored(tx, spent.identity, item.event.reviewNumber, options.now());
+            });
+            knownActionIds.add(spent.identity.actionId);
+          }
           continue;
         }
         if (verification.kind === "transient") continue;
