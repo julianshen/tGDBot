@@ -200,6 +200,14 @@ export function renderReconsiderReply(
  * what this carries is the reading of the code AS IT STANDS NOW, which is the
  * part a reader cannot get anywhere else.
  */
+/**
+ * How much of the model's reading of the code the reply carries.
+ *
+ * Generous for a paragraph and far short of the body limit, so the lines after
+ * it — the invitation to disagree — cannot be truncated away.
+ */
+const MAX_VERIFICATION_RATIONALE_CHARS = 4_000;
+
 export function renderVerificationReply(
   input: {
     readonly verdict: "confirmed" | "revised" | "withdrawn";
@@ -224,16 +232,27 @@ export function renderVerificationReply(
       ? "Part of it is addressed; part still stands."
       : "It still stands.";
 
+  // A LOGIN, not prose. `sanitizeMultiline` escapes Markdown, so a GitLab
+  // account like `acme_bot` rendered as `acme\_bot` — a command that copies to
+  // a mention matching no account (PR #73 review). Invisible characters,
+  // whitespace and backticks are still stripped; nothing else is touched.
+  const login = input.botLogin === undefined
+    ? undefined
+    : stripInvisible(input.botLogin).replace(/[\s`]/gu, "");
   // Only when there is something left to disagree ABOUT.
-  const invitation = input.verdict === "withdrawn" || input.botLogin === undefined
-    ? []
-    : [`If you read it differently: \`@${sanitizeMultiline(input.botLogin).replace(/\s+/gu, "")} reconsider <why>\`.`];
+  const invitation = input.verdict === "withdrawn" || login === undefined || login.length === 0
+    ? undefined
+    : `If you read it differently: \`@${login} reconsider <why>\`.`;
 
+  // The rationale is capped BEFORE assembly, not after. The body is truncated
+  // from the end, so a verbose model could otherwise push the invitation off
+  // it — leaving a reader told they may disagree but not how (PR #73 review).
+  const rationale = sanitizeMultiline(input.rationale).slice(0, MAX_VERIFICATION_RATIONALE_CHARS);
   return renderSections("## Verification", [
     because,
     verdict,
-    sanitizeMultiline(input.rationale),
-    ...invitation,
+    rationale,
+    invitation,
   ], marker);
 }
 

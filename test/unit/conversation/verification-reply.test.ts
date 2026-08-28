@@ -77,3 +77,35 @@ describe("renderVerificationReply", () => {
     expect(renderVerificationReply(input(), marker).text).toContain(marker);
   });
 });
+
+// PR #73 review. Both of these make the invitation useless in a different way:
+// one renders a mention that does not match any account, the other drops the
+// line entirely when the model is verbose.
+describe("renderVerificationReply — the invitation has to survive and to work", () => {
+  it("does not markdown-escape a login", () => {
+    const body = renderVerificationReply(input({ botLogin: "acme_bot" }), marker).text;
+
+    expect(body).toContain("@acme_bot reconsider");
+    expect(body).not.toContain("acme\\_bot");
+  });
+
+  // The command itself is wrapped in backticks, so the check is on the LOGIN:
+  // nothing that would break out of that span, and no whitespace.
+  it("still strips anything that is not part of a login", () => {
+    const body = renderVerificationReply(input({ botLogin: "acme`bot with spaces" }), marker).text;
+
+    expect(body).toContain("@acmebotwithspaces reconsider");
+    expect(body).not.toContain("acme`bot");
+  });
+
+  // The body is truncated from the END, so a long rationale could push the
+  // command off it — leaving a reader told they can disagree but not how.
+  it("keeps the command when the rationale is enormous", () => {
+    const body = renderVerificationReply(input({
+      rationale: "x".repeat(100_000),
+      botLogin: "acme-bot",
+    }), marker).text;
+
+    expect(body).toContain("@acme-bot reconsider");
+  });
+});

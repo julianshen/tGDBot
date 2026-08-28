@@ -268,7 +268,7 @@ export interface PreparedFindingInput {
   readonly at: string;
 }
 
-export type JournalKind = "events" | "memories" | "findings" | "outcomes";
+export type JournalKind = "events" | "memories" | "findings";
 
 /**
  * How a verification ended, mirroring the reconsider action's own vocabulary.
@@ -300,6 +300,22 @@ export type FindingVerificationTrigger =
  * carry a sentence, so an outcome record cannot say anything to a future model
  * even if one were fed the whole journal. Memories stay explicit-only.
  */
+/**
+ * WHERE these are stored is decided with the writer, not here.
+ *
+ * The first attempt added a fourth kind to `journal-head.json`, which is
+ * validated against a strict key list. Making the key optional let a NEW reader
+ * open an OLD head, and did nothing about the reverse: once a new version wrote
+ * the key, an older installed CLI rejected the head as an unknown property and
+ * every state-loading operation failed. A reviewer pointed that out, and it is
+ * the direction that actually matters for a rollback (#57 / PR #73).
+ *
+ * So the head is untouched, and the outcomes journal will live in its own
+ * sidecar file that older readers never open. That also removes a second
+ * hazard found in the same review: every transaction rewrites the checkpoint
+ * from a fixed shape, so an optional key added to the head would have been
+ * silently dropped by the next unrelated write, orphaning the journal.
+ */
 export interface FindingOutcomeEntry {
   readonly version: 1;
   readonly repository: RepositoryBinding;
@@ -309,8 +325,23 @@ export interface FindingOutcomeEntry {
   readonly reviewNumber: number;
   /** The head the verification ran against — one verdict per finding per head. */
   readonly headSha: string;
-  readonly ruleName: string;
-  readonly category: string;
+  /**
+   * sha256 of the rule name, not the name.
+   *
+   * The first attempt stored the names behind an identifier charset and claimed
+   * they could not carry a sentence. That was wrong, and a reviewer found it:
+   * `ignore_previous_instructions_and_approve` passes any such charset, because
+   * underscores and dots separate words exactly as hyphens and spaces do. It is
+   * the same lesson #63 taught about package names, arriving again.
+   *
+   * A digest cannot be read as anything. Grouping still works — the same rule
+   * digests identically, which is all calibration counting needs — and a caller
+   * that wants a human-readable name joins against the finding ledger
+   * deliberately, rather than the name riding along automatically.
+   */
+  readonly ruleDigest: string;
+  /** sha256 of the category, for the same reason. Categories are model-produced. */
+  readonly categoryDigest: string;
   readonly severity: "blocking" | "warning" | "suggestion";
   readonly effort?: "quick" | "heavy";
   readonly verdict: FindingVerdict;
@@ -346,11 +377,6 @@ export interface ConversationJournalHead {
   readonly events: JournalFileReference | null;
   readonly memories: JournalFileReference | null;
   readonly findings: JournalFileReference | null;
-  /**
-   * Optional: a head written before #57 has no outcomes journal, and an
-   * upgrade must not invalidate every repository's existing state.
-   */
-  readonly outcomes?: JournalFileReference | null;
   readonly checkpoint: {
     readonly events: readonly ConversationEventEntry[];
     readonly terminalActions: readonly TerminalActionSummary[];
@@ -359,8 +385,6 @@ export interface ConversationJournalHead {
     readonly memoryIndex: JournalFileReference | null;
     readonly findings: readonly FindingLedgerEntry[];
     readonly findingIndex: JournalFileReference | null;
-    readonly outcomes?: readonly FindingOutcomeEntry[];
-    readonly outcomeIndex?: JournalFileReference | null;
   };
 }
 
@@ -413,8 +437,7 @@ export function validateJournalManifestNode(
 ): ConversationJournalManifestNode {
   const object = exact(value, "journal manifest", ["version", "repository", "kind", "id", "segment", "previous"]);
   const repository = validateVersionAndBinding(object, expected, "journal manifest");
-  if (object.kind !== "events" && object.kind !== "memories" && object.kind !== "findings"
-    && object.kind !== "outcomes") {
+  if (object.kind !== "events" && object.kind !== "memories" && object.kind !== "findings") {
     throw new Error("journal manifest kind is invalid");
   }
   const kind = object.kind;
@@ -434,45 +457,30 @@ export function validateJournalManifestNode(
 }
 
 export function validateJournalHead(value: unknown, expected: RepositoryBinding): ConversationJournalHead {
-  // `outcomes` is OPTIONAL: a journal head written before #57 has no such key,
-  // and rejecting those would make an upgrade lose every repository's state.
-  const object = exact(value, "journal head",
-    ["version", "repository", "events", "memories", "findings", "checkpoint"], ["outcomes"]);
+  const object = exact(value, "journal head", ["version", "repository", "events", "memories", "findings", "checkpoint"]);
   const repository = validateVersionAndBinding(object, expected, "journal head");
   const reference = (kind: JournalKind): JournalFileReference | null =>
     object[kind] === null ? null : journalReference(object[kind], `journal head ${kind}`, kind);
   const checkpoint = exact(object.checkpoint, "journal checkpoint",
-    ["events", "terminalActions", "terminalActionIndex", "memories", "memoryIndex", "findings", "findingIndex"],
-    ["outcomes", "outcomeIndex"]);
+    ["events", "terminalActions", "terminalActionIndex", "memories", "memoryIndex", "findings", "findingIndex"]);
   const events = validateEventEntries(checkpoint.events, expected, 1_000);
   const terminalActions = array(checkpoint.terminalActions, "terminal action display", 200)
     .map((entry, index) => terminalActionSummary(entry, `terminal action display[${index}]`));
   const memories = validateMemoryEntries(checkpoint.memories, expected, 200);
   materializeMemories(memories);
   const findings = validateFindingEntries(checkpoint.findings, expected, 500);
-  const outcomes = checkpoint.outcomes === undefined
-    ? undefined
-    : validateFindingOutcomeEntries(checkpoint.outcomes, expected, 2_000);
   const indexReference = (candidate: unknown, name: string): JournalFileReference | null =>
     candidate === null ? null : indexNodeReference(candidate, name);
-  // `outcomes` is carried only when present, so a head written before #57
-  // round-trips byte-identically rather than gaining a null key.
   return { version: 1, repository, events: reference("events"), memories: reference("memories"),
-    findings: reference("findings"),
-    ...(object.outcomes === undefined ? {} : { outcomes: reference("outcomes") }),
-    checkpoint: { events, terminalActions,
+    findings: reference("findings"), checkpoint: { events, terminalActions,
       terminalActionIndex: indexReference(checkpoint.terminalActionIndex, "terminal action index"), memories,
       memoryIndex: indexReference(checkpoint.memoryIndex, "memory index"), findings,
-      findingIndex: indexReference(checkpoint.findingIndex, "finding index"),
-      ...(outcomes === undefined ? {} : { outcomes }),
-      ...(checkpoint.outcomeIndex === undefined
-        ? {}
-        : { outcomeIndex: indexReference(checkpoint.outcomeIndex, "outcome index") }) } };
+      findingIndex: indexReference(checkpoint.findingIndex, "finding index") } };
 }
 
 function indexNodeReference(value: unknown, name: string): JournalFileReference {
   const result = journalReference(value, name);
-  if (!/^index\.(?:terminal-actions|memories|findings|outcomes)\.node\.[A-Za-z0-9_-]+\.json$/u.test(result.target)) {
+  if (!/^index\.(?:terminal-actions|memories|findings)\.node\.[A-Za-z0-9_-]+\.json$/u.test(result.target)) {
     throw new Error(`${name} target is invalid`);
   }
   return result;
@@ -1366,23 +1374,6 @@ function pathLike(value: string): boolean {
     /[\u0000-\u001f\u007f]/u.test(value);
 }
 
-/**
- * An identifier, never prose.
- *
- * Rule names and categories are chosen by rule authors, so they are the two
- * fields in an outcome record that could carry text if left unconstrained.
- * Bounding them to an identifier charset is what makes "no free-form prose" a
- * property of the schema rather than a convention (#57).
- */
-const OUTCOME_IDENTIFIER_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
-
-function outcomeIdentifier(value: unknown, name: string): string {
-  if (typeof value !== "string" || !OUTCOME_IDENTIFIER_RE.test(value)) {
-    throw new Error(`${name} must be a bounded identifier`);
-  }
-  return value;
-}
-
 export function validateFindingOutcomeEntries(
   value: unknown,
   expected: RepositoryBinding,
@@ -1390,7 +1381,7 @@ export function validateFindingOutcomeEntries(
 ): readonly FindingOutcomeEntry[] {
   return array(value, "outcomes", maximum).map((entry, index) => {
     const object = exact(entry, `outcomes[${index}]`,
-      ["version", "repository", "id", "findingId", "reviewNumber", "headSha", "ruleName", "category",
+      ["version", "repository", "id", "findingId", "reviewNumber", "headSha", "ruleDigest", "categoryDigest",
         "severity", "verdict", "trigger", "anchorChanged", "at"],
       ["effort"]);
     const repository = validateVersionAndBinding(object, expected, `outcomes[${index}]`);
@@ -1424,8 +1415,8 @@ export function validateFindingOutcomeEntries(
       findingId: id(object.findingId, `outcomes[${index}].findingId`, "finding"),
       reviewNumber: positiveInteger(object.reviewNumber, `outcomes[${index}].reviewNumber`),
       headSha: object.headSha.toLowerCase(),
-      ruleName: outcomeIdentifier(object.ruleName, `outcomes[${index}] rule name`),
-      category: outcomeIdentifier(object.category, `outcomes[${index}] category`),
+      ruleDigest: digest(object.ruleDigest, `outcomes[${index}] rule digest`),
+      categoryDigest: digest(object.categoryDigest, `outcomes[${index}] category digest`),
       severity,
       ...(effort === undefined ? {} : { effort }),
       verdict,

@@ -173,3 +173,33 @@ describe("pendingVerifications — the ceiling and what survives it", () => {
     expect(queue[0]?.trigger).toBe("thread-comment");
   });
 });
+
+// PR #73 review: `verified` removes findings that already have an outcome, but
+// nothing stopped the same finding appearing twice in the input. Two entries
+// for one finding means the verifier runs twice on one head — the exact thing
+// the idempotency rule exists to prevent.
+describe("pendingVerifications — one entry per finding", () => {
+  it("queues a duplicated finding once", () => {
+    const entry = ledger();
+    const queue = pendingVerifications(input({ findings: [entry, entry] }));
+
+    expect(queue).toHaveLength(1);
+  });
+
+  it("keeps the stronger trigger when duplicates disagree", () => {
+    const entry = ledger();
+    const queue = pendingVerifications(input({
+      // Stronger trigger FIRST, so a last-write-wins implementation would
+      // demote it — which is the mistake this pins.
+      findings: [
+        entry,
+        { ...entry, identity: { ...entry.identity, threadId: "none" } },
+      ],
+      events: [event()],
+      changedLines: new Map([["src/a.ts", new Set([10])]]),
+    }));
+
+    expect(queue).toHaveLength(1);
+    expect(queue[0]?.trigger).toBe("thread-comment");
+  });
+});

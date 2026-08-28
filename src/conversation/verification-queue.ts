@@ -112,7 +112,10 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
     }
   }
 
-  const queued: PendingVerification[] = [];
+  // Keyed by finding ID: the same finding appearing twice in the input would
+  // otherwise be verified twice on one head, which is precisely what the
+  // idempotency rule exists to prevent (PR #73 review).
+  const queued = new Map<string, PendingVerification>();
   for (const candidate of input.findings) {
     if (verified.has(candidate.id)) continue;
 
@@ -125,10 +128,15 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
 
     const trigger = humanTrigger ?? (touched ? "head-change" : undefined);
     if (trigger === undefined) continue;
-    queued.push({ findingId: candidate.id, trigger, severity: candidate.finding.severity });
+    const existing = queued.get(candidate.id);
+    // Keep the strongest signal, so a duplicate cannot demote a human reply to
+    // an inferred code change.
+    if (existing === undefined || TRIGGER_RANK[trigger] < TRIGGER_RANK[existing.trigger]) {
+      queued.set(candidate.id, { findingId: candidate.id, trigger, severity: candidate.finding.severity });
+    }
   }
 
-  return queued
+  return [...queued.values()]
     .sort((left, right) =>
       SEVERITY_RANK[left.severity] - SEVERITY_RANK[right.severity]
       || TRIGGER_RANK[left.trigger] - TRIGGER_RANK[right.trigger])
