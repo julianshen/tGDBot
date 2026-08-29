@@ -1949,9 +1949,14 @@ const MAX_VERIFICATION_CANDIDATES = 200;
  * recovering findings whose publication crashed before identity binding
  * (issue #85). Scoped to unmatched events only, so the ordinary path — every
  * reply in a bound finding's thread — performs no additional provider
- * round-trip. An event in a thread the bot did not root, or whose root carries
- * no finding marker, can never recover; beyond the cap such events are
- * consumed rather than read again on every poll.
+ * round-trip.
+ *
+ * Events past the cap are DEFERRED, not consumed (Codex review of PR #87,
+ * round two): a genuine crash orphan sitting behind unrelated threads would
+ * otherwise be consumed unread and lost for good. Each poll still consumes
+ * durably every non-match it inspects and recovers every match, so the tail
+ * drains and the cursor hold terminates — only after an INSPECTION finds an
+ * event unmatchable is it consumed.
  */
 const MAX_IDENTITY_RECOVERY_READS = 4;
 
@@ -2076,6 +2081,11 @@ async function queueVerifications(input: {
   // spending a second read on it would double the recovery path's cost for no
   // information.
   const recoveredThreads = new Map<string, ReviewThreadSnapshot>();
+  // The uninspected tail is DEFERRED, not consumed: a genuine crash orphan
+  // sitting behind unrelated threads must be inspected on a later poll, not
+  // lost unread (Codex review of PR #87, round two). Each poll still consumes
+  // durably every non-match it inspects, so the tail drains.
+  recoveryDeferred.push(...unmatched.slice(MAX_IDENTITY_RECOVERY_READS));
   for (const event of unmatched.slice(0, MAX_IDENTITY_RECOVERY_READS)) {
     let thread: ReviewThreadSnapshot;
     try {
@@ -2126,9 +2136,10 @@ async function queueVerifications(input: {
   // Recovered events are in `waiting` now: their binding is repaired, so they
   // are held here and reached through the ordinary bound path once model
   // budget returns — never re-read, never re-recovered. Unmatched events that
-  // did NOT recover (no marker, not the bot's thread, past the cap) are not
-  // held: there is no way to ever match them, and holding unmatchable events
-  // pins the cursor forever.
+  // did NOT recover (no marker, not the bot's thread) are not held: there is
+  // no way to ever match them, and holding unmatchable events pins the cursor
+  // forever. Read failures and the unread past-the-cap tail ARE held — both
+  // may still resolve on a later poll.
   const holdAll = { items: [], deferred: true, deferredEvents: [...waiting, ...recoveryDeferred] };
   if (input.budget <= 0) return holdAll;
 

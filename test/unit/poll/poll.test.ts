@@ -2473,6 +2473,51 @@ describe("automatic verification", () => {
       .toBe("T2");
   });
 
+  // Codex review of PR #87, round two: events past the recovery cap must be
+  // DEFERRED, not consumed. Four unrelated thread events ahead of a genuine
+  // crash orphan used to exhaust the cap and push the orphan's reply out of
+  // both waiting and recovery sets — consumed unread, lost for good. The tail
+  // is held instead; each poll still consumes durably every non-match it
+  // inspects, so the tail drains and the hold terminates.
+  it("defers a crash orphan that sits past the recovery read cap", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const events: ReviewActivityEvent[] = [];
+    // FOUR unrelated threads ahead of the orphan — exactly the recovery read
+    // cap (MAX_IDENTITY_RECOVERY_READS in poll.ts) — with roots the bot did
+    // not write, which recovery inspects, refuses, and consumes.
+    for (let index = 0; index < 4; index += 1) {
+      events.push(installFindingThread(
+        adapter, "", threadComment(`stray-${index}`, "unrelated chatter", { threadId: `S${index}` }),
+        { rootAuthorIsBot: false },
+      ));
+    }
+    // The orphan is fifth: past the cap of four.
+    events.push(installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    ));
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents(events);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    // Not recovered YET — the cap spent this page's reads on the strays — but
+    // crucially not consumed either.
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID)?.identity).toBeUndefined();
+
+    // The strays were consumed durably, so the replay skips them and the
+    // orphan finally gets its read.
+    adapter.replaceEvents(events);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID)?.identity?.threadId).toBe("T1");
+  });
+
   // Metadata is a provider round-trip like any other, and failing it is an
   // outage rather than an answer.
   it("retries after review metadata fails to load", async () => {
