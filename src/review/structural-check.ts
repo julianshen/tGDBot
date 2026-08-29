@@ -105,6 +105,17 @@ export type StructuralCheck =
     readonly status: "lexical-matches";
     readonly references: readonly SymbolReference[];
     readonly filesSearched: number;
+    /**
+     * The EXACT number of external occurrences, counted as each match is
+     * found (issue #83). `references` is a bounded display sample — enough
+     * for every renderer — so the published count must NOT be read from
+     * `references.length`; a capped list would publish a number the host
+     * cannot stand behind. Absent on legacy results whose check predates
+     * inline reconciliation, and on results from an injected check; those
+     * are reconciled post-hoc by `reconcileWithDiff`, whose count stays
+     * `references.length` because nothing was discarded before the filter.
+     */
+    readonly occurrences?: number;
   }
   /** Nothing was established. Always carries why, and never means "no callers exist". */
   | { readonly status: "not-checked"; readonly reason: string };
@@ -188,6 +199,14 @@ export interface StructuralCheckOptions {
   /** Overridable so a test can exercise the oversized-file skip without a 2 MiB fixture. */
   readonly maxFileBytes?: number;
   readonly now?: () => number;
+  /**
+   * Lines this diff removes, keyed by base file (issue #83). Supplied so
+   * reconciliation can happen DURING collection — each match is counted or
+   * discarded at the moment it is found, which is what lets the published
+   * count stay exact while the retained sample is bounded. When absent,
+   * nothing is suppressed and `occurrences` counts every external match.
+   */
+  readonly removedLinesByFile?: ReadonlyMap<string, RemovedLines>;
 }
 
 /**
@@ -309,6 +328,7 @@ export async function checkStructuralClaim(
   const fileBudget = options.fileBudget ?? DEFAULT_FILE_BUDGET;
   const timeBudgetMs = options.timeBudgetMs ?? DEFAULT_TIME_BUDGET_MS;
   const maxFileBytes = options.maxFileBytes ?? MAX_FILE_BYTES;
+  const removedLinesByFile = options.removedLinesByFile;
   const started = now();
 
   if (!path.isAbsolute(input.baseRoot)) {
@@ -359,13 +379,29 @@ export async function checkStructuralClaim(
     canonicalRelative(input.findingFile),
     ...(input.findingFileAtBase === undefined ? [] : [canonicalRelative(input.findingFileAtBase)]),
   ]);
+  // Bounded by MAX_RETAINED_REFERENCES: a display sample, not the census.
+  // Issue #83 — a generated file dense with one identifier used to push one
+  // {file, line} pair per match into this list, on the order of 10⁵ entries
+  // for a 2 MiB file, all retained before any counting happened.
   const references: SymbolReference[] = [];
+  // The census. Counted at the moment each match is found, together with the
+  // reconciliation decision for THAT match — so the published count survives
+  // the retention cap exactly, and reconciliation no longer needs the
+  // discarded matches' coordinates.
+  let occurrences = 0;
+  let suppressedOccurrences = 0;
   let filesSearched = 0;
+  // Whether the walk stopped early on the clock. A PARTIAL scan cannot make
+  // the complete-scan claim below — see the `occurrences === 0` branch.
+  let walkExpired = false;
 
-  for (const file of files) {
+  walk: for (const file of files) {
     // Stop, but evaluate what was already found rather than discarding it: a
     // reference read before the deadline is still a reference.
-    if (expired()) break;
+    if (expired()) {
+      walkExpired = true;
+      break;
+    }
     const language = LANG_BY_EXTENSION.get(path.extname(file).toLowerCase());
     const kinds = language === undefined ? undefined : REFERENCE_KINDS.get(language);
     const astLangName = language === undefined ? undefined : AST_LANG.get(language);
@@ -393,26 +429,81 @@ export async function checkStructuralClaim(
 
     const relative = canonicalRelative(path.relative(input.baseRoot, file));
     for (const kind of kinds) {
+      // Never START a discovery after the deadline (CodeRabbit review of
+      // PR #93): the overshoot is then bounded by one kind's discovery in one
+      // file. `findAll` itself is atomic — it materializes every match of one
+      // kind in Rust before JS sees the first node, and napi 0.45.2 offers no
+      // streaming or cancellation API (SgNode.findAll → Array; there is no
+      // iterator). Measured on the pathological file from issue #83 (2 MiB,
+      // ~190k matches): discovery ≈ 200ms, which the budget absorbs; the
+      // 2 MiB parse BEFORE it is also atomic and three-halves the cost, so a
+      // manual `children()` walk — thousands of FFI calls per ordinary file —
+      // could not make the per-file cost deadline-aware anyway. Everything
+      // JS-side below IS per-node deadline-bounded.
+      if (expired()) {
+        walkExpired = true;
+        break walk;
+      }
       for (const node of root.findAll({ rule: { kind } })) {
+        // Issue #83: the deadline is consulted MID-FILE, not only between
+        // files. One dense file could otherwise run the whole budget after
+        // the last file boundary. Stopping here yields a PARTIAL count, and
+        // undercounting is the safe direction — the same trade the per-file
+        // break above already made.
+        if (expired()) {
+          walkExpired = true;
+          break walk;
+        }
         if (node.text() !== claim.symbol) continue;
-        references.push({ file: relative, line: node.range().start.line + 1 });
+        // The finding's own files are filtered HERE rather than after the
+        // walk: reconciliation and the census are per-match decisions, and a
+        // discarded match must be discarded before it costs memory.
+        if (ownFiles.has(relative)) continue;
+        const reference: SymbolReference = { file: relative, line: node.range().start.line + 1 };
+        // Reconcile DURING collection (issue #83): a match the diff may
+        // already have deleted is counted as suppressed and discarded NOW,
+        // at the moment it is found. This is the rework the issue called
+        // for — a cap bolted onto the old shape would have made the published
+        // count wrong, because reconciliation subtracts from the retained
+        // list, and with the list capped the post-reconciliation count is
+        // unknowable.
+        if (suppressedByDiff(claim.symbol, reference, removedLinesByFile)) {
+          suppressedOccurrences += 1;
+          continue;
+        }
+        occurrences += 1;
+        if (references.length < MAX_RETAINED_REFERENCES) references.push(reference);
       }
     }
   }
 
+  // The every-file-removed claim is a statement about the WHOLE walk, so it
+  // must never fire on a partial one (CodeRabbit review of PR #93): the
+  // deadline may have stopped the scan after the last suppressed match but
+  // before an unread survivor, and publishing "removes lines mentioning it
+  // from every file" over a half-read tree would be the host asserting more
+  // than it read. A partial scan falls back to the ordinary not-checked
+  // reason, which overclaims nothing. A partial scan that DID find survivors
+  // still publishes them — undercounting is the safe direction.
+  if (occurrences === 0 && suppressedOccurrences > 0 && !walkExpired) {
+    return { status: "not-checked", reason: REMOVED_EVERYWHERE_REASON };
+  }
+  if (occurrences === 0) {
+    return {
+      status: "not-checked",
+      reason: `the name did not occur outside its own file in ${filesSearched} file(s) of the base branch, which is not evidence that no reference exists`,
+    };
+  }
+
   references.sort((left, right) =>
     left.file === right.file ? left.line - right.line : left.file.localeCompare(right.file));
-
-  const external = references.filter((reference) => !ownFiles.has(reference.file));
-  if (external.length > 0) {
-    // Survives every gap above: a file left unread cannot unmake an occurrence
-    // that was read. What it does NOT survive is name collision, which is why
-    // the status and its wording claim only a lexical match.
-    return { status: "lexical-matches", references: external, filesSearched };
-  }
   return {
-    status: "not-checked",
-    reason: `the name did not occur outside its own file in ${filesSearched} file(s) of the base branch, which is not evidence that no reference exists`,
+    status: "lexical-matches",
+    references,
+    // Exact even when the sample is capped: the count was taken at
+    // collection, not read off the retained list.
+    occurrences,
+    filesSearched,
   };
 }
 
@@ -446,12 +537,15 @@ export function describeCheck(
     return `Host check: not performed — ${escape(check.reason)}.`;
   }
   const scope = `${check.filesSearched} file(s) of the base branch`;
+  // `occurrences` is the exact census (issue #83); legacy and injected results
+  // predate it, and for them `references.length` is still the whole truth.
+  const total = check.occurrences ?? check.references.length;
   const shown = check.references.slice(0, 5);
   const rendered = shown.map((reference) => `\`${escape(`${reference.file}:${reference.line}`)}\``).join(", ");
-  const more = check.references.length > shown.length
-    ? `, and ${check.references.length - shown.length} more`
+  const more = total > shown.length
+    ? `, and ${total - shown.length} more`
     : "";
-  return `Host check: the name \`${escape(claim.symbol)}\` occurs ${check.references.length} time(s) outside this file, across ${scope} — ${rendered}${more}. These are LEXICAL matches: the host did not resolve whether they refer to this \`${escape(claim.symbol)}\`, and a same-named member of an unrelated type looks identical here. Worth checking before relying on the claim above.`;
+  return `Host check: the name \`${escape(claim.symbol)}\` occurs ${total} time(s) outside this file, across ${scope} — ${rendered}${more}. These are LEXICAL matches: the host did not resolve whether they refer to this \`${escape(claim.symbol)}\`, and a same-named member of an unrelated type looks identical here. Worth checking before relying on the claim above.`;
 }
 
 /**
@@ -535,6 +629,55 @@ function identifierMatcher(symbol: string): RegExp {
 }
 
 /**
+ * How many surviving occurrences are RETAINED for display (issue #83).
+ *
+ * Every renderer shows at most five locations, so five would do; the margin
+ * absorbs a renderer change without a second rework of the collection loop.
+ * The point of the bound is that the count is NOT carried by this list —
+ * `occurrences` is — so the cap costs display detail only, never truth.
+ */
+const MAX_RETAINED_REFERENCES = 8;
+
+/**
+ * Whether the diff removes the line this occurrence sits on.
+ *
+ * The ONE reconciliation predicate, shared by the collection loop (which
+ * counts as it discards, issue #83) and by `reconcileWithDiff` (which filters
+ * results whose check predates inline reconciliation, including every
+ * injected check). Two predicate definitions would eventually disagree — the
+ * word-boundary rule below was itself a round-4 fix, and a drift here would
+ * silently resurrect it.
+ *
+ * An occurrence becomes doubtful when the pull request removes the line it
+ * sits on. Base line numbers and the diff's old-side numbers are the same
+ * coordinates by construction — both count the file at the base commit. Where
+ * the diff's hunk headers could not be parsed, the positions are not
+ * trustworthy and it falls back to the whole file. Over-suppressing is the
+ * safe direction for a check whose only output is an accusation.
+ */
+function suppressedByDiff(
+  symbol: string,
+  reference: SymbolReference,
+  removedLinesByFile: ReadonlyMap<string, RemovedLines> | undefined,
+): boolean {
+  if (removedLinesByFile === undefined) return false;
+  const removed = removedLinesByFile.get(reference.file);
+  if (removed === undefined) return false;
+  if (!removed.positioned) return identifierMatcher(symbol).test(removed.text);
+  const line = removed.byLine.get(reference.line);
+  return line !== undefined && identifierMatcher(symbol).test(line);
+}
+
+/**
+ * The not-checked reason for a claim whose every base occurrence the diff
+ * may already have deleted. Shared verbatim by `reconcileWithDiff` and the
+ * inline reconciliation in `checkStructuralClaim` — the same answer must
+ * carry the same wording whichever path produced it.
+ */
+const REMOVED_EVERYWHERE_REASON =
+  "the name occurs at the base commit, but this pull request removes lines mentioning it from every file where it was found — the check reads the base, so it cannot tell whether those are the occurrences being deleted";
+
+/**
  * Drops occurrences the diff may already have deleted, and reports what is left.
  *
  * An occurrence becomes doubtful when the pull request removes the line it sits
@@ -555,20 +698,19 @@ function reconcileWithDiff(
   removedLinesByFile: ReadonlyMap<string, RemovedLines> | undefined,
 ): StructuralCheck {
   if (result.status !== "lexical-matches" || removedLinesByFile === undefined) return result;
-  const asIdentifier = identifierMatcher(claim.symbol);
-  const surviving = result.references.filter((reference) => {
-    const removed = removedLinesByFile.get(reference.file);
-    if (removed === undefined) return true;
-    if (!removed.positioned) return !asIdentifier.test(removed.text);
-    const line = removed.byLine.get(reference.line);
-    return line === undefined || !asIdentifier.test(line);
-  });
+  // A result carrying `occurrences` was reconciled DURING collection
+  // (issue #83): every match was counted or discarded at the moment it was
+  // found, so there is nothing left to filter and the count is already the
+  // exact post-reconciliation figure. Filtering the bounded sample again
+  // would be pointless — and could not reconstruct what was discarded anyway.
+  // Results without `occurrences` come from an injected check (or predate the
+  // rework): they retained EVERYTHING, so the post-hoc filter is exact.
+  if (result.occurrences !== undefined) return result;
+  const surviving = result.references.filter((reference) =>
+    !suppressedByDiff(claim.symbol, reference, removedLinesByFile));
   if (surviving.length === result.references.length) return result;
   if (surviving.length === 0) {
-    return {
-      status: "not-checked",
-      reason: `the name occurs at the base commit, but this pull request removes lines mentioning it from every file where it was found — the check reads the base, so it cannot tell whether those are the occurrences being deleted`,
-    };
+    return { status: "not-checked", reason: REMOVED_EVERYWHERE_REASON };
   }
   return { ...result, references: surviving };
 }
@@ -708,6 +850,12 @@ export async function runStructuralChecks(
         // cannot multiply itself by the claim budget.
         timeBudgetMs: Math.min(DEFAULT_TIME_BUDGET_MS, remainingMs),
         now,
+        // The diff travels INTO the check so reconciliation can happen during
+        // collection (issue #83): counting each match as it is found is what
+        // keeps the published count exact while retention is bounded. The
+        // post-hoc `reconcileWithDiff` below remains for injected checks,
+        // which retain everything and skip it via the `occurrences` marker.
+        ...(input.removedLinesByFile === undefined ? {} : { removedLinesByFile: input.removedLinesByFile }),
       });
       // The base/head reconciliation lives here because this is the only layer
       // that can see the diff; `checkStructuralClaim` knows one tree.
@@ -749,7 +897,10 @@ export function describeCheckCompact(
   escape: (value: string) => string = (value) => value,
 ): string {
   if (check.status === "not-checked") return "Host check: not performed";
+  // Same census rule as `describeCheck`: with retention capped, the count
+  // lives in `occurrences`, never in the length of the display sample.
+  const total = check.occurrences ?? check.references.length;
   const first = check.references[0];
   const where = first === undefined ? "" : `, e.g. ${escape(`${first.file}:${first.line}`)}`;
-  return `Host check: the name occurs ${check.references.length} time(s) elsewhere${where} — unresolved lexical matches`;
+  return `Host check: the name occurs ${total} time(s) elsewhere${where} — unresolved lexical matches`;
 }
