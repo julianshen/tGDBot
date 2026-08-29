@@ -620,6 +620,7 @@ function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): Review
     // A polled review must run under the poll's own network setting, not a
     // different one (PR #54 review).
     dependencyFacts: config.dependencyFacts,
+    structuralChecks: config.structuralChecks,
     suggestions: config.suggestions,
     dryRun: config.dryRun,
     trustLocalRules: config.trustLocalRules,

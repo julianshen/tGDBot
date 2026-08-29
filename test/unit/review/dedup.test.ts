@@ -245,3 +245,28 @@ describe("computeReviewConfigHash — dependency facts", () => {
       .toBe("157353dcae62");
   });
 });
+
+// Codex review on #76: without this, turning the feature on after a review
+// skips before dispatch on an unchanged head, so no check ever appears until
+// some unrelated commit moves the head. Same class as --dispatch and
+// --dependency-facts, which are hashed for exactly this reason.
+describe("structural checks in the config hash", () => {
+  const base = {
+    advisor: "on" as const,
+    suggestions: "on" as const,
+    disableBuiltinRule: false,
+    trustLocalRules: false,
+    rulesDir: "rules",
+    dispatch: "direct" as const,
+  };
+
+  it("changes the hash, so flipping it re-triggers on an unchanged head", () => {
+    expect(computeReviewConfigHash({ ...base, structuralChecks: "on" }))
+      .not.toBe(computeReviewConfigHash({ ...base, structuralChecks: "off" }));
+  });
+
+  it("treats off and absent as the same, so existing markers stay valid", () => {
+    expect(computeReviewConfigHash({ ...base, structuralChecks: "off" }))
+      .toBe(computeReviewConfigHash(base));
+  });
+});

@@ -9,6 +9,8 @@ import { describe, expect, it } from "vitest";
 import {
   changedFiles,
   changedFilesWithRenameSources,
+  removedLinesByFile,
+  renameSourcesByHeadPath,
   quoteGitPathOperand,
   commentableLines,
   diffPositionRange,
@@ -676,5 +678,256 @@ describe("quoteGitPathOperand", () => {
       const header = `diff --git ${quoteGitPathOperand("a", name)} ${quoteGitPathOperand("b", name)}`;
       expect(changedFiles(header)).toEqual([name]);
     }
+  });
+});
+
+// Issue #75. The structural check reports BASE-relative paths, so a map keyed
+// only by the head side silently misses every file the pull request renames —
+// and the reconciliation this feeds exists precisely to catch a PR that deletes
+// a call site. Renaming that file too made it invisible again (CodeRabbit
+// review).
+describe("removedLinesByFile", () => {
+  it("finds a renamed file's removed lines under either path", () => {
+    const diff = [
+      "diff --git a/src/old.ts b/src/new.ts",
+      "similarity index 90%",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+      "--- a/src/old.ts",
+      "+++ b/src/new.ts",
+      "@@ -1,2 +1,1 @@",
+      " import { budget } from './retry.js';",
+      "-export const a = budget(1);",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/old.ts")?.text).toContain("budget(1)");
+    expect(removed.get("src/new.ts")?.text).toContain("budget(1)");
+    // The removed line is the second of the hunk, which starts at old line 1.
+    expect(removed.get("src/old.ts")?.byLine.get(2)).toContain("budget(1)");
+    expect(removed.get("src/old.ts")?.positioned).toBe(true);
+  });
+
+  it("keys an ordinary edit once, by its single path", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -1,2 +1,1 @@",
+      "-export const a = budget(1);",
+      "+export const a = 1;",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect([...removed.keys()]).toEqual(["src/http.ts"]);
+    expect(removed.get("src/http.ts")?.byLine.get(1)).toContain("budget(1)");
+  });
+
+  // `---` opens the file header and would otherwise read as a removed line
+  // beginning with `--`, putting the base path itself into the removed text.
+  it("does not mistake the file header for a removed line", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1 +1 @@",
+      "-const x = 1;",
+    ].join("\n");
+
+    expect(removedLinesByFile(diff).get("src/a.ts")?.text).not.toContain("a/src/a.ts");
+  });
+
+  // Codex review, round 7. A removed line whose CONTENT begins with `--` — a
+  // decrement, say `--budget;` — is written `---budget;` in a unified diff.
+  // Treating every `---` as a file header lost the removal, so reconciliation
+  // kept the stale base occurrence and published a match against a correct
+  // finding; worse, it also failed to advance the base line counter, sliding
+  // every later removal in that file by one.
+  it("reads a triple-minus line inside a hunk as removed content", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -1,3 +1,1 @@",
+      " const keep = 1;",
+      "---budget;",
+      "-const after = 2;",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/http.ts")?.byLine.get(2)).toBe("--budget;");
+    // The counter advanced past the decrement, so the next removal is line 3.
+    expect(removed.get("src/http.ts")?.byLine.get(3)).toBe("const after = 2;");
+    expect(removed.get("src/http.ts")?.positioned).toBe(true);
+  });
+
+  // The mirror case: an added line whose content starts with `++` is `+++x;`,
+  // and must not advance the base counter the way a context line does.
+  it("does not let a triple-plus added line advance the base counter", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -1,2 +1,3 @@",
+      " const keep = 1;",
+      "+++counter;",
+      "-const gone = budget(1);",
+    ].join("\n");
+
+    expect(removedLinesByFile(diff).get("src/http.ts")?.byLine.get(2))
+      .toBe("const gone = budget(1);");
+  });
+
+  // Codex review, round 13. Round 12 fixed the ` b/` ambiguity for RENAME
+  // endpoints; an ordinary modification still took its key from the greedy
+  // header split. Verified against git, which writes an edit to `foo b/bar.ts`
+  // as `diff --git a/foo b/bar.ts b/foo b/bar.ts` and terminates the
+  // `---`/`+++` lines with a TAB when the path contains a space.
+  it("keys removals by the real path when the header is ambiguous", () => {
+    const diff = [
+      "diff --git a/foo b/bar.ts b/foo b/bar.ts",
+      "index 1eb743d..7898192 100644",
+      "--- a/foo b/bar.ts\t",
+      "+++ b/foo b/bar.ts\t",
+      "@@ -1,2 +1 @@",
+      " a",
+      "-budget(1);",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("foo b/bar.ts")?.byLine.get(2)).toBe("budget(1);");
+    expect(removed.has("bar.ts")).toBe(false);
+  });
+
+  // A deleted file has `+++ /dev/null`, so the base-side path is the only one.
+  it("keys a deleted file by its base-side path", () => {
+    const diff = [
+      "diff --git a/src/gone.ts b/src/gone.ts",
+      "--- a/src/gone.ts",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-const x = budget(1);",
+    ].join("\n");
+
+    expect(removedLinesByFile(diff).get("src/gone.ts")?.byLine.get(1))
+      .toBe("const x = budget(1);");
+  });
+
+  // Codex review, round 8. A COPY diff also carries two different paths. Its
+  // removed lines belong to the NEW file; recording them under the source path
+  // would suppress occurrences in a file the diff never touched — and, through
+  // `renameSourcesByHeadPath`, would exclude the still-existing original from
+  // external matches entirely, hiding the best evidence against the claim.
+  it("does not treat a copy's source as the same file", () => {
+    const diff = [
+      "diff --git a/src/original.ts b/src/copy.ts",
+      "similarity index 95%",
+      "copy from src/original.ts",
+      "copy to src/copy.ts",
+      "--- a/src/original.ts",
+      "+++ b/src/copy.ts",
+      "@@ -1,2 +1,1 @@",
+      " const keep = 1;",
+      "-const gone = budget(1);",
+    ].join("\n");
+
+    expect(renameSourcesByHeadPath(diff).has("src/copy.ts")).toBe(false);
+    const removed = removedLinesByFile(diff);
+    expect(removed.get("src/copy.ts")?.text).toContain("budget(1)");
+    expect(removed.has("src/original.ts")).toBe(false);
+  });
+
+  // Codex review, round 12. A path may legally contain ` b/`, and git does NOT
+  // quote it — verified against git, which writes a rename to `foo b/bar.ts` as
+  // `diff --git a/old.ts b/foo b/bar.ts`. A greedy split yields `bar.ts` as the
+  // head path, so the mapping never matches the finding's file and the base
+  // file's own declaration is published as an external match.
+  it("takes rename endpoints from the metadata, not the ambiguous header", () => {
+    const diff = [
+      "diff --git a/src/old.ts b/src/foo b/bar.ts",
+      "similarity index 100%",
+      "rename from src/old.ts",
+      "rename to src/foo b/bar.ts",
+    ].join("\n");
+
+    const renames = renameSourcesByHeadPath(diff);
+
+    expect(renames.get("src/foo b/bar.ts")).toBe("src/old.ts");
+    expect(renames.has("bar.ts")).toBe(false);
+  });
+
+  // A C-quoted path is the one case the metadata lines cannot be read verbatim,
+  // and it is exactly the case `parseDiffGitHeader` already handles — so the
+  // header operands stay the source of truth there.
+  it("falls back to the header operands for a quoted rename", () => {
+    const diff = [
+      'diff --git a/src/old.ts "b/src/caf\\303\\251.ts"',
+      "rename from src/old.ts",
+      'rename to "src/caf\\303\\251.ts"',
+    ].join("\n");
+
+    const renames = renameSourcesByHeadPath(diff);
+
+    expect([...renames.values()]).toEqual(["src/old.ts"]);
+    expect([...renames.keys()][0]).toContain("caf");
+  });
+
+  // The rename case still works, and now rests on the metadata rather than on
+  // the paths merely differing.
+  it("requires rename metadata, not just differing paths", () => {
+    const withMeta = [
+      "diff --git a/src/old.ts b/src/new.ts",
+      "rename from src/old.ts",
+      "rename to src/new.ts",
+    ].join("\n");
+    const withoutMeta = "diff --git a/src/old.ts b/src/new.ts";
+
+    expect(renameSourcesByHeadPath(withMeta).get("src/new.ts")).toBe("src/old.ts");
+    expect(renameSourcesByHeadPath(withoutMeta).has("src/new.ts")).toBe(false);
+  });
+
+  // Base line numbers only advance on removed and CONTEXT lines. Counting an
+  // added line would slide every later position, and a position that is off by
+  // one suppresses the wrong occurrence — or none.
+  it("numbers removals by their base-side line, ignoring additions", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ -10,4 +10,4 @@",
+      " const before = 1;",
+      "+const added = 2;",
+      "-const gone = budget(1);",
+      " const after = 3;",
+      "-const alsoGone = 4;",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/http.ts")?.byLine.get(11)).toBe("const gone = budget(1);");
+    expect(removed.get("src/http.ts")?.byLine.get(13)).toBe("const alsoGone = 4;");
+    expect(removed.get("src/http.ts")?.positioned).toBe(true);
+  });
+
+  // An unparseable hunk header makes every later position a guess, and a wrong
+  // position is worse than none: it would fail to suppress an occurrence the
+  // diff really deleted. The whole-file text stays usable as a fallback.
+  it("marks a file unpositioned when a hunk header cannot be parsed", () => {
+    const diff = [
+      "diff --git a/src/http.ts b/src/http.ts",
+      "--- a/src/http.ts",
+      "+++ b/src/http.ts",
+      "@@ nonsense @@",
+      "-const gone = budget(1);",
+    ].join("\n");
+
+    const removed = removedLinesByFile(diff);
+
+    expect(removed.get("src/http.ts")?.positioned).toBe(false);
+    expect(removed.get("src/http.ts")?.text).toContain("budget(1)");
   });
 });

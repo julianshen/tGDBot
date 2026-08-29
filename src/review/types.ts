@@ -1,4 +1,5 @@
 import type { ContextPackResult } from "../context/context-pack.js";
+import type { StructuralCheck, StructuralClaim } from "./structural-check.js";
 import type { RuleDefinition } from "../rules/types.js";
 
 // Finding/DispatchResult: the shape produced by dispatching every loaded rule
@@ -95,6 +96,41 @@ export interface Finding {
    * available, every citation is dropped: fail closed.
    */
   references?: readonly string[];
+
+  /**
+   * Issue #75: a structural assertion this finding rests on, for the HOST to
+   * check against the trusted base tree.
+   *
+   * The failure mode it exists for is the confident false positive: "this
+   * function is never called", written about code the reviewer cannot see,
+   * because its only caller sits outside the diff. #58's context pack helps the
+   * reviewer reason; nothing checked the assertion afterwards.
+   *
+   * Structured rather than inferred from `message`, for the same reason
+   * `references` is a field rather than a regex over prose: "never called",
+   * "no other caller" and "nothing else implements this" are one claim in three
+   * phrasings, and a matcher over them would both miss real claims and invent
+   * ones that were never made. Absent is the safe default.
+   *
+   * The claim is the model's; the CHECK is the host's, and only the check is
+   * ever presented as established. A contradicted claim never suppresses the
+   * finding — see `structural-check.ts`.
+   */
+  claim?: StructuralClaim;
+
+  /**
+   * Issue #75: what the HOST found when it checked `claim`. Host-computed, and
+   * never copied from reviewer output.
+   *
+   * That guarantee is structural rather than a matter of the model behaving:
+   * `normalizeUnknownFinding` builds a finding field by field from an allowlist,
+   * so a reviewer that emits `"hostCheck"` in its JSON has it dropped like any
+   * other unknown key. A forged verification would be the most damaging thing a
+   * finding could carry — it is the one part a reader is meant to trust without
+   * re-deriving — so it must not be forgeable, the same reasoning that keeps
+   * `suggestion` a validated field rather than free text in `message`.
+   */
+  hostCheck?: StructuralCheck;
 }
 
 export interface DispatchResult {

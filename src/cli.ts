@@ -67,7 +67,7 @@ import {
   formatMarker,
   stateRootDomainIdentifier,
 } from "./review/dedup.js";
-import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions } from "./review/diff-anchors.js";
+import { changedFiles, changedFilesWithRenameSources, commentableLines, isCommentable, parseDiffPositions, removedLinesByFile, renameSourcesByHeadPath } from "./review/diff-anchors.js";
 import {
   formatPendingMarker,
   replacePendingMarker,
@@ -75,7 +75,7 @@ import {
 import type { InlineRecoveryState } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
-import { orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
+import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, ReviewDispatchInput } from "./review/types.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
@@ -87,6 +87,8 @@ import {
   prepareReviewContext as prepareReviewContextReal,
 } from "./context/prepare.js";
 import { contextRoots, selectContextRoot } from "./context/root.js";
+import { runStructuralChecks as runStructuralChecksReal } from "./review/structural-check.js";
+import { prepareWorkspace as prepareWorkspaceReal } from "./workspace/manager.js";
 import {
   combineContextPacks,
   DEFAULT_CONTEXT_MAX_CHARS,
@@ -212,6 +214,13 @@ export interface ReviewDependencies {
    * stance `dispatchRules` takes for its session factory.
    */
   prepareContext?: typeof prepareReviewContextReal;
+  /**
+   * Issue #75. Injected for the same reason `prepareContext` is: a review test
+   * must never walk a real git worktree with a real parser.
+   */
+  runStructuralChecks?: typeof runStructuralChecksReal;
+  /** Resolves the trusted base worktree the checks read. Injected alongside them. */
+  prepareStructuralWorkspace?: typeof prepareWorkspaceReal;
   now?: () => string;
 }
 
@@ -878,6 +887,8 @@ export async function review(
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
+  const runStructuralChecksFn = deps.runStructuralChecks ?? runStructuralChecksReal;
+  const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? prepareWorkspaceReal;
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
   const fetchJsonFn = deps.fetchJson ?? fetchJsonReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
@@ -1468,6 +1479,72 @@ export async function review(
       ? {}
       : { conversationContext: loadedContext.conversationContext }),
   });
+
+  // Issue #75: check the structural claims the reviewer chose to make, against
+  // the trusted BASE tree. Best-effort throughout — a check that cannot run
+  // degrades to "not performed, with reason" beside the finding, and never
+  // costs the review. Deliberately AFTER dispatch: the claims do not exist
+  // until the findings do.
+  //
+  // The worktree is prepared here rather than reused from context preparation,
+  // because that only builds one on a cache MISS. Reusing it would mean the
+  // same review got checks or not depending on cache state, which is a worse
+  // property than paying for the worktree.
+  if (config.structuralChecks === "on" && dispatchResult.findings.some((f) => f.claim !== undefined)) {
+    try {
+      const addressedKeys = new Set(
+        dispatchResult.findings
+          .filter((finding) => finding.decision === "addressed")
+          .map(dedupeKey),
+      );
+      const prepared = await prepareStructuralWorkspaceFn({
+        // The SAME managed workspace context mapping uses, so a repository
+        // is mirrored once whichever feature asked for it first.
+        root: contextRoots(selectContextRoot({
+          ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
+        })).workspaceRoot,
+        repo: repository,
+        baseSha: pr.baseSha,
+        rejectPreviouslySharedRoot: true,
+      });
+      if (prepared.baseSha !== pr.baseSha) {
+        throw new Error("prepared worktree does not sit at the requested base commit");
+      }
+      dispatchResult.findings = await runStructuralChecksFn({
+        findings: dispatchResult.findings,
+        baseRoot: prepared.baseWorktreePath,
+        // A finding names its HEAD path; the base tree holds a renamed file
+        // under the old one, and without this the symbol's own declaration
+        // reads as a reference from elsewhere.
+        renamedFrom: renameSourcesByHeadPath(diff),
+        // Lets the checker drop occurrences whose base-side lines may be
+        // precisely the ones this PR deletes — per file, so an untouched
+        // caller elsewhere survives.
+        removedLinesByFile: removedLinesByFile(diff),
+        // `orchestrate` drops an actionable finding whose dedup key matches an
+        // `addressed` one, so checking those spends budget on results no reader
+        // sees. Wired HERE, at the composition root, using orchestrate's own
+        // `dedupeKey` — the checker stays independent of the orchestrator and
+        // there is only one definition of the rule.
+        isSuppressed: (finding) => addressedKeys.has(dedupeKey(finding))
+          && (finding.decision ?? "new") !== "addressed",
+      });
+    } catch (error) {
+      // Stated on the findings that asked for a check, so the reader learns the
+      // claim went unverified rather than silently reading it as unchallenged.
+      //
+      // HOST-AUTHORED, not the caught error. This string is rendered into a
+      // review comment, which is world-readable on a public repository, and a
+      // workspace failure quotes the absolute path it failed on — leaking the
+      // CI runner's filesystem layout to anyone reading the PR (CodeRabbit
+      // review). Same rule `ruleFailureReasons` already follows, arrived at the
+      // same way; the raw error goes to stderr, which is private CI logs.
+      const reason = "the base worktree could not be prepared";
+      dispatchResult.findings = dispatchResult.findings.map((finding) =>
+        finding.claim === undefined ? finding : { ...finding, hostCheck: { status: "not-checked" as const, reason } });
+      console.warn(`tgd-review-agent: structural checks skipped (${reason}: ${redactedMessage(error)})`);
+    }
+  }
 
   if (extracted.omittedCount > 0) {
     console.warn(`tgd-review-agent: ${extracted.omittedCount} additional related-work reference(s) omitted`);

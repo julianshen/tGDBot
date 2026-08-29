@@ -96,6 +96,8 @@ const COMPLETE: Required<Finding> = {
   suggestion: "\tif stale(entry) {\n\t\treturn revalidate(ctx)\n\t}",
   effort: "heavy",
   references: ["https://docs.example.com/ttl"],
+  claim: { kind: "no-other-references", symbol: "revalidate" },
+  hostCheck: { status: "lexical-matches", references: [{ file: "src/other.go", line: 7 }], filesSearched: 3 },
 };
 
 const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
@@ -103,6 +105,33 @@ const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
 /** Fields a REVIEWING rule is deliberately never asked to produce. */
 const NOT_IN_RULE_CONTRACT: Partial<Record<keyof Finding, string>> = {
   ruleName: "stamped by the dispatcher from the rule that actually ran — a rule naming itself would be unverifiable",
+  hostCheck: "computed by the host from the base tree (#75); a rule able to emit it could forge its own verification, which is the one part of a finding a reader is invited to trust without re-deriving",
+};
+
+/**
+ * Fields the reviewer-output parser deliberately refuses.
+ *
+ * This is not an omission to be fixed later — it IS the forgery guarantee for
+ * #75. The parser rebuilds a finding from an allowlist, so a field absent from
+ * that list cannot arrive from reviewer output however the model spells it.
+ */
+const NOT_FROM_REVIEWER: Partial<Record<keyof Finding, string>> = {
+  hostCheck: "host-computed; accepting it from reviewer output would let a finding fabricate its own verification",
+};
+
+/**
+ * Fields deliberately absent from the PERSISTED forms.
+ *
+ * Both are derived from one review against one base commit. `hostCheck` is a
+ * parse of the base tree, and a stored verification goes stale the moment that
+ * tree moves — a stale verification being precisely the artifact #75 exists to
+ * prevent. `claim` is only meaningful next to its check: persisting the
+ * assertion without the answer would store an unverified claim as part of the
+ * finding's identity. Both are recomputed per review, cheaply, from scratch.
+ */
+const NOT_PERSISTED: Partial<Record<keyof Finding, string>> = {
+  claim: "recomputed per review; meaningless without the check that answers it",
+  hostCheck: "derived from one base commit; a persisted verification would go stale silently",
 };
 
 /**
@@ -115,6 +144,7 @@ const NOT_IN_RULE_CONTRACT: Partial<Record<keyof Finding, string>> = {
  * question rather than defaulting to silence.
  */
 const NOT_COPIED_THROUGH: Partial<Record<keyof Finding, string>> = {
+  hostCheck: "never emitted by a task in the first place — see NOT_IN_RULE_CONTRACT",
   file: "structural; the aggregator carries it, not the prose of it",
   line: "structural, as above",
   severity: "a closed vocabulary, not free text",
@@ -124,6 +154,7 @@ const NOT_COPIED_THROUGH: Partial<Record<keyof Finding, string>> = {
 
 /** Fields the builtin reviewer agent is deliberately never asked to produce. */
 const NOT_IN_REVIEWER_AGENT: Partial<Record<keyof Finding, string>> = {
+  hostCheck: "host-computed, as above",
   ruleName: "stamped by the dispatcher, as above",
   decision: "requires prior-discussion context the builtin agent is not given",
   question: "only meaningful alongside `decision`, which the agent does not emit",
@@ -143,6 +174,7 @@ describe("every Finding field survives every representation", () => {
     const snapshot = toFindingSnapshot(COMPLETE) as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
+      if (NOT_PERSISTED[field]) continue;
       expect(snapshot[field], `toFindingSnapshot drops ${field}`).toEqual(COMPLETE[field]);
     }
   });
@@ -151,6 +183,7 @@ describe("every Finding field survives every representation", () => {
     const snapshot = toClarificationFindingSnapshot(COMPLETE) as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
+      if (NOT_PERSISTED[field]) continue;
       expect(snapshot[field], `toClarificationFindingSnapshot drops ${field}`).toEqual(COMPLETE[field]);
     }
   });
@@ -176,6 +209,7 @@ describe("every Finding field survives every representation", () => {
     const stored = validated.clarifications[0]?.finding as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
+      if (NOT_PERSISTED[field]) continue;
       expect(stored[field], `the state schema drops ${field}`).toEqual(COMPLETE[field]);
     }
   });
@@ -195,6 +229,10 @@ describe("every Finding field survives every representation", () => {
     const finding = parsed[0] as unknown as Record<string, unknown>;
 
     for (const field of FIELDS) {
+      if (NOT_FROM_REVIEWER[field]) {
+        expect(finding[field], `the parser accepted ${field} from reviewer output`).toBeUndefined();
+        continue;
+      }
       expect(finding[field], `the parser drops ${field}`).toEqual(COMPLETE[field]);
     }
   });
@@ -222,6 +260,7 @@ describe("every Finding field is described to the model", () => {
     const copyThrough = schemaLine(prompt, "through EXACTLY as the task emitted them");
 
     for (const field of FIELDS) {
+      if (NOT_IN_RULE_CONTRACT[field] && NOT_COPIED_THROUGH[field]) continue;
       expect(schema, `the aggregator schema omits ${field}`).toContain(`"${field}"`);
       if (NOT_COPIED_THROUGH[field]) continue;
       expect(copyThrough, `the aggregator never copies ${field} through`).toContain(`"${field}"`);
@@ -244,6 +283,8 @@ describe("every Finding field is described to the model", () => {
       ...Object.keys(NOT_IN_RULE_CONTRACT),
       ...Object.keys(NOT_IN_REVIEWER_AGENT),
       ...Object.keys(NOT_COPIED_THROUGH),
+      ...Object.keys(NOT_FROM_REVIEWER),
+      ...Object.keys(NOT_PERSISTED),
     ];
     for (const field of excepted) {
       expect(FIELDS, `${field} is excepted but is not a Finding field`).toContain(field);
@@ -268,10 +309,13 @@ describe("every Finding field reaches the reader", () => {
     message: COMPLETE.message,
     suggestion: COMPLETE.suggestion,
     references: COMPLETE.references[0],
+    // The check is what a reader sees; the claim is only visible through it.
+    hostCheck: "Host check:",
   };
 
   /** Fields an inline comment deliberately does not print. */
   const NOT_IN_INLINE_BODY: Partial<Record<keyof Finding, string>> = {
+    claim: "shown through the host check that answers it (#75) — printing the raw assertion as well would present the reviewer's word alongside the host's, which is the confusion the split avoids",
     file: "the comment is anchored to the file; repeating the path would be noise",
     line: "likewise — the anchor IS the line",
     endLine: "structural: it bounds a suggestion rather than being shown",
@@ -303,7 +347,10 @@ describe("every Finding field reaches the reader", () => {
         rulesRun: [COMPLETE.ruleName],
         rulesFailed: [],
       },
-      400,
+      // Large enough that every field has room: this test is about field
+      // COVERAGE, and a budget so tight that the finding is elided entirely
+      // would pass vacuously on nothing rather than fail on a dropped field.
+      700,
     );
 
     expect(body).toContain("compacted to fit the provider limit");
