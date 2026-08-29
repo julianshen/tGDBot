@@ -4,23 +4,38 @@
     "noEmit": true,
     "rootDir": "."
   },
-  // An explicit ALLOWLIST, not the whole test tree. `test/**/*.ts` currently
-  // reports ~530 errors, nearly all loose mock typing that predates this file;
-  // fixing those is real work and unrelated to any one change, so the program
-  // grows one file at a time instead of being switched on and immediately
-  // suppressed.
+  // The whole test tree, MINUS an explicit debt list. This used to be an
+  // allowlist, which meant a new test file was unchecked by default — and an
+  // unchecked test can assert against a type that does not exist and still go
+  // green. That is what happened in #76: five fixtures asserted a
+  // `StructuralCheck` status deleted three rounds earlier, and nothing caught
+  // it because nothing type-checked them.
   //
-  // A file listed here is one whose TYPES are load-bearing. Both current
-  // entries earned it: `finding-field-coverage` breaks at compile time when a
-  // `Finding` field gains no rendering decision, and `structural-check` was
-  // added after five fixtures kept asserting a `StructuralCheck` status that
-  // had been deleted three rounds earlier — green, because nothing type-checked
-  // them (CodeRabbit review).
-  "include": [
-    "src/**/*.ts",
-    "test/**/*.test-d.ts",
-    "test/unit/review/finding-field-coverage.test.ts",
-    "test/unit/review/structural-check.test.ts"
-  ],
-  "exclude": ["node_modules", "dist"]
+  // Inverted, the default is safe: a file added tomorrow is checked unless
+  // someone deliberately adds it below. The list only shrinks (#81).
+  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "test/smoke/poll.test.ts",
+    "test/unit/cli-review-default-wiring.test.ts",
+    "test/unit/cli-review.test.ts",
+    "test/unit/context/context-pack.test.ts",
+    "test/unit/conversation/actions.test.ts",
+    "test/unit/conversation/clarification.test.ts",
+    "test/unit/conversation/context.test.ts",
+    "test/unit/conversation/publication-manifest.test.ts",
+    "test/unit/conversation/state-store.test.ts",
+    "test/unit/poll/config.test.ts",
+    "test/unit/poll/discovery.test.ts",
+    "test/unit/poll/poll.test.ts",
+    "test/unit/review/dependency-facts.test.ts",
+    "test/unit/review/dispatch.test.ts",
+    "test/unit/review/existing-discussion.test.ts",
+    "test/unit/vcs/adapter.test.ts",
+    "test/unit/vcs/github-adapter.test.ts",
+    "test/unit/vcs/gitlab-adapter.test.ts",
+    "test/unit/workspace/lock.test.ts",
+    "test/unit/workspace/manager.test.ts"
+  ]
 }

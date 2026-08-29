@@ -234,9 +234,10 @@ describe("renderReviewDigest — the legend is generated, not written", () => {
     const legend = legendOf(renderReviewDigest(input()));
 
     for (const severity of ["blocking", "warning", "suggestion"] as const) {
-      const rendered = renderInlineComment(finding({ severity }), "abc1234", {
-        suggestions: false,
-      });
+      // `renderInlineComment` takes (finding, options). The stray sha argument
+      // meant the string landed as `options` and `suggestions: false` was
+      // dropped, so this rendered WITH suggestion blocks while claiming not to.
+      const rendered = renderInlineComment(finding({ severity }), { suggestions: false });
       // The meta line is `_category_ | _severity_ | …`; take the second chip.
       const badge = /^_[^_]+_ \| _([^_]+)_/mu.exec(rendered)?.[1];
 

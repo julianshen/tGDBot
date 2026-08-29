@@ -163,7 +163,8 @@ describe("repository state paths", () => {
     await expect(prepareConversationStatePaths(paths)).rejects.toThrow(/permission|writable|mode/i);
     await chmod(providerDirectory, 0o700);
 
-    const actualUid = process.getuid();
+    // Non-null: the test returns early on win32, the only platform without it.
+    const actualUid = process.getuid!();
     await expect(prepareConversationStatePaths(paths, {
       platform: "linux",
       uid: actualUid,

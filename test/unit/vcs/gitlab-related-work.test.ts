@@ -66,7 +66,7 @@ describe("resolveGitLabRelatedWork", () => {
   });
 
   it("isolates auth, not-found, timeout, and malformed failures without leaking details", async () => {
-    const refs = [1, 2, 3, 4].map(reference);
+    const refs = [1, 2, 3, 4].map((number) => reference(number));
     const execGlab = vi.fn(async (args: readonly string[]) => {
       const number = Number(args[2]);
       if (number < 4) throw Object.assign(new Error("TOKEN=secret body"), { stderr: "credential" });
@@ -141,7 +141,7 @@ describe("resolveGitLabRelatedWork", () => {
       const number = args[2]!;
       return JSON.stringify({ title: number, state: "opened", web_url: `https://gitlab.com/group/project/-/issues/${number}` });
     });
-    const pending = resolveGitLabRelatedWork([1, 2, 3, 4, 5].map(reference), execGlab);
+    const pending = resolveGitLabRelatedWork([1, 2, 3, 4, 5].map((number) => reference(number)), execGlab);
     await vi.waitFor(() => expect(execGlab).toHaveBeenCalledTimes(3));
     releases.splice(0).forEach((release) => release());
     await vi.waitFor(() => expect(execGlab).toHaveBeenCalledTimes(5));

@@ -1950,7 +1950,8 @@ describe("renderInlineComment — host structural check", () => {
     const body = renderSummaryComment({
       allFindings: [] as Finding[],
       inlineCount: 0,
-      unanchored: [] as Finding[],
+      // `unanchored` comes from `route`; setting it here too was dead, and the
+      // spread silently overwrote it.
       ...route(finding),
       filesReviewed: ["src/a.ts"],
       rulesRun: ["rule-a"],
