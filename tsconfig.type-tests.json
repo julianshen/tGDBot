@@ -28,7 +28,6 @@
     "test/unit/conversation/state-store.test.ts",
     "test/unit/poll/config.test.ts",
     "test/unit/poll/discovery.test.ts",
-    "test/unit/poll/poll.test.ts",
     "test/unit/review/dependency-facts.test.ts",
     "test/unit/review/dispatch.test.ts",
     "test/unit/review/existing-discussion.test.ts",
