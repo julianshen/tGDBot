@@ -242,7 +242,12 @@ export function renderVerificationReply(
   // Only when there is something left to disagree ABOUT.
   const invitation = input.verdict === "withdrawn" || login === undefined || login.length === 0
     ? undefined
-    : `If you read it differently: \`@${login} reconsider <why>\`.`;
+    : [
+      "Reply with one of:",
+      `- \`@${login} accept\` — intentional; stop raising it on this PR`,
+      `- \`@${login} defer\` — real, not now; tGDBot drafts a follow-up issue`,
+      `- \`@${login} reconsider <why>\` — you disagree with the reading above`,
+    ].join("\n");
 
   // The rationale is capped BEFORE assembly, not after. The body is truncated
   // from the end, so a verbose model could otherwise push the invitation off
@@ -362,6 +367,8 @@ export function renderUsageReply(marker: string): RenderedConversationBody {
   return renderSections("## Command usage", [
     "tGDBot accepts exactly one command per comment. Use one of:",
     "- `@bot explain`",
+    "- `@bot accept`",
+    "- `@bot defer`",
     "- `@bot reconsider <reason>`",
     "- `@bot review focus: <direction>`",
     "- `@bot check latest`",
@@ -372,9 +379,41 @@ export function renderUsageReply(marker: string): RenderedConversationBody {
   ], marker);
 }
 
+export function renderDispositionReply(
+  input: {
+    readonly disposition: "accepted" | "deferred";
+    readonly file: string;
+    readonly line?: number;
+    readonly ruleName: string;
+    readonly severity: "blocking" | "warning" | "suggestion";
+    readonly botLogin?: string;
+  },
+  marker: string,
+): RenderedConversationBody {
+  const file = flattenAuthor(input.file) || "the file";
+  const ruleName = flattenAuthor(input.ruleName) || "this rule";
+  const where = input.line === undefined ? `\`${file}\`` : `\`${file}:${input.line}\``;
+  if (input.disposition === "accepted") {
+    return renderSections("## Accepted", [
+      `Recorded as accepted on this review at ${where} (\`${ruleName}\`). I will not raise this finding again on this PR.`,
+    ], marker);
+  }
+  const login = input.botLogin === undefined
+    ? undefined
+    : stripInvisible(input.botLogin).replace(/[\s`]/gu, "");
+  const mention = login === undefined || login.length === 0 ? "@bot" : `@${login}`;
+  return renderSections("## Deferred", [
+    `Real, not now — at ${where} (\`${ruleName}\`, ${input.severity}).`,
+    "Draft follow-up (not filed):",
+    `**Title:** \`${ruleName}\` at ${where}`,
+    "File this yourself if you want it tracked. Nothing was opened.",
+    `Reply \`${mention} accept\` if this should stop being raised on this PR instead.`,
+  ], marker);
+}
+
 export function renderScopeErrorReply(marker: string): RenderedConversationBody {
   return renderSections("## Out of scope", [
-    "`explain` and `reconsider` only work inside a thread started by a marked tGDBot finding.",
+    "`explain`, `reconsider`, `accept` and `defer` only work inside a thread started by a marked tGDBot finding.",
   ], marker);
 }
 

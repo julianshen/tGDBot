@@ -357,6 +357,8 @@ describe("classification-only poll", () => {
       commentEvent("focus", "@tgdbot review focus: the error handling", "2026-08-14T00:00:06.000Z"),
       commentEvent("force", "@tgdbot check latest", "2026-08-14T00:00:07.000Z"),
       commentEvent("exp", "@tgdbot explain", "2026-08-14T00:00:08.000Z"),
+      commentEvent("acc", "@tgdbot accept", "2026-08-14T00:00:09.000Z"),
+      commentEvent("def", "@tgdbot defer", "2026-08-14T00:00:10.000Z"),
     ]);
 
     await expect(poll(pollArgs(stateDir, { dryRun: true, model: "anthropic/claude-opus-4-5" }), {
@@ -2504,5 +2506,77 @@ describe("automatic verification", () => {
     })).resolves.toBe(0);
 
     expect(sessions).toBe(0);
+  });
+});
+
+// Issue #57 remaining: accept/defer are parser decisions, recorded as
+// mechanical outcomes, and they never write a memory.
+describe("finding dispositions", () => {
+  it("accepts a finding without calling a model", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([command]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+
+    expect(createSession).not.toHaveBeenCalled();
+    const body = adapter.postedBodies.find((entry) => /## Accepted/.test(entry)) ?? "";
+    expect(body).toMatch(/this PR/i);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.disposition).toBe("accepted");
+    expect(JSON.stringify(outcomes[0])).not.toContain("alice");
+    expect(JSON.stringify(outcomes[0])).not.toContain("src/auth.ts");
+  });
+
+  it("defers by drafting a follow-up, not filing one", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot defer"),
+    );
+    adapter.replaceEvents([command]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const body = adapter.postedBodies.find((entry) => /## Deferred/.test(entry)) ?? "";
+    expect(body).toMatch(/not filed/i);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes[0]!.disposition).toBe("deferred");
+  });
+
+  it("leaves the memory store byte-identical through accept", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const before = await store.readContextSnapshot();
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    adapter.replaceEvents([command]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const after = await store.readContextSnapshot();
+    expect(after.memories).toEqual(before.memories);
+    expect(after.memoryLedger).toEqual(before.memoryLedger);
   });
 });

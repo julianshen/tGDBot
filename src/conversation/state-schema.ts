@@ -368,6 +368,18 @@ export interface FindingOutcomeEntry {
   /** Whether the lines the finding was anchored to changed since it was raised. */
   readonly anchorChanged: boolean;
   readonly at: string;
+  /**
+   * A human's decision about a finding that still stands. Absent on a
+   * verification-only record. Enumerated, never prose — `accept` is
+   * review-scoped waiver; `defer` is "real, not now".
+   */
+  readonly disposition?: "accepted" | "deferred";
+  /** sha256 of the actor login. Required when `disposition` is set. */
+  readonly actorDigest?: string;
+  /** sha256 of the file path, so later reviews can match without storing a path. */
+  readonly fileDigest?: string;
+  /** The finding's line, when it had one. Matching uses this, not a message. */
+  readonly line?: number;
 }
 export type ConversationStateTarget = string;
 
@@ -1413,7 +1425,7 @@ export function validateFindingOutcomeEntries(
     const object = exact(entry, `outcomes[${index}]`,
       ["version", "repository", "id", "findingId", "reviewNumber", "headSha", "ruleDigest", "categoryDigest",
         "severity", "verdict", "trigger", "anchorChanged", "at"],
-      ["effort"]);
+      ["effort", "disposition", "actorDigest", "fileDigest", "line"]);
     const repository = validateVersionAndBinding(object, expected, `outcomes[${index}]`);
     // COMPLETE, not the 7-to-64 the shared pattern allows. Per-head
     // idempotency compares this exactly, so an abbreviation and the full sha
@@ -1442,6 +1454,23 @@ export function validateFindingOutcomeEntries(
     if (typeof object.anchorChanged !== "boolean") {
       throw new Error(`outcomes[${index}].anchorChanged must be a boolean`);
     }
+    const disposition = object.disposition;
+    if (disposition !== undefined && disposition !== "accepted" && disposition !== "deferred") {
+      throw new Error(`outcomes[${index}].disposition is not a known disposition`);
+    }
+    if (disposition !== undefined && object.actorDigest === undefined) {
+      throw new Error(`outcomes[${index}].actorDigest is required when a disposition is set`);
+    }
+    const actorDigest = object.actorDigest === undefined
+      ? undefined
+      : digest(object.actorDigest, `outcomes[${index}] actor digest`);
+    const fileDigest = object.fileDigest === undefined
+      ? undefined
+      : digest(object.fileDigest, `outcomes[${index}] file digest`);
+    const line = object.line;
+    if (line !== undefined && (!Number.isInteger(line) || (line as number) < 1)) {
+      throw new Error(`outcomes[${index}].line is not a positive line number`);
+    }
     return {
       version: 1 as const,
       repository,
@@ -1457,6 +1486,10 @@ export function validateFindingOutcomeEntries(
       trigger,
       anchorChanged: object.anchorChanged,
       at: date(object.at, `outcomes[${index}].at`),
+      ...(disposition === undefined ? {} : { disposition }),
+      ...(actorDigest === undefined ? {} : { actorDigest }),
+      ...(fileDigest === undefined ? {} : { fileDigest }),
+      ...(line === undefined ? {} : { line: line as number }),
     };
   });
 }
@@ -1482,6 +1515,11 @@ export function validateFindingOutcomeEntries(
  * outcome records exist for idempotency and for calibration reported to a
  * HUMAN. Feeding them to a model was never the plan and must not become one.
  */
+/** Digest a label the way outcome records store it. Grouping keys use this. */
+export function outcomeLabelDigest(value: string): string {
+  return createHash("sha256").update("tgd:outcome-label:v1\0", "utf8").update(value, "utf8").digest("hex");
+}
+
 export function prepareFindingOutcome(input: {
   readonly repository: RepositoryBinding;
   readonly id: string;
@@ -1497,9 +1535,13 @@ export function prepareFindingOutcome(input: {
   readonly trigger: FindingVerificationTrigger;
   readonly anchorChanged: boolean;
   readonly at: string;
+  readonly disposition?: "accepted" | "deferred";
+  /** The actor login, not a digest. Hashed here so a caller cannot choose it. */
+  readonly actor?: string;
+  /** The file path, not a digest. Hashed here for the same reason. */
+  readonly file?: string;
+  readonly line?: number;
 }): FindingOutcomeEntry {
-  const sha = (value: string): string =>
-    createHash("sha256").update("tgd:outcome-label:v1\0", "utf8").update(value, "utf8").digest("hex");
   return validateFindingOutcomeEntries([{
     version: 1,
     repository: input.repository,
@@ -1507,14 +1549,18 @@ export function prepareFindingOutcome(input: {
     findingId: input.findingId,
     reviewNumber: input.reviewNumber,
     headSha: input.headSha,
-    ruleDigest: sha(input.ruleName),
-    categoryDigest: sha(input.category),
+    ruleDigest: outcomeLabelDigest(input.ruleName),
+    categoryDigest: outcomeLabelDigest(input.category),
     severity: input.severity,
     ...(input.effort === undefined ? {} : { effort: input.effort }),
     verdict: input.verdict,
     trigger: input.trigger,
     anchorChanged: input.anchorChanged,
     at: input.at,
+    ...(input.disposition === undefined ? {} : { disposition: input.disposition }),
+    ...(input.actor === undefined ? {} : { actorDigest: outcomeLabelDigest(input.actor) }),
+    ...(input.file === undefined ? {} : { fileDigest: outcomeLabelDigest(input.file) }),
+    ...(input.line === undefined ? {} : { line: input.line }),
   }], input.repository)[0]!;
 }
 

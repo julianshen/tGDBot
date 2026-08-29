@@ -21,6 +21,7 @@ import {
 import { clusterFindings } from "./finding-clusters.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
+import { acceptanceKey } from "../conversation/disposition.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./existing-discussion.js";
 
 export type { InlineComment } from "./comment-format.js";
@@ -72,6 +73,8 @@ export type OrchestrateOptions = {
   deferredClarificationCount?: number;
   existingIssues?: readonly ExistingReviewIssue[];
   discussionMemories?: readonly DiscussionMemory[];
+  /** Acceptance keys (`acceptanceKey`) for findings waived on this review. */
+  waivedKeys?: ReadonlySet<string>;
 } & RenderOptions;
 
 function decisionOf(finding: Finding): FindingDecision {
@@ -177,8 +180,11 @@ export function orchestrate(
   const addressedKeys = new Set(
     dispatchResult.findings.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
   );
+  const waivedKeys = options.waivedKeys ?? new Set<string>();
   const actionable = dispatchResult.findings.filter(
-    (finding) => isActionableDecision(decisionOf(finding)) && !addressedKeys.has(dedupeKey(finding)),
+    (finding) => isActionableDecision(decisionOf(finding))
+      && !addressedKeys.has(dedupeKey(finding))
+      && !waivedKeys.has(acceptanceKey(finding)),
   );
   const disputed = dispatchResult.findings.filter((finding) => decisionOf(finding) === "disputed");
   const clarification = options.clarification === undefined

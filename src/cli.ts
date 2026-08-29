@@ -35,6 +35,7 @@ import {
   type ContextUnavailableLabel,
 } from "./review/comment-format.js";
 import type { FindingReviewOptions, PendingClarification } from "./conversation/state-schema.js";
+import { acceptanceKeyFromOutcome } from "./conversation/disposition.js";
 import { computeRepositoryDigest } from "./conversation/markers.js";
 import { redactedMessage } from "./conversation/redact.js";
 import { isTransientGhFailure } from "./vcs/gh-retry.js";
@@ -1595,12 +1596,21 @@ export async function review(
     ...loadedContext.unavailable,
     ...(contextPreparation.status === "unavailable" ? ["repository" as const] : []),
   ];
+  const waivedKeys = stateStore === undefined
+    ? new Set<string>()
+    : new Set((await stateStore.readFindingOutcomes())
+      .filter((entry) => entry.reviewNumber === Number(pr.id))
+      .flatMap((entry) => {
+        const key = acceptanceKeyFromOutcome(entry);
+        return key === undefined ? [] : [key];
+      }));
   const orchestration = orchestrateFn(dispatchResult, diff, {
     inline: true,
     ...renderOpts,
     relatedWork,
     existingIssues: loadedContext.existingIssues,
     discussionMemories: loadedContext.discussionMemories,
+    waivedKeys,
     reviewBinding,
     ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
     ...(reviewContextLabels.length === 0 ? {} : { contextUnavailable: reviewContextLabels }),

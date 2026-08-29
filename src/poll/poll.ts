@@ -65,6 +65,7 @@ import {
   renderVerificationReply,
   renderScopeErrorReply,
   renderUnsupportedHistoryReply,
+  renderDispositionReply,
   renderUsageReply,
   type MemoryReply,
   type RenderedConversationBody,
@@ -77,7 +78,9 @@ import {
 } from "../conversation/state-store.js";
 import {
   prepareFindingLedgerEntry,
+  prepareFindingOutcome,
   type ConversationEventEntry,
+  type FindingSnapshot,
   type MemoryEntry,
 } from "../conversation/state-schema.js";
 import type {
@@ -394,6 +397,7 @@ async function classifyOpenReviewEvents(options: {
       }
       if (item.parsed.kind === "command" && item.parsed.command.kind !== "answer" &&
         !isMemoryCommand(item.parsed.command) &&
+        !isDispositionCommand(item.parsed.command) &&
         !isReviewCommand(item.parsed.command) &&
         !isExecutableConversationCommand(item.parsed.command)) {
         console.log(
@@ -691,6 +695,12 @@ type ReplyPlan =
       readonly operation?: MemoryEntry;
     }
   | { readonly kind: "scope" }
+  | {
+      readonly kind: "disposition";
+      readonly disposition: "accepted" | "deferred";
+      readonly finding: FindingSnapshot;
+      readonly outcome: FindingOutcomeEntry;
+    }
   | { readonly kind: "history" }
   | { readonly kind: "inactive"; readonly ruleName: string }
   | { readonly kind: "explain"; readonly explanation: string; readonly headSha: string }
@@ -765,13 +775,22 @@ async function executeConversationEvent(input: {
 
   const planned = await planConversationReply({ item, reviewIdentity, options });
   if (planned.status === "transient") return "transient";
-  return publishReplyPlan({
+  const published = await publishReplyPlan({
     event: item.event,
     identity,
     plan: planned.plan,
     reviewIdentity,
     options,
   });
+  if (published === "completed" && planned.plan.kind === "disposition") {
+    const recorded = planned.plan.outcome;
+    const already = (await options.store.readFindingOutcomes())
+      .some((entry) => entry.id === recorded.id);
+    if (!already) {
+      await options.store.transact((tx) => { tx.appendOutcome(recorded); });
+    }
+  }
+  return published;
 }
 
 /** Commands that re-run the review itself rather than posting a composed reply. */
@@ -952,7 +971,11 @@ function pollActionEvent(
 }
 
 async function planConversationReply(input: {
-  readonly item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult };
+  readonly item: {
+    readonly event: ReviewActivityEvent;
+    readonly parsed: CommandParseResult;
+    readonly identity: { actionId: string };
+  };
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
   readonly options: {
     readonly adapter: ConversationAdapter;
@@ -973,6 +996,11 @@ async function planConversationReply(input: {
   // commands that reason about a finding.
   const memory = await planMemoryCommand(item, options);
   if (memory !== undefined) return { status: "ready", plan: memory };
+  const disposition = await planDispositionCommand(item, reviewIdentity, options);
+  if (disposition !== undefined) {
+    if (disposition.status === "transient") return { status: "transient" };
+    return { status: "ready", plan: disposition.plan };
+  }
   if (item.parsed.kind !== "command" || !isExecutableConversationCommand(item.parsed.command)) {
     return { status: "ready", plan: { kind: "usage" } };
   }
@@ -1063,6 +1091,84 @@ function isMemoryCommand(command: ConversationCommand): command is
   | { readonly kind: "remember"; readonly lesson: string }
   | { readonly kind: "forget"; readonly memoryId: string } {
   return command.kind === "memories" || command.kind === "remember" || command.kind === "forget";
+}
+
+function isDispositionCommand(command: ConversationCommand): command is
+  | { readonly kind: "accept" }
+  | { readonly kind: "defer" } {
+  return command.kind === "accept" || command.kind === "defer";
+}
+
+async function planDispositionCommand(
+  item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult; readonly identity: { actionId: string } },
+  reviewIdentity: ReturnType<typeof reviewIdentityFrom>,
+  options: {
+    readonly adapter: ConversationAdapter;
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  },
+): Promise<
+  | { readonly status: "ready"; readonly plan: ReplyPlan }
+  | { readonly status: "transient" }
+  | undefined
+> {
+  if (item.parsed.kind !== "command" || !isDispositionCommand(item.parsed.command)) return undefined;
+  const command = item.parsed.command;
+
+  let thread: ReviewThreadSnapshot | undefined;
+  if (item.event.threadId !== undefined) {
+    try {
+      thread = await options.adapter.getReviewThread(reviewIdentity, item.event.threadId);
+    } catch (error) {
+      console.warn(`tgd-review-agent: could not load addressed thread (${redactedMessage(error)})`);
+      return { status: "transient" };
+    }
+  }
+  const snapshot = await options.store.readContextSnapshot();
+  const publicDigest = computeRepositoryDigest(options.config.repository.provider, options.config.repository.canonicalUrl);
+  const resolution = resolveMarkedFindingThread({
+    event: item.event,
+    thread,
+    findings: snapshot.findings,
+    repository: options.store.repositoryBinding,
+    markerRepositoryDigest: publicDigest,
+  });
+  if (resolution.status === "scope-error") return { status: "ready", plan: { kind: "scope" } };
+  if (resolution.status === "unsupported-history") return { status: "ready", plan: { kind: "history" } };
+
+  const metadata = await loadReviewMetadata(item.event.reviewNumber, options);
+  if (metadata === undefined) return { status: "transient" };
+
+  const prior = (await options.store.readFindingOutcomes())
+    .filter((entry) => entry.findingId === resolution.ledger.id)
+    .at(-1);
+  const disposition = command.kind === "accept" ? "accepted" as const : "deferred" as const;
+  const outcome = prepareFindingOutcome({
+    repository: options.store.repositoryBinding,
+    id: `outcome_${createHash("sha256")
+      .update(`disposition\0${item.identity.actionId}`, "utf8").digest("hex").slice(0, 32)}`,
+    findingId: resolution.ledger.id,
+    reviewNumber: resolution.ledger.reviewNumber,
+    headSha: metadata.headSha,
+    ruleName: resolution.ledger.finding.ruleName,
+    category: resolution.ledger.finding.category,
+    severity: resolution.ledger.finding.severity,
+    ...(resolution.ledger.finding.effort === undefined ? {} : { effort: resolution.ledger.finding.effort }),
+    verdict: prior?.verdict ?? "confirmed",
+    trigger: "thread-comment",
+    anchorChanged: false,
+    at: options.now(),
+    disposition,
+    actor: item.event.authorLogin ?? "unknown",
+    file: resolution.ledger.finding.file,
+    ...(resolution.ledger.finding.line === undefined ? {} : { line: resolution.ledger.finding.line }),
+  });
+  return {
+    status: "ready",
+    plan: { kind: "disposition", disposition, finding: resolution.ledger.finding, outcome },
+  };
 }
 
 async function planMemoryCommand(
@@ -1374,6 +1480,16 @@ function buildReplyChild(input: {
       }, marker);
     }
     if (input.plan.kind === "usage") return renderUsageReply(marker);
+    if (input.plan.kind === "disposition") {
+      return renderDispositionReply({
+        disposition: input.plan.disposition,
+        file: input.plan.finding.file,
+        ...(input.plan.finding.line === undefined ? {} : { line: input.plan.finding.line }),
+        ruleName: input.plan.finding.ruleName,
+        severity: input.plan.finding.severity,
+        ...(input.botLogin === undefined ? {} : { botLogin: input.botLogin }),
+      }, marker);
+    }
     if (input.plan.kind === "clarification-unavailable") return renderClarificationUnavailableReply(marker);
     if (input.plan.kind === "memory") return renderMemoryReply(input.plan.reply, marker);
     if (input.plan.kind === "scope") return renderScopeErrorReply(marker);

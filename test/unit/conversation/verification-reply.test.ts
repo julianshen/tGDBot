@@ -54,6 +54,8 @@ describe("renderVerificationReply", () => {
     const body = renderVerificationReply(input({ botLogin: "acme-bot" }), marker).text;
 
     expect(body).toContain("@acme-bot reconsider");
+    expect(body).toContain("@acme-bot accept");
+    expect(body).toContain("@acme-bot defer");
   });
 
   it("omits the invitation when it withdrew the finding", () => {
