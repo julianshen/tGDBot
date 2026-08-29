@@ -39,7 +39,7 @@ function pollArgs(repo: string, stateDir: string, vcs: "github" | "gitlab"): Pol
  */
 function fakeExec(routes: readonly { match: (args: readonly string[]) => boolean; reply: string }[]) {
   const calls: string[][] = [];
-  const exec = async (args: string[]): Promise<string> => {
+  const exec = async (args: readonly string[]): Promise<string> => {
     calls.push([...args]);
     const route = routes.find((candidate) => candidate.match(args));
     if (route === undefined) throw new Error(`unrouted CLI call: ${args.join(" ")}`);

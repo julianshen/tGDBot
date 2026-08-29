@@ -23,7 +23,7 @@ import {
   computeRepositoryDigest,
   formatChildMarker,
 } from "../../../src/conversation/markers.js";
-import type { ReviewActivityEvent } from "../../../src/vcs/conversation-adapter.js";
+import type { ReviewActivityEvent, ReviewEventCursor } from "../../../src/vcs/conversation-adapter.js";
 import type { ReviewIdentity } from "../../../src/conversation/types.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
@@ -885,19 +885,21 @@ describe("GitLabAdapter inline discussions", () => {
       position: { line_range: { start: Record<string, unknown>; end: Record<string, unknown> } };
     };
     const pathHash = createHash("sha1").update("src/new-name.ts").digest("hex");
+    const startOldLine = start.type === "old" ? start.oldLine : undefined;
+    const endOldLine = end.type === "old" ? end.oldLine : undefined;
     expect(payload.body).toBe("```text\nreplacement\n```");
     expect(outcomes).toMatchObject([{ clientId: "finding-range", status: "posted" }]);
     expect(payload.position.line_range).toEqual({
       start: {
-        line_code: `${pathHash}_${start.oldLine ?? ""}_${start.newLine}`,
+        line_code: `${pathHash}_${startOldLine ?? ""}_${start.newLine}`,
         type: start.type,
-        ...(start.oldLine === undefined ? {} : { old_line: start.oldLine }),
+        ...(startOldLine === undefined ? {} : { old_line: startOldLine }),
         new_line: start.newLine,
       },
       end: {
-        line_code: `${pathHash}_${end.oldLine ?? ""}_${end.newLine}`,
+        line_code: `${pathHash}_${endOldLine ?? ""}_${end.newLine}`,
         type: end.type,
-        ...(end.oldLine === undefined ? {} : { old_line: end.oldLine }),
+        ...(endOldLine === undefined ? {} : { old_line: endOldLine }),
         new_line: end.newLine,
       },
     });
@@ -955,7 +957,11 @@ describe("GitLabAdapter inline discussions", () => {
       { clientId: "finding-1", status: "failed", reason: expect.any(String) },
       { clientId: "finding-2", status: "posted" },
     ]);
-    expect(outcomes[1]?.reason).not.toMatch(/TOKEN|secret|private provider/i);
+    const failed = outcomes[1];
+    expect(failed?.status).toBe("failed");
+    if (failed?.status === "failed") {
+      expect(failed.reason).not.toMatch(/TOKEN|secret|private provider/i);
+    }
   });
 
   it.each([
@@ -1131,11 +1137,11 @@ describe("GitLab adapter helpers", () => {
 
 describe("realExecGlab", () => {
   it("forwards an optional timeout to execFile", async () => {
-    vi.mocked(execFile).mockImplementation(((_file, _args, options, callback) => {
+    vi.mocked(execFile).mockImplementation(((_file: string, _args: readonly string[], options: object, callback: (error: Error | null, stdout: string, stderr: string) => void) => {
       expect(options).toMatchObject({ timeout: 5_000 });
       queueMicrotask(() => callback(null, "ok", ""));
       return { stdin: new Writable() };
-    }) as typeof execFile);
+    }) as unknown as typeof execFile);
     await expect(realExecGlab(["issue", "view", "1"], undefined, { timeoutMs: 5_000 })).resolves.toBe("ok");
   });
   it("uses execFile argv, a 10 MiB buffer, non-interactive environment, and optional stdin", async () => {
@@ -1159,7 +1165,7 @@ describe("realExecGlab", () => {
       });
       queueMicrotask(() => callback(null, "ok\n", ""));
       return { stdin };
-    }) as typeof execFile);
+    }) as unknown as typeof execFile);
 
     await expect(realExecGlab(["api", "user"], "secret stdin")).resolves.toBe("ok\n");
     expect(end).toHaveBeenCalledWith("secret stdin", expect.any(Function));
@@ -1179,7 +1185,7 @@ describe("realExecGlab", () => {
     ) => {
       setImmediate(() => callback(null, "late success", ""));
       return { stdin };
-    }) as typeof execFile);
+    }) as unknown as typeof execFile);
 
     const error = await realExecGlab(
       ["api", "--hostname", "gitlab.example.com", "projects/x"],
@@ -1213,7 +1219,7 @@ describe("realExecGlab", () => {
         ),
       );
       return { stdin };
-    }) as typeof execFile);
+    }) as unknown as typeof execFile);
 
     const error = await realExecGlab(
       ["api", "--hostname", "gitlab.example.com", "projects/x"],
@@ -1240,7 +1246,7 @@ describe("realExecGlab", () => {
       const error = Object.assign(new Error("spawn glab ENOENT"), { code: "ENOENT" });
       queueMicrotask(() => callback(error, "", ""));
       return { stdin: { end: vi.fn() } };
-    }) as typeof execFile);
+    }) as unknown as typeof execFile);
 
     const error = await realExecGlab([
       "api",
@@ -1266,7 +1272,7 @@ describe("realExecGlab", () => {
       });
       queueMicrotask(() => callback(error, "", "TOKEN=secret"));
       return { stdin: { end: vi.fn() } };
-    }) as typeof execFile);
+    }) as unknown as typeof execFile);
 
     await expect(realExecGlab(["mr", "diff", "42"])).rejects.toMatchObject({
       name: "GlabCommandError",
@@ -1323,7 +1329,7 @@ describe("realExecGlab", () => {
       ) => {
         queueMicrotask(() => callback(Object.assign(new Error("secret"), { code: 1 }), "", sample.stderr));
         return { stdin: { end: vi.fn() } };
-      }) as typeof execFile);
+      }) as unknown as typeof execFile);
       const error = await realExecGlab(sample.args).catch((caught: unknown) => caught);
       expect(error).toBeInstanceOf(GlabCommandError);
       expect(error).toMatchObject({ httpStatus: sample.status, stderr: sample.stderr });
@@ -1382,8 +1388,8 @@ describe("GitLab conversation activity", () => {
     notes = activityNotes(),
     discussions = activityDiscussions(),
     mr = conversationMr(),
-  ): ExecGlab =>
-    vi.fn(async (args) => {
+  ) =>
+    vi.fn<ExecGlab>(async (args) => {
       if (args[1] === "user") return JSON.stringify({ username: "Octo-Bot" });
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/merge_requests")) {
@@ -1408,7 +1414,7 @@ describe("GitLab conversation activity", () => {
     });
 
   it("evicts a failed authenticated identity lookup and normalizes the retry", async () => {
-    const execGlab = vi.fn()
+    const execGlab = vi.fn<ExecGlab>()
       .mockRejectedValueOnce(new Error("expired token"))
       .mockResolvedValueOnce(JSON.stringify({ username: "Octo-Bot" }));
     const adapter = new GitLabAdapter(execGlab, repo);
@@ -1444,7 +1450,7 @@ describe("GitLab conversation activity", () => {
       ...template, id: index + 1, iid: index + 1,
       web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
     }));
-    const execGlab = vi.fn(async (args) => field(args, "page") === "1" ? toNdjson(rows) : "");
+    const execGlab = vi.fn<ExecGlab>(async (args) => field(args, "page") === "1" ? toNdjson(rows) : "");
     const adapter = new GitLabAdapter(execGlab, repo);
     const first = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest });
     expect(first.reviews).toHaveLength(100);
@@ -1456,7 +1462,7 @@ describe("GitLab conversation activity", () => {
     const rows = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture);
     rows[0]!.updated_at = "2026-08-13T10:00:00Z";
     rows[1]!.updated_at = "2026-08-12T10:00:00Z";
-    const adapter = new GitLabAdapter(vi.fn().mockResolvedValue(toNdjson(rows)), repo);
+    const adapter = new GitLabAdapter(vi.fn<ExecGlab>().mockResolvedValue(toNdjson(rows)), repo);
     const page = await adapter.listOpenReviews(
       { provider: "gitlab", repositoryDigest },
       { scope: "open-review-discovery", provider: "gitlab", repositoryDigest, opaque: JSON.stringify({ at: "2026-08-12T10:00:00Z", seen: [] }), orderKey: "2026-08-12T10:00:00Z" },
@@ -1468,7 +1474,7 @@ describe("GitLab conversation activity", () => {
   it("replays the same MR at the inclusive updated-time boundary even when its ID was seen", async () => {
     const rows = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture);
     rows[0]!.updated_at = "2026-08-12T10:00:00Z";
-    const adapter = new GitLabAdapter(vi.fn().mockResolvedValue(toNdjson([rows[0]])), repo);
+    const adapter = new GitLabAdapter(vi.fn<ExecGlab>().mockResolvedValue(toNdjson([rows[0]])), repo);
     const page = await adapter.listOpenReviews(
       { provider: "gitlab", repositoryDigest },
       { scope: "open-review-discovery", provider: "gitlab", repositoryDigest,
@@ -1482,7 +1488,7 @@ describe("GitLab conversation activity", () => {
     const open = { ...template, id: 1, iid: 1, web_url: `${repo.canonicalUrl}/-/merge_requests/1` };
     const closed = { ...template, id: 2, iid: 2, state: "closed", web_url: `${repo.canonicalUrl}/-/merge_requests/2` };
     let completeScans = 0;
-    const execGlab = vi.fn(async () => {
+    const execGlab = vi.fn<ExecGlab>(async () => {
       completeScans += 1;
       if (completeScans === 1) return toNdjson([open]);
       return toNdjson([open, closed]);
@@ -1496,7 +1502,7 @@ describe("GitLab conversation activity", () => {
   it("fails closed when every verified open-review snapshot pair changes", async () => {
     const template = decodeNdjsonRecords<Record<string, unknown>>(openMrsFixture)[0]!;
     let sequence = 0;
-    const execGlab = vi.fn(async () => {
+    const execGlab = vi.fn<ExecGlab>(async () => {
       sequence += 1;
       return toNdjson([{ ...template, id: sequence, iid: sequence, web_url: `${repo.canonicalUrl}/-/merge_requests/${sequence}` }]);
     });
@@ -1511,7 +1517,7 @@ describe("GitLab conversation activity", () => {
       updated_at: "2026-08-12T10:00:00Z",
       web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
     }));
-    const execGlab = vi.fn(async (args) => {
+    const execGlab = vi.fn<ExecGlab>(async (args) => {
       const page = Number(field(args, "page") ?? "1");
       return toNdjson(rows.slice((page - 1) * 100, page * 100));
     });
@@ -1534,7 +1540,7 @@ describe("GitLab conversation activity", () => {
       updated_at: "2026-08-12T10:00:00Z",
       web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
     }));
-    const execGlab = vi.fn(async (args) => toNdjson(field(args, "page") === "1" ? rows.slice(0, 100) : rows.slice(100)));
+    const execGlab = vi.fn<ExecGlab>(async (args) => toNdjson(field(args, "page") === "1" ? rows.slice(0, 100) : rows.slice(100)));
     const adapter = new GitLabAdapter(execGlab, repo);
     const first = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest });
     const token = JSON.parse(first.nextPageToken!.opaque) as Record<string, unknown>;
@@ -1549,7 +1555,7 @@ describe("GitLab conversation activity", () => {
       updated_at: "2026-08-12T10:00:00Z",
       web_url: `${repo.canonicalUrl}/-/merge_requests/${index + 1}`,
     }));
-    const execGlab = vi.fn(async (args) => toNdjson(field(args, "page") === "1" ? rows.slice(0, 100) : rows.slice(100)));
+    const execGlab = vi.fn<ExecGlab>(async (args) => toNdjson(field(args, "page") === "1" ? rows.slice(0, 100) : rows.slice(100)));
     const adapter = new GitLabAdapter(execGlab, repo);
     const first = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest });
     const last = await adapter.listOpenReviews({ provider: "gitlab", repositoryDigest }, undefined, first.nextPageToken);
@@ -1590,7 +1596,7 @@ describe("GitLab conversation activity", () => {
     const boundary = { at: "2027-01-01T00:00:00.000Z", seen: [] as string[] };
     const cursor = { scope: "review-events" as const, provider: "gitlab" as const, repositoryDigest, reviewNumber: 42, opaque: JSON.stringify(boundary), orderKey: boundary.at };
     let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
-    let last = cursor;
+    let last: ReviewEventCursor = cursor;
     do {
       const page = await new GitLabAdapter(execGlab, repo).listReviewEvents(review, cursor, token);
       expect(page.events).toHaveLength(0);
@@ -1604,7 +1610,7 @@ describe("GitLab conversation activity", () => {
   it("emits resolved and reopened thread snapshot revisions without a new comment", async () => {
     const discussions = activityDiscussions();
     let mrUpdated = "2026-08-03T00:00:00Z";
-    const execGlab = vi.fn(async (args) => {
+    const execGlab = vi.fn<ExecGlab>(async (args) => {
       if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr({ updated_at: mrUpdated });
@@ -1643,7 +1649,7 @@ describe("GitLab conversation activity", () => {
         },
       }],
     }));
-    const execGlab = vi.fn(async (args) => {
+    const execGlab = vi.fn<ExecGlab>(async (args) => {
       if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr({ updated_at: "2026-09-01T00:00:00Z" });
@@ -1676,7 +1682,7 @@ describe("GitLab conversation activity", () => {
       id: index + 1, body: `note-${index}`, author: { username: "alice" },
       created_at: at, updated_at: at, type: null, system: false,
     }));
-    const execGlab = vi.fn(async (args) => {
+    const execGlab = vi.fn<ExecGlab>(async (args) => {
       if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.match(/merge_requests\/\d+$/u)) return conversationMr({ updated_at: at });
@@ -1701,7 +1707,7 @@ describe("GitLab conversation activity", () => {
   });
 
   it("resolves the merge request database id as reviewId", async () => {
-    const execGlab = vi.fn().mockResolvedValue(conversationMr());
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(conversationMr());
     const adapter = new GitLabAdapter(execGlab, repo);
     await expect(adapter.resolveReviewIdentity(repo, 42)).resolves.toEqual({
       provider: "gitlab",
@@ -1729,7 +1735,7 @@ describe("GitLab conversation activity", () => {
 
   it("normalizes human thumbs-up award emoji on discussion notes", async () => {
     const fallback = activityExec();
-    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+    const execGlab = vi.fn<ExecGlab>(async (args, stdin) => {
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/merge_requests/42/notes/8/award_emoji")) {
         return toNdjson([{
@@ -1764,7 +1770,7 @@ describe("GitLab conversation activity", () => {
       user: { username: `user-${index}` },
       created_at: new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString(),
     }));
-    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+    const execGlab = vi.fn<ExecGlab>(async (args, stdin) => {
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/merge_requests/42/notes/8/award_emoji")) {
         const page = Number(field(args, "page") ?? "1");
@@ -1790,7 +1796,7 @@ describe("GitLab conversation activity", () => {
     const fallback = activityExec(activityNotes(), discussions);
     let active = 0;
     let peak = 0;
-    const execGlab = vi.fn(async (args: string[], stdin?: string) => {
+    const execGlab = vi.fn<ExecGlab>(async (args, stdin) => {
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (endpoint?.endsWith("/award_emoji")) {
         active += 1;
@@ -1879,7 +1885,7 @@ describe("GitLab conversation activity", () => {
   });
 
   it("posts replies with stdin JSON and validates the returned binding", async () => {
-    const execGlab = vi.fn(async (args, stdin) => {
+    const execGlab = vi.fn<ExecGlab>(async (args, stdin) => {
       if (args[1] === "user") return JSON.stringify({ username: "octo-bot" });
       const endpoint = args.find((arg) => arg.startsWith("projects/"));
       if (args.includes("POST")) {
@@ -1931,7 +1937,7 @@ describe("GitLab conversation activity", () => {
       created_at: "2026-08-01T00:00:01Z", updated_at: "2026-08-01T00:00:01Z",
       type: "DiffNote", system: false, resolvable: true, resolved: false,
     });
-    const execGlab = vi.fn(async (args, stdin) => {
+    const execGlab = vi.fn<ExecGlab>(async (args, stdin) => {
       if (args.includes("POST")) {
         return JSON.stringify({ id: 10, body: JSON.parse(stdin!).body, author: { username: "octo-bot" } });
       }
@@ -2058,13 +2064,13 @@ describe("GitLab conversation activity", () => {
 // Issue #56: one file at one ref, the general form of the machinery
 // getRuleFilesFromBase already used for rule files.
 describe("GitLabAdapter.getFileAtRef", () => {
-  const repo = parseRepositoryRef("https://gitlab.com/acme/app") as GitLabRepositoryRef;
+  const repo = parseRepositoryRef("https://gitlab.com/acme/app", "gitlab");
   const at = { kind: "repository" as const, repo, number: 7 };
 
   it("reads a file at the given ref", async () => {
-    const execGlab = vi.fn(async () => '{"name":"x"}');
+    const execGlab = vi.fn<ExecGlab>(async () => '{"name":"x"}');
 
-    const content = await new GitLabAdapter(execGlab as unknown as ExecGlab)
+    const content = await new GitLabAdapter(execGlab)
       .getFileAtRef(at, "headsha", "package.json");
 
     expect(content).toBe('{"name":"x"}');
@@ -2078,9 +2084,9 @@ describe("GitLabAdapter.getFileAtRef", () => {
   });
 
   it("encodes the whole path, separators included, as the API requires", async () => {
-    const execGlab = vi.fn(async () => "{}");
+    const execGlab = vi.fn<ExecGlab>(async () => "{}");
 
-    await new GitLabAdapter(execGlab as unknown as ExecGlab)
+    await new GitLabAdapter(execGlab)
       .getFileAtRef(at, "headsha", "packages/@acme/w/package.json");
 
     expect(execGlab).toHaveBeenCalledWith(
@@ -2094,23 +2100,23 @@ describe("GitLabAdapter.getFileAtRef", () => {
   });
 
   it("returns undefined for a path that is not there", async () => {
-    const execGlab = vi.fn(async () => {
+    const execGlab = vi.fn<ExecGlab>(async () => {
       throw new GlabCommandError("not found", { httpStatus: 404 } as never);
     });
 
     await expect(
-      new GitLabAdapter(execGlab as unknown as ExecGlab).getFileAtRef(at, "headsha", "nope.json"),
+      new GitLabAdapter(execGlab).getFileAtRef(at, "headsha", "nope.json"),
     ).resolves.toBeUndefined();
   });
 
   // An outage or an auth failure is not "the file is absent".
   it("propagates a genuine failure", async () => {
-    const execGlab = vi.fn(async () => {
+    const execGlab = vi.fn<ExecGlab>(async () => {
       throw new GlabCommandError("unauthorized", { httpStatus: 401 } as never);
     });
 
     await expect(
-      new GitLabAdapter(execGlab as unknown as ExecGlab).getFileAtRef(at, "headsha", "package.json"),
+      new GitLabAdapter(execGlab).getFileAtRef(at, "headsha", "package.json"),
     ).rejects.toThrow(/unauthorized/);
   });
 });

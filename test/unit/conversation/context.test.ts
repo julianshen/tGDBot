@@ -17,11 +17,14 @@ function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function comment(overrides: Partial<ReviewActivityEvent> & Pick<ReviewActivityEvent, "commentId" | "threadId" | "body">): ReviewActivityEvent {
+type ThreadCommentEvent = Extract<ReviewActivityEvent, { kind: "thread-comment" }>;
+
+function comment(
+  overrides: Partial<ThreadCommentEvent> & Pick<ThreadCommentEvent, "commentId" | "threadId" | "body">,
+): ReviewActivityEvent {
   const commentId = overrides.commentId;
   return {
     ...BINDING,
-    kind: "thread-comment",
     eventId: `review-comment:${commentId}`,
     revisionId: `rev-${commentId}`,
     orderKey: `comment:${commentId}`,
@@ -31,6 +34,7 @@ function comment(overrides: Partial<ReviewActivityEvent> & Pick<ReviewActivityEv
     updatedAt: "2026-01-01T00:00:00.000Z",
     url: `https://github.com/o/r/pull/7#discussion_r${commentId}`,
     ...overrides,
+    kind: "thread-comment" as const,
     commentId,
     threadId: overrides.threadId,
     body: overrides.body,

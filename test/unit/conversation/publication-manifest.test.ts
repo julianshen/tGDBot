@@ -16,6 +16,7 @@ import {
   supersedeWithSuccessor,
   updatePublicationChild,
   type PublicationChild,
+  type PublicationWriteResult,
   type PublicationWriter,
 } from "../../../src/conversation/publication-manifest.js";
 import { computeContentDigest } from "../../../src/conversation/markers.js";
@@ -64,9 +65,8 @@ function digestOf(body: string): string {
 
 function child(overrides: Partial<PublicationChild> & Pick<PublicationChild, "id" | "kind">): PublicationChild {
   const body = overrides.body ?? `${overrides.kind} body ${overrides.id}`;
+  const bodyDigest = overrides.bodyDigest ?? digestOf(body);
   return {
-    body,
-    bodyDigest: overrides.bodyDigest ?? digestOf(body),
     marker: overrides.marker ?? `<!-- tgd-pub:${overrides.id} -->`,
     placement: overrides.placement ?? (
       overrides.kind === "inline"
@@ -82,7 +82,7 @@ function child(overrides: Partial<PublicationChild> & Pick<PublicationChild, "id
     status: overrides.status ?? "pending",
     ...overrides,
     body,
-    bodyDigest: overrides.bodyDigest ?? digestOf(overrides.body ?? `${overrides.kind} body ${overrides.id}`),
+    bodyDigest,
   };
 }
 

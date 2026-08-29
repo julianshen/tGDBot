@@ -22,6 +22,8 @@ describe("poll command configuration", () => {
       "poll", "--repo", "Owner/Repo", "--state-dir", "/tmp/tgd-state",
       "--model", "openai/gpt-5", "--dispatch", "direct", "--advisor", "off",
     ]);
+    expect(args.command).toBe("poll");
+    if (args.command !== "poll") throw new Error("expected poll");
     const config = resolvePollConfig(args);
     expect(config.repository).toMatchObject({
       provider: "github",
@@ -48,6 +50,8 @@ describe("poll command configuration", () => {
       "poll", "--vcs", "gitlab", "--repo", "gitlab.example.com/group/project",
       "--state-dir", "/tmp/tgd-state",
     ]);
+    expect(args.command).toBe("poll");
+    if (args.command !== "poll") throw new Error("expected poll");
     const config = resolvePollConfig(args);
     expect(config.repository).toMatchObject({
       provider: "gitlab",
@@ -59,6 +63,8 @@ describe("poll command configuration", () => {
 
   it("rejects ambient or implicit repositories for poll", () => {
     const args = parseCommandArgs(["poll", "--repo", "owner/repo", "--state-dir", "/tmp/tgd-state"]);
+    expect(args.command).toBe("poll");
+    if (args.command !== "poll") throw new Error("expected poll");
     expect(() => resolvePollConfig({ ...args, repo: "" })).toThrow(/--repo|repository|ambient/i);
   });
 });

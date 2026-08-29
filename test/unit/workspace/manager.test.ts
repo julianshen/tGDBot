@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
-import type { WorkspaceRequest } from "../../../src/workspace/types.js";
+import type { ExecWorkspaceCommand, WorkspaceRequest, WorkspaceTool } from "../../../src/workspace/types.js";
 import { prepareWorkspace, realExecWorkspaceCommand } from "../../../src/workspace/manager.js";
 import { deriveWorkspacePaths, encodeWorkspaceAuthority } from "../../../src/workspace/paths.js";
 
@@ -24,6 +24,10 @@ const gitlabRepo: GitLabRepositoryRef = {
 };
 const baseSha = "def4567890def4567890def4567890def4567890";
 const roots: string[] = [];
+
+function unexpectedWorkspaceTool(tool: WorkspaceTool): never {
+  throw new Error(`unexpected workspace tool: ${tool}`);
+}
 
 async function tempRoot(): Promise<string> {
   // Resolved, because macOS makes `os.tmpdir()` `/var/folders/...` and `/var`
@@ -105,13 +109,14 @@ describe("prepareWorkspace", () => {
       "project%2E.lock",
     );
     let lockObserved = false;
-    const exec = vi.fn(async (tool: "gh" | "glab" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
       if (tool === "glab" && args[0] === "repo" && args[1] === "clone") {
         lockObserved = (await stat(expectedLockPath)).isFile();
         await mkdir(args[3]!, { recursive: true });
-      }
-      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+      } else if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2)!, { recursive: true });
+      } else if (tool !== "glab" && tool !== "git") {
+        unexpectedWorkspaceTool(tool);
       }
       return "";
     });
@@ -133,12 +138,13 @@ describe("prepareWorkspace", () => {
 
   it("clones GitLab mirrors through glab so its configured Git transport is honored", async () => {
     const root = await tempRoot();
-    const exec = vi.fn(async (tool: "gh" | "git" | "glab", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
       if (tool === "glab" && args[0] === "repo" && args[1] === "clone") {
         await mkdir(args[3]!, { recursive: true });
-      }
-      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+      } else if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2)!, { recursive: true });
+      } else if (tool !== "glab" && tool !== "git") {
+        unexpectedWorkspaceTool(tool);
       }
       return "";
     });
@@ -170,7 +176,8 @@ describe("prepareWorkspace", () => {
     const root = await tempRoot();
     const paths = deriveWorkspacePaths({ root, repo: gitlabRepo, baseSha });
     await mkdir(paths.mirrorPath, { recursive: true });
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (args.includes("get-url")) return `${origin}\n`;
       if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2)!, { recursive: true });
@@ -192,7 +199,8 @@ describe("prepareWorkspace", () => {
     const paths = deriveWorkspacePaths({ root, repo: explicitDefaultPortRepo, baseSha });
     await mkdir(paths.mirrorPath, { recursive: true });
     let origin = "https://gitlab.example.com:443/group/sub/project.git";
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (args.includes("get-url")) return `${origin}\n`;
       if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2)!, { recursive: true });
@@ -227,8 +235,10 @@ describe("prepareWorkspace", () => {
     const root = await tempRoot();
     const paths = deriveWorkspacePaths({ root, repo: gitlabRepo, baseSha });
     await mkdir(paths.mirrorPath, { recursive: true });
-    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
-      args.includes("get-url") ? `${origin}\n` : "");
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
+      return args.includes("get-url") ? `${origin}\n` : "";
+    });
 
     await expect(prepareWorkspace({ root, repo: gitlabRepo, baseSha }, { exec }))
       .rejects.toThrow(/origin does not match/i);
@@ -259,7 +269,7 @@ describe("prepareWorkspace", () => {
       ...marker,
       baseSha,
     }));
-    const exec = vi.fn(async () => baseSha);
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => baseSha);
 
     await expect(prepareWorkspace({ root, repo: gitlabRepo, baseSha }, { exec }))
       .rejects.toThrow(/ownership mismatch/i);
@@ -269,10 +279,12 @@ describe("prepareWorkspace", () => {
   it.skipIf(process.platform === "win32")("protects the managed root from other operating-system users", async () => {
     const root = await tempRoot();
     await chmod(root, 0o777);
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
       if (tool === "gh" && args[0] === "repo" && args[1] === "clone") await mkdir(args[3], { recursive: true });
-      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+      else if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2) as string, { recursive: true });
+      } else if (tool !== "gh" && tool !== "git") {
+        unexpectedWorkspaceTool(tool);
       }
       return "";
     });
@@ -289,7 +301,7 @@ describe("prepareWorkspace", () => {
     // 0700 would lock that in rather than shut it out.
     const root = await tempRoot();
     await chmod(root, 0o777);
-    const exec = vi.fn(async () => "");
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => "");
 
     await expect(
       prepareWorkspace({ root, repo, baseSha, rejectPreviouslySharedRoot: true }, { exec }),
@@ -303,7 +315,7 @@ describe("prepareWorkspace", () => {
     const root = path.join(parent, "workspace");
     await mkdir(root);
     await chmod(parent, 0o777);
-    const exec = vi.fn(async () => "");
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => "");
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/parent.*another user/i);
     expect(exec).not.toHaveBeenCalled();
@@ -374,14 +386,15 @@ describe("prepareWorkspace", () => {
 
   it("AC-3.1: creates a managed mirror and detached base-SHA worktree on a cold root", async () => {
     const root = await tempRoot();
-    const commands: { tool: "gh" | "git"; args: string[] }[] = [];
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const commands: { tool: WorkspaceTool; args: string[] }[] = [];
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
       commands.push({ tool, args });
       if (tool === "gh" && args[0] === "repo" && args[1] === "clone") {
         await mkdir(args[3], { recursive: true });
-      }
-      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+      } else if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2) as string, { recursive: true });
+      } else if (tool !== "gh" && tool !== "git") {
+        unexpectedWorkspaceTool(tool);
       }
       return "";
     });
@@ -417,9 +430,10 @@ describe("prepareWorkspace", () => {
 
     const mirrorPath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "repository.git");
     await mkdir(mirrorPath, { recursive: true });
-    const commands: { tool: "gh" | "git"; args: string[] }[] = [];
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const commands: { tool: WorkspaceTool; args: string[] }[] = [];
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
       commands.push({ tool, args });
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (args.includes("get-url")) return "https://github.com/octo-org/octo-repo.git\n";
       if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2) as string, { recursive: true });
@@ -440,7 +454,7 @@ describe("prepareWorkspace", () => {
 
   it("AC-3.3: rejects unsafe repository components and unmanaged worktree collisions before destructive Git", async () => {
     const root = await tempRoot();
-    const exec = vi.fn(async () => "");
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => "");
 
     await expect(
       prepareWorkspace(
@@ -472,7 +486,7 @@ describe("prepareWorkspace", () => {
     );
     await mkdir(path.dirname(markerPath), { recursive: true });
     await writeFile(markerPath, JSON.stringify({ version: 1, repository: "github.com/octo-org/octo-repo", baseSha }));
-    const exec = vi.fn(async () => "");
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => "");
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/orphaned/i);
     expect(exec).not.toHaveBeenCalled();
@@ -485,7 +499,7 @@ describe("prepareWorkspace", () => {
     await mkdir(worktreePath, { recursive: true });
     await mkdir(path.dirname(markerPath), { recursive: true });
     await writeFile(markerPath, "null\n", "utf8");
-    const exec = vi.fn(async () => baseSha);
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => baseSha);
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(
       `Refusing unmanaged worktree collision at ${worktreePath}`,
@@ -508,8 +522,10 @@ describe("prepareWorkspace", () => {
       repository: "https://github.com/octo-org/octo-repo",
       baseSha: abbreviatedSha,
     }));
-    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
-      args.includes("--git-common-dir") ? `${mirrorPath}\n` : `${baseSha}\n`);
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
+      return args.includes("--git-common-dir") ? `${mirrorPath}\n` : `${baseSha}\n`;
+    });
 
     await expect(prepareWorkspace({ root, repo, baseSha: abbreviatedSha }, { exec })).resolves.toMatchObject({
       baseSha: abbreviatedSha,
@@ -530,8 +546,10 @@ describe("prepareWorkspace", () => {
       repository: "github.com/octo-org/octo-repo",
       baseSha,
     }));
-    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
-      args.includes("--git-common-dir") ? `${paths.mirrorPath}\n` : `${baseSha}\n`);
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
+      return args.includes("--git-common-dir") ? `${paths.mirrorPath}\n` : `${baseSha}\n`;
+    });
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).resolves.toMatchObject({
       baseWorktreePath: paths.baseWorktreePath,
@@ -558,8 +576,10 @@ describe("prepareWorkspace", () => {
       repository: "https://github.com/octo-org/octo-repo",
       baseSha,
     }));
-    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) =>
-      args.includes("--git-common-dir") ? `${foreignCommonDir}\n` : `${baseSha}\n`);
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
+      return args.includes("--git-common-dir") ? `${foreignCommonDir}\n` : `${baseSha}\n`;
+    });
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/managed mirror/i);
     expect(exec).not.toHaveBeenCalledWith("git", expect.arrayContaining(["reset"]));
@@ -580,7 +600,8 @@ describe("prepareWorkspace", () => {
       repository: "https://github.com/octo-org/octo-repo",
       baseSha,
     }));
-    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (args.includes("--git-common-dir")) {
         await rename(paths.baseWorktreePath, parkedWorktree);
         await symlink(outside, paths.baseWorktreePath);
@@ -605,7 +626,7 @@ describe("prepareWorkspace", () => {
       repository: "github.com/octo-org/octo-repo",
       baseSha,
     }));
-    const exec = vi.fn(async () => `${baseSha}\n`);
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => `${baseSha}\n`);
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/ownership mismatch/i);
     expect(exec).not.toHaveBeenCalled();
@@ -618,7 +639,8 @@ describe("prepareWorkspace", () => {
     const cloneBlocked = new Promise<void>((resolve) => { releaseClone = resolve; });
     let cloneStarted!: () => void;
     const cloneEntered = new Promise<void>((resolve) => { cloneStarted = resolve; });
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (tool === "gh") {
         cloneStarted();
         await cloneBlocked;
@@ -650,7 +672,8 @@ describe("prepareWorkspace", () => {
     const firstStarted = new Promise<void>((resolve) => { firstEntered = resolve; });
     let secondEntered!: () => void;
     const secondStarted = new Promise<void>((resolve) => { secondEntered = resolve; });
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (tool === "gh") {
         const target = args[3]!;
         await mkdir(target, { recursive: true });
@@ -694,7 +717,7 @@ describe("prepareWorkspace", () => {
     const root = await tempRoot();
     const outside = await tempRoot();
     await symlink(outside, path.join(root, "repos"));
-    const exec = vi.fn(async () => "");
+    const exec = vi.fn<ExecWorkspaceCommand>(async () => "");
 
     await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/symbolic link/i);
     expect(exec).not.toHaveBeenCalled();
@@ -708,7 +731,8 @@ describe("prepareWorkspace", () => {
     const linkedParent = path.join(parent, "linked");
     await symlink(outside, linkedParent);
     const root = path.join(linkedParent, "workspace");
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (tool === "gh") await mkdir(args[3]!, { recursive: true });
       if (args.includes("add")) await mkdir(args.at(-2)!, { recursive: true });
       return "";
@@ -734,7 +758,8 @@ describe("prepareWorkspace", () => {
     const root = path.join(linkedParent, "workspace");
     // The root exists BEFORE the call — the case the resolution used to skip.
     await mkdir(root, { recursive: true, mode: 0o700 });
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (tool === "gh") await mkdir(args[3]!, { recursive: true });
       if (args.includes("add")) await mkdir(args.at(-2)!, { recursive: true });
       return "";
@@ -753,7 +778,8 @@ describe("prepareWorkspace", () => {
   it("removes a newly-created worktree when ownership-marker creation fails", async () => {
     const root = await tempRoot();
     const paths = deriveWorkspacePaths({ root, repo, baseSha });
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (tool === "gh") await mkdir(paths.mirrorPath, { recursive: true });
       if (args.includes("add")) {
         await mkdir(paths.baseWorktreePath, { recursive: true });
@@ -778,7 +804,7 @@ describe("prepareWorkspace", () => {
       const paths = deriveWorkspacePaths({ root, repo, baseSha });
       await mkdir(path.dirname(paths[candidateName]), { recursive: true });
       await symlink(outside, paths[candidateName]);
-      const exec = vi.fn(async () => "");
+      const exec = vi.fn<ExecWorkspaceCommand>(async () => "");
 
       await expect(prepareWorkspace({ root, repo, baseSha }, { exec })).rejects.toThrow(/symbolic link/i);
       expect(exec).not.toHaveBeenCalled();
@@ -792,7 +818,8 @@ describe("prepareWorkspace", () => {
     const root = await tempRoot();
     const mirrorPath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "repository.git");
     await mkdir(mirrorPath, { recursive: true });
-    const exec = vi.fn(async (tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (args.includes("get-url")) return `${origin}\n`;
       if (tool === "git" && args.includes("worktree") && args.includes("add")) {
         await mkdir(args.at(-2) as string, { recursive: true });
@@ -807,7 +834,8 @@ describe("prepareWorkspace", () => {
     const root = await tempRoot();
     const mirrorPath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "repository.git");
     await mkdir(mirrorPath, { recursive: true });
-    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (args.includes("get-url")) return "http://github.com/octo-org/octo-repo.git\n";
       return "";
     });
@@ -821,7 +849,8 @@ describe("prepareWorkspace", () => {
     const root = await tempRoot();
     const mirrorPath = path.join(root, "repos", "github.com", "octo-org", "octo-repo", "repository.git");
     await mkdir(mirrorPath, { recursive: true });
-    const exec = vi.fn(async (_tool: "gh" | "git", args: string[]) => {
+    const exec = vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
       if (args.includes("get-url")) return "https://github.com:444/octo-org/octo-repo.git\n";
       return "";
     });

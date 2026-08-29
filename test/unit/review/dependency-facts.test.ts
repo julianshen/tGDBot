@@ -10,7 +10,7 @@ const change = (name: string, version: string, pinned = true): DependencyChange 
   spec: pinned ? version : `^${version}`,
   manifest: "package.json",
   pinned,
-  inDependencySection: true,
+  section: "dependencies",
 });
 
 const registry = (body: Record<string, unknown>) => vi.fn(async () => body);
@@ -100,8 +100,8 @@ describe("fetchDependencyFacts", () => {
 
     const facts = await fetchDependencyFacts(
       [
-        { name: "lodash", version: "1.0.0", manifest: "package.json" },
-        { name: "lodash", version: "1.0.0", manifest: "web/package.json" },
+        { name: "lodash", version: "1.0.0", spec: "1.0.0", manifest: "package.json", pinned: true, section: "dependencies" },
+        { name: "lodash", version: "1.0.0", spec: "1.0.0", manifest: "web/package.json", pinned: true, section: "dependencies" },
       ],
       fetchJson,
     );
@@ -123,7 +123,7 @@ describe("fetchDependencyFacts", () => {
     const fetchJson = vi.fn(async () => ({}));
 
     const [fact] = await fetchDependencyFacts(
-      [{ name: "../etc/passwd", version: "1.0.0", manifest: "package.json" }],
+      [{ name: "../etc/passwd", version: "1.0.0", spec: "1.0.0", manifest: "package.json", pinned: true, section: "dependencies" }],
       fetchJson,
     );
 
@@ -403,7 +403,7 @@ describe("fetchDependencyFacts — the reason is host-authored", () => {
 
   it("keeps the categories distinct", async () => {
     const [badName] = await fetchDependencyFacts(
-      [{ name: "../etc/passwd", version: "1.0.0", spec: "1.0.0", manifest: "package.json", pinned: true, inDependencySection: true }],
+      [{ name: "../etc/passwd", version: "1.0.0", spec: "1.0.0", manifest: "package.json", pinned: true, section: "dependencies" }],
       vi.fn(async () => ({})),
     );
     const [noDocument] = await fetchDependencyFacts(

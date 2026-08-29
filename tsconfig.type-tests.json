@@ -2,39 +2,11 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": "."
+    "rootDir": ".",
+    "lib": ["ES2023", "ES2024.Promise"]
   },
-  // The whole test tree, MINUS an explicit debt list. This used to be an
-  // allowlist, which meant a new test file was unchecked by default — and an
-  // unchecked test can assert against a type that does not exist and still go
-  // green. That is what happened in #76: five fixtures asserted a
-  // `StructuralCheck` status deleted three rounds earlier, and nothing caught
-  // it because nothing type-checked them.
-  //
-  // Inverted, the default is safe: a file added tomorrow is checked unless
-  // someone deliberately adds it below. The list only shrinks (#81).
+  // Whole test tree. New files are checked by default. `lib` includes
+  // ES2024.Promise so `Promise.withResolvers` in tests type-checks.
   "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": [
-    "node_modules",
-    "dist",
-    "test/smoke/poll.test.ts",
-    "test/unit/cli-review-default-wiring.test.ts",
-    "test/unit/cli-review.test.ts",
-    "test/unit/context/context-pack.test.ts",
-    "test/unit/conversation/actions.test.ts",
-    "test/unit/conversation/clarification.test.ts",
-    "test/unit/conversation/context.test.ts",
-    "test/unit/conversation/publication-manifest.test.ts",
-    "test/unit/conversation/state-store.test.ts",
-    "test/unit/poll/config.test.ts",
-    "test/unit/poll/discovery.test.ts",
-    "test/unit/review/dependency-facts.test.ts",
-    "test/unit/review/dispatch.test.ts",
-    "test/unit/review/existing-discussion.test.ts",
-    "test/unit/vcs/adapter.test.ts",
-    "test/unit/vcs/github-adapter.test.ts",
-    "test/unit/vcs/gitlab-adapter.test.ts",
-    "test/unit/workspace/lock.test.ts",
-    "test/unit/workspace/manager.test.ts"
-  ]
+  "exclude": ["node_modules", "dist"]
 }

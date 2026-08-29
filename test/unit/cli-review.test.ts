@@ -36,8 +36,9 @@ import { computeRepositoryDigest, parseChildMarker } from "../../src/conversatio
 import { createConversationStateStore } from "../../src/conversation/state-store.js";
 import { deriveConversationStatePaths } from "../../src/conversation/state-paths.js";
 import { parseRepositoryRef } from "../../src/target/review-target.js";
-import type { ReviewThreadSnapshot } from "../../src/vcs/conversation-adapter.js";
+import type { ReviewActivityEvent, ReviewThreadSnapshot } from "../../src/vcs/conversation-adapter.js";
 import { INLINE_COMMENT_MARKER } from "../../src/review/comment-format.js";
+import { emptyOrchestration, emptySummaryInput } from "../helpers/orchestration.js";
 
 const temporaryStateRoots: string[] = [];
 
@@ -221,6 +222,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     disableBuiltinRule: false,
     advisor: "on",
     suggestions: "on",
+    dependencyFacts: "off",
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",
@@ -273,10 +275,10 @@ interface Harness {
   config: ResolvedConfig;
   vcsAdapter: {
     resolveRelatedWork: ReturnType<typeof vi.fn>;
-    getPullRequest: ReturnType<typeof vi.fn>;
+    getPullRequest: MockedFunction<VcsAdapter["getPullRequest"]>;
     getDiff: ReturnType<typeof vi.fn>;
-    findBotComment: ReturnType<typeof vi.fn>;
-    upsertComment: ReturnType<typeof vi.fn>;
+    findBotComment: MockedFunction<VcsAdapter["findBotComment"]>;
+    upsertComment: MockedFunction<VcsAdapter["upsertComment"]>;
     getRuleFilesFromBase: ReturnType<typeof vi.fn>;
     getFileAtRef: ReturnType<typeof vi.fn>;
     getMergeBaseSha: ReturnType<typeof vi.fn>;
@@ -285,8 +287,14 @@ interface Harness {
     recoverInlineReview: ReturnType<typeof vi.fn>;
     resolveStaleReviewThreads: ReturnType<typeof vi.fn>;
     findPublishedMarker: ReturnType<typeof vi.fn>;
-    findBotChildMarker: ReturnType<typeof vi.fn>;
-    postGeneralReply: ReturnType<typeof vi.fn>;
+    findBotChildMarker: MockedFunction<(
+      review: unknown,
+      lookup: { childId: string; contentDigest: string },
+    ) => Promise<{ provider: "github"; commentId: string; url: string } | null>>;
+    postGeneralReply: MockedFunction<(
+      review: unknown,
+      input: { body: string },
+    ) => Promise<{ provider: "github"; commentId: string; url: string; body?: string }>>;
     listReviewThreads?: ReturnType<typeof vi.fn>;
     listReviewEvents?: ReturnType<typeof vi.fn>;
     getReviewThread?: ReturnType<typeof vi.fn>;
@@ -296,9 +304,9 @@ interface Harness {
   loadRules: MockedFunction<ReviewDependencies["loadRules"]>;
   dispatchRules: MockedFunction<ReviewDependencies["dispatchRules"]>;
   orchestrate: MockedFunction<ReviewDependencies["orchestrate"]>;
-  prepareContext: MockedFunction<ReviewDependencies["prepareContext"]>;
-  runStructuralChecks: MockedFunction<ReviewDependencies["runStructuralChecks"]>;
-  prepareStructuralWorkspace: MockedFunction<ReviewDependencies["prepareStructuralWorkspace"]>;
+  prepareContext: MockedFunction<NonNullable<ReviewDependencies["prepareContext"]>>;
+  runStructuralChecks: MockedFunction<NonNullable<ReviewDependencies["runStructuralChecks"]>>;
+  prepareStructuralWorkspace: MockedFunction<NonNullable<ReviewDependencies["prepareStructuralWorkspace"]>>;
   publicationHooks?: ReviewDependencies["publicationHooks"];
 }
 
@@ -321,22 +329,22 @@ function makeHarness(options: {
     rulesRun: ["rule-a"],
     rulesFailed: [],
   };
-  const orchestrationResult: OrchestrationResult = options.orchestrationResult ?? {
+  const orchestrationResult: OrchestrationResult = options.orchestrationResult ?? emptyOrchestration({
     commentBody: "**No actionable comments.** ✅",
     inlineComments: [],
     findingsCount: 0,
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
-  };
+  });
   const ruleFilesFromBase = options.ruleFilesFromBase ?? [];
 
   const vcsAdapter = {
     resolveRelatedWork: vi.fn().mockImplementation((references) => Promise.resolve(references)),
-    getPullRequest: vi.fn().mockResolvedValue(pr),
+    getPullRequest: vi.fn<VcsAdapter["getPullRequest"]>().mockResolvedValue(pr),
     getDiff: vi.fn().mockResolvedValue("diff --git a/x b/x"),
-    findBotComment: vi.fn().mockResolvedValue(botComment),
-    upsertComment: vi.fn().mockImplementation(
-      (_locator, body: string, existing: BotComment | null) => {
+    findBotComment: vi.fn<VcsAdapter["findBotComment"]>().mockResolvedValue(botComment),
+    upsertComment: vi.fn<VcsAdapter["upsertComment"]>().mockImplementation(
+      (_locator, body, existing) => {
         const parsed = parseBotMarker(body);
         return Promise.resolve({
           id: existing?.id ?? "written-summary-1",
@@ -416,7 +424,7 @@ function makeHarness(options: {
     loadRules: vi.fn().mockResolvedValue(loadResult),
     dispatchRules: vi.fn().mockResolvedValue(dispatchResult),
     prepareContext: vi.fn().mockResolvedValue({ status: "off" }),
-    runStructuralChecks: vi.fn(async (input: { findings: unknown[] }) => input.findings),
+    runStructuralChecks: vi.fn(async (input) => [...input.findings]),
     prepareStructuralWorkspace: vi.fn().mockResolvedValue({
       root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
@@ -576,13 +584,19 @@ describe("review", () => {
     const h = makeHarness({
       args,
       dispatchResult: findings,
-      orchestrationResult: {
+      orchestrationResult: emptyOrchestration({
         commentBody: "- x.ts:1 — the error path drops the cause",
         inlineComments: [],
         findingsCount: 1,
         rulesRun: findings.rulesRun,
         rulesFailed: findings.rulesFailed,
-      },
+        summaryInput: emptySummaryInput({
+          allFindings: findings.findings,
+          unanchored: findings.findings,
+          rulesRun: findings.rulesRun,
+          rulesFailed: findings.rulesFailed,
+        }),
+      }),
     });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -639,7 +653,7 @@ describe("review", () => {
     const h = makeHarness({
       args,
       dispatchResult: { findings: [finding], rulesRun: ["rule-a"], rulesFailed: [] },
-      orchestrationResult: {
+      orchestrationResult: emptyOrchestration({
         commentBody: "- x.ts:1 — the error path drops the cause",
         inlineComments: [{
           clientId: "finding-0",
@@ -657,7 +671,13 @@ describe("review", () => {
         findingsCount: 1,
         rulesRun: ["rule-a"],
         rulesFailed: [],
-      },
+        findingByClientId: new Map([["finding-0", finding]]),
+        summaryInput: emptySummaryInput({
+          allFindings: [finding],
+          inlineCount: 1,
+          rulesRun: ["rule-a"],
+        }),
+      }),
     });
 
     // Stands in for the real adapters' `this.repositoryForReview(review)`.
@@ -698,7 +718,7 @@ describe("review", () => {
     const h = makeHarness({
       args,
       dispatchResult: { findings: [finding, secondFinding], rulesRun: ["rule-a"], rulesFailed: [] },
-      orchestrationResult: {
+      orchestrationResult: emptyOrchestration({
         commentBody: "- x.ts:1 — the error path drops the cause\n- x.ts:2 — the retry path drops the cause",
         inlineComments: [{
           // The orchestrator mints client IDs in this exact shape, and the
@@ -730,7 +750,7 @@ describe("review", () => {
         findingsCount: 2,
         rulesRun: ["rule-a"],
         rulesFailed: [],
-      },
+      }),
     });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1306,13 +1326,13 @@ describe("review", () => {
       rulesRun: ["rule-a"],
       rulesFailed: ["rule-b"],
     };
-    const orchestrationResult: OrchestrationResult = {
+    const orchestrationResult: OrchestrationResult = emptyOrchestration({
       inlineComments: [],
       commentBody: "## Code Review\n\n### ⚠️ Rules that failed\n\n- rule-b",
       findingsCount: 0,
       rulesRun: ["rule-a"],
       rulesFailed: ["rule-b"],
-    };
+    });
     const h = makeHarness({ botComment: null, loadResult, dispatchResult, orchestrationResult });
     vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -1337,13 +1357,13 @@ describe("review", () => {
       errors: [{ sourcePath: "/rules/bad.md", message: 'missing required frontmatter field "model"' }],
     };
     const dispatchResult: DispatchResult = { findings: [], rulesRun: ["rule-a"], rulesFailed: [] };
-    const orchestrationResult: OrchestrationResult = {
+    const orchestrationResult: OrchestrationResult = emptyOrchestration({
       inlineComments: [],
       commentBody: "## Code Review\n\nNo issues found.",
       findingsCount: 0,
       rulesRun: ["rule-a"],
       rulesFailed: [],
-    };
+    });
     const h = makeHarness({ botComment: null, loadResult, dispatchResult, orchestrationResult });
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1484,13 +1504,13 @@ describe("review", () => {
       rulesRun: [],
       rulesFailed: ["rule-a", "rule-b"],
     };
-    const orchestrationResult: OrchestrationResult = {
+    const orchestrationResult: OrchestrationResult = emptyOrchestration({
       inlineComments: [],
       commentBody: "## Code Review\n\n### ⚠️ Rules that failed\n\nThe following rules failed to run and were skipped:\n\n- rule-a\n- rule-b",
       findingsCount: 0,
       rulesRun: [],
       rulesFailed: ["rule-a", "rule-b"],
-    };
+    });
     const h = makeHarness({ botComment: null, loadResult, dispatchResult, orchestrationResult });
     vi.spyOn(console, "log").mockImplementation(() => {});
 
@@ -2249,11 +2269,11 @@ describe("inline review comments", () => {
       inlineComments: [],
       findingsCount: 0,
     });
-    let stored: BotComment | null = null;
+    let stored = null as BotComment | null;
     let rejectFinalization = true;
     h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(stored));
     h.vcsAdapter.upsertComment.mockImplementation(
-      (_locator, body: string, existing: BotComment | null) => {
+      (_locator, body, existing) => {
         const parsed = parseBotMarker(body);
         const written: BotComment = {
           id: existing?.id ?? "written-777",
@@ -2293,11 +2313,11 @@ describe("inline review comments", () => {
       { clientId: "finding-1", status: "failed", reason: "position rejected" },
       postedInline("finding-2"),
     ]);
-    let stored: BotComment | null = null;
+    let stored = null as BotComment | null;
     let rejectCompleteOnce = true;
     h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(stored));
     h.vcsAdapter.upsertComment.mockImplementation(
-      (_locator, body: string, existing: BotComment | null) => {
+      (_locator, body, existing) => {
         const parsed = parseBotMarker(body);
         const written: BotComment = {
           id: existing?.id ?? "written-777",
@@ -2357,11 +2377,11 @@ describe("inline review comments", () => {
       { clientId: "finding-1", status: "failed", reason: "position rejected" },
       postedInline("finding-2"),
     ]);
-    let stored: BotComment | null = null;
+    let stored = null as BotComment | null;
     let rejectCompleteOnce = true;
     h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(stored));
     h.vcsAdapter.upsertComment.mockImplementation(
-      (_locator, body: string, existing: BotComment | null) => {
+      (_locator, body, existing) => {
         const parsed = parseBotMarker(body);
         const written: BotComment = {
           id: existing?.id ?? "written-777",
@@ -2488,7 +2508,7 @@ describe("inline review comments", () => {
       { clientId: "finding-1", status: "failed", reason: "position rejected" },
       postedInline("finding-2"),
     ]);
-    h.vcsAdapter.upsertComment.mockResolvedValueOnce(undefined);
+    h.vcsAdapter.upsertComment.mockResolvedValueOnce(undefined as unknown as BotComment);
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/exact identity|pending summary/i);
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(1);
@@ -2903,10 +2923,10 @@ describe("review publication crash-matrix", () => {
 
   it("does not promote the conservative ready body after a crash between complete persist and summary rewrite", async () => {
     const stateDir = isolatedStateDir();
-    let stored: BotComment | null = null;
+    let stored = null as BotComment | null;
     const wire = (h: Harness) => {
       h.vcsAdapter.findBotComment.mockImplementation(() => Promise.resolve(stored));
-      h.vcsAdapter.upsertComment.mockImplementation((_locator, body: string, existing: BotComment | null) => {
+      h.vcsAdapter.upsertComment.mockImplementation((_locator, body, existing) => {
         const parsed = parseBotMarker(body);
         stored = {
           id: existing?.id ?? "written-summary-1",
@@ -3027,13 +3047,18 @@ function conversationThread(overrides: Partial<ReviewThreadSnapshot> & Pick<Revi
   };
 }
 
-function conversationComment(threadId: string, commentId: string, body: string, extras: Record<string, unknown> = {}) {
+function conversationComment(
+  threadId: string,
+  commentId: string,
+  body: string,
+  extras: { authorLogin?: string; authorIsBot?: boolean; revisionId?: string } = {},
+): ReviewActivityEvent {
   const binding = conversationBinding();
   return {
     ...binding,
-    kind: "thread-comment" as const,
+    kind: "thread-comment",
     eventId: `review-comment:${commentId}`,
-    revisionId: `rev-${commentId}`,
+    revisionId: extras.revisionId ?? `rev-${commentId}`,
     orderKey: `comment:${commentId}`,
     authorLogin: extras.authorLogin ?? "tgdbot",
     authorIsBot: extras.authorIsBot ?? true,
@@ -3043,7 +3068,6 @@ function conversationComment(threadId: string, commentId: string, body: string, 
     commentId,
     threadId,
     body,
-    ...extras,
   };
 }
 
@@ -3335,7 +3359,7 @@ describe("conversation-aware review", () => {
       expect.objectContaining({ reviewId: nativeId }),
       undefined,
     );
-    expect(nativeId).not.toBe(String((await h.vcsAdapter.getPullRequest()).id));
+    expect(nativeId).not.toBe(String((await h.vcsAdapter.getPullRequest(h.config.locator)).id));
   });
 
   it("does not skip when a human unresolved thread sits on a file that appears in the new diff", async () => {
@@ -3778,7 +3802,7 @@ describe("conversation context integrity fail-closed", () => {
     });
     h.vcsAdapter.getReviewThread = vi.fn().mockImplementation(async (_identity, threadId: string) => {
       if (threadId === "broken") throw new Error("reaction lookup failed");
-      return conversationThread({ threadId: "known" });
+      return conversationThread({ threadId: "known", events: [] });
     });
 
     await expect(review(h.args, depsFrom(h))).rejects.toThrow(/duplicate|discussion context/i);
@@ -3975,7 +3999,9 @@ describe("clarification question publication", () => {
       findBotChildMarker: async (_review: unknown, lookup: { childId: string; contentDigest: string }) =>
         first.vcsAdapter.findBotChildMarker(undefined, lookup),
     };
-    await poll(parseCommandArgs(["poll", "--repo", "acme/app", "--state-dir", stateDir]), {
+    const firstPollArgs = parseCommandArgs(["poll", "--repo", "acme/app", "--state-dir", stateDir]);
+    if (firstPollArgs.command !== "poll") throw new Error("expected poll");
+    await poll(firstPollArgs, {
       conversationAdapter: adapter as never,
     });
     const release = Promise.withResolvers<void>();
@@ -3990,7 +4016,7 @@ describe("clarification question publication", () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
     const runs = Promise.all([
       review(first.args, depsFrom(first)),
-      poll(parseCommandArgs(["poll", "--repo", "acme/app", "--state-dir", stateDir]), {
+      poll(firstPollArgs, {
         conversationAdapter: adapter as never,
       }),
     ]);
@@ -4198,7 +4224,7 @@ describe("repository context", () => {
     await review(h.args, depsFrom(h));
 
     logSpy.mockRestore();
-    const request = h.prepareContext.mock.calls[0]![0] as { changedFiles: string[] };
+    const request = h.prepareContext.mock.calls[0]![0];
     // The map is built from the base commit, where this file is still
     // `src/old-name.ts`; sending only the new path finds no graph node.
     expect(request.changedFiles).toContain("src/old-name.ts");

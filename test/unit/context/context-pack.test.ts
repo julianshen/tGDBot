@@ -264,6 +264,7 @@ describe("buildContextPack", () => {
       { ...valid, maxChars: MAX_CONTEXT_MAX_CHARS + 1 },
       { ...valid, maxChars: Number.NaN },
     ];
+    if (manifest.key.provider !== "github") throw new Error("expected github fixture");
     const injectedKeyManifest: ContextManifest = {
       ...manifest,
       key: { ...manifest.key, owner: "octo-org\n## Injected Instructions" },

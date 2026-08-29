@@ -69,9 +69,10 @@ vi.mock("../../src/review/direct-dispatch.js", () => ({
   dispatchRulesDirect: vi.fn(),
 }));
 
-vi.mock("../../src/review/orchestrate.js", () => ({
-  orchestrate: vi.fn(),
-}));
+vi.mock("../../src/review/orchestrate.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../src/review/orchestrate.js")>();
+  return { ...actual, orchestrate: vi.fn() };
+});
 
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import os from "node:os";
@@ -83,6 +84,7 @@ import { dispatchRules } from "../../src/review/dispatch.js";
 import { dispatchRulesDirect } from "../../src/review/direct-dispatch.js";
 import { orchestrate } from "../../src/review/orchestrate.js";
 import { parseBotMarker } from "../../src/review/comment-marker.js";
+import { emptyOrchestration } from "../helpers/orchestration.js";
 
 const stateRoots: string[] = [];
 afterEach(() => {
@@ -98,6 +100,9 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     rulesDir: ".review/rules",
     disableBuiltinRule: false,
     advisor: "on",
+    suggestions: "on",
+    dependencyFacts: "off",
+    structuralChecks: "off",
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",
@@ -155,13 +160,13 @@ describe("review — default dependency wiring", () => {
       rulesRun: ["rule-a"],
       rulesFailed: [],
     });
-    vi.mocked(orchestrate).mockReturnValue({
+    vi.mocked(orchestrate).mockReturnValue(emptyOrchestration({
       commentBody: "**No actionable comments.** ✅",
       inlineComments: [],
       findingsCount: 0,
       rulesRun: ["rule-a"],
       rulesFailed: [],
-    });
+    }));
 
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 

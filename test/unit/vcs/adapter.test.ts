@@ -226,7 +226,7 @@ describe("conversation cursor and anchor contracts", () => {
   it("keeps bounded page tokens distinct from discovery high-water cursors", () => {
     const token = { scope: "open-review-page" as const, provider: "gitlab" as const, repositoryDigest, opaque: "p".repeat(MAX_PAGE_TOKEN_BYTES) };
     expect(validateOpenReviewPageToken(token, { provider: "gitlab", repositoryDigest })).toEqual(token);
-    expect(() => validateOpenReviewPageToken({ ...token, opaque: `${token.opaque}p` })).toThrow(/page token/i);
+    expect(() => validateOpenReviewPageToken({ ...token, opaque: `${token.opaque}p` }, { provider: "gitlab", repositoryDigest })).toThrow(/page token/i);
     const reviewToken = { scope: "review-event-page" as const, provider: "gitlab" as const, repositoryDigest, reviewNumber: 42, opaque: "p" };
     expect(validateReviewEventPageToken(reviewToken, { provider: "gitlab", repositoryDigest, reviewNumber: 42 })).toEqual(reviewToken);
     expect(() => validateReviewThreadPageToken({ ...reviewToken, scope: "review-thread-page" }, { provider: "gitlab", repositoryDigest, reviewNumber: 43 })).toThrow(/review/i);
@@ -248,10 +248,10 @@ describe("conversation cursor and anchor contracts", () => {
   it("rejects wrong scopes, unknown own keys, and inherited envelope fields", () => {
     expect(() => validateReviewEventCursor({ ...eventCursor, scope: "open-review-discovery" })).toThrow(/scope/i);
     const discovery = { scope: "open-review-discovery", provider: "github", repositoryDigest, opaque: "o", orderKey: "k" };
-    expect(() => validateReviewDiscoveryCursor({ ...discovery, scope: "page-token" })).toThrow(/scope/i);
-    expect(() => validateOpenReviewPageToken({ scope: "review-events", provider: "github", repositoryDigest, opaque: "o" })).toThrow(/scope/i);
+    expect(() => validateReviewDiscoveryCursor({ ...discovery, scope: "page-token" }, { provider: "github", repositoryDigest })).toThrow(/scope/i);
+    expect(() => validateOpenReviewPageToken({ scope: "review-events", provider: "github", repositoryDigest, opaque: "o" }, { provider: "github", repositoryDigest })).toThrow(/scope/i);
     expect(() => validateReviewEventCursor({ ...eventCursor, extra: "x".repeat(MAX_CURSOR_BYTES * 2) })).toThrow(/unknown|keys/i);
-    expect(() => validateOpenReviewPageToken({ scope: "open-review-page", provider: "github", repositoryDigest, opaque: "o", extra: true })).toThrow(/unknown|keys/i);
+    expect(() => validateOpenReviewPageToken({ scope: "open-review-page", provider: "github", repositoryDigest, opaque: "o", extra: true }, { provider: "github", repositoryDigest })).toThrow(/unknown|keys/i);
 
     const inherited = Object.create({ scope: "review-events" }) as Record<string, unknown>;
     Object.assign(inherited, eventCursor);

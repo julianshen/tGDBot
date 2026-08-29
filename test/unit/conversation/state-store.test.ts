@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { constants, type Stats } from "node:fs";
+import { constants as fsConstants, type Stats } from "node:fs";
 import { chmod, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -10,7 +10,10 @@ import { MAX_OUTCOME_CHECKPOINT } from "../../../src/conversation/state-schema.j
 import {
   createConversationStateStore as createStoreRaw,
   type ConversationStateStoreOptions,
+  type ConversationStateTransaction,
 } from "../../../src/conversation/state-store.js";
+
+const FS_O_ACCMODE = fsConstants.O_RDONLY | fsConstants.O_WRONLY | fsConstants.O_RDWR;
 
 const temporaryDirectories: string[] = [];
 const repo = parseRepositoryRef("owner/repo", "github");
@@ -78,7 +81,7 @@ describe("conversation state store", () => {
     const stateRoot = await root();
     const paths = deriveConversationStatePaths(stateRoot, repo);
     const store = createStore({ root: stateRoot, repository: repo });
-    await expect(store.transact((async (tx) => { tx.initializeIfAbsent(); }) as never))
+    await expect(store.transact((async (tx: ConversationStateTransaction) => { tx.initializeIfAbsent(); }) as never))
       .rejects.toThrow(/synchronous|thenable|async/i);
     await expect(readFile(paths.cursorPath)).rejects.toMatchObject({ code: "ENOENT" });
     await expect(store.transact(((tx: Parameters<Parameters<typeof store.transact>[0]>[0]) => {
@@ -159,7 +162,10 @@ describe("conversation state store", () => {
       onFileSystemOperation: (operation) => operations.push(operation),
       fileSystem: {
         lstat: async (candidate) => nonPosixMode(await lstat(mapPath(candidate))),
-        mkdir: (candidate, options) => mkdir(mapPath(candidate), options),
+        mkdir: async (candidate, options) => {
+          await mkdir(mapPath(candidate), options);
+          return undefined;
+        },
         chmod: (candidate, mode) => chmod(mapPath(candidate), mode),
         rename: (from, to) => rename(mapPath(from), mapPath(to)),
         link: (from, to) => link(mapPath(from), mapPath(to)),
@@ -533,7 +539,7 @@ describe("conversation state store", () => {
     let swapped = false;
     const store = createStore({ root: stateRoot, repository: repo, dependencies: { fileSystem: {
       open: async (candidate, flags, mode) => {
-        if (candidate === paths.cursorPath && !swapped && (flags & constants.O_ACCMODE) === constants.O_RDONLY) {
+        if (candidate === paths.cursorPath && !swapped && (flags & FS_O_ACCMODE) === fsConstants.O_RDONLY) {
           swapped = true;
           await rename(candidate, `${candidate}.swapped`);
           await writeFile(candidate, original, { mode: 0o600 });
@@ -819,7 +825,7 @@ describe("conversation state store", () => {
     let readOpens = 0;
     const observed = createStore({ root: stateRoot, repository: repo, dependencies: { fileSystem: {
       open: async (candidate, flags, mode) => {
-        if ((flags & constants.O_ACCMODE) === constants.O_RDONLY &&
+        if ((flags & FS_O_ACCMODE) === fsConstants.O_RDONLY &&
           /(?:journal-head|findings\.(?:manifest|segment))/u.test(candidate)) readOpens += 1;
         return open(candidate, flags, mode);
       },

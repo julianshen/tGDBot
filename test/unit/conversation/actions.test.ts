@@ -26,6 +26,10 @@ import type { Finding } from "../../../src/review/types.js";
 import type { FindingLedgerEntry, FindingReviewOptions, FindingSnapshot } from "../../../src/conversation/state-schema.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 
+function findingOf(result: ReconsiderResult | null | undefined) {
+  return result && result.outcome !== "withdrawn" ? result.finding : undefined;
+}
+
 const HEX32 = "1".repeat(32);
 const finding: FindingSnapshot = {
   file: "src/auth.ts",
@@ -581,7 +585,7 @@ describe("effort survives clarification reassessment", () => {
     const result = parseReconsiderOutput(answer({ ...original, effort: undefined }), original);
 
     expect(result?.outcome).toBe("confirmed");
-    expect(result?.finding?.effort).toBe("heavy");
+    expect(findingOf(result)?.effort).toBe("heavy");
   });
 
   // A "revised" outcome may legitimately change the fix, and with it the work
@@ -593,18 +597,18 @@ describe("effort survives clarification reassessment", () => {
       finding: { ...original, effort: "quick" },
     });
 
-    expect(parseReconsiderOutput(revised, original)?.finding?.effort).toBe("quick");
+    expect(findingOf(parseReconsiderOutput(revised, original))?.effort).toBe("quick");
   });
 
   it("invents nothing when neither side has an estimate", () => {
     const { effort, ...withoutEffort } = original;
     void effort;
 
-    expect(parseReconsiderOutput(answer(withoutEffort), withoutEffort)?.finding?.effort).toBeUndefined();
+    expect(findingOf(parseReconsiderOutput(answer(withoutEffort), withoutEffort))?.effort).toBeUndefined();
   });
 
   it("still works with no original to inherit from", () => {
-    expect(parseReconsiderOutput(answer(original))?.finding?.effort).toBe("heavy");
+    expect(findingOf(parseReconsiderOutput(answer(original)))?.effort).toBe("heavy");
   });
 });
 
@@ -677,7 +681,7 @@ describe("conversation prompts carry the shape they ask for", () => {
       original,
     );
 
-    expect(result?.finding).toMatchObject({
+    expect(findingOf(result)).toMatchObject({
       title: original.title,
       suggestion: original.suggestion,
       endLine: original.endLine,
@@ -700,8 +704,8 @@ describe("conversation prompts carry the shape they ask for", () => {
       original,
     );
 
-    expect(result?.finding?.title).toBe("New title.");
-    expect(result?.finding?.effort).toBe("quick");
+    expect(findingOf(result)?.title).toBe("New title.");
+    expect(findingOf(result)?.effort).toBe("quick");
   });
 });
 
@@ -752,7 +756,8 @@ describe("a focus review refuses output it cannot use", () => {
     const result = await focusWith(valid);
 
     expect(result).toMatchObject({ status: "success" });
-    expect((result as { result: { findings: unknown[] } }).result.findings).toHaveLength(1);
+    if (result.status !== "success") throw new Error("expected success");
+    expect(result.result.findings).toHaveLength(1);
   });
 });
 
@@ -806,7 +811,7 @@ describe("the reconsider contract is usable as written", () => {
       original,
     );
 
-    expect(result?.finding?.ruleName).toBe("rule-a");
+    expect(findingOf(result)?.ruleName).toBe("rule-a");
   });
 });
 
@@ -829,11 +834,11 @@ describe("an explicit null clears rather than inherits", () => {
   );
 
   it("drops a suggestion the revision set to null", () => {
-    expect(revise({ suggestion: null })?.finding?.suggestion).toBeUndefined();
+    expect(findingOf(revise({ suggestion: null }))?.suggestion).toBeUndefined();
   });
 
   it("drops endLine and effort set to null", () => {
-    const result = revise({ endLine: null, effort: null })?.finding;
+    const result = findingOf(revise({ endLine: null, effort: null }));
 
     expect(result?.endLine).toBeUndefined();
     expect(result?.effort).toBeUndefined();
@@ -847,7 +852,7 @@ describe("an explicit null clears rather than inherits", () => {
       original,
     );
 
-    expect(result?.finding?.suggestion).toBe("return stale(ctx)");
+    expect(findingOf(result)?.suggestion).toBe("return stale(ctx)");
   });
 });
 
@@ -914,11 +919,11 @@ describe("line is inherited, not demanded", () => {
   );
 
   it("keeps the original anchor when the reassessment omits it", () => {
-    expect(parse({ line: undefined })?.finding?.line).toBe(12);
+    expect(findingOf(parse({ line: undefined }))?.line).toBe(12);
   });
 
   it("lets an explicit null make the finding file-level", () => {
-    expect(parse({ line: null })?.finding?.line).toBeUndefined();
+    expect(findingOf(parse({ line: null }))?.line).toBeUndefined();
   });
 
   it("does not claim line is always required", () => {
@@ -948,10 +953,10 @@ describe("a rejected replacement is not silently reverted", () => {
     message: "unclear", ruleName: "rule-a",
     suggestion: "return stale(ctx)", endLine: 6, effort: "heavy" as const,
   };
-  const revise = (patch: Record<string, unknown>) => parseReconsiderOutput(
+  const revise = (patch: Record<string, unknown>) => findingOf(parseReconsiderOutput(
     JSON.stringify({ outcome: "revised", rationale: "changed", finding: { ...original, ...patch } }),
     original,
-  )?.finding;
+  ));
 
   it("drops a replacement suggestion that fails validation, rather than restoring the old one", () => {
     // Trailing whitespace is refused by the suggestion sanitizer (#43/#45).
@@ -974,7 +979,7 @@ describe("a rejected replacement is not silently reverted", () => {
       original,
     );
 
-    expect(result?.finding?.suggestion).toBe("return stale(ctx)");
+    expect(findingOf(result)?.suggestion).toBe("return stale(ctx)");
   });
 });
 
@@ -1011,7 +1016,7 @@ describe("parseReconsiderOutput — citations survive reassessment", () => {
     const result = parseReconsiderOutput(response(core), original);
 
     expect(result?.outcome).toBe("confirmed");
-    expect(result?.finding?.references).toEqual(["https://docs.example.com/ttl"]);
+    expect(findingOf(result)?.references).toEqual(["https://docs.example.com/ttl"]);
   });
 
   // The model cannot establish provenance here — there is no rule text to
@@ -1023,7 +1028,7 @@ describe("parseReconsiderOutput — citations survive reassessment", () => {
       original,
     );
 
-    expect(result?.finding?.references).toEqual(["https://docs.example.com/ttl"]);
+    expect(findingOf(result)?.references).toEqual(["https://docs.example.com/ttl"]);
   });
 
   it("adds no citation when the original had none", () => {
@@ -1033,7 +1038,7 @@ describe("parseReconsiderOutput — citations survive reassessment", () => {
       uncited,
     );
 
-    expect(result?.finding?.references).toBeUndefined();
+    expect(findingOf(result)?.references).toBeUndefined();
   });
 });
 
@@ -1064,12 +1069,12 @@ describe("parseReconsiderOutput — a revised claim does not inherit evidence", 
   );
 
   it("drops the citations when the claim was revised", () => {
-    expect(result("revised", "A materially different claim.")?.finding?.references)
+    expect(findingOf(result("revised", "A materially different claim."))?.references)
       .toBeUndefined();
   });
 
   it("keeps them when the claim was confirmed", () => {
-    expect(result("confirmed", "Original claim.")?.finding?.references)
+    expect(findingOf(result("confirmed", "Original claim."))?.references)
       .toEqual(["https://docs.example.com/ttl"]);
   });
 });
