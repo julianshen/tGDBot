@@ -462,6 +462,22 @@ export function describeCheck(
  * because they are the ones a reader acts on soonest, and a wrong "never
  * called" is most expensive there.
  */
+/**
+ * The parser this check's answers came from, for the review-config hash.
+ *
+ * A published host check is a parse by a specific ast-grep version. Upgrade the
+ * parser and the same claim can get a different answer — but the dedup marker
+ * is keyed on head SHA plus config hash, so without this an already-reviewed
+ * head is skipped and the stale answer stands. Same reasoning as `dispatch`,
+ * and the same modest price: one re-review per open pull request per upgrade.
+ *
+ * Kept as a constant rather than read from `package.json` at runtime, because
+ * that file sits outside `rootDir` and importing it would complicate the build
+ * for a value that changes once a year. `structural-check-engine.test.ts`
+ * asserts it matches the dependency pin, so the two cannot drift silently.
+ */
+export const STRUCTURAL_CHECK_ENGINE = "ast-grep@0.45.2";
+
 export const DEFAULT_CLAIM_BUDGET = 10;
 
 /**

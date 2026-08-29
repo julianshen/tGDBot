@@ -4,6 +4,7 @@
 // "Always" bullet: a missing or malformed marker is always treated as "no prior
 // review" (safe default — re-review, never silently skip).
 import { createHash } from "node:crypto";
+import { STRUCTURAL_CHECK_ENGINE } from "./structural-check.js";
 import type { BotComment, PullRequestInfo } from "../vcs/adapter.js";
 
 export type DedupDecision = "skip-no-new-commits" | "review";
@@ -42,6 +43,12 @@ export interface ReviewConfigForDedup {
    * older callers and their pinned hashes still typecheck.
    */
   structuralChecks?: "on" | "off";
+  /**
+   * The structural-check parser identity. Defaults to `STRUCTURAL_CHECK_ENGINE`
+   * and exists as a field only so a test can vary it; production callers should
+   * leave it unset so there is one source of truth.
+   */
+  structuralCheckEngine?: string;
 }
 
 /**
@@ -121,7 +128,13 @@ export function computeReviewConfigHash(
     // `dispatch` field above had to pay. Turning the flag on still changes the
     // hash, which is the whole point.
     ...(config.dependencyFacts === "on" ? ["dependency-facts"] : []),
-    ...(config.structuralChecks === "on" ? ["structural-checks"] : []),
+    // The parser VERSION rides along, because a published check is a parse by a
+    // specific ast-grep and an upgrade can change the answer. Inside the
+    // `=== "on"` guard, so a repository that never enables the flag keeps its
+    // hash across ast-grep upgrades and pays nothing.
+    ...(config.structuralChecks === "on"
+      ? ["structural-checks", config.structuralCheckEngine ?? STRUCTURAL_CHECK_ENGINE]
+      : []),
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,
