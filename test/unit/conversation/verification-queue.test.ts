@@ -2,7 +2,7 @@
 // any model is called. Verification costs a model call per finding, so this is
 // where the cost is controlled and where "verify once per head" is guaranteed.
 import { describe, expect, it } from "vitest";
-import { pendingVerifications } from "../../../src/conversation/verification-queue.js";
+import { observeResolvedThreads, pendingVerifications } from "../../../src/conversation/verification-queue.js";
 import type { Finding } from "../../../src/review/types.js";
 
 const HEAD = "a".repeat(40);
@@ -36,6 +36,8 @@ const input = (over: Record<string, unknown> = {}) => ({
   findings: [ledger()],
   events: [event()],
   outcomes: [],
+  // Nothing observed resolved yet, which is the state a fresh repository is in.
+  resolvedThreads: new Set<string>(),
   changedLines: new Map<string, ReadonlySet<number>>(),
   ceiling: 10,
   ...over,
@@ -258,7 +260,7 @@ describe("pendingVerifications — a resolution is an event, not a standing stat
   it("ignores a repeated resolution snapshot at a later head", () => {
     const queue = pendingVerifications(input({
       events: [resolution],
-      outcomes: [{ findingId: ledger().id, headSha: OLD, trigger: "thread-resolution" }],
+      resolvedThreads: new Set(["t1"]),
     }));
 
     expect(queue).toEqual([]);
@@ -333,10 +335,76 @@ describe("pendingVerifications — a reopened thread can be resolved again", () 
   it("still ignores a repeat with no reopen", () => {
     const queue = pendingVerifications(input({
       events: [resolved],
-      outcomes: alreadyActed,
+      resolvedThreads: new Set(["t1"]),
     }));
 
     expect(queue).toEqual([]);
+  });
+
+  // #90: the bug this replaced. Suppression used to be read from the outcome
+  // CHECKPOINT, which keeps only the most recent records — so once enough newer
+  // outcomes accumulated, a still-resolved thread verified again at the next
+  // head. Durable observed state has no such window: no outcomes at all, and
+  // the repeat is still suppressed.
+  it("suppresses a repeat with no outcome record whatsoever", () => {
+    const queue = pendingVerifications(input({
+      events: [resolved],
+      outcomes: [],
+      resolvedThreads: new Set(["t1"]),
+    }));
+
+    expect(queue).toEqual([]);
+  });
+
+  // The #73 residual: a reopen and its re-resolution no longer have to arrive
+  // in the same poll, because what was observed is remembered between them.
+  it("queues again when the reopen was seen in an EARLIER poll", () => {
+    // The earlier poll saw the reopen, so the thread is no longer observed
+    // resolved. This poll sees only the re-resolution.
+    const queue = pendingVerifications(input({
+      events: [resolved],
+      outcomes: [],
+      resolvedThreads: new Set(),
+    }));
+
+    expect(queue[0]?.trigger).toBe("thread-resolution");
+  });
+
+  // PR #94 review: a caller that caps this set needs the tail to be the
+  // LAST-observed threads. `Set.add` is a no-op for a member already present,
+  // so re-observing left insertion order at first-observed — and a cap would
+  // then evict threads it had just seen, re-read them as transitions, and cycle
+  // duplicate verifications on every push.
+  it("moves a re-observed thread to the end, so a cap evicts the stalest", () => {
+    const seen = (threadId: string, resolved: boolean) => ({
+      kind: "thread-resolution" as const, threadId, resolved, authorIsBot: undefined,
+    });
+
+    const first = observeResolvedThreads(new Set(), [seen("a", true), seen("b", true)]);
+    expect([...first.resolved]).toEqual(["a", "b"]);
+
+    // "a" is re-emitted, as an adapter does on every later push.
+    const second = observeResolvedThreads(first.resolved, [seen("a", true), seen("c", true)]);
+    expect([...second.resolved]).toEqual(["b", "a", "c"]);
+    // Re-observing is not a transition: nothing changed about "a".
+    expect([...second.transitioned]).toEqual(["c"]);
+  });
+
+  // The caller CAPS what it stores, so what fills the cap matters. A thread no
+  // finding is bound to can never produce a verification, and letting those
+  // occupy the cap would evict the threads that can.
+  it("remembers only the threads it is told are worth remembering", () => {
+    const seen = (threadId: string) => ({
+      kind: "thread-resolution" as const, threadId, resolved: true, authorIsBot: undefined,
+    });
+
+    const observed = observeResolvedThreads(
+      new Set(["stale"]), [seen("bound"), seen("unbound")], new Set(["bound", "stale"]),
+    );
+
+    expect([...observed.resolved]).toEqual(["stale", "bound"]);
+    // An unbound thread is not a transition either: nothing will act on it.
+    expect([...observed.transitioned]).toEqual(["bound"]);
   });
 
   // A reopen on its own is not a request to re-verify.

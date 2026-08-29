@@ -2365,6 +2365,52 @@ describe("automatic verification", () => {
   // comment is visible to everyone, so a human reply lands in its thread — and
   // before recovery, the event matched no bound finding, was consumed as
   // classified-and-ignored, and the reply was never answered.
+  // PR #94 review: `boundThreads` is computed before the queue, and recovery
+  // binds an orphaned finding DURING it. A thread first seen that way was
+  // dropped from the remembered record, so the next re-emission of the same
+  // still-resolved thread read as a fresh transition and verified again.
+  it("remembers a thread bound during orphan recovery", async () => {
+    const adapter = new ExecutionAdapter([]);
+    // UNBOUND, as a crash between the provider write and binding leaves it.
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    const resolution = (eventId: string, at: string) => ({
+      kind: "thread-resolution" as const,
+      provider: "github" as const,
+      repositoryDigest,
+      reviewNumber: 1,
+      eventId,
+      revisionId: `${eventId}:1`,
+      orderKey: `${at}|${eventId}`,
+      createdAt: at,
+      updatedAt: at,
+      body: "",
+      url: "https://github.com/owner/repo/pull/1#discussion_rroot",
+      threadId: "T1",
+      resolved: true,
+      outdated: false,
+    } as unknown as ReviewActivityEvent);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    // The resolution is the FIRST event for this finding, so its thread is
+    // bound only by recovery inside the queue.
+    adapter.replaceEvents([resolution("res-1", "2026-08-14T00:00:02.000Z")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+
+    // A push moves the head; the thread is still resolved, so it is re-emitted.
+    adapter.headSha = "d".repeat(40);
+    adapter.replaceEvents([resolution("res-2", "2026-08-14T00:00:09.000Z")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+  });
+
   it("verifies a crash-orphaned finding by its marker, and repairs the binding", async () => {
     const adapter = new ExecutionAdapter([]);
     // Deliberately UNBOUND: the ledger state a crash between the provider
@@ -2794,6 +2840,54 @@ describe("automatic verification", () => {
     );
     adapter.replaceEvents([again]);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // #90 end to end: the observed state has to be DURABLE, or the suppression
+  // is only as good as one poll's memory.
+  it("remembers a resolution it acted on, across polls", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    const resolution = (at: string, eventId: string) => ({
+      kind: "thread-resolution" as const,
+      provider: "github" as const,
+      repositoryDigest,
+      reviewNumber: 1,
+      eventId,
+      revisionId: `${eventId}:1`,
+      orderKey: `${at}|${eventId}`,
+      createdAt: at,
+      updatedAt: at,
+      body: "",
+      url: "https://github.com/owner/repo/pull/1#discussion_rroot",
+      threadId: "T1",
+      resolved: true,
+      outdated: false,
+    } as unknown as ReviewActivityEvent);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    adapter.replaceEvents([resolution("2026-08-14T00:00:02.000Z", "res-1")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+
+    // A PUSH lands, so the head moves — which is what makes this #90 rather
+    // than ordinary idempotency. The per-head action identity cannot suppress
+    // across a head change, and with enough newer outcomes the checkpoint would
+    // have forgotten this one. Only the observed resolution state is left.
+    adapter.headSha = "d".repeat(40);
+    // The thread is still resolved, so the adapter re-emits it.
+    adapter.replaceEvents([resolution("2026-08-14T00:00:09.000Z", "res-2")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
     expect(sessions).toBe(1);
     expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
   });

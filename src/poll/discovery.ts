@@ -311,6 +311,9 @@ function applyDiscoveredReviews(
       }),
       retired: false,
       ...(existing?.eventPageToken === undefined ? {} : { eventPageToken: existing.eventPageToken }),
+      // Carried across the sweep, like the page token. Rebuilding without it
+      // discarded the observed resolution state on every discovery pass (#90).
+      ...(existing?.threadsResolved === undefined ? {} : { threadsResolved: existing.threadsResolved }),
     });
   }
   return [...byNumber.values()].sort((left, right) => left.reviewNumber - right.reviewNumber);
@@ -339,6 +342,11 @@ function retireUnseen(
           cursor: review.cursor,
           retired: false,
           ...(review.eventPageToken === undefined ? {} : { eventPageToken: review.eventPageToken }),
+          // Carried, not rebuilt from scratch. This rebuild dropped
+          // `threadsResolved` on every sweep, so the observed resolution state
+          // never survived a poll and a still-resolved thread verified again
+          // at each new head (#90).
+          ...(review.threadsResolved === undefined ? {} : { threadsResolved: review.threadsResolved }),
         };
     return { reviewNumber: review.reviewNumber, cursor: review.cursor, retired: true, retiredAt };
   });

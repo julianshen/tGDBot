@@ -62,6 +62,16 @@ export interface VerificationQueueInput {
   readonly outcomes: readonly VerificationOutcome[];
   /** Lines the new head touched, by path. Empty when the head did not move. */
   readonly changedLines: ReadonlyMap<string, ReadonlySet<number>>;
+  /**
+   * Threads the caller last observed RESOLVED, from durable state.
+   *
+   * A resolution is a state both adapters re-emit, not an event, so acting on
+   * it requires knowing whether it changed. With this, the trigger is the
+   * TRANSITION `not resolved -> resolved`, which suppresses re-emissions at any
+   * head and lets a genuine reopen-then-resolve trigger again even when the two
+   * land in different polls (#90, and the #73 residual).
+   */
+  readonly resolvedThreads: ReadonlySet<string>;
   /** The most verifications one poll may perform. */
   readonly ceiling: number;
 }
@@ -97,6 +107,49 @@ const TRIGGER_RANK: Record<FindingVerificationTrigger, number> = {
  * every open finding, which is why the head trigger is anchor-scoped rather
  * than "the head moved".
  */
+/**
+ * Folds this page's resolution events over what was last observed.
+ *
+ * ONE definition, used both to decide what to verify and to persist what was
+ * seen. Computing the same rule separately in the poll loop would let the two
+ * drift, and a disagreement here means either a lost verification or a repeated
+ * one.
+ */
+export function observeResolvedThreads(
+  previous: ReadonlySet<string>,
+  events: readonly VerificationEvent[],
+  /**
+   * Threads worth REMEMBERING — those a finding is bound to.
+   *
+   * A thread with no finding can never produce a verification, so its state is
+   * dead weight, and the caller caps what it stores: letting those fill the cap
+   * would evict the threads that can (PR #94 review). Absent, everything is
+   * remembered, which is what a caller with no findings loaded wants.
+   */
+  remembered?: ReadonlySet<string>,
+): { readonly resolved: ReadonlySet<string>; readonly transitioned: ReadonlySet<string> } {
+  const keep = (threadId: string): boolean => remembered === undefined || remembered.has(threadId);
+  const resolved = new Set([...previous].filter(keep));
+  const transitioned = new Set<string>();
+  for (const event of events) {
+    if (event.kind !== "thread-resolution" || event.threadId === undefined) continue;
+    // A reopen CLEARS the thread, so the next `true` reads as a real transition
+    // even in a later poll.
+    if (event.resolved === false) { resolved.delete(event.threadId); continue; }
+    if (event.resolved !== true || !keep(event.threadId)) continue;
+    const known = resolved.has(event.threadId);
+    // DELETE then add, so re-observing moves the thread to the end. `Set.add`
+    // is a no-op for a member already present, so insertion order was
+    // first-observed rather than last — and a caller capping the tail would
+    // evict threads it had just seen, re-read them as transitions, and cycle
+    // (PR #94 review).
+    resolved.delete(event.threadId);
+    resolved.add(event.threadId);
+    if (!known) transitioned.add(event.threadId);
+  }
+  return { resolved, transitioned };
+}
+
 export function pendingVerifications(input: VerificationQueueInput): PendingVerification[] {
   // Already answered at this head. Three replies in one thread in one poll is
   // still one verification, and a resumed poll re-verifies nothing.
@@ -106,28 +159,19 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
       .map((outcome) => outcome.findingId),
   );
 
-  // A resolution is an EVENT, not a standing state. Both adapters timestamp
-  // each resolution snapshot with the pull request's update time, so an
-  // already-resolved thread emits `resolved: true` again on every later push.
-  // Acting on each of those would re-queue every previously resolved finding at
-  // every new head, bypassing the anchor filter entirely (PR #73 review). Once
-  // a resolution has been acted on for a finding, a repeat says nothing new.
-  const resolutionActedOn = new Set(
-    input.outcomes
-      .filter((outcome) => outcome.trigger === "thread-resolution")
-      .map((outcome) => outcome.findingId),
-  );
-
-  // A thread REOPENED since the last verdict makes the next resolution a
-  // genuine new transition rather than a repeated snapshot. Both adapters emit
-  // `resolved: false` on reopen, and a maintainer may reopen and re-resolve
-  // without commenting or touching the code (PR #73 review).
-  const reopenedThreads = new Set(
-    input.events
-      .filter((event) => event.kind === "thread-resolution" && event.resolved === false)
-      .map((event) => event.threadId)
-      .filter((threadId): threadId is string => threadId !== undefined),
-  );
+  // A resolution is a STATE both adapters re-emit, not an event: an
+  // already-resolved thread reports `resolved: true` again on every later push.
+  // So the trigger is the transition into it, computed against what the caller
+  // durably observed last. Reading "already acted on" from the outcome
+  // checkpoint instead meant it was forgotten after
+  // `MAX_OUTCOME_CHECKPOINT` newer records, and the same still-resolved thread
+  // verified again at the next head (#90).
+  //
+  // A reopen is the same rule from the other side: observing `resolved: false`
+  // clears the thread, so the next `true` is a real transition — and because
+  // the record is durable, the reopen and the re-resolution no longer have to
+  // arrive in the same poll (the #73 residual).
+  const { transitioned } = observeResolvedThreads(input.resolvedThreads, input.events);
 
   const humanEventsByThread = new Map<string, FindingVerificationTrigger>();
   for (const event of input.events) {
@@ -157,8 +201,7 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
     const threadId = candidate.identity?.threadId;
     const signalled = threadId === undefined ? undefined : humanEventsByThread.get(threadId);
     const suppressedRepeat = signalled === "thread-resolution"
-      && resolutionActedOn.has(candidate.id)
-      && !(threadId !== undefined && reopenedThreads.has(threadId));
+      && !(threadId !== undefined && transitioned.has(threadId));
     const humanTrigger = suppressedRepeat ? undefined : signalled;
     // An unanchored finding cannot be matched against a diff, so a push tells
     // us nothing about it — and neither does a finding RAISED at this head,
