@@ -6,7 +6,8 @@ import {
   planForget,
   planRemember,
 } from "../../../src/conversation/memories.js";
-import type { MemoryCreateEntry, RepositoryBinding } from "../../../src/conversation/state-schema.js";
+import type { MemoryCreateEntry } from "../../../src/conversation/state-schema.js";
+import type { RepositoryBinding } from "../../../src/conversation/types.js";
 
 const binding: RepositoryBinding = {
   provider: "github",

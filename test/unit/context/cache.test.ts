@@ -305,7 +305,7 @@ describe("ContextCache", () => {
       provider: "gitlab",
       host: gitlabRepo.host,
       port: gitlabRepo.port,
-      namespace: gitlabRepo.namespace,
+      // `namespace` comes from the override; setting it here too was dead.
       repo: gitlabRepo.repo,
       baseSha: "a".repeat(40),
       schemaVersion: 1,
@@ -858,7 +858,11 @@ describe("ContextCache", () => {
     const root = await tempRoot();
     const cache = new ContextCache(root);
     expect(() => cache.entryPath(null as unknown as ContextCacheKey)).toThrow(/key/i);
-    expect(() => cache.entryPath({ ...key, provider: "gitlab" } as ContextCacheKey)).toThrow(/key|fields/i);
+    // DELIBERATELY invalid: a GitLab key needs `namespace`, not `owner`, so the
+    // two shapes do not overlap and the direct cast is not expressible. Via
+    // `unknown`, as the `null` case above already does.
+    expect(() => cache.entryPath({ ...key, provider: "gitlab" } as unknown as ContextCacheKey))
+      .toThrow(/key|fields/i);
     expect(() => cache.entryPath({ ...key, schemaVersion: 0 })).toThrow(/schemaVersion/i);
     expect(() => cache.entryPath({ ...key, unexpected: true } as ContextCacheKey)).toThrow(/key/i);
     await expect(cache.lookupContext(null as unknown as ContextCacheKey)).resolves.toBeUndefined();

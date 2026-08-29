@@ -118,7 +118,9 @@ describe("orchestrate", () => {
 +added
 `;
     const presentation = orchestrate(makeDispatchResult({ findings: [
-      makeFinding({ line: null, severity: "suggestion", message: "summary suggestion" }),
+      // `undefined`, not `null`: `line` is `number | undefined`, and the helper
+      // defaults it to 10, so absence has to be stated to override the default.
+      makeFinding({ line: undefined, severity: "suggestion", message: "summary suggestion" }),
       makeFinding({ line: 10, severity: "blocking", message: "failed blocking" }),
     ] }), diff);
 

@@ -17,6 +17,7 @@ import type { VcsAdapter } from "../../../src/vcs/adapter.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
 import { createConversationStateStore } from "../../../src/conversation/state-store.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
+import type { RepositoryRef } from "../../../src/target/types.js";
 import type {
   ChildMarkerLookup,
   ConversationAdapter,
@@ -121,7 +122,9 @@ function commentEvent(
     url: `https://github.com/owner/repo/pull/1#issuecomment-${eventId}`,
     commentId: eventId,
     ...extras,
-  };
+    // `extras` may carry any variant's `kind`, so the literal no longer narrows
+    // to one member of the union. Cast, as `threadComment` already does.
+  } as ReviewActivityEvent;
 }
 
 function encodeEventCursor(events: readonly ReviewActivityEvent[]): ReviewEventCursor {
@@ -230,22 +233,42 @@ class ClassificationAdapter implements ConversationAdapter {
     return { threads: [] };
   }
 
-  async getReviewThread(): Promise<never> {
+  // These carry the INTERFACE's parameters even though the base ignores them.
+  // Declared with none, the subclass overrides that DO use them were not
+  // assignable to the base, and the whole file went unchecked as a result.
+  // `Parameters<>` states the signature without naming arguments nothing reads.
+  async getReviewThread(
+    ..._args: Parameters<ConversationAdapter["getReviewThread"]>
+  ): Promise<ReviewThreadSnapshot> {
+    void _args;
     throw new Error("unused");
   }
 
-  async postGeneralReply(): Promise<never> {
+  async postGeneralReply(
+    ..._args: Parameters<ConversationAdapter["postGeneralReply"]>
+  ): Promise<ConversationItemIdentity> {
+    void _args;
     this.writes.push("general");
     throw new Error("provider writes are not implemented");
   }
 
-  async postThreadReply(): Promise<never> {
+  async postThreadReply(
+    ..._args: Parameters<ConversationAdapter["postThreadReply"]>
+  ): Promise<ConversationItemIdentity> {
+    void _args;
     this.writes.push("thread");
     throw new Error("provider writes are not implemented");
   }
 
-  async findBotChildMarker() {
+  async findBotChildMarker(
+    ..._args: Parameters<ConversationAdapter["findBotChildMarker"]>
+  ): Promise<ConversationItemIdentity | null> {
+    void _args;
     return null;
+  }
+
+  async resolveReviewIdentity(_repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
+    return identity(reviewNumber);
   }
 }
 
@@ -556,7 +579,6 @@ function threadComment(
 ): ReviewActivityEvent {
   const threadId = extras.threadId ?? "T1";
   return {
-    kind: "thread-comment",
     provider: "github",
     repositoryDigest,
     reviewNumber: 1,
@@ -570,8 +592,8 @@ function threadComment(
     body,
     url: `https://github.com/owner/repo/pull/1#discussion_r${eventId}`,
     commentId: eventId,
-    threadId,
     ...extras,
+    // AFTER the spread on purpose: the computed values win over `extras`.
     kind: extras.kind === "comment-edit" ? "comment-edit" : "thread-comment",
     threadId,
   } as ReviewActivityEvent;
@@ -662,8 +684,6 @@ async function bootstrapAndSeed(
     readonly bindThreadId?: string;
     /** A distinct finding id, so several can be seeded into one repository. */
     readonly findingId?: string;
-    /** Seed a finding whose review recorded no model, so none can be resolved. */
-    readonly withoutModel?: boolean;
   } = {},
 ): Promise<{ stateDir: string; ledger?: FindingLedgerEntry; findingMarker?: string }> {
   const stateDir = await tempStateDir();
@@ -707,7 +727,7 @@ async function seedFindingInto(
       disableBuiltinRule: false,
       trustLocalRules: false,
       rulesDir: ".review/rules",
-      ...(options.withoutModel === true ? {} : { model: "anthropic/claude-opus-4-5" }),
+      model: "anthropic/claude-opus-4-5",
       dispatch: "direct",
     },
     placement: {
@@ -931,7 +951,7 @@ describe("event-to-action poll", () => {
     }), { ...executionDeps(adapter), runReview })).resolves.toBe(0);
 
     expect(runReview).toHaveBeenCalledTimes(1);
-    const [reviewArgs, reviewDeps] = runReview.mock.calls[0] as [Record<string, unknown>, Record<string, unknown>];
+    const [reviewArgs, reviewDeps] = runReview.mock.calls[0] as unknown as [Record<string, unknown>, Record<string, unknown>];
     expect(reviewArgs).toMatchObject({
       pr: "1",
       repo: "owner/repo",
@@ -971,7 +991,7 @@ describe("event-to-action poll", () => {
     })).resolves.toBe(0);
 
     expect(runReview).toHaveBeenCalledTimes(1);
-    const [, reviewDeps] = runReview.mock.calls[0] as [unknown, Record<string, unknown>];
+    const [, reviewDeps] = runReview.mock.calls[0] as unknown as [unknown, Record<string, unknown>];
     expect(reviewDeps.invocation).toMatchObject({
       kind: "focused-command",
       direction: "check the error handling",
@@ -1176,9 +1196,14 @@ describe("event-to-action poll", () => {
       .resolves.toBe(0);
     expect(adapter.postedBodies).toHaveLength(1);
 
-    const formatted = {
+    const formatted: ReviewActivityEvent = {
       ...original,
+      // A comment-edit REQUIRES these four; on the union they are optional, so
+      // spreading an event does not establish them.
       kind: "comment-edit" as const,
+      commentId: original.commentId!,
+      authorLogin: original.authorLogin!,
+      authorIsBot: original.authorIsBot!,
       revisionId: "cmd:2",
       editedRevisionId: "cmd:2",
       body: "@TGDBot   explain  ",
@@ -1199,7 +1224,12 @@ describe("event-to-action poll", () => {
 
     const material = {
       ...original,
+      // A comment-edit REQUIRES these four; on the union they are optional, so
+      // spreading an event does not establish them.
       kind: "comment-edit" as const,
+      commentId: original.commentId!,
+      authorLogin: original.authorLogin!,
+      authorIsBot: original.authorIsBot!,
       revisionId: "cmd:3",
       editedRevisionId: "cmd:3",
       body: "@tgdbot reconsider because the wrapper redacts the token",
@@ -1311,8 +1341,8 @@ describe("event-to-action poll", () => {
 
 describe("ambiguous-write recovery", () => {
   it.each([
-    ["usage", commentEvent("bad", "@tgdbot frobnicate"), /## Command usage/, undefined],
-    ["scope", commentEvent("gen", "@tgdbot explain"), /## Out of scope/, undefined],
+    ["usage", commentEvent("bad", "@tgdbot frobnicate"), /## Command usage/],
+    ["scope", commentEvent("gen", "@tgdbot explain"), /## Out of scope/],
   ] as const)("recovers a %s reply from the provider marker without a second write", async (_name, event, heading) => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);
@@ -1753,7 +1783,11 @@ describe("clarification answer lifecycle", () => {
 
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
       ...executionDeps(adapter, { createSession }),
-      getReviewMetadata: async () => undefined,
+      // THROWS, rather than resolving undefined. The dependency's type promises
+      // metadata, and production reaches "unavailable" through the catch in
+      // `loadReviewMetadata` — so a rejection is the faithful simulation, and
+      // resolving `undefined` was modelling a state the seam cannot produce.
+      getReviewMetadata: async () => { throw new Error("review metadata is unavailable"); },
     })).resolves.toBe(1);
 
     expect(createSession).not.toHaveBeenCalled();
@@ -2441,7 +2475,9 @@ describe("automatic verification", () => {
       findingId: `finding_${"2".repeat(32)}`,
     });
     const events = [
-      installFindingThread(adapter, boundMarker, threadComment(
+      // `bootstrapAndSeed` types the marker optional; `seedFinding: true` above
+      // is what makes it present, as everywhere else in this file.
+      installFindingThread(adapter, boundMarker!, threadComment(
         "human-1", "fixed this in the latest push", { threadId: "T1" },
       )),
       installFindingThread(adapter, orphanMarker, threadComment(
@@ -2537,9 +2573,9 @@ describe("automatic verification", () => {
     const base = executionDeps(adapter, { createSession: session });
     const deps = {
       ...base,
-      getReviewMetadata: async (reviewNumber: number) => {
+      getReviewMetadata: async () => {
         if (failMetadata) throw new Error("the pull request is temporarily unavailable");
-        return base.getReviewMetadata(reviewNumber);
+        return base.getReviewMetadata();
       },
     };
 

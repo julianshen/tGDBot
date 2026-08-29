@@ -120,7 +120,7 @@ describe("resolveGitHubRelatedWork", () => {
       const value = outputs.shift();
       return typeof value === "string" ? value : JSON.stringify(value);
     });
-    const refs = [1, 2, 3, 4].map(reference);
+    const refs = [1, 2, 3, 4].map((number) => reference(number));
     expect(await resolveGitHubRelatedWork(refs, execGh)).toEqual(refs);
   });
 
@@ -211,7 +211,7 @@ describe("resolveGitHubRelatedWork", () => {
       const number = args[3]!.split("/").at(-1)!;
       return JSON.stringify({ title: number, state: "open", html_url: `https://github.com/octo/repo/issues/${number}` });
     });
-    const pending = resolveGitHubRelatedWork([1, 2, 3, 4, 5].map(reference), execGh);
+    const pending = resolveGitHubRelatedWork([1, 2, 3, 4, 5].map((number) => reference(number)), execGh);
     await vi.waitFor(() => expect(execGh).toHaveBeenCalledTimes(3));
     releases.splice(0).forEach((release) => release());
     await vi.waitFor(() => expect(execGh).toHaveBeenCalledTimes(5));
