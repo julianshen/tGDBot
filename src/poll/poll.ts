@@ -316,7 +316,7 @@ async function classifyOpenReviewEvents(options: {
         item.event.threadId !== undefined && !boundThreads.has(item.event.threadId))
       .map((item) => item.event);
     const queued = candidateEvents.length === 0 && recoveryEvents.length === 0
-      ? { items: [], deferred: false, deferredEvents: [] } as VerificationQueue
+      ? { items: [], deferred: false, deferredEvents: [], boundThreads } as VerificationQueue
       : await queueVerifications({
       events: classified.filter((item) => item.parsed.kind === "irrelevant"),
       reviewNumber: review.reviewNumber,
@@ -331,6 +331,7 @@ async function classifyOpenReviewEvents(options: {
       return {
         items: [],
         deferred: true,
+        boundThreads,
         deferredEvents: [...candidateEvents, ...recoveryEvents],
       } as VerificationQueue;
     });
@@ -350,7 +351,11 @@ async function classifyOpenReviewEvents(options: {
         authorIsBot: item.event.authorIsBot,
         resolved: item.event.kind === "thread-resolution" ? item.event.resolved : undefined,
       })),
-      boundThreads,
+      // The queue's set, not the one computed above: recovery binds orphaned
+      // findings DURING the call, and a thread first seen that way would
+      // otherwise be dropped from the record and re-read as a transition
+      // later (PR #94 review).
+      queued.boundThreads,
     ).resolved]
       // Last-observed at the end, now that the fold refreshes order.
       .slice(-MAX_RESOLVED_THREADS);
@@ -2130,6 +2135,16 @@ interface VerificationQueue {
    */
   readonly deferred: boolean;
   /**
+   * Threads a finding is bound to AFTER recovery.
+   *
+   * The caller computes its own set before calling, and recovery binds
+   * orphaned findings during the call — so a thread first seen through a
+   * recovered finding was missing from the caller's set, dropped from the
+   * remembered record, and read as a fresh transition on the next re-emission
+   * (PR #94 review).
+   */
+  readonly boundThreads: ReadonlySet<string>;
+  /**
    * The trigger events the budget could not reach.
    *
    * They are excluded from this page's processing entirely, because the poll
@@ -2200,7 +2215,7 @@ async function queueVerifications(input: {
     .filter((item) => replyShape(item) && !bound.has(item.event.threadId!))
     .map((item) => item.event);
   if (waiting.length === 0 && unmatched.length === 0) {
-    return { items: [], deferred: false, deferredEvents: [] };
+    return { items: [], deferred: false, deferredEvents: [], boundThreads: bound };
   }
 
   // Identity recovery for crash-orphaned findings (issue #85). Only unmatched
@@ -2278,7 +2293,7 @@ async function queueVerifications(input: {
   // no way to ever match them, and holding unmatchable events pins the cursor
   // forever. Read failures and the unread past-the-cap tail ARE held — both
   // may still resolve on a later poll.
-  const holdAll = { items: [], deferred: true, deferredEvents: [...waiting, ...recoveryDeferred] };
+  const holdAll = { items: [], deferred: true, deferredEvents: [...waiting, ...recoveryDeferred], boundThreads: bound };
   if (input.budget <= 0) return holdAll;
 
   const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
@@ -2316,7 +2331,7 @@ async function queueVerifications(input: {
     // A recovery read outage defers its event even when no candidate emerged:
     // the event is off the page either way, and the reply it carries must not
     // be spent on a transport failure.
-    return { items: [], deferred: recoveryDeferred.length > 0, deferredEvents: recoveryDeferred };
+    return { items: [], deferred: recoveryDeferred.length > 0, deferredEvents: recoveryDeferred, boundThreads: bound };
   }
 
   const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
@@ -2417,6 +2432,7 @@ async function queueVerifications(input: {
   return {
     items,
     deferred,
+    boundThreads: bound,
     deferredEvents: [...deferredEvents, ...recoveryDeferred],
     context: { metadata, rules },
   };
