@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   checkStructuralClaim,
   describeCheck,
+  hasCheckableClaim,
   parseStructuralClaim,
   runStructuralChecks,
   type StructuralCheck,
@@ -976,5 +977,27 @@ describe("runStructuralChecks", () => {
     const reason = (output[0]?.hostCheck as { reason: string }).reason;
     expect(reason).not.toContain("/home/runner");
     expect(reason).toBe("the check failed");
+  });
+});
+
+describe("hasCheckableClaim — the eligibility predicate the CLI gate shares (issue #80)", () => {
+  // One definition of "can be checked", used by both the CLI's clone gate and
+  // (through its own parts) the checker. Each case mirrors a refusal the
+  // production path makes.
+  it.each([
+    ["a claim on a supported language with a reader", {}, true],
+    ["no claim", { claim: undefined }, false],
+    ["an unsupported language", { file: "src/retry.go" }, false],
+    ["an extension-less file", { file: "retry" }, false],
+    ["a decision no reader sees", { decision: "needs-clarification" as const }, false],
+    ["an addressed finding", { decision: "addressed" as const }, false],
+  ])("%s", (_name, overrides, expected) => {
+    expect(hasCheckableClaim(finding({ claim: claim, ...overrides }))).toBe(expected);
+  });
+
+  it("honours the injected suppression predicate", () => {
+    const f = finding({ claim });
+    expect(hasCheckableClaim(f, () => true)).toBe(false);
+    expect(hasCheckableClaim(f, () => false)).toBe(true);
   });
 });
