@@ -450,8 +450,11 @@ async function classifyOpenReviewEvents(options: {
         if (latest !== undefined && (latest.state === "manifest-ready" || latest.state === "published" ||
           latest.state === "prepared")) {
           const recoveredAction = actionFromEvent(latest);
-          const resolveOwn = recoveredAction.children.some((child) =>
-            child.placement.kind === "group-reply" && child.placement.resolveOwnThread === true);
+          const recoveredVerdict = recoveredAction.children.find((child) =>
+            child.placement.kind === "group-reply")?.placement;
+          const verificationVerdict = recoveredVerdict?.kind === "group-reply"
+            ? recoveredVerdict.verificationVerdict
+            : undefined;
           const recoveredMetadata = queued.context?.metadata;
           const recovered = await publishPreparedReply({
             event: item.event,
@@ -459,7 +462,7 @@ async function classifyOpenReviewEvents(options: {
             latest,
             reviewIdentity: identity,
             options,
-            ...(resolveOwn && recoveredMetadata !== undefined
+            ...(verificationVerdict !== undefined && recoveredMetadata !== undefined
               ? {
                   onComplete: (tx) => {
                     tx.appendOutcome(prepareFindingOutcome({
@@ -476,7 +479,7 @@ async function classifyOpenReviewEvents(options: {
                       ...(item.ledger.finding.effort === undefined
                         ? {}
                         : { effort: item.ledger.finding.effort }),
-                      verdict: "withdrawn",
+                      verdict: verificationVerdict,
                       trigger: item.pending.trigger,
                       anchorChanged: item.pending.trigger === "head-change",
                       at: options.now(),
@@ -1629,8 +1632,11 @@ function buildReplyChild(input: {
           ? { headSha: input.plan.headSha }
           : {}
       ),
-      ...(input.plan.kind === "verification" && input.plan.resolveOwnThread
-        ? { resolveOwnThread: true as const }
+      ...(input.plan.kind === "verification"
+        ? {
+            verificationVerdict: input.plan.verdict,
+            ...(input.plan.resolveOwnThread ? { resolveOwnThread: true as const } : {}),
+          }
         : {}),
     },
     body: render(marker),

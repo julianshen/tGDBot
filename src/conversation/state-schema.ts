@@ -94,7 +94,13 @@ export type PublicationStatus = PublicationChildStatus;
 
 export type PublicationPlacement =
   | { readonly kind: "summary"; readonly headSha?: string; readonly configHash?: string; readonly terminalResult?: PublicationTerminalResult }
-  | { readonly kind: "group-reply"; readonly threadId?: string; readonly headSha?: string; readonly resolveOwnThread?: true }
+  | {
+      readonly kind: "group-reply";
+      readonly threadId?: string;
+      readonly headSha?: string;
+      readonly resolveOwnThread?: true;
+      readonly verificationVerdict?: FindingVerdict;
+    }
   | { readonly kind: "inline"; readonly file: string; readonly line: number; readonly startLine?: number; readonly side?: "old" | "new"; readonly clientId?: string; readonly position?: PublicationInlinePosition }
   | { readonly kind: "general-question"; readonly file?: string; readonly line?: number }
   | { readonly kind: "fallback" };
@@ -895,7 +901,8 @@ function publicationTerminalResult(value: unknown, name: string): PublicationTer
 }
 
 function publicationPlacement(value: unknown, name: string): PublicationPlacement {
-  const object = exact(value, name, ["kind"], ["headSha", "configHash", "terminalResult", "threadId", "resolveOwnThread", "file", "line",
+  const object = exact(value, name, ["kind"], ["headSha", "configHash", "terminalResult", "threadId", "resolveOwnThread",
+    "verificationVerdict", "file", "line",
     "startLine", "side", "clientId", "position"]);
   if (object.kind === "summary") {
     return {
@@ -911,11 +918,16 @@ function publicationPlacement(value: unknown, name: string): PublicationPlacemen
     if (object.resolveOwnThread !== undefined && object.resolveOwnThread !== true) {
       throw new Error(`${name}.resolveOwnThread is invalid`);
     }
+    const verdict = object.verificationVerdict;
+    if (verdict !== undefined && verdict !== "confirmed" && verdict !== "revised" && verdict !== "withdrawn") {
+      throw new Error(`${name}.verificationVerdict is invalid`);
+    }
     return {
       kind: "group-reply",
       ...(object.threadId === undefined ? {} : { threadId: text(object.threadId, `${name}.threadId`, 256) }),
       ...(object.headSha === undefined ? {} : { headSha: text(object.headSha, `${name}.headSha`, 64) }),
       ...(object.resolveOwnThread === true ? { resolveOwnThread: true as const } : {}),
+      ...(verdict === undefined ? {} : { verificationVerdict: verdict }),
     };
   }
   if (object.kind === "inline") {

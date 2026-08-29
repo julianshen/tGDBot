@@ -2233,6 +2233,62 @@ describe("automatic verification", () => {
     expect(body).toContain("`@tgdbot reconsider <why>`");
   });
 
+  it("records a confirmed outcome when recovery completes a posted reply", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "I think this one is wrong"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("confirmed")).session;
+    };
+    adapter.replaceEvents([reply]);
+    let crashOnce = true;
+    const crashComplete = <T>(fn: (tx: ConversationStateTransaction) => T) =>
+      (tx: ConversationStateTransaction) => {
+        const appendEvent = tx.appendEvent.bind(tx);
+        tx.appendEvent = (entry) => {
+          if (crashOnce && entry.state === "completed") {
+            crashOnce = false;
+            throw new Error("crash before complete persist");
+          }
+          appendEvent(entry);
+        };
+        return fn(tx);
+      };
+    const deps = {
+      ...executionDeps(adapter, { createSession: session }),
+      createStateStore: (opts: Parameters<typeof createConversationStateStore>[0]) => {
+        const store = createConversationStateStore(opts);
+        const transact = store.transact.bind(store);
+        store.transact = ((fn: Parameters<ConversationStateStore["transact"]>[0]) =>
+          transact(crashComplete(fn) as typeof fn)) as typeof store.transact;
+        const lock = store.withExclusiveLock.bind(store);
+        store.withExclusiveLock = (fn) => lock(async (session) => {
+          const commit = session.commit.bind(session);
+          session.commit = ((txFn: Parameters<typeof commit>[0]) =>
+            commit(crashComplete(txFn) as typeof txFn)) as typeof commit;
+          return fn(session);
+        });
+        return store;
+      },
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
+      .resolves.toEqual([]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("confirmed");
+  });
+
   // A transient provider failure must not consume the reply. The poll marks an
   // ordinary comment classified-and-ignored as soon as it reads it, so an event
   // left on the page is spent whether or not the verification it asked for ever
