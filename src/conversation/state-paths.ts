@@ -328,8 +328,14 @@ export async function prepareConversationStatePaths(
   for (const directory of managedDirectories) {
     repositoryInfo = await protectDirectory(fs, directory, platform, uid);
   }
+  // EVERY head, sidecar included. `outcomes-head.json` was absent here, so a
+  // pre-existing group- or world-writable one passed preparation unexamined:
+  // `openValidated` later chmods it and accepts whatever schema-valid outcomes
+  // are already in it — and a forged outcome SUPPRESSES verification, which is
+  // a silent way to stop the tool answering (PR #74 review).
   for (const candidate of [paths.cursorPath, paths.eventsPath, paths.memoriesPath, paths.findingsPath,
-    paths.pendingPath, paths.lockPath, paths.transactionIntentPath, paths.transactionRetiredPath, paths.journalHeadPath]) {
+    paths.pendingPath, paths.lockPath, paths.transactionIntentPath, paths.transactionRetiredPath,
+    paths.journalHeadPath, paths.outcomeHeadPath]) {
     await inspectExistingPath(fs, candidate, false, platform, uid);
   }
   if (repositoryInfo === undefined) throw new Error("Conversation repository directory was not prepared");

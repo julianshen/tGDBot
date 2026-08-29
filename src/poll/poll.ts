@@ -487,7 +487,11 @@ async function classifyOpenReviewEvents(options: {
 
     const completedPage = !stoppedEarly && !haltCursor && !deferredHold;
     const listingComplete = page.nextPageToken === undefined;
-    const nextRoundRobinKey = stoppedEarly || haltCursor || deferredHold
+    // `deferredHold` deliberately does NOT pin the key. Holding this review's
+    // own event cursor is what keeps its deferred work; pinning the ROTATION as
+    // well meant a continuously busy review took the whole poll-wide budget
+    // first every time, and every later review starved (PR #74 review).
+    const nextRoundRobinKey = stoppedEarly || haltCursor
       ? String(review.reviewNumber)
       : nextKey(currentActive, index);
     const advancedProgress = listingComplete && page.events.length > 0 && !haltCursor && !deferredHold

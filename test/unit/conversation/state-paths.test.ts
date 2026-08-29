@@ -1,5 +1,5 @@
 import type { Stats } from "node:fs";
-import { chmod, lstat, mkdtemp, mkdir, realpath, rm, symlink, stat } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, mkdir, realpath, rm, symlink, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -131,6 +131,25 @@ describe("repository state paths", () => {
         parseRepositoryRef("https://gitlab.example.com:8443/a/b/repo", "gitlab"));
       await expect(prepareConversationStatePaths(paths)).rejects.toThrow(/symbolic link/i);
     }
+  });
+
+  // A forged outcome SUPPRESSES verification, so a writable sidecar is a silent
+  // way to stop the tool answering. It is a head like any other.
+  test("refuses a world-writable outcome sidecar", async () => {
+    if (process.platform === "win32") return;
+    const parent = await temporaryDirectory();
+    const root = path.join(parent, "state");
+    const paths = deriveConversationStatePaths(root, parseRepositoryRef("owner/repo", "github"));
+    await prepareConversationStatePaths(paths);
+
+    await writeFile(paths.outcomeHeadPath, "{}\n");
+    await chmod(paths.outcomeHeadPath, 0o666);
+    await expect(prepareConversationStatePaths(paths)).rejects.toThrow(/permission|writable|mode/i);
+
+    // The same file at a safe mode is accepted, so the refusal is about the
+    // mode rather than about the file existing at all.
+    await chmod(paths.outcomeHeadPath, 0o600);
+    await expect(prepareConversationStatePaths(paths)).resolves.toBeDefined();
   });
 
   test("rejects unsafe managed modes and injectable foreign ownership", async () => {

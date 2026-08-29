@@ -181,9 +181,12 @@ class ClassificationAdapter implements ConversationAdapter {
       : JSON.parse(pageToken.opaque) as { page: number; after: string | null };
     if (continuation.after !== startAfter) throw new Error("continuation cursor binding mismatch");
     this.eventCalls.push({ after: after?.opaque, pageToken: pageToken?.opaque });
+    // Scoped to the review being asked about. A stub that answers every review
+    // with every event cannot exercise round-robin fairness at all.
+    const mine = this.events.filter((event) => event.reviewNumber === _review.reviewNumber);
     const remaining = after === undefined
-      ? this.events
-      : this.events.filter((event) => {
+      ? mine
+      : mine.filter((event) => {
           const boundary = JSON.parse(after.opaque) as { at: string; seen: string[] };
           return event.updatedAt > boundary.at ||
             (event.updatedAt === boundary.at && !boundary.seen.includes(event.eventId));
@@ -573,6 +576,8 @@ function threadComment(
 class ExecutionAdapter extends ClassificationAdapter {
   readonly postedBodies: string[] = [];
   readonly postedKinds: Array<"general" | "thread"> = [];
+  /** Which thread each reply landed in, so fairness across reviews is visible. */
+  readonly postedThreadIds: Array<string | undefined> = [];
   readonly publishedByMarker = new Map<string, ConversationItemIdentity>();
   readonly acceptedBodies: string[] = [];
   failNextWrite: "throw" | "accept-then-fail" | null = null;
@@ -613,6 +618,7 @@ class ExecutionAdapter extends ClassificationAdapter {
   }
 
   private recordWrite(kind: "general" | "thread", body: string, threadId?: string): ConversationItemIdentity {
+    this.postedThreadIds.push(threadId);
     const marker = lastMarker(body);
     const identity: ConversationItemIdentity = {
       provider: "github",
@@ -666,14 +672,18 @@ async function bootstrapAndSeed(
 /** Places one published finding into an ALREADY bootstrapped repository. */
 async function seedFindingInto(
   stateDir: string,
-  options: { readonly bindThreadId?: string; readonly findingId?: string } = {},
+  options: {
+    readonly bindThreadId?: string;
+    readonly findingId?: string;
+    readonly reviewNumber?: number;
+  } = {},
 ): Promise<{ ledger: FindingLedgerEntry; findingMarker: string }> {
   const store = createConversationStateStore({ root: stateDir, repository: repo });
   const binding = store.repositoryBinding;
   const ledger = prepareFindingLedgerEntry({
     repository: binding,
     id: options.findingId ?? FINDING_ID,
-    reviewNumber: 1,
+    reviewNumber: options.reviewNumber ?? 1,
     reviewId: "PR_1",
     baseSha: "b".repeat(40),
     headSha: "c".repeat(40),
@@ -721,7 +731,7 @@ async function seedFindingInto(
     parentId: `act_${"2".repeat(32)}`,
     childId: ledger.id,
     repositoryDigest,
-    reviewNumber: 1,
+    reviewNumber: options.reviewNumber ?? 1,
     contentDigest: ledger.contentDigest,
   });
   return { ledger: seeded, findingMarker };
@@ -731,19 +741,21 @@ function installFindingThread(
   adapter: ExecutionAdapter,
   findingMarker: string,
   command: ReviewActivityEvent,
-  extras: { readonly rootAuthorIsBot?: boolean } = {},
+  extras: { readonly rootAuthorIsBot?: boolean; readonly reviewNumber?: number } = {},
 ): ReviewActivityEvent {
+  const reviewNumber = extras.reviewNumber ?? 1;
   const root = threadComment("root", `${visibleFindingBody}\n${findingMarker}`, {
     authorLogin: extras.rootAuthorIsBot === false ? "mallory" : "tgdbot",
     authorIsBot: extras.rootAuthorIsBot !== false,
     updatedAt: "2026-08-13T23:00:00.000Z",
     threadId: command.threadId ?? "T1",
+    reviewNumber,
   });
-  const reply = { ...command, threadId: command.threadId ?? "T1", parentCommentId: "root" };
+  const reply = { ...command, threadId: command.threadId ?? "T1", parentCommentId: "root", reviewNumber };
   adapter.threads.set(reply.threadId ?? "T1", {
     provider: "github",
     repositoryDigest,
-    reviewNumber: 1,
+    reviewNumber,
     threadId: reply.threadId ?? "T1",
     rootCommentId: "root",
     url: "https://github.com/owner/repo/pull/1#discussion_rroot",
@@ -2326,6 +2338,59 @@ describe("automatic verification", () => {
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
     expect(sessions).toBe(7);
     expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(7);
+  });
+
+  // Two reviews is the ONLY shape that separates a poll-wide budget from a
+  // per-iteration one: they differ solely across loop iterations, so every
+  // single-review fixture passes against either. I claimed this held by
+  // construction two rounds ago; this is the test that actually shows it.
+  it("spends one poll-wide budget across reviews, not one per review", async () => {
+    const adapter = new ExecutionAdapter([], [summary(1), summary(2)]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const events: ReviewActivityEvent[] = [];
+    // Review 1: more candidates than the poll-wide budget of five.
+    for (let index = 0; index < 7; index += 1) {
+      const { findingMarker } = await seedFindingInto(stateDir, {
+        findingId: `finding_${String(index).repeat(32)}`,
+        bindThreadId: `A${index}`,
+        reviewNumber: 1,
+      });
+      events.push(installFindingThread(adapter, findingMarker, threadComment(
+        `one-${index}`, "fixed this in the latest push", { threadId: `A${index}` },
+      ), { reviewNumber: 1 }));
+    }
+    // Review 2: one reply, behind all of them.
+    const { findingMarker: second } = await seedFindingInto(stateDir, {
+      findingId: `finding_${"9".repeat(32)}`,
+      bindThreadId: "B0",
+      reviewNumber: 2,
+    });
+    events.push(installFindingThread(
+      adapter,
+      second,
+      threadComment("two-0", "fixed this in the latest push", { threadId: "B0", reviewNumber: 2 }),
+      { reviewNumber: 2 },
+    ));
+
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents(events);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    // Exactly the poll-wide budget, spent entirely on review 1 — which is also
+    // the only fixture that separates a poll-wide budget from a per-iteration
+    // one, since with two reviews the latter would spend ten.
+    expect(adapter.postedThreadIds.filter((id) => id !== undefined)).toHaveLength(5);
+
+    // NOT asserted here: which review the next poll starts with. When every
+    // classified event is deferred the cursor transaction is skipped entirely,
+    // so the round-robin key is not written in either direction and no fixture
+    // I built can tell the rotation change from its absence.
+
+    adapter.replaceEvents(events);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedThreadIds.filter((threadId) => threadId === "B0")).toHaveLength(1);
   });
 
   // A dry run previews; it does not buy anything. Reporting the VERDICT meant
