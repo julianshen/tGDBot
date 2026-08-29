@@ -1123,6 +1123,24 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     }
   }
 
+  async resolveReviewThread(review: ReviewIdentity, threadId: string): Promise<void> {
+    const repo = this.repositoryForReview(review);
+    const id = providerId(threadId, "review thread id");
+    const out = await this.execGh([
+      "api",
+      "graphql",
+      "-f",
+      `query=${RESOLVE_THREAD_MUTATION}`,
+      "-f",
+      `threadId=${id}`,
+      ...apiHost(repo),
+    ]);
+    const parsed = JSON.parse(out) as { data?: { resolveReviewThread?: { thread?: { id?: unknown } } }; errors?: unknown };
+    if (parsed.data?.resolveReviewThread?.thread?.id === undefined) {
+      throw new Error(`GitHub resolveReviewThread response missing expected data: ${out.slice(0, 200)}`);
+    }
+  }
+
   async findBotChildMarker(review: ReviewIdentity, marker: ChildMarkerLookup): Promise<ConversationItemIdentity | null> {
     if (marker.provider !== review.provider || marker.repositoryDigest !== review.repositoryDigest || marker.reviewNumber !== review.reviewNumber) {
       throw new Error("GitHub child marker lookup binding mismatch");
