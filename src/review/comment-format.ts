@@ -287,6 +287,33 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
+/** Every line that opens or closes a fenced code block, with its fence run. */
+function fenceRuns(value: string): string[] {
+  return [...value.matchAll(/^[ \t]*(`{3,}|~{3,})/gm)].map((match) => match[1]!);
+}
+
+/**
+ * Truncate prose that may quote a fenced code block, without leaving a fence
+ * open (Codex review of PR #84, P2). Findings legitimately quote code; a naive
+ * cut can keep the opening fence and drop its close, and every later compact
+ * section — the host check, the references, the rules that failed — then
+ * renders inside that code block.
+ *
+ * Never exceeds the budget: an over-budget body is what pushes the summary
+ * into the emergency form that drops the Disputed section wholesale, so the
+ * close fence is bought by cutting the prose shorter, not by spending more.
+ */
+function truncateCompactProse(text: string, max: number): string {
+  if (max <= 0) return "";
+  const first = truncate(text, max);
+  const runs = fenceRuns(first);
+  if (runs.length % 2 === 0) return first;
+  const marker = runs[runs.length - 1]!;
+  const close = marker[0] === "~" ? "~".repeat(marker.length) : "`".repeat(marker.length);
+  const retry = truncate(text, max - close.length - 1);
+  return fenceRuns(retry).length % 2 === 0 ? retry : `${retry}\n${close}`;
+}
+
 function splitHeadline(message: string): { headline: string; body: string } {
   const trimmed = message.trim();
 
@@ -707,6 +734,16 @@ function renderReferences(finding: Finding): string | undefined {
 const MAX_COMPACT_REFERENCE_CHARS = 200;
 
 /**
+ * The longest disputed message compact mode will REQUEST.
+ *
+ * A ceiling on demand, not a guarantee of supply: the request goes through the
+ * shared compact allocator (see `renderCompactSummary`), so a dispute gets 240
+ * characters only when there is room. Stated once because a rule expressed in
+ * two places eventually disagrees with itself.
+ */
+const MAX_COMPACT_DISPUTED_MESSAGE_CHARS = 240;
+
+/**
  * The compact budget: the first citation, and only if it fits WHOLE.
  *
  * The single definition on purpose. It was briefly stated twice — once for
@@ -993,15 +1030,22 @@ function renderClarificationSection(input: SummaryInput): string | undefined {
  * disputed citations kept the compact body oversized, dropped it into the
  * emergency status-only form, and took the whole disputed section with it —
  * silently (PR #54 review, round six).
+ * @param messageBudgets - per-finding message allowance in compact mode, from
+ * the shared compact allocator. Absent entries fall back to
+ * `MAX_COMPACT_DISPUTED_MESSAGE_CHARS`. Ignored when `compact` is false.
  */
-function renderDisputedSection(input: SummaryInput, compact = false): string | undefined {
+function renderDisputedSection(
+  input: SummaryInput,
+  compact = false,
+  messageBudgets?: readonly number[],
+): string | undefined {
   const disputed = input.disputed ?? [];
   if (disputed.length === 0) return undefined;
-  const items = disputed.flatMap((finding) => {
+  const items = disputed.flatMap((finding, index) => {
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const message = compact
-      ? truncate(sanitizeText(finding.message), 240)
+      ? truncateCompactProse(sanitizeText(finding.message), messageBudgets?.[index] ?? MAX_COMPACT_DISPUTED_MESSAGE_CHARS)
       : sanitizeText(finding.message);
     // A disputed finding is precisely the one whose evidence a reader needs —
     // which is why the host check belongs here most of all. A finding the
@@ -1146,7 +1190,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
       : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);
-  const disputed = renderDisputedSection(input, true);
+  const disputedFindings = input.disputed ?? [];
   const failedRules = input.rulesFailed.length > 0
     ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
         .map((name) => {
@@ -1201,14 +1245,33 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
       reference: `${check}${reference}`,
     };
   });
-  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
+  // Disputed messages draw from the SAME pool as the relocated findings'
+  // messages. The first fix gave each dispute a fixed 240-character cap, but
+  // enough disputes at the cap still pushed the body past the limit —
+  // `available` hit zero and the emergency fallback took the whole Disputed
+  // section, the exact failure this path exists to prevent (Codex review of
+  // PR #84, P1). The skeleton below prices the section WITHOUT its messages;
+  // the messages then compete for the remaining space through the shared
+  // allocator, so the section shrinks instead of vanishing.
+  const disputedSkeleton = renderDisputedSection(input, true, disputedFindings.map(() => 0));
+  const fixed = [header, notice, contextUnavailable, clarification, disputedSkeleton, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
   const messageBudgets = allocateCompactMessageBudgets(
-    findings.map(({ message }) => message.length),
+    [
+      ...findings.map(({ message }) => message.length),
+      // Demand is capped, not granted: a dispute requests at most
+      // MAX_COMPACT_DISPUTED_MESSAGE_CHARS and receives whatever the shared
+      // allocator grants from what is left after the fixed parts.
+      ...disputedFindings.map((finding) =>
+        Math.min(sanitizeText(finding.message).length, MAX_COMPACT_DISPUTED_MESSAGE_CHARS)),
+    ],
     available,
   );
+  const disputed = disputedFindings.length > 0
+    ? renderDisputedSection(input, true, messageBudgets.slice(findings.length))
+    : undefined;
   const body = [
     header,
     notice,

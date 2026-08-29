@@ -1747,6 +1747,53 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).toContain("### Disputed");
     expect(body).toContain("unresolved lexical matches");
     expect(body).toContain("src/queue.ts:12");
+    expect(body.length).toBeLessThanOrEqual(1200);
+  });
+
+  // Codex review of PR #84, P1: the first fix capped each disputed message at
+  // 240 characters, but enough disputes AT the cap still overflowed the limit,
+  // and the emergency fallback took the whole section again. The messages must
+  // draw from the shared compact budget so the section shrinks, not vanishes.
+  it("keeps the Disputed section when many long disputed messages exceed the limit together", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: Array.from({ length: 40 }, (_unused, index) => makeFinding({
+        decision: "disputed",
+        ruleName: `rule-${index}`,
+        message: "x".repeat(4000),
+      })),
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 4000);
+
+    expect(body).toContain("### Disputed");
+    expect(body.length).toBeLessThanOrEqual(4000);
+  });
+
+  // Codex review of PR #84, P2: a truncated disputed message must not leave a
+  // code fence open — the unclosed fence swallows the host check, the
+  // references, and every later section into a code block when rendered.
+  it("does not leave an unclosed code fence when a disputed message is truncated", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: `prose before the block\n\n\`\`\`go\n${"x".repeat(4000)}`,
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    const fences = body.match(/^[ \t]*`{3,}/gm) ?? [];
+    expect(fences.length).toBeGreaterThan(0);
+    expect(fences.length % 2).toBe(0);
+    expect(body).toContain("### Disputed");
   });
 
   // Five review rounds produced five separate "this path drops the check"
