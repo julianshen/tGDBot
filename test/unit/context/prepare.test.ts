@@ -226,6 +226,50 @@ describe("prepareReviewContext", () => {
     expect(prepared.packs["tgd-review"]!.manifestHash).toBe(prepared.manifestHash);
   });
 
+  // PR #99 review: with the mapping now inside the lock, a second review of the
+  // same base waits for the first and would then pay for an identical mapping.
+  // The first has published by the time the lock is released.
+  it("takes a cache entry published while it waited, instead of mapping again", async () => {
+    const { worktree, request } = await baseRequest();
+    // A concurrent review already mapped and published this exact base.
+    await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => stubMapper(),
+    });
+
+    const mapper = stubMapper();
+    const real = new ContextCache(request.cacheRoot as string);
+    let lookups = 0;
+    // Misses before the lock, hits inside it — the entry a concurrent review
+    // published while this one waited.
+    const racing = Object.assign(Object.create(ContextCache.prototype) as ContextCache, {
+      root: real.root,
+      entryPath: (k: Parameters<ContextCache["entryPath"]>[0]) => real.entryPath(k),
+      promoteContext: (
+        staging: string, input: Parameters<ContextCache["promoteContext"]>[1],
+      ) => real.promoteContext(staging, input),
+      // The first lookup happens BEFORE the lock and misses, as it did for the
+      // concurrent review too; the second happens after and finds what that
+      // review published in the meantime.
+      lookupContext: async (k: Parameters<ContextCache["lookupContext"]>[0]) => {
+        lookups += 1;
+        return lookups === 1 ? undefined : await real.lookupContext(k);
+      },
+    }) as ContextCache;
+
+    await prepareReviewContext(request, {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      createCache: () => racing,
+    });
+
+    // Twice: once before taking the lock, once after — and the second is what
+    // finds the entry the concurrent review published while this one waited.
+    expect(lookups).toBe(2);
+    // THE point: the expensive step never ran.
+    expect(mapper.calls).toHaveLength(0);
+  });
+
   it("never maps the head commit — the mapper only ever sees the base", async () => {
     const { worktree, request } = await baseRequest();
     const mapper = stubMapper();

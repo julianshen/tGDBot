@@ -20,6 +20,19 @@ import type { RepositoryRef } from "../target/types.js";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
+
+/**
+ * How long a consumer waits for the lock when the work runs UNDER it.
+ *
+ * Preparation is seconds, so 30s is right for `prepareWorkspace`. Mapping is
+ * budgeted at 30 minutes, so the same 30s would turn serialisation into a
+ * timeout: the second review would fail rather than queue, which is worse than
+ * the race it replaced — `--context require` would fail outright (PR #99
+ * review). Slightly over the mapper's own budget, so the holder's timeout
+ * fires first and the waiter reports a genuine deadlock rather than
+ * pre-empting work that was still progressing.
+ */
+export const SCOPED_LOCK_TIMEOUT_MS = 31 * 60 * 1000;
 const GIT_PATH_OVERRIDE_VARIABLES = [
   "GIT_DIR",
   "GIT_WORK_TREE",
@@ -380,7 +393,11 @@ export async function withPreparedWorkspace<T>(
   use: (prepared: PreparedWorkspace) => Promise<T>,
   dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
 ): Promise<T> {
-  return prepareWorkspaceLocked(request, dependencies, use);
+  return prepareWorkspaceLocked(
+    request,
+    { lockTimeoutMs: SCOPED_LOCK_TIMEOUT_MS, ...dependencies },
+    use,
+  );
 }
 
 export async function prepareWorkspace(

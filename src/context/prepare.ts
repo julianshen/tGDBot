@@ -481,6 +481,17 @@ export async function prepareReviewContext(
     const sourceRoot = prepared.baseWorktreePath;
     onProgress({ stage: "workspace", status: "completed" });
 
+    // Checked AGAIN, now that the lock is held. Two reviews of the same base
+    // can both miss the cache before either publishes; without this the second
+    // waits out the first and then pays for an identical mapping, which is the
+    // most expensive step in a review (PR #99 review). The first has published
+    // by the time the lock is released, so the second finds it here.
+    //
+    // A failure is NOT fatal: the pre-lock lookup already succeeded, so this is
+    // an optimisation and mapping remains the correct fallback.
+    const alreadyPublished = await cache.lookupContext(key).catch(() => undefined);
+    if (alreadyPublished !== undefined) return await pack(alreadyPublished, true);
+
   // Staging must live beneath the cache root — `promoteContext` refuses to
   // publish from anywhere else — and outside the source worktree, which
   // `ContextMapper.map` refuses to violate.

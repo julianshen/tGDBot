@@ -4,7 +4,12 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 import type { ExecWorkspaceCommand, WorkspaceRequest, WorkspaceTool } from "../../../src/workspace/types.js";
-import { prepareWorkspace, realExecWorkspaceCommand, withPreparedWorkspace } from "../../../src/workspace/manager.js";
+import {
+  SCOPED_LOCK_TIMEOUT_MS,
+  prepareWorkspace,
+  realExecWorkspaceCommand,
+  withPreparedWorkspace,
+} from "../../../src/workspace/manager.js";
 import { deriveWorkspacePaths, encodeWorkspaceAuthority } from "../../../src/workspace/paths.js";
 
 const repo: WorkspaceRequest["repo"] = {
@@ -78,6 +83,60 @@ describe("withPreparedWorkspace", () => {
     // Released once the consumer is done, or one job would hold it forever.
     expect(lockedAfter).toBe(false);
     expect(result).toContain("octo-repo");
+  });
+
+  // PR #99 review: serialisation only works if the waiter waits. The work under
+  // the lock is now a mapping budgeted at 30 minutes, so a waiter carrying
+  // `prepareWorkspace`'s 30-SECOND timeout would give up rather than queue, and
+  // `--context require` would fail outright.
+  //
+  // Tested as BEHAVIOUR with a short injected timeout: the second caller does
+  // not start until the first has finished. The default's size is asserted
+  // separately below, as a constant, because distinguishing 30s from 31min by
+  // observation would mean waiting 30 seconds.
+  it("serialises a second consumer behind the first", async () => {
+    const root = await tempRoot();
+    const order: string[] = [];
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    // The validation resolves the reported common dir on disk, so it has to
+    // exist for the warm path to be reachable at all.
+    await mkdir(paths.mirrorPath, { recursive: true });
+    // The SECOND call finds a warm worktree and validates it, which asks
+    // questions the cold path never does.
+    const exec = () => vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
+      if (args.includes("get-url")) return "https://github.com/octo-org/octo-repo\n";
+      if (args.includes("--git-common-dir")) return `${paths.mirrorPath}\n`;
+      if (args.includes("rev-parse") && args.includes("HEAD")) return `${baseSha}\n`;
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2)!, { recursive: true });
+      }
+      return "";
+    });
+
+    const consumer = (name: string) => async () => {
+      order.push(`${name}:start`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      order.push(`${name}:end`);
+    };
+
+    await Promise.all([
+      withPreparedWorkspace({ root, repo, baseSha }, consumer("a"), { exec: exec() }),
+      withPreparedWorkspace({ root, repo, baseSha }, consumer("b"), { exec: exec() }),
+    ]);
+
+    // NON-OVERLAP is the property; which one wins the lock is not promised, and
+    // asserting an order the lock never guaranteed made this fail for the wrong
+    // reason. Whoever starts must finish before the other begins.
+    expect(order).toHaveLength(4);
+    expect(order[1]).toBe(`${order[0]!.split(":")[0]}:end`);
+    expect(order[3]).toBe(`${order[2]!.split(":")[0]}:end`);
+    expect(new Set([order[0], order[2]])).toEqual(new Set(["a:start", "b:start"]));
+  });
+
+  // A constant check, stated as one: the wait has to outlast the work.
+  it("waits longer than the mapping it now has to wait for", () => {
+    expect(SCOPED_LOCK_TIMEOUT_MS).toBeGreaterThanOrEqual(30 * 60 * 1000);
   });
 });
 
