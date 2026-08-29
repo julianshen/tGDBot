@@ -36,6 +36,8 @@ const input = (over: Record<string, unknown> = {}) => ({
   findings: [ledger()],
   events: [event()],
   outcomes: [],
+  // Nothing observed resolved yet, which is the state a fresh repository is in.
+  resolvedThreads: new Set<string>(),
   changedLines: new Map<string, ReadonlySet<number>>(),
   ceiling: 10,
   ...over,
@@ -258,7 +260,7 @@ describe("pendingVerifications — a resolution is an event, not a standing stat
   it("ignores a repeated resolution snapshot at a later head", () => {
     const queue = pendingVerifications(input({
       events: [resolution],
-      outcomes: [{ findingId: ledger().id, headSha: OLD, trigger: "thread-resolution" }],
+      resolvedThreads: new Set(["t1"]),
     }));
 
     expect(queue).toEqual([]);
@@ -333,10 +335,39 @@ describe("pendingVerifications — a reopened thread can be resolved again", () 
   it("still ignores a repeat with no reopen", () => {
     const queue = pendingVerifications(input({
       events: [resolved],
-      outcomes: alreadyActed,
+      resolvedThreads: new Set(["t1"]),
     }));
 
     expect(queue).toEqual([]);
+  });
+
+  // #90: the bug this replaced. Suppression used to be read from the outcome
+  // CHECKPOINT, which keeps only the most recent records — so once enough newer
+  // outcomes accumulated, a still-resolved thread verified again at the next
+  // head. Durable observed state has no such window: no outcomes at all, and
+  // the repeat is still suppressed.
+  it("suppresses a repeat with no outcome record whatsoever", () => {
+    const queue = pendingVerifications(input({
+      events: [resolved],
+      outcomes: [],
+      resolvedThreads: new Set(["t1"]),
+    }));
+
+    expect(queue).toEqual([]);
+  });
+
+  // The #73 residual: a reopen and its re-resolution no longer have to arrive
+  // in the same poll, because what was observed is remembered between them.
+  it("queues again when the reopen was seen in an EARLIER poll", () => {
+    // The earlier poll saw the reopen, so the thread is no longer observed
+    // resolved. This poll sees only the re-resolution.
+    const queue = pendingVerifications(input({
+      events: [resolved],
+      outcomes: [],
+      resolvedThreads: new Set(),
+    }));
+
+    expect(queue[0]?.trigger).toBe("thread-resolution");
   });
 
   // A reopen on its own is not a request to re-verify.

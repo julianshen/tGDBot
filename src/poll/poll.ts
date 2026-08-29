@@ -90,9 +90,10 @@ import type {
   ConversationCommand,
   RepositoryBinding,
 } from "../conversation/types.js";
-import { pendingVerifications } from "../conversation/verification-queue.js";
+import { observeResolvedThreads, pendingVerifications } from "../conversation/verification-queue.js";
 import type { PendingVerification } from "../conversation/verification-queue.js";
 import { verifyFinding } from "../conversation/verification.js";
+import { MAX_RESOLVED_THREADS } from "../conversation/state-schema.js";
 import type {
   FindingLedgerEntry,
   FindingOutcomeEntry,
@@ -320,6 +321,7 @@ async function classifyOpenReviewEvents(options: {
       events: classified.filter((item) => item.parsed.kind === "irrelevant"),
       reviewNumber: review.reviewNumber,
       reviewIdentity: identity,
+      resolvedThreads: new Set(review.threadsResolved ?? []),
       budget: verificationBudget,
       options,
     }).catch((error: unknown) => {
@@ -332,6 +334,24 @@ async function classifyOpenReviewEvents(options: {
         deferredEvents: [...candidateEvents, ...recoveryEvents],
       } as VerificationQueue;
     });
+    // Computed BEFORE retention, which takes triggering events off the page:
+    // observing from what survives would never see the resolution that just
+    // caused a verification, so the next poll would run it again.
+    //
+    // Persisted WITH the cursor further down, in the same transaction. Earlier
+    // would suppress a verification whose reply had not published; later would
+    // re-verify a thread already answered. Both are only safe when the events
+    // and the observation advance together.
+    const threadsResolved = [...observeResolvedThreads(
+      new Set(review.threadsResolved ?? []),
+      classified.map((item) => ({
+        kind: item.event.kind,
+        threadId: item.event.kind === "general-comment" ? undefined : item.event.threadId,
+        authorIsBot: item.event.authorIsBot,
+        resolved: item.event.kind === "thread-resolution" ? item.event.resolved : undefined,
+      })),
+    ).resolved].slice(-MAX_RESOLVED_THREADS); // newest-last, so the cap drops the longest untouched
+
     // THE INVARIANT: an event taken off the page must either complete its
     // verification this poll or hold the cursor. Removal and the cursor
     // decision were independent, so a thread-read outage, a transient verdict,
@@ -526,6 +546,7 @@ async function classifyOpenReviewEvents(options: {
                       cursor: encodeReviewProgress(advancedProgress),
                       retired: false,
                       ...(page.nextPageToken === undefined ? {} : { eventPageToken: page.nextPageToken.opaque }),
+                      ...(threadsResolved.length === 0 ? {} : { threadsResolved }),
                     }
                   : entry)
             : tx.snapshot.cursor.reviews,
@@ -2133,6 +2154,8 @@ async function queueVerifications(input: {
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
   /** What is left of this POLL's allowance, not this page's. */
   readonly budget: number;
+  /** Threads this review last observed resolved, from the durable cursor. */
+  readonly resolvedThreads: ReadonlySet<string>;
   readonly options: {
     readonly adapter: ConversationAdapter;
     readonly store: ConversationStateStore;
@@ -2280,6 +2303,7 @@ async function queueVerifications(input: {
       resolved: item.event.kind === "thread-resolution" ? item.event.resolved : undefined,
     })),
     outcomes: await input.options.store.readFindingOutcomes(),
+    resolvedThreads: input.resolvedThreads,
     // Event-driven only until head-change lands: an empty map means the anchor
     // trigger can never fire, rather than firing on stale information.
     changedLines: new Map(),

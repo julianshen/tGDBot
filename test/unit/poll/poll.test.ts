@@ -2798,6 +2798,54 @@ describe("automatic verification", () => {
     expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
   });
 
+  // #90 end to end: the observed state has to be DURABLE, or the suppression
+  // is only as good as one poll's memory.
+  it("remembers a resolution it acted on, across polls", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    const resolution = (at: string, eventId: string) => ({
+      kind: "thread-resolution" as const,
+      provider: "github" as const,
+      repositoryDigest,
+      reviewNumber: 1,
+      eventId,
+      revisionId: `${eventId}:1`,
+      orderKey: `${at}|${eventId}`,
+      createdAt: at,
+      updatedAt: at,
+      body: "",
+      url: "https://github.com/owner/repo/pull/1#discussion_rroot",
+      threadId: "T1",
+      resolved: true,
+      outdated: false,
+    } as unknown as ReviewActivityEvent);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    adapter.replaceEvents([resolution("2026-08-14T00:00:02.000Z", "res-1")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+
+    // A PUSH lands, so the head moves — which is what makes this #90 rather
+    // than ordinary idempotency. The per-head action identity cannot suppress
+    // across a head change, and with enough newer outcomes the checkpoint would
+    // have forgotten this one. Only the observed resolution state is left.
+    adapter.headSha = "d".repeat(40);
+    // The thread is still resolved, so the adapter re-emits it.
+    adapter.replaceEvents([resolution("2026-08-14T00:00:09.000Z", "res-2")]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
   // A dry run previews; it does not buy anything. Reporting the VERDICT meant
   // asking the model for it, which is a provider charge for a preview the
   // operator asked to be free.

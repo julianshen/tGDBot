@@ -17,12 +17,31 @@ const MAX_COLLECTION = 10_000;
 const MAX_TEXT = 20_000;
 const MAX_STATE_FILE_BYTES = 10_000_000;
 
+/** How many threads' resolution state one review may remember. */
+export const MAX_RESOLVED_THREADS = 1_000;
+
 export interface ReviewCursorRecord {
   readonly reviewNumber: number;
   readonly cursor: string | null;
   readonly retired: boolean;
   readonly retiredAt?: string;
   readonly eventPageToken?: string;
+  /**
+   * Threads last OBSERVED resolved, so a resolution can be read as a
+   * transition rather than as a snapshot.
+   *
+   * Both adapters re-emit `resolved: true` on every later push — resolving is a
+   * state, not an event — so "has this been acted on?" cannot come from the
+   * outcome checkpoint, which keeps only the most recent
+   * `MAX_OUTCOME_CHECKPOINT` records and forgets older ones while the thread
+   * stays resolved (#90). It cannot come from the action ledger either: that
+   * identity is head-scoped, and a re-emitted resolution after a head change is
+   * a genuinely new identity for work that is not new.
+   *
+   * Held per review so retirement prunes it, and so it is bounded by the
+   * threads of one review rather than of a repository.
+   */
+  readonly threadsResolved?: readonly string[];
 }
 
 export interface ConversationCursorSnapshot {
@@ -691,13 +710,18 @@ export function validateCursorSnapshot(value: unknown, expected: RepositoryBindi
     throw new Error("cursor initialized flag and epoch are inconsistent");
   }
   const reviews = array(object.reviews, "cursor.reviews", 5_000).map((entry, index) => {
-    const review = exact(entry, `cursor.reviews[${index}]`, ["reviewNumber", "cursor", "retired"], ["retiredAt", "eventPageToken"]);
+    const review = exact(entry, `cursor.reviews[${index}]`, ["reviewNumber", "cursor", "retired"],
+      ["retiredAt", "eventPageToken", "threadsResolved"]);
     if (typeof review.retired !== "boolean") throw new Error("review retired flag must be boolean");
     if (review.retired && review.retiredAt === undefined) throw new Error("retired review must record retiredAt");
     if (!review.retired && review.retiredAt !== undefined) throw new Error("active review cannot record retiredAt");
     return { reviewNumber: positiveInteger(review.reviewNumber, "reviewNumber"), cursor: nullableText(review.cursor, "review cursor"),
       retired: review.retired, ...(review.retiredAt === undefined ? {} : { retiredAt: date(review.retiredAt, "retiredAt") }),
-      ...(review.eventPageToken === undefined ? {} : { eventPageToken: text(review.eventPageToken, "eventPageToken", 4_096) }) };
+      ...(review.eventPageToken === undefined ? {} : { eventPageToken: text(review.eventPageToken, "eventPageToken", 4_096) }),
+      ...(review.threadsResolved === undefined ? {} : {
+        threadsResolved: array(review.threadsResolved, `cursor.reviews[${index}].threadsResolved`, MAX_RESOLVED_THREADS)
+          .map((threadId, at) => text(threadId, `cursor.reviews[${index}].threadsResolved[${at}]`, 512)),
+      }) };
   });
   if (new Set(reviews.map((review) => review.reviewNumber)).size !== reviews.length) throw new Error("cursor contains duplicate reviews");
   return { version: 1, repository, initialized: object.initialized, initializedEpoch: object.initializedEpoch as number,
