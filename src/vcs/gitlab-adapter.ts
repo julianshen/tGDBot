@@ -1862,6 +1862,16 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
     }, { repo, reviewNumber: review.reviewNumber });
   }
 
+  async resolveReviewThread(review: ReviewIdentity, threadId: string): Promise<void> {
+    const repo = this.repositoryForReview(review);
+    const id = conversationDiscussionId(threadId);
+    await this.execGlab([
+      "api", "--method", "PUT", "--hostname", repo.host,
+      projectEndpoint(repo, `merge_requests/${review.reviewNumber}/discussions/${encodeURIComponent(id)}`),
+      "--input", "-",
+    ], JSON.stringify({ resolved: true }));
+  }
+
   async postGeneralReply(review: ReviewIdentity, input: GeneralReplyInput): Promise<ConversationItemIdentity> {
     this.validateReplyInput(review, input);
     this.repositoryForReview(review);

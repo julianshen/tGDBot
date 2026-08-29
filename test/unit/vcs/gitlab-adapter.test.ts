@@ -1720,6 +1720,19 @@ describe("GitLab conversation activity", () => {
     expect(repositoryDigest).toBe(computeRepositoryDigest("gitlab", repo.canonicalUrl));
   });
 
+  it("resolves one discussion through PUT resolved:true", async () => {
+    const execGlab = vi.fn<ExecGlab>(async () => "");
+    const adapter = new GitLabAdapter(execGlab, repo);
+    await expect(adapter.resolveReviewThread(review, "T1")).resolves.toBeUndefined();
+    expect(execGlab).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        "api", "--method", "PUT", "--hostname", "gitlab.com",
+        expect.stringContaining("/discussions/T1"),
+      ]),
+      JSON.stringify({ resolved: true }),
+    );
+  });
+
   it("pages discussion thread summaries and can fetch a complete addressed thread", async () => {
     const execGlab = activityExec();
     const adapter = new GitLabAdapter(execGlab, repo);

@@ -75,6 +75,7 @@ import {
   createConversationStateStore,
   replacePendingClarification,
   type ConversationStateStore,
+  type ConversationStateTransaction,
 } from "../conversation/state-store.js";
 import {
   prepareFindingLedgerEntry,
@@ -445,6 +446,51 @@ async function classifyOpenReviewEvents(options: {
     // be repeated.
     if (!options.dryRun && !haltTransient && !haltCursor) {
       for (const item of queued.items) {
+        const latest = await resolveLatestAction(options.store, item.identity);
+        if (latest !== undefined && (latest.state === "manifest-ready" || latest.state === "published" ||
+          latest.state === "prepared")) {
+          const recoveredAction = actionFromEvent(latest);
+          const resolveOwn = recoveredAction.children.some((child) =>
+            child.placement.kind === "group-reply" && child.placement.resolveOwnThread === true);
+          const recoveredMetadata = queued.context?.metadata;
+          const recovered = await publishPreparedReply({
+            event: item.event,
+            identity: item.identity,
+            latest,
+            reviewIdentity: identity,
+            options,
+            ...(resolveOwn && recoveredMetadata !== undefined
+              ? {
+                  onComplete: (tx) => {
+                    tx.appendOutcome(prepareFindingOutcome({
+                      repository: options.store.repositoryBinding,
+                      id: `outcome_${createHash("sha256")
+                        .update(`${item.ledger.id}\0${recoveredMetadata.headSha}`, "utf8")
+                        .digest("hex").slice(0, 32)}`,
+                      findingId: item.ledger.id,
+                      reviewNumber: item.ledger.reviewNumber,
+                      headSha: recoveredMetadata.headSha,
+                      ruleName: item.ledger.finding.ruleName,
+                      category: item.ledger.finding.category,
+                      severity: item.pending.severity,
+                      ...(item.ledger.finding.effort === undefined
+                        ? {}
+                        : { effort: item.ledger.finding.effort }),
+                      verdict: "withdrawn",
+                      trigger: item.pending.trigger,
+                      anchorChanged: item.pending.trigger === "head-change",
+                      at: options.now(),
+                    }));
+                  },
+                }
+              : {}),
+          });
+          if (recovered === "transient") { haltTransient = true; haltCursor = true; break; }
+          if (recovered === "stale") { haltCursor = true; break; }
+          knownActionIds.add(item.identity.actionId);
+          outstanding.delete(item.event.eventId);
+          continue;
+        }
         const verification = queued.context === undefined
           ? ({ kind: "transient" } as const)
           : await verifyQueued({ item, context: queued.context, reviewNumber: review.reviewNumber, options });
@@ -733,6 +779,7 @@ type ReplyPlan =
       readonly rationale: string;
       readonly outcome: FindingOutcomeEntry;
       readonly headSha: string;
+      readonly resolveOwnThread: boolean;
     }
   | {
       readonly kind: "clarification";
@@ -1304,6 +1351,13 @@ async function publishReplyPlan(input: {
         writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event,
           input.parentCommentId),
         now: input.options.now,
+        finalize: async (publishedAction) => {
+          await resolveOwnThreadAfterReply({
+            adapter: input.options.adapter,
+            reviewIdentity: input.reviewIdentity,
+            action: publishedAction,
+          });
+        },
         ...(plan.kind === "verification"
           ? { onComplete: (tx) => { tx.appendOutcome(plan.outcome); } }
           : {}),
@@ -1378,6 +1432,7 @@ async function publishPreparedReply(input: {
     readonly config: ResolvedPollConfig;
     readonly deps: PollDependencies;
   };
+  readonly onComplete?: (tx: ConversationStateTransaction) => void;
 }): Promise<"completed" | "transient" | "stale"> {
   try {
     const action = actionFromEvent(input.latest);
@@ -1403,12 +1458,33 @@ async function publishPreparedReply(input: {
       action,
       writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event),
       now: input.options.now,
+      finalize: async (publishedAction) => {
+        await resolveOwnThreadAfterReply({
+          adapter: input.options.adapter,
+          reviewIdentity: input.reviewIdentity,
+          action: publishedAction,
+        });
+      },
+      ...(input.onComplete === undefined ? {} : { onComplete: input.onComplete }),
     });
     return published.state === "completed" ? "completed" : "transient";
   } catch (error) {
     console.warn(`tgd-review-agent: conversation reply recovery failed (${redactedMessage(error)})`);
     return "transient";
   }
+}
+
+async function resolveOwnThreadAfterReply(input: {
+  readonly adapter: ConversationAdapter;
+  readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  readonly action: PublicationAction;
+}): Promise<void> {
+  const owed = input.action.children.find((child) =>
+    child.placement.kind === "group-reply" && child.placement.resolveOwnThread === true);
+  if (owed === undefined || owed.placement.kind !== "group-reply") return;
+  const threadId = owed.placement.threadId;
+  if (threadId === undefined) return;
+  await input.adapter.resolveReviewThread(input.reviewIdentity, threadId);
 }
 
 function conversationWriter(
@@ -1553,6 +1629,9 @@ function buildReplyChild(input: {
           ? { headSha: input.plan.headSha }
           : {}
       ),
+      ...(input.plan.kind === "verification" && input.plan.resolveOwnThread
+        ? { resolveOwnThread: true as const }
+        : {}),
     },
     body: render(marker),
     marker: `<!-- tgd-conversation:${input.actionId}:${childId} -->`,
@@ -2489,6 +2568,7 @@ async function verifyQueued(input: {
       rationale: result.plan.reply.rationale,
       outcome: result.plan.outcome,
       headSha: metadata.headSha,
+      resolveOwnThread: result.plan.resolveOwnThread,
     },
   };
 }

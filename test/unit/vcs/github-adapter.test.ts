@@ -1552,6 +1552,28 @@ describe("GitHub conversation activity", () => {
       .not.toBe(computeRepositoryDigest("github", canonical.canonicalUrl));
   });
 
+  it("resolves one review thread through the GraphQL mutation", async () => {
+    const execGh = vi.fn<ExecGh>(async (args) => {
+      if (args[0] === "api" && args[1] === "graphql" && args.some((arg) => arg.startsWith("query=mutation("))) {
+        return JSON.stringify({ data: { resolveReviewThread: { thread: { id: "PRRT_kwDOThread1" } } } });
+      }
+      throw new Error(`unexpected gh invocation: ${args.join(" ")}`);
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.resolveReviewThread(review, "PRRT_kwDOThread1")).resolves.toBeUndefined();
+    expect(execGh).toHaveBeenCalledWith(expect.arrayContaining([
+      "api", "graphql",
+      "query=mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id}}}",
+      "threadId=PRRT_kwDOThread1",
+    ]));
+  });
+
+  it("rejects a GraphQL resolve that returns no thread", async () => {
+    const execGh = vi.fn<ExecGh>(async () => JSON.stringify({ errors: [{ message: "not found" }] }));
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.resolveReviewThread(review, "PRRT_kwDOThread1")).rejects.toThrow(/missing expected data/);
+  });
+
   it("loads threads and child markers when GraphQL/REST keep mixed-case GitHub URLs", async () => {
     const mixed = parseRepositoryRef("Azure/sdk", "github");
     const canonical = parseRepositoryRef("azure/sdk", "github");

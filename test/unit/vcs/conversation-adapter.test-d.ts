@@ -22,3 +22,6 @@ expectTypeOf<Parameters<ConversationAdapter["listReviewThreads"]>[1]>().toEqualT
 expectTypeOf<ConversationAdapter["resolveReviewIdentity"]>().toEqualTypeOf<
   (repository: RepositoryRef, reviewNumber: number) => Promise<ReviewIdentity>
 >();
+expectTypeOf<ConversationAdapter["resolveReviewThread"]>().toEqualTypeOf<
+  (review: ReviewIdentity, threadId: string) => Promise<void>
+>();
