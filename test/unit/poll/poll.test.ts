@@ -380,6 +380,8 @@ describe("classification-only poll", () => {
       commentEvent("focus", "@tgdbot review focus: the error handling", "2026-08-14T00:00:06.000Z"),
       commentEvent("force", "@tgdbot check latest", "2026-08-14T00:00:07.000Z"),
       commentEvent("exp", "@tgdbot explain", "2026-08-14T00:00:08.000Z"),
+      commentEvent("acc", "@tgdbot accept", "2026-08-14T00:00:09.000Z"),
+      commentEvent("def", "@tgdbot defer", "2026-08-14T00:00:10.000Z"),
     ]);
 
     await expect(poll(pollArgs(stateDir, { dryRun: true, model: "anthropic/claude-opus-4-5" }), {
@@ -2304,6 +2306,254 @@ describe("automatic verification", () => {
     expect(adapter.threadReads).toBe(1);
   });
 
+  // Issue #85: a finding whose publication crashed after the provider write
+  // but before the identity was bound has NO threadId in the ledger. Its
+  // comment is visible to everyone, so a human reply lands in its thread — and
+  // before recovery, the event matched no bound finding, was consumed as
+  // classified-and-ignored, and the reply was never answered.
+  it("verifies a crash-orphaned finding by its marker, and repairs the binding", async () => {
+    const adapter = new ExecutionAdapter([]);
+    // Deliberately UNBOUND: the ledger state a crash between the provider
+    // write and `bindPublishedFindingIdentities` leaves behind.
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const repaired = (await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID);
+    // The repair is the deliverable beyond the reply: the ordinary path
+    // matches this thread from now on, with no recovery read.
+    expect(repaired?.identity?.threadId).toBe("T1");
+    expect(repaired?.identity?.provider).toBe("github");
+  });
+
+  // The recovery reads cost provider calls; the ordinary path — every reply in
+  // a finding whose identity is already bound — must perform none beyond the
+  // thread read verification itself needs (issue #85 acceptance).
+  it("adds no recovery round-trip when the identity is already bound", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    // Exactly one thread read: the verification's own. Recovery never looked
+    // at the thread because the binding already matched it.
+    expect(adapter.threadReads).toBe(1);
+  });
+
+  // Recovery must not let a marker turn someone else's thread into a finding
+  // the bot will answer. The root's author is the bot-refusal gate the command
+  // path already applies, and it applies here too.
+  it("refuses to recover a finding from a thread the bot did not root", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+      { rootAuthorIsBot: false },
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID)?.identity).toBeUndefined();
+  });
+
+  // A recovery read outage is a transport failure, not an answer. Consuming
+  // the event on one would lose the reply for good — the exact failure
+  // recovery exists to repair.
+  it("defers instead of consuming when the recovery thread read fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    adapter.failNextThreadRead = true;
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // Codex review of PR #87, P1: recovery needs a provider thread read, not a
+  // model call. A poll-wide budget exhausted by earlier verifications is no
+  // reason to consume a crash orphan's reply — the binding is repaired even
+  // when nothing can be verified this poll, and the held reply is answered
+  // once budget returns.
+  it("recovers a crash orphan even when the verification budget is already spent", async () => {
+    const adapter = new ExecutionAdapter([], [summary(1), summary(2)]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const events: ReviewActivityEvent[] = [];
+    // Review 1: five candidates, exactly the poll-wide budget.
+    for (let index = 0; index < 5; index += 1) {
+      const { findingMarker } = await seedFindingInto(stateDir, {
+        findingId: `finding_${String(index).repeat(32)}`,
+        bindThreadId: `A${index}`,
+        reviewNumber: 1,
+      });
+      events.push(installFindingThread(adapter, findingMarker, threadComment(
+        `one-${index}`, "fixed this in the latest push", { threadId: `A${index}` },
+      ), { reviewNumber: 1 }));
+    }
+    // Review 2: a crash orphan. Its queue call will see budget 0.
+    const { findingMarker: orphanMarker } = await seedFindingInto(stateDir, {
+      findingId: `finding_${"9".repeat(32)}`,
+      reviewNumber: 2,
+    });
+    events.push(installFindingThread(adapter, orphanMarker, threadComment(
+      "two-0", "fixed this in the latest push", { threadId: "B0" },
+    ), { reviewNumber: 2 }));
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents(events);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(5);
+    // THE POINT: the binding was repaired even though no model call was
+    // available for review 2. Recovery is a thread read, not a verification.
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === `finding_${"9".repeat(32)}`)?.identity?.threadId)
+      .toBe("B0");
+
+    // And the reply is not spent: a second poll with fresh budget verifies it.
+    adapter.replaceEvents(events);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(6);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(6);
+  });
+
+  // Codex review of PR #87, P2: a recovery read failure must survive EVERY
+  // post-recovery early return. A rules load error after a failed thread read
+  // used to return without naming the failed event, so the page consumed it —
+  // terminal, and invisible on replay because the surviving candidate's
+  // outcome already recorded the verdict.
+  it("keeps a recovery read failure owed when the rules also fail to load", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker: boundMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1", findingId: `finding_${"1".repeat(32)}`,
+    });
+    const { findingMarker: orphanMarker } = await seedFindingInto(stateDir, {
+      findingId: `finding_${"2".repeat(32)}`,
+    });
+    const events = [
+      installFindingThread(adapter, boundMarker, threadComment(
+        "human-1", "fixed this in the latest push", { threadId: "T1" },
+      )),
+      installFindingThread(adapter, orphanMarker, threadComment(
+        "human-2", "fixed this too", { threadId: "T2" },
+      )),
+    ];
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents(events);
+    let failRules = true;
+    const deps = {
+      ...executionDeps(adapter, { createSession: session }),
+      loadConversationRules: async () => failRules
+        ? { rules: [], error: new Error("the trusted rule set could not be loaded") }
+        : { rules: [currentRule] },
+    };
+
+    adapter.failNextThreadRead = true;
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    // Both replies are still owed: the rules load recovers, the thread read
+    // recovers, and the orphan is matched by its marker.
+    failRules = false;
+    adapter.replaceEvents(events);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(2);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === `finding_${"2".repeat(32)}`)?.identity?.threadId)
+      .toBe("T2");
+  });
+
+  // Codex review of PR #87, round two: events past the recovery cap must be
+  // DEFERRED, not consumed. Four unrelated thread events ahead of a genuine
+  // crash orphan used to exhaust the cap and push the orphan's reply out of
+  // both waiting and recovery sets — consumed unread, lost for good. The tail
+  // is held instead; each poll still consumes durably every non-match it
+  // inspects, so the tail drains and the hold terminates.
+  it("defers a crash orphan that sits past the recovery read cap", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const events: ReviewActivityEvent[] = [];
+    // FOUR unrelated threads ahead of the orphan — exactly the recovery read
+    // cap (MAX_IDENTITY_RECOVERY_READS in poll.ts) — with roots the bot did
+    // not write, which recovery inspects, refuses, and consumes.
+    for (let index = 0; index < 4; index += 1) {
+      events.push(installFindingThread(
+        adapter, "", threadComment(`stray-${index}`, "unrelated chatter", { threadId: `S${index}` }),
+        { rootAuthorIsBot: false },
+      ));
+    }
+    // The orphan is fifth: past the cap of four.
+    events.push(installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    ));
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents(events);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    // Not recovered YET — the cap spent this page's reads on the strays — but
+    // crucially not consumed either.
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID)?.identity).toBeUndefined();
+
+    // The strays were consumed durably, so the replay skips them and the
+    // orphan finally gets its read.
+    adapter.replaceEvents(events);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID)?.identity?.threadId).toBe("T1");
+  });
+
   // Metadata is a provider round-trip like any other, and failing it is an
   // outage rather than an answer.
   it("retries after review metadata fails to load", async () => {
@@ -2538,5 +2788,144 @@ describe("automatic verification", () => {
     })).resolves.toBe(0);
 
     expect(sessions).toBe(0);
+  });
+});
+
+// Issue #57 remaining: accept/defer are parser decisions, recorded as
+// mechanical outcomes, and they never write a memory.
+describe("finding dispositions", () => {
+  it("records the waiver even if publication crashes after the provider write", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    adapter.replaceEvents([command]);
+    adapter.failNextWrite = "accept-then-fail";
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(1);
+
+    adapter.replaceEvents([command]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    expect((await store.readDispositionOutcomes()).some((entry) => entry.disposition === "accepted")).toBe(true);
+    expect([...adapter.postedBodies, ...adapter.acceptedBodies].filter((body) => /## Accepted/.test(body)))
+      .toHaveLength(1);
+  });
+
+  it("accepts a finding without calling a model", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([command]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+
+    expect(createSession).not.toHaveBeenCalled();
+    const body = adapter.postedBodies.find((entry) => /## Accepted/.test(entry)) ?? "";
+    expect(body).toMatch(/this PR/i);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.disposition).toBe("accepted");
+    expect(JSON.stringify(outcomes[0])).not.toContain("alice");
+    expect(JSON.stringify(outcomes[0])).not.toContain("src/auth.ts");
+  });
+
+  it("defers by drafting a follow-up, not filing one", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot defer"),
+    );
+    adapter.replaceEvents([command]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const body = adapter.postedBodies.find((entry) => /## Deferred/.test(entry)) ?? "";
+    expect(body).toMatch(/not filed/i);
+    expect(body).toContain("@tgdbot accept");
+    expect(body).not.toContain("@bot accept");
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes[0]!.disposition).toBe("deferred");
+  });
+
+  it("leaves the memory store byte-identical through accept", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const before = await store.readContextSnapshot();
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    adapter.replaceEvents([command]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const after = await store.readContextSnapshot();
+    expect(after.memories).toEqual(before.memories);
+    expect(after.memoryLedger).toEqual(before.memoryLedger);
+  });
+
+  it("keeps an accepted waiver after the verification checkpoint rolls", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    adapter.replaceEvents([command]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const binding = store.repositoryBinding;
+    await store.transact((tx) => {
+      for (let batch = 0; batch < MAX_OUTCOME_CHECKPOINT + 5; batch += 1) {
+        tx.appendOutcome(prepareFindingOutcome({
+          repository: binding,
+          id: `outcome_${String(batch).padStart(32, "7")}`,
+          findingId: `finding_${String(batch).padStart(32, "8")}`,
+          reviewNumber: 1,
+          headSha: "c".repeat(40),
+          verdict: "confirmed",
+          trigger: "thread-comment",
+          ruleName: "no-token-logs",
+          category: "security",
+          severity: "blocking",
+          anchorChanged: false,
+          at: "2026-08-14T00:00:00.000Z",
+        }));
+      }
+    });
+
+    const checkpoint = await store.readFindingOutcomes();
+    expect(checkpoint.some((entry) => entry.disposition === "accepted")).toBe(false);
+    const waivers = await store.readDispositionOutcomes();
+    expect(waivers.some((entry) => entry.disposition === "accepted")).toBe(true);
   });
 });

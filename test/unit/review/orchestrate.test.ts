@@ -1,6 +1,7 @@
 // Tests for orchestrate — see TASKS.md Task 7 "Acceptance Criteria (BDD)"
 // AC-7.1 through AC-7.4.
 import { describe, expect, it } from "vitest";
+import { acceptanceKey } from "../../../src/conversation/disposition.js";
 import { orchestrate, renderSummary } from "../../../src/review/orchestrate.js";
 import type { DispatchResult, Finding } from "../../../src/review/types.js";
 
@@ -801,6 +802,45 @@ describe("finding decisions", () => {
     expect(result.commentBody).toContain("**2 findings · 2 inline comments posted**");
     expect(result.commentBody).not.toContain("fixed");
     expect(result.commentBody).not.toMatch(/^\*\*[345] findings ·/mu);
+  });
+
+  it("does not raise a finding a human accepted on this review", () => {
+    const waived = makeFinding({ message: "Tokens must not be logged.", ruleName: "no-token-logs", line: 14 });
+    const other = makeFinding({ message: "Different issue", ruleName: "other-rule", line: 9 });
+    const result = orchestrate(
+      makeDispatchResult({ findings: [waived, other] }),
+      DIFF,
+      { waivedKeys: new Set([acceptanceKey(waived)]) },
+    );
+
+    expect(result.findingsCount).toBe(1);
+    expect(result.commentBody).not.toContain("Tokens must not be logged.");
+    expect(result.inlineComments.some((comment) => comment.body.includes("Different issue"))).toBe(true);
+  });
+
+  it("does not surface an accepted finding as disputed or as a clarification", () => {
+    const waived = makeFinding({
+      message: "Tokens must not be logged.",
+      ruleName: "no-token-logs",
+      line: 14,
+      decision: "disputed",
+    });
+    const clarify = makeFinding({
+      message: "Tokens must not be logged.",
+      ruleName: "no-token-logs",
+      line: 14,
+      decision: "needs-clarification",
+      question: "Is logging the token intentional?",
+    });
+    const result = orchestrate(
+      makeDispatchResult({ findings: [waived, clarify] }),
+      DIFF,
+      { waivedKeys: new Set([acceptanceKey(waived)]) },
+    );
+
+    expect(result.commentBody).not.toMatch(/### Disputed/i);
+    expect(result.commentBody).not.toContain("Tokens must not be logged.");
+    expect(result.commentBody).not.toMatch(/clarif/i);
   });
 
   it("suppresses a repeated finding once any copy is addressed", () => {

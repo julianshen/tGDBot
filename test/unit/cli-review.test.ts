@@ -3158,6 +3158,8 @@ function captureFindingAppends(h: Harness) {
     return {
       ...store,
       repositoryBinding: store.repositoryBinding,
+      readFindingOutcomes: store.readFindingOutcomes.bind(store),
+      readDispositionOutcomes: store.readDispositionOutcomes.bind(store),
       readContextSnapshot: store.readContextSnapshot.bind(store),
       readAuditPage: store.readAuditPage.bind(store),
       findTerminalAction: store.findTerminalAction.bind(store),
