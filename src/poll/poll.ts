@@ -2059,24 +2059,17 @@ async function queueVerifications(input: {
   if (waiting.length === 0 && unmatched.length === 0) {
     return { items: [], deferred: false, deferredEvents: [] };
   }
-  const holdAll = { items: [], deferred: true, deferredEvents: waiting };
-
-  // Nothing may run, but everything waiting must still be NAMED. Enumerating
-  // through the full path spent a thread read per review on a poll that could
-  // not afford to verify anything (PR #74 review). Unmatched events are NOT
-  // held here: without a read there is no way to tell a crash orphan from a
-  // thread the bot never rooted, and holding unmatchable events pins the
-  // cursor forever.
-  if (input.budget <= 0) return holdAll;
-
-  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
-  if (metadata === undefined) return holdAll;
 
   // Identity recovery for crash-orphaned findings (issue #85). Only unmatched
   // events are read, and only up to the cap — the ordinary path performs no
   // additional provider round-trip (issue #85 acceptance). A read outage
   // DEFERS the event rather than consuming it: dropping it here would lose the
   // reply for good, the exact failure being repaired.
+  //
+  // This runs BEFORE the budget gate deliberately (Codex review of PR #87):
+  // recovery needs a provider thread read, not a model call, so a budget
+  // exhausted by earlier verifications is no reason to consume a crash
+  // orphan's reply — the scarcest thing this path handles.
   const recoveryDeferred: ReviewActivityEvent[] = [];
   // Threads already read during recovery: the verification loop re-reads each
   // candidate's thread, and a recovered finding's thread is already in hand —
@@ -2125,6 +2118,22 @@ async function queueVerifications(input: {
     waiting.push(event);
     recoveredThreads.set(event.threadId!, thread);
   }
+
+  // Nothing may run, but everything waiting must still be NAMED. Enumerating
+  // through the full path spent a thread read per review on a poll that could
+  // not afford to verify anything (PR #74 review).
+  //
+  // Recovered events are in `waiting` now: their binding is repaired, so they
+  // are held here and reached through the ordinary bound path once model
+  // budget returns — never re-read, never re-recovered. Unmatched events that
+  // did NOT recover (no marker, not the bot's thread, past the cap) are not
+  // held: there is no way to ever match them, and holding unmatchable events
+  // pins the cursor forever.
+  const holdAll = { items: [], deferred: true, deferredEvents: [...waiting, ...recoveryDeferred] };
+  if (input.budget <= 0) return holdAll;
+
+  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
+  if (metadata === undefined) return holdAll;
 
   const queue = pendingVerifications({
     headSha: metadata.headSha,
