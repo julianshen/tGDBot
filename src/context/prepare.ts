@@ -28,7 +28,7 @@ import {
   ContextCachePublicationInProgressError,
 } from "./cache.js";
 import { contextCacheKeyForRepository, type ContextCacheKey, type ContextManifest } from "./types.js";
-import { prepareWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
+import { withPreparedWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
 import { assertNoSymlinkedAncestors, protectManagedRoot } from "../workspace/protect.js";
 import type { ContextMapper } from "./mapper.js";
 import type { RepositoryRef } from "../target/types.js";
@@ -92,6 +92,11 @@ export type ContextPreparation =
   | { readonly status: "unavailable"; readonly reasons: readonly string[] };
 
 export interface PrepareContextDependencies {
+  /**
+   * Runs the mapping INSIDE the repository lock. It was `prepareWorkspace`,
+   * which releases the lock before returning, so the mapper read a tree
+   * another job could be resetting underneath it (#78).
+   */
   readonly prepareWorkspace?: typeof realPrepareWorkspace;
   /** Constructed lazily so a run with `--context off` never loads the pi SDK. */
   readonly createMapper?: () => Promise<ContextMapper> | ContextMapper;
@@ -448,10 +453,14 @@ export async function prepareReviewContext(
     return unavailable(["no rules to build context for"]);
   }
 
-  let sourceRoot: string;
+  // Everything below reads the shared base worktree, so it runs INSIDE the
+  // repository lock. `prepareWorkspace` releases the lock before returning, so
+  // the mapper walked a tree another job could be resetting and cleaning
+  // underneath it (#78). The cost is deliberate: a long mapping now serialises
+  // other jobs on the same repository and base, which is what the lock is for.
   try {
     onProgress({ stage: "workspace", status: "started" });
-    const prepared = await workspace({
+    return await workspace({
       root: request.workspaceRoot,
       repo: request.repository,
       baseSha: request.baseSha,
@@ -461,7 +470,7 @@ export async function prepareReviewContext(
       // attacker's hook in it, which chmod 0700 would lock in rather than shut
       // out — so refuse such a root instead of adopting it.
       rejectPreviouslySharedRoot: true,
-    });
+    }, async (prepared) => {
     // Invariant 1, checked rather than assumed. `prepareWorkspace` already
     // refuses a worktree whose HEAD is not the requested base SHA; this is the
     // second lock on the same door, because the cost of it being wrong is
@@ -469,12 +478,8 @@ export async function prepareReviewContext(
     if (prepared.baseSha !== request.baseSha) {
       throw new Error("Prepared worktree does not sit at the requested base commit");
     }
-    sourceRoot = prepared.baseWorktreePath;
+    const sourceRoot = prepared.baseWorktreePath;
     onProgress({ stage: "workspace", status: "completed" });
-  } catch (error) {
-    onProgress({ stage: "workspace", status: "failed" });
-    return unavailable([`base worktree could not be prepared: ${errorMessage(error)}`]);
-  }
 
   // Staging must live beneath the cache root — `promoteContext` refuses to
   // publish from anywhere else — and outside the source worktree, which
@@ -550,6 +555,15 @@ export async function prepareReviewContext(
     return unavailable(["context could not be published and no concurrent entry was found"]);
   }
   return await pack(published.manifest, false, published.ours);
+    });
+  } catch (error) {
+    // `unavailable` THROWS under `require`, and everything inside the callback
+    // may call it. Re-thrown rather than relabelled, or a mapping failure would
+    // be reported as a workspace one and its reasons replaced by this message.
+    if (error instanceof ContextRequiredError) throw error;
+    onProgress({ stage: "workspace", status: "failed" });
+    return unavailable([`base worktree could not be prepared: ${errorMessage(error)}`]);
+  }
 }
 
 /**

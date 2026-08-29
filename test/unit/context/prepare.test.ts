@@ -13,6 +13,8 @@ import {
   prepareReviewContext,
 } from "../../../src/context/prepare.js";
 import type { ContextMapRequest, ContextMapper, MappingResult } from "../../../src/context/mapper.js";
+import type { PrepareContextDependencies } from "../../../src/context/prepare.js";
+import type { PreparedWorkspace } from "../../../src/workspace/types.js";
 import type { GitHubRepositoryRef } from "../../../src/target/types.js";
 
 const BASE_SHA = "def4567890def4567890def4567890def4567890";
@@ -123,8 +125,17 @@ function stubMapper(overrides: {
 }
 
 /** A `prepareWorkspace` stand-in that hands back a directory at the base SHA. */
+// Lock-SCOPED, like the real one: the consumer runs inside the callback, so a
+// stub that merely returns the paths would let the tests pass against a version
+// that reads the worktree after the lock is released (#78).
 function stubWorkspace(worktreePath: string, reportedBaseSha?: string) {
-  return vi.fn(async (request: { root: string; baseSha: string }) => ({
+  // Cast for the same reason as elsewhere: `vi.fn` cannot express the real
+  // function's generic return. The stub honours the contract that matters here
+  // — the consumer runs under the caller's control, inside the lock (#78).
+  return vi.fn(async (
+    request: { root: string; baseSha: string },
+    use: (prepared: PreparedWorkspace) => Promise<unknown>,
+  ) => use({
     root: request.root,
     repositoryRoot: path.join(request.root, "repo"),
     mirrorPath: path.join(request.root, "repo", "mirror"),
@@ -132,7 +143,7 @@ function stubWorkspace(worktreePath: string, reportedBaseSha?: string) {
     baseWorktreePath: worktreePath,
     ownerMarkerPath: path.join(request.root, "repo", "owner.json"),
     baseSha: reportedBaseSha ?? request.baseSha,
-  }));
+  } as PreparedWorkspace));
 }
 
 async function baseRequest(overrides: Record<string, unknown> = {}) {
@@ -202,7 +213,7 @@ describe("prepareReviewContext", () => {
     const { worktree, request } = await baseRequest();
     const mapper = stubMapper();
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => mapper,
     });
 
@@ -219,13 +230,15 @@ describe("prepareReviewContext", () => {
     const { worktree, request } = await baseRequest();
     const mapper = stubMapper();
     const workspace = stubWorkspace(worktree);
-    await prepareReviewContext(request, { prepareWorkspace: workspace, createMapper: () => mapper });
+    await prepareReviewContext(request, { prepareWorkspace: workspace as unknown as PrepareContextDependencies["prepareWorkspace"], createMapper: () => mapper });
 
     expect(mapper.calls).toHaveLength(1);
     expect(mapper.calls[0]!.baseSha).toBe(BASE_SHA);
     expect(mapper.calls[0]!.baseSha).not.toBe(HEAD_SHA);
     expect(mapper.calls[0]!.sourceRoot).toBe(worktree);
-    expect(workspace).toHaveBeenCalledWith(expect.objectContaining({ baseSha: BASE_SHA }));
+    // Two arguments now: the request, and the callback the lock is held for.
+    expect(workspace).toHaveBeenCalledWith(
+      expect.objectContaining({ baseSha: BASE_SHA }), expect.any(Function));
     expect(JSON.stringify(workspace.mock.calls)).not.toContain(HEAD_SHA);
   });
 
@@ -235,7 +248,7 @@ describe("prepareReviewContext", () => {
     // A worktree reporting some other commit must never be handed to a mapper
     // that can run bash: that is how a PR's own code would get executed.
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree, HEAD_SHA),
+      prepareWorkspace: stubWorkspace(worktree, HEAD_SHA) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => mapper,
     });
 
@@ -247,14 +260,14 @@ describe("prepareReviewContext", () => {
     const { worktree, request } = await baseRequest();
     const first = stubMapper();
     await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => first,
     });
 
     const second = stubMapper();
     const workspace = stubWorkspace(worktree);
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: workspace,
+      prepareWorkspace: workspace as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => second,
     });
 
@@ -270,7 +283,7 @@ describe("prepareReviewContext", () => {
       ruleNames: ["tgd-review", "security-audit", "naming"],
     });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -289,7 +302,7 @@ describe("prepareReviewContext", () => {
   it("gives each rule its own truncation accounting rather than a shared counter", async () => {
     const { worktree, request } = await baseRequest({ ruleNames: ["one", "two"] });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -310,7 +323,7 @@ describe("prepareReviewContext", () => {
       changedFiles: ["src/entry.ts", "src/index.ts"],
     });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -325,7 +338,7 @@ describe("prepareReviewContext", () => {
     // The defect this guards: the new path does not exist at the base.
     const { worktree, request } = await baseRequest({ changedFiles: ["src/entry.ts"] });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -342,7 +355,7 @@ describe("prepareReviewContext", () => {
     // whole dispatch.
     const { worktree, request } = await baseRequest({ ruleNames: ["  spaced  ", "plain"] });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -354,7 +367,7 @@ describe("prepareReviewContext", () => {
   it("keeps two names that differ only by whitespace as two packs", async () => {
     const { worktree, request } = await baseRequest({ ruleNames: ["dup", "dup "] });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -366,7 +379,7 @@ describe("prepareReviewContext", () => {
   it("still rejects a rule name that is not usable at all", async () => {
     const { worktree, request } = await baseRequest({ ruleNames: ["   "] });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -378,7 +391,7 @@ describe("prepareReviewContext", () => {
     const mapper = stubMapper();
     const workspace = stubWorkspace(worktree);
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: workspace,
+      prepareWorkspace: workspace as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => mapper,
     });
 
@@ -390,7 +403,7 @@ describe("prepareReviewContext", () => {
   it("degrades to a context-free review when mapping fails", async () => {
     const { worktree, request } = await baseRequest();
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper({
         result: () => ({
           status: "failed",
@@ -409,7 +422,7 @@ describe("prepareReviewContext", () => {
   it("degrades when the mapper throws instead of returning a failure", async () => {
     const { worktree, request } = await baseRequest();
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => ({
         map: () => Promise.reject(new Error("session crashed")),
       }),
@@ -437,7 +450,7 @@ describe("prepareReviewContext", () => {
   it("reports a degraded map by what is missing, and publishes nothing", async () => {
     const { worktree, request } = await baseRequest({ allowDegraded: true });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper({
         result: () => ({
           status: "degraded",
@@ -464,7 +477,7 @@ describe("prepareReviewContext", () => {
     const permissive = await baseRequest({ allowDegraded: true });
     const permissiveMapper = stubMapper();
     await prepareReviewContext(permissive.request, {
-      prepareWorkspace: stubWorkspace(permissive.worktree),
+      prepareWorkspace: stubWorkspace(permissive.worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => permissiveMapper,
     });
     expect(permissiveMapper.calls[0]!.allowDegradedContext).toBe(true);
@@ -472,7 +485,7 @@ describe("prepareReviewContext", () => {
     const strict = await baseRequest();
     const strictMapper = stubMapper();
     await prepareReviewContext(strict.request, {
-      prepareWorkspace: stubWorkspace(strict.worktree),
+      prepareWorkspace: stubWorkspace(strict.worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => strictMapper,
     });
     expect(strictMapper.calls[0]!.allowDegradedContext).toBeUndefined();
@@ -481,7 +494,7 @@ describe("prepareReviewContext", () => {
   it("throws in require mode rather than reviewing blind, carrying the real reason", async () => {
     const { worktree, request } = await baseRequest({ mode: "require" });
     const thrown = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper({
         result: () => ({
           status: "failed",
@@ -506,7 +519,7 @@ describe("prepareReviewContext", () => {
   it("throws the degraded reasons intact in require mode", async () => {
     const { worktree, request } = await baseRequest({ mode: "require", allowDegraded: true });
     const thrown = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper({
         result: () => ({
           status: "degraded",
@@ -527,7 +540,7 @@ describe("prepareReviewContext", () => {
     const { worktree, request } = await baseRequest();
     const events: Array<{ stage: string; status: string }> = [];
     await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => ({ map: () => Promise.reject(new Error("session crashed")) }),
       onProgress: (event) => void events.push(event),
     });
@@ -543,7 +556,7 @@ describe("prepareReviewContext", () => {
     const mapper = stubMapper();
     const workspace = stubWorkspace(worktree);
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: workspace,
+      prepareWorkspace: workspace as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => mapper,
     });
 
@@ -555,7 +568,7 @@ describe("prepareReviewContext", () => {
   it("leaves no staging directory behind on either outcome", async () => {
     const success = await baseRequest();
     await prepareReviewContext(success.request, {
-      prepareWorkspace: stubWorkspace(success.worktree),
+      prepareWorkspace: stubWorkspace(success.worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
     await expect(readdir(path.join(success.request.cacheRoot as string, "staging")))
@@ -563,7 +576,7 @@ describe("prepareReviewContext", () => {
 
     const failure = await baseRequest();
     await prepareReviewContext(failure.request, {
-      prepareWorkspace: stubWorkspace(failure.worktree),
+      prepareWorkspace: stubWorkspace(failure.worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper({
         result: () => ({
           status: "failed",
@@ -582,7 +595,7 @@ describe("prepareReviewContext", () => {
   it("honours the per-rule size ceiling", async () => {
     const { worktree, request } = await baseRequest({ maxChars: 4000 });
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -613,7 +626,7 @@ describe("prepareReviewContext", () => {
     if (!gaveAway) return;
 
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => mapper,
     });
 
@@ -629,7 +642,7 @@ describe("prepareReviewContext", () => {
     if (process.platform === "win32") return;
     const { worktree, request } = await baseRequest();
     await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -663,7 +676,7 @@ describe("prepareReviewContext", () => {
       cacheRoot: path.join(link, "cache"),
     };
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -684,7 +697,7 @@ describe("prepareReviewContext", () => {
     await chmod(request.cacheRoot as string, 0o777);
 
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => mapper,
     });
 
@@ -700,7 +713,7 @@ describe("prepareReviewContext", () => {
     // than inheriting a permissive umask and then failing its own check.
     const { worktree, request } = await baseRequest();
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -731,7 +744,7 @@ describe("prepareReviewContext", () => {
       workspaceRoot: path.join(root, "workspaces"),
       cacheRoot: path.join(parent, "cache"),
     }, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -776,7 +789,7 @@ describe("prepareReviewContext", () => {
     }) as ContextCache;
 
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
       createCache: () => breakingProxy,
     });
@@ -798,7 +811,7 @@ describe("prepareReviewContext", () => {
     const key = contextCacheKey({ repository, baseSha: BASE_SHA });
     // A real, complete entry, published by "another run".
     await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
     const cache = new ContextCache(request.cacheRoot as string);
@@ -816,7 +829,7 @@ describe("prepareReviewContext", () => {
     } as unknown as ContextCache;
 
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
       createCache: () => losing,
     });
@@ -838,7 +851,7 @@ describe("prepareReviewContext", () => {
     const { worktree, request } = await baseRequest({ mode: "require" });
     // Publish a real entry so a genuine manifest exists to hand back.
     await prepareReviewContext({ ...request, mode: "auto" }, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
     const cache = new ContextCache(request.cacheRoot as string);
@@ -856,7 +869,7 @@ describe("prepareReviewContext", () => {
     } as unknown as ContextCache;
 
     const error = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
       createCache: () => hitting,
     }).then(() => undefined, (thrown: unknown) => thrown);
@@ -885,7 +898,7 @@ describe("prepareReviewContext", () => {
 
     const started = Date.now();
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
 
@@ -905,7 +918,7 @@ describe("prepareReviewContext", () => {
     const { worktree, request } = await baseRequest();
     // First run publishes normally, so a real entry exists to be found.
     await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
     });
     const published = await new ContextCache(request.cacheRoot as string)
@@ -932,7 +945,7 @@ describe("prepareReviewContext", () => {
     } as unknown as ContextCache;
 
     const prepared = await prepareReviewContext(request, {
-      prepareWorkspace: stubWorkspace(worktree),
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
       createMapper: () => stubMapper(),
       createCache: () => racing,
     });

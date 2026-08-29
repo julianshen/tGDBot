@@ -4,7 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 import type { ExecWorkspaceCommand, WorkspaceRequest, WorkspaceTool } from "../../../src/workspace/types.js";
-import { prepareWorkspace, realExecWorkspaceCommand } from "../../../src/workspace/manager.js";
+import { prepareWorkspace, realExecWorkspaceCommand, withPreparedWorkspace } from "../../../src/workspace/manager.js";
 import { deriveWorkspacePaths, encodeWorkspaceAuthority } from "../../../src/workspace/paths.js";
 
 const repo: WorkspaceRequest["repo"] = {
@@ -43,6 +43,42 @@ async function tempRoot(): Promise<string> {
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+// #78: `prepareWorkspace` releases the lock before returning, so the `reset
+// --hard` and `clean -ffdx` it runs cannot protect a later reader. Two jobs on
+// the same repository and base could have one rewriting the worktree while the
+// other read it — and a structural check derives a HOST-authored fact from that
+// tree, the one line a reader is invited to trust without re-deriving it.
+describe("withPreparedWorkspace", () => {
+  it("still holds the repository lock while the consumer reads the worktree", async () => {
+    const root = await tempRoot();
+    const lockPath = path.join(root, ".locks", "github.com", "octo-org", "octo-repo.lock");
+
+    let lockedDuringUse: boolean | undefined;
+
+    const result = await withPreparedWorkspace(
+      { root, repo, baseSha },
+      async (prepared) => {
+        lockedDuringUse = await stat(lockPath).then((s) => s.isFile(), () => false);
+        return prepared.baseWorktreePath;
+      },
+      { exec: vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+        if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
+        if (args.includes("get-url")) return "https://github.com/octo-org/octo-repo\n";
+        if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+          await mkdir(args.at(-2)!, { recursive: true });
+        }
+        return "";
+      }) },
+    );
+
+    const lockedAfter = await stat(lockPath).then((s) => s.isFile(), () => false);
+    expect(lockedDuringUse).toBe(true);
+    // Released once the consumer is done, or one job would hold it forever.
+    expect(lockedAfter).toBe(false);
+    expect(result).toContain("octo-repo");
+  });
 });
 
 describe("prepareWorkspace", () => {

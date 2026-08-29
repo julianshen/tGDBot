@@ -359,10 +359,42 @@ async function prepareWorkspaceUnlocked(
   return { ...paths, baseSha: expectedMarker.baseSha };
 }
 
+/**
+ * Prepares the workspace and holds the repository lock for `use`.
+ *
+ * `prepareWorkspace` releases the lock before it returns, so every caller read
+ * the shared worktree unlocked: the `reset --hard` and `clean -ffdx` that run
+ * inside the lock cannot protect a later reader, and two jobs on the same
+ * repository and base could have one rewriting the tree while the other read
+ * it (#78). That was tolerable while the readers produced CONTEXT, which is
+ * framed as untrusted and which a reader weighs. A structural check derives a
+ * host-authored fact — the one line a reader is invited to trust without
+ * re-deriving — so the same race can now publish "the name occurs at
+ * src/x.ts:88" for a line that only ever existed in another job's scratch edit.
+ *
+ * The cost is real and deliberate: a long consumer now serialises other jobs
+ * against the same repository and base. That is what the lock was always for.
+ */
+export async function withPreparedWorkspace<T>(
+  request: WorkspaceRequest,
+  use: (prepared: PreparedWorkspace) => Promise<T>,
+  dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
+): Promise<T> {
+  return prepareWorkspaceLocked(request, dependencies, use);
+}
+
 export async function prepareWorkspace(
   request: WorkspaceRequest,
   dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
 ): Promise<PreparedWorkspace> {
+  return prepareWorkspaceLocked(request, dependencies, async (prepared) => prepared);
+}
+
+async function prepareWorkspaceLocked<T>(
+  request: WorkspaceRequest,
+  dependencies: WorkspaceDependencies,
+  use: (prepared: PreparedWorkspace) => Promise<T>,
+): Promise<T> {
   const paths = deriveWorkspacePaths({ ...request, root: await physicalWorkspaceRoot(request.root) });
   const normalizedRequest = { ...request, root: paths.root };
   await mkdir(paths.root, { recursive: true });
@@ -391,6 +423,8 @@ export async function prepareWorkspace(
       paths.root,
       [paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
     );
-    return prepareWorkspaceUnlocked(normalizedRequest, dependencies);
+    // The consumer runs INSIDE the lock, so what it reads is what preparation
+    // just guaranteed.
+    return use(await prepareWorkspaceUnlocked(normalizedRequest, dependencies));
   });
 }

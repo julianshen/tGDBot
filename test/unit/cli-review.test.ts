@@ -17,6 +17,7 @@ import { main, parseArgs, review } from "../../src/cli.js";
 import { selectClarification } from "../../src/conversation/clarification.js";
 import { poll } from "../../src/poll/poll.js";
 import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
+import type { PreparedWorkspace, WorkspaceRequest } from "../../src/workspace/types.js";
 import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
 import { BOT_SIGNATURE, BOT_SIGNATURE_BLOCK } from "../../src/review/comment-format.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
@@ -425,11 +426,22 @@ function makeHarness(options: {
     dispatchRules: vi.fn().mockResolvedValue(dispatchResult),
     prepareContext: vi.fn().mockResolvedValue({ status: "off" }),
     runStructuralChecks: vi.fn(async (input) => [...input.findings]),
-    prepareStructuralWorkspace: vi.fn().mockResolvedValue({
+    // Lock-SCOPED: the consumer runs inside the callback. A stub that only
+    // returned the paths would pass against a version that reads the worktree
+    // after the lock is released (#78).
+    // The cast is about generic-mock ergonomics, not semantics: `vi.fn` cannot
+    // express the real function's `<T>`, and `MockedFunction` wants an exact
+    // parameter match including the optional dependencies argument. The stub
+    // does implement the contract — it runs the callback under the caller's
+    // control, which is the property #78 is about.
+    prepareStructuralWorkspace: vi.fn(async (
+      _request: WorkspaceRequest,
+      use: (prepared: PreparedWorkspace) => Promise<unknown>,
+    ) => use({
       root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
       ownerMarkerPath: "/ws/repo/owner.json", baseSha: "deadbeef",
-    }),
+    } as PreparedWorkspace)) as unknown as Harness["prepareStructuralWorkspace"],
     orchestrate: vi.fn().mockReturnValue(orchestrationResult),
   };
 }
@@ -5187,8 +5199,10 @@ describe("review — structural checks", () => {
 
     await review(h.args, depsFrom(h));
 
+    // Two arguments now: the request, and the callback the lock is held for.
     expect(h.prepareStructuralWorkspace).toHaveBeenCalledWith(
       expect.objectContaining({ baseSha: "deadbeef", rejectPreviouslySharedRoot: true }),
+      expect.any(Function),
     );
     expect(h.runStructuralChecks).toHaveBeenCalledWith(
       expect.objectContaining({ baseRoot: "/ws/repo/base" }),
@@ -5200,11 +5214,11 @@ describe("review — structural checks", () => {
   it("refuses a worktree that is not at the requested base commit", async () => {
     const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
     h.dispatchRules.mockResolvedValue({ findings: [claimed], rulesRun: ["rule-a"], rulesFailed: [] });
-    h.prepareStructuralWorkspace.mockResolvedValue({
+    h.prepareStructuralWorkspace.mockImplementation(async (_request, use) => use({
       root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
       ownerMarkerPath: "/ws/repo/owner.json", baseSha: "not-the-base",
-    });
+    }));
     vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await review(h.args, depsFrom(h));

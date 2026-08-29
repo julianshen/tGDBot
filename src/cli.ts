@@ -89,7 +89,7 @@ import {
 } from "./context/prepare.js";
 import { contextRoots, selectContextRoot } from "./context/root.js";
 import { runStructuralChecks as runStructuralChecksReal } from "./review/structural-check.js";
-import { prepareWorkspace as prepareWorkspaceReal } from "./workspace/manager.js";
+import { withPreparedWorkspace as withPreparedWorkspaceReal } from "./workspace/manager.js";
 import {
   combineContextPacks,
   DEFAULT_CONTEXT_MAX_CHARS,
@@ -221,7 +221,13 @@ export interface ReviewDependencies {
    */
   runStructuralChecks?: typeof runStructuralChecksReal;
   /** Resolves the trusted base worktree the checks read. Injected alongside them. */
-  prepareStructuralWorkspace?: typeof prepareWorkspaceReal;
+  /**
+   * Runs the structural check INSIDE the repository lock. It was
+   * `prepareWorkspace`, which releases the lock before returning, so the
+   * checker read a tree another job could be resetting underneath it — and a
+   * host-authored fact is the one output a reader does not re-derive (#78).
+   */
+  prepareStructuralWorkspace?: typeof withPreparedWorkspaceReal;
   now?: () => string;
 }
 
@@ -889,7 +895,7 @@ export async function review(
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
   const runStructuralChecksFn = deps.runStructuralChecks ?? runStructuralChecksReal;
-  const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? prepareWorkspaceReal;
+  const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? withPreparedWorkspaceReal;
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
   const fetchJsonFn = deps.fetchJson ?? fetchJsonReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
@@ -1498,7 +1504,7 @@ export async function review(
           .filter((finding) => finding.decision === "addressed")
           .map(dedupeKey),
       );
-      const prepared = await prepareStructuralWorkspaceFn({
+      dispatchResult.findings = await prepareStructuralWorkspaceFn({
         // The SAME managed workspace context mapping uses, so a repository
         // is mirrored once whichever feature asked for it first.
         root: contextRoots(selectContextRoot({
@@ -1507,11 +1513,11 @@ export async function review(
         repo: repository,
         baseSha: pr.baseSha,
         rejectPreviouslySharedRoot: true,
-      });
+      }, async (prepared) => {
       if (prepared.baseSha !== pr.baseSha) {
         throw new Error("prepared worktree does not sit at the requested base commit");
       }
-      dispatchResult.findings = await runStructuralChecksFn({
+      return runStructuralChecksFn({
         findings: dispatchResult.findings,
         baseRoot: prepared.baseWorktreePath,
         // A finding names its HEAD path; the base tree holds a renamed file
@@ -1529,6 +1535,7 @@ export async function review(
         // there is only one definition of the rule.
         isSuppressed: (finding) => addressedKeys.has(dedupeKey(finding))
           && (finding.decision ?? "new") !== "addressed",
+      });
       });
     } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the
