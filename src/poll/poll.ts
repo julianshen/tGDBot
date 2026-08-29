@@ -474,16 +474,7 @@ async function classifyOpenReviewEvents(options: {
         if (published === "transient") { haltTransient = true; haltCursor = true; break; }
         if (published === "stale") { haltCursor = true; break; }
         knownActionIds.add(verification.identity.actionId);
-        // AFTER the reply, not before: publication is already exactly-once on
-        // this action identity, so the ordering cannot produce two replies. It
-        // can lose the record if the process dies in between — and a missing
-        // record costs the learning ledger one row, where a missing reply would
-        // cost the maintainer an answer they were owed.
-        const settled = verification.plan;
-        if (settled.kind === "verification") {
-          await options.store.transact((tx) => { tx.appendOutcome(settled.outcome); });
-        }
-        // Answered, and the outcome recorded. Nothing is owed for this event.
+        // Answered, and the outcome recorded with the completed action.
         outstanding.delete(verification.event.eventId);
       }
     }
@@ -1298,6 +1289,9 @@ async function publishReplyPlan(input: {
         writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event,
           input.parentCommentId),
         now: input.options.now,
+        ...(plan.kind === "verification"
+          ? { onComplete: (tx) => { tx.appendOutcome(plan.outcome); } }
+          : {}),
         hooks: {
           beforeFreeze: capturedHead === undefined && memoryOperation === undefined
             && dispositionOutcome === undefined

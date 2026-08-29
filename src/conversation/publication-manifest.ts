@@ -21,6 +21,7 @@ import {
   replacePendingClarification,
   type ConversationExclusiveSession,
   type ConversationStateStore,
+  type ConversationStateTransaction,
 } from "./state-store.js";
 import type { ConversationItemIdentity, RepositoryBinding, ReviewIdentity } from "./types.js";
 import type { ConversationAdapter } from "../vcs/conversation-adapter.js";
@@ -381,6 +382,7 @@ async function persistAction(
   session: ConversationExclusiveSession,
   action: PublicationAction,
   at: string,
+  extras?: (tx: ConversationStateTransaction) => void,
 ): Promise<void> {
   const existing = latestPublication(session.snapshot().events, action.actionId);
   if (existing?.state === action.state &&
@@ -388,7 +390,10 @@ async function persistAction(
     existing.successorActionId === action.successorActionId) {
     return;
   }
-  await session.commit((tx) => tx.appendEvent(eventFromAction(action, at)));
+  await session.commit((tx) => {
+    tx.appendEvent(eventFromAction(action, at));
+    extras?.(tx);
+  });
 }
 
 async function markPosted(
@@ -477,6 +482,11 @@ export async function executePublication(options: {
   readonly strategy?: PublicationStrategy;
   readonly now?: () => string;
   readonly finalize?: (action: PublicationAction) => Promise<void>;
+  /**
+   * Runs inside the transaction that records `completed`. Used so a
+   * verification outcome cannot exist without the reply, or vice versa (#89).
+   */
+  readonly onComplete?: (tx: ConversationStateTransaction) => void;
 }): Promise<PublicationAction> {
   const now = options.now ?? (() => new Date().toISOString());
   const strategy = options.strategy ?? "sequential";
@@ -578,7 +588,7 @@ export async function executePublication(options: {
       await options.hooks?.afterPublication?.(action);
       await options.finalize?.(action);
       action = completePublication(action);
-      await persistAction(session, action, now());
+      await persistAction(session, action, now(), options.onComplete);
     }
     return action;
   });
