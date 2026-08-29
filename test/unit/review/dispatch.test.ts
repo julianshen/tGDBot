@@ -57,7 +57,7 @@ const hoisted = vi.hoisted(() => {
   // hasConfiguredAuth is THE credential gate (review: getModel() is a pure name
   // lookup with no auth check). Takes a provider id. Default true; tests flip
   // it to prove an un-credentialed model is never handed to the session.
-  const hasConfiguredAuthMock = vi.fn((_provider: string) => true);
+  const hasConfiguredAuthMock = vi.fn(() => true);
   // Design-review #6: resolveEffectiveRules falls back to the runtime's
   // auth-aware getAvailableSnapshot() when no --model/settings default
   // resolves for UNPINNED rules. Default empty (no credentialed provider);

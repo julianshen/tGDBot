@@ -91,6 +91,14 @@ import type {
   RepositoryBinding,
 } from "../conversation/types.js";
 import { observeResolvedThreads, pendingVerifications } from "../conversation/verification-queue.js";
+import { contextRoots, selectContextRoot } from "../context/root.js";
+import {
+  removedLinesByFile as removedLinesFromDiff,
+  renameSourcesByHeadPath,
+} from "../review/diff-anchors.js";
+import { runStructuralChecks as runStructuralChecksReal } from "../review/structural-check.js";
+import { prepareWorkspace as prepareWorkspaceReal } from "../workspace/manager.js";
+import type { Finding } from "../review/types.js";
 import type { PendingVerification } from "../conversation/verification-queue.js";
 import { verifyFinding } from "../conversation/verification.js";
 import { MAX_RESOLVED_THREADS } from "../conversation/state-schema.js";
@@ -147,6 +155,14 @@ export interface PollDependencies {
     readonly baseSha?: string;
   }) => Promise<{ readonly rules: readonly RuleDefinition[]; readonly error?: Error }>;
   readonly publicationHooks?: PublicationExecutorHooks;
+  /**
+   * Issue #79: the clarification path checks a regenerated finding's claim
+   * against the trusted base at answer time. Injected for the same reason
+   * `prepareStructuralWorkspace` is in cli.ts — a poll test must never walk a
+   * real git worktree with a real parser.
+   */
+  readonly prepareStructuralWorkspace?: typeof prepareWorkspaceReal;
+  readonly runStructuralChecks?: typeof runStructuralChecksReal;
   /**
    * Injected rather than imported: cli.ts already imports poll(), so importing
    * review() back would close a module cycle. main() supplies the real one.
@@ -1942,6 +1958,10 @@ async function executeClarificationAnswer(input: {
       at: observed.createdAt,
     });
     let frozenOutcome = observed.frozenOutcome;
+    // Issue #79: the checked (claim + fresh hostCheck) version of the
+    // reassessed finding, kept separate from what gets frozen — the durable
+    // snapshot strips both fields (see the confirmed/revised branch).
+    let checkedClarifiedFinding: Finding | undefined;
     if (frozenOutcome === undefined) {
       const model = input.options.config.model ?? currentRule?.model;
       if (model === undefined) {
@@ -1968,11 +1988,73 @@ async function executeClarificationAnswer(input: {
         frozenOutcome = { outcome: "withdrawn", rationale: `The trusted rule ${result.ruleName} is no longer active.` };
       } else if (result.result.outcome === "confirmed" || result.result.outcome === "revised") {
         if (!("finding" in result.result) || result.result.finding === undefined) return "transient";
+        // Issue #79: the reassessment returns a FRESHLY generated finding whose
+        // shared contract can carry a brand-new claim — and nothing ever checks
+        // it, because `needs-clarification` findings are deliberately excluded
+        // from the review-time check and the snapshot strips the claim. Run a
+        // FRESH check HERE, at answer time, against the base as it is now —
+        // never a stale one replayed from the snapshot.
+        const reassessed: Finding = result.result.finding;
+        let checkedFinding: Finding = reassessed;
+        if (input.options.config.structuralChecks === "on" && reassessed.claim !== undefined) {
+          const prepareStructuralWorkspaceFn =
+            input.options.deps.prepareStructuralWorkspace ?? prepareWorkspaceReal;
+          const runStructuralChecksFn =
+            input.options.deps.runStructuralChecks ?? runStructuralChecksReal;
+          const baseSha = input.metadata.baseSha ?? "0".repeat(40);
+          try {
+            const prepared = await prepareStructuralWorkspaceFn({
+              // The SAME managed workspace the review path uses, so a
+              // repository is mirrored once whichever feature asked first.
+              root: contextRoots(selectContextRoot({
+                ...(input.options.config.contextDir === undefined
+                  ? {}
+                  : { explicitContextDir: input.options.config.contextDir }),
+              })).workspaceRoot,
+              repo: input.options.config.repository,
+              baseSha,
+              rejectPreviouslySharedRoot: true,
+            });
+            if (prepared.baseSha !== baseSha) {
+              throw new Error("prepared worktree does not sit at the requested base commit");
+            }
+            const [verified] = await runStructuralChecksFn({
+              findings: [checkedFinding],
+              baseRoot: prepared.baseWorktreePath,
+              // The same base/head reconciliation the review path applies.
+              renamedFrom: renameSourcesByHeadPath(input.metadata.diff),
+              removedLinesByFile: removedLinesFromDiff(input.metadata.diff),
+            });
+            if (verified !== undefined) checkedFinding = verified;
+          } catch (error) {
+            // HOST-AUTHORED, not the caught error: this reason is rendered
+            // into a world-readable review comment, and a workspace failure
+            // would quote absolute paths from the CI runner's filesystem
+            // (CodeRabbit review, same rule as the CLI path). The raw error
+            // is a stderr concern.
+            console.warn(`tgd-review-agent: could not prepare a base worktree for a clarified finding (${redactedMessage(error)})`);
+            checkedFinding = {
+              ...checkedFinding,
+              hostCheck: { status: "not-checked", reason: "the base worktree could not be prepared" },
+            };
+          }
+        }
+        // Freeze WITHOUT claim and hostCheck. FindingSnapshot deliberately
+        // omits both (a stale verification must never be replayed against a
+        // newer base), and the durable ledger rejects unknown fields outright
+        // — a frozen finding carrying a claim made the transact throw, so the
+        // answer was never durably recorded and the poll retried the model on
+        // every pass. The publication below receives the CHECKED finding in
+        // memory; only the durable snapshot is stripped.
+        const frozenFinding: Finding = { ...checkedFinding };
+        delete frozenFinding.claim;
+        delete frozenFinding.hostCheck;
         frozenOutcome = {
           outcome: result.result.outcome,
           rationale: result.result.rationale,
-          finding: result.result.finding,
+          finding: frozenFinding,
         };
+        checkedClarifiedFinding = checkedFinding;
       } else {
         frozenOutcome = { outcome: "withdrawn", rationale: result.result.rationale };
       }
@@ -1991,10 +2073,13 @@ async function executeClarificationAnswer(input: {
     };
     if (frozenOutcome.outcome === "confirmed" || frozenOutcome.outcome === "revised") {
       if (frozenOutcome.finding === undefined) return "transient";
-        try {
+      // The CHECKED finding (claim + fresh hostCheck) is what publishes; the
+      // durable snapshot deliberately carries neither field (see above).
+      const findingForPublication: Finding = checkedClarifiedFinding ?? frozenOutcome.finding;
+      try {
           const publishedFinding = await publishConfirmedClarificationFinding({
             store: input.options.store,
-            finding: frozenOutcome.finding,
+            finding: findingForPublication,
             rules: rules.rules,
             reviewOptions: {
               advisor: input.options.config.advisor,

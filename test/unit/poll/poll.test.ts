@@ -1676,6 +1676,158 @@ describe("clarification answer lifecycle", () => {
     expect(snapshot.pending.clarifications[0]?.answerIdentity?.commentId).toBe("human-1");
   });
 
+  // Issue #79: the reassessment's shared contract can return a brand-new
+  // claim, and with `--structural-checks on` that claim must get a FRESH host
+  // check at answer time — against the base as it is then, the same worktree
+  // gate the review path uses.
+  it("checks a clarified finding's new claim before publishing it", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    const prepare = vi.fn().mockResolvedValue({
+      root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
+      worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
+      ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
+    });
+    const check = vi.fn().mockImplementation(async (input: { findings: readonly { id?: string }[] }) =>
+      input.findings.map((entry) => ({
+        ...entry,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })));
+    const vcs = silentReviewVcs();
+
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The current hunk still logs the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+            claim: { kind: "no-other-references", symbol: "token" },
+          },
+        })),
+      }),
+      prepareStructuralWorkspace: prepare,
+      runStructuralChecks: check,
+    })).resolves.toBe(0);
+
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
+      baseSha: "b".repeat(40),
+      rejectPreviouslySharedRoot: true,
+    }));
+    expect(check).toHaveBeenCalledTimes(1);
+    expect((check.mock.calls[0]?.[0] as { findings: { claim?: unknown }[] }).findings[0]?.claim)
+      .toMatchObject({ symbol: "token" });
+    // The published INLINE comment carries the fresh host check beside the
+    // claim — it goes through the review vcs, not the conversation adapter.
+    const inline = vcs.postedInlines.map((entry) => entry.body).join("\n");
+    expect(inline).toMatch(/LEXICAL matches/);
+    expect(inline).toContain("src/queue.ts:12");
+    // And the durable snapshot strips both fields — FindingSnapshot omits
+    // them so a stale check can never be replayed (pre-fix, this write
+    // THREW and the answer was never durably recorded).
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    const frozen = snapshot.pending.clarifications[0]?.frozenOutcome;
+    expect(frozen?.outcome).toBe("confirmed");
+    expect(JSON.stringify(frozen)).not.toContain("claim");
+    expect(JSON.stringify(frozen)).not.toContain("hostCheck");
+  });
+
+  it("annotates a clarified claim when the base worktree cannot be prepared", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    const prepare = vi.fn().mockRejectedValue(
+      new Error("EACCES: permission denied, mkdir '/home/runner/.cache/tgd/workspaces'"),
+    );
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const vcs = silentReviewVcs();
+
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The current hunk still logs the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+            claim: { kind: "no-other-references", symbol: "token" },
+          },
+        })),
+      }),
+      prepareStructuralWorkspace: prepare,
+    })).resolves.toBe(0);
+
+    // Degrades to a HOST-AUTHORED not-checked reason; the raw error (which
+    // quotes the runner's filesystem) stays on stderr.
+    const inline = vcs.postedInlines.map((entry) => entry.body).join("\n");
+    expect(inline).toContain("the base worktree could not be prepared");
+    expect(inline).not.toContain("/home/runner");
+    expect(warn.mock.calls.flat().join(" ")).toContain("/home/runner");
+    vi.restoreAllMocks();
+  });
+
+  it("prepares no worktree for a clarified claim when the feature is off", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    const prepare = vi.fn();
+    const vcs = silentReviewVcs();
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The current hunk still logs the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+            claim: { kind: "no-other-references", symbol: "token" },
+          },
+        })),
+      }),
+      prepareStructuralWorkspace: prepare,
+    })).resolves.toBe(0);
+
+    expect(prepare).not.toHaveBeenCalled();
+    expect(vcs.postedInlines.map((entry) => entry.body).join("\n")).not.toMatch(/Host check/);
+  });
+
   it("accepts an unthreaded answer clar_id: without a mention", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);
