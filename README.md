@@ -146,6 +146,8 @@ so quoting someone else's command does not re-run it.
 | Command | Where | What it does |
 | --- | --- | --- |
 | `@bot explain` | in a tGDBot finding's thread | Explains that finding against the rule that produced it |
+| `@bot accept` | in a tGDBot finding's thread | Intentional; stop raising that finding on this PR |
+| `@bot defer` | in a tGDBot finding's thread | Real, not now; drafts a follow-up issue for you to file |
 | `@bot reconsider <reason>` | in a tGDBot finding's thread | Re-assesses it against current code and the current rule |
 | `@bot answer <clar-id>: <text>` | anywhere on the review | Answers an unthreaded clarification question |
 | `@bot remember <lesson>` | anywhere on the review | Records a repository-local lesson |

@@ -32,6 +32,8 @@ export interface BotIdentity {
 
 export type ConversationCommand =
   | { readonly kind: "explain" }
+  | { readonly kind: "accept" }
+  | { readonly kind: "defer" }
   | { readonly kind: "check-latest" }
   | { readonly kind: "memories" }
   | { readonly kind: "reconsider"; readonly reason: string }

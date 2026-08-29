@@ -102,6 +102,62 @@ describe("validateFindingOutcomeEntries", () => {
       .toThrow(/unknown property/i);
   });
 
+  it("accepts a verification record with no disposition", () => {
+    expect(() => validateFindingOutcomeEntries([outcome()], repository)).not.toThrow();
+    expect(validateFindingOutcomeEntries([outcome()], repository)[0]).not.toHaveProperty("disposition");
+  });
+
+  it("accepts an accepted or deferred disposition with an actor digest", () => {
+    for (const disposition of ["accepted", "deferred"]) {
+      const [entry] = validateFindingOutcomeEntries([outcome({
+        disposition,
+        actorDigest: "e".repeat(64),
+        fileDigest: "f".repeat(64),
+        line: 14,
+      })], repository);
+      expect(entry?.disposition).toBe(disposition);
+      expect(entry?.line).toBe(14);
+    }
+  });
+
+  it("refuses a disposition outside the vocabulary", () => {
+    expect(() => validateFindingOutcomeEntries([outcome({
+      disposition: "looks fine to me",
+      actorDigest: "e".repeat(64),
+      fileDigest: "f".repeat(64),
+    })], repository)).toThrow(/disposition/i);
+  });
+
+  it("refuses a disposition without an actor digest", () => {
+    expect(() => validateFindingOutcomeEntries([outcome({
+      disposition: "accepted",
+      fileDigest: "f".repeat(64),
+    })], repository)).toThrow(/actor/i);
+  });
+
+  it("refuses an accepted outcome without a file digest", () => {
+    expect(() => validateFindingOutcomeEntries([outcome({
+      disposition: "accepted",
+      actorDigest: "e".repeat(64),
+    })], repository)).toThrow(/file/i);
+  });
+
+  it("refuses an actor login in place of a digest", () => {
+    expect(() => validateFindingOutcomeEntries([outcome({
+      disposition: "accepted",
+      actorDigest: "alice",
+      fileDigest: "f".repeat(64),
+    })], repository)).toThrow(/digest/i);
+  });
+
+  it("refuses a file path in place of a digest", () => {
+    expect(() => validateFindingOutcomeEntries([outcome({
+      disposition: "accepted",
+      actorDigest: "e".repeat(64),
+      fileDigest: "src/auth.ts",
+    })], repository)).toThrow(/digest/i);
+  });
+
   it("refuses a record bound to another repository", () => {
     expect(() => validateFindingOutcomeEntries(
       [outcome({ repository: { ...repository, repositoryDigest: "b".repeat(64) } })],
@@ -200,6 +256,24 @@ describe("prepareFindingOutcome", () => {
     const entry = prepareFindingOutcome({ ...source, repository });
 
     expect(() => validateFindingOutcomeEntries([entry], repository)).not.toThrow();
+  });
+
+  it("digests the actor and file when a disposition is recorded", () => {
+    const entry = prepareFindingOutcome({
+      ...source,
+      repository,
+      disposition: "accepted",
+      actor: "alice",
+      file: "src/auth.ts",
+      line: 14,
+    });
+
+    expect(entry.disposition).toBe("accepted");
+    expect(entry.line).toBe(14);
+    expect(entry.actorDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(entry.fileDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(entry)).not.toContain("alice");
+    expect(JSON.stringify(entry)).not.toContain("src/auth.ts");
   });
 });
 

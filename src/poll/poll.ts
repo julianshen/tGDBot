@@ -65,6 +65,7 @@ import {
   renderVerificationReply,
   renderScopeErrorReply,
   renderUnsupportedHistoryReply,
+  renderDispositionReply,
   renderUsageReply,
   type MemoryReply,
   type RenderedConversationBody,
@@ -78,7 +79,9 @@ import {
 import {
   prepareFindingLedgerEntry,
   bindFindingLedgerIdentity,
+  prepareFindingOutcome,
   type ConversationEventEntry,
+  type FindingSnapshot,
   type MemoryEntry,
 } from "../conversation/state-schema.js";
 import type {
@@ -409,6 +412,7 @@ async function classifyOpenReviewEvents(options: {
       }
       if (item.parsed.kind === "command" && item.parsed.command.kind !== "answer" &&
         !isMemoryCommand(item.parsed.command) &&
+        !isDispositionCommand(item.parsed.command) &&
         !isReviewCommand(item.parsed.command) &&
         !isExecutableConversationCommand(item.parsed.command)) {
         console.log(
@@ -420,6 +424,7 @@ async function classifyOpenReviewEvents(options: {
       const outcome = await executeConversationEvent({
         item,
         reviewIdentity: identity,
+        ...(botIdentity.login === undefined ? {} : { botLogin: botIdentity.login }),
         options,
       });
       if (outcome === "transient") {
@@ -706,6 +711,12 @@ type ReplyPlan =
       readonly operation?: MemoryEntry;
     }
   | { readonly kind: "scope" }
+  | {
+      readonly kind: "disposition";
+      readonly disposition: "accepted" | "deferred";
+      readonly finding: FindingSnapshot;
+      readonly outcome: FindingOutcomeEntry;
+    }
   | { readonly kind: "history" }
   | { readonly kind: "inactive"; readonly ruleName: string }
   | { readonly kind: "explain"; readonly explanation: string; readonly headSha: string }
@@ -744,6 +755,7 @@ type ReplyPlan =
 async function executeConversationEvent(input: {
   readonly item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult; readonly identity: { actionId: string; identityDigest: string } };
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  readonly botLogin?: string;
   readonly options: {
     readonly adapter: ConversationAdapter;
     readonly store: ConversationStateStore;
@@ -784,6 +796,7 @@ async function executeConversationEvent(input: {
     event: item.event,
     identity,
     plan: planned.plan,
+    ...(input.botLogin === undefined ? {} : { botLogin: input.botLogin }),
     reviewIdentity,
     options,
   });
@@ -967,7 +980,11 @@ function pollActionEvent(
 }
 
 async function planConversationReply(input: {
-  readonly item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult };
+  readonly item: {
+    readonly event: ReviewActivityEvent;
+    readonly parsed: CommandParseResult;
+    readonly identity: { actionId: string };
+  };
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
   readonly options: {
     readonly adapter: ConversationAdapter;
@@ -988,6 +1005,11 @@ async function planConversationReply(input: {
   // commands that reason about a finding.
   const memory = await planMemoryCommand(item, options);
   if (memory !== undefined) return { status: "ready", plan: memory };
+  const disposition = await planDispositionCommand(item, reviewIdentity, options);
+  if (disposition !== undefined) {
+    if (disposition.status === "transient") return { status: "transient" };
+    return { status: "ready", plan: disposition.plan };
+  }
   if (item.parsed.kind !== "command" || !isExecutableConversationCommand(item.parsed.command)) {
     return { status: "ready", plan: { kind: "usage" } };
   }
@@ -1080,6 +1102,84 @@ function isMemoryCommand(command: ConversationCommand): command is
   return command.kind === "memories" || command.kind === "remember" || command.kind === "forget";
 }
 
+function isDispositionCommand(command: ConversationCommand): command is
+  | { readonly kind: "accept" }
+  | { readonly kind: "defer" } {
+  return command.kind === "accept" || command.kind === "defer";
+}
+
+async function planDispositionCommand(
+  item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult; readonly identity: { actionId: string } },
+  reviewIdentity: ReturnType<typeof reviewIdentityFrom>,
+  options: {
+    readonly adapter: ConversationAdapter;
+    readonly store: ConversationStateStore;
+    readonly now: () => string;
+    readonly config: ResolvedPollConfig;
+    readonly deps: PollDependencies;
+  },
+): Promise<
+  | { readonly status: "ready"; readonly plan: ReplyPlan }
+  | { readonly status: "transient" }
+  | undefined
+> {
+  if (item.parsed.kind !== "command" || !isDispositionCommand(item.parsed.command)) return undefined;
+  const command = item.parsed.command;
+
+  let thread: ReviewThreadSnapshot | undefined;
+  if (item.event.threadId !== undefined) {
+    try {
+      thread = await options.adapter.getReviewThread(reviewIdentity, item.event.threadId);
+    } catch (error) {
+      console.warn(`tgd-review-agent: could not load addressed thread (${redactedMessage(error)})`);
+      return { status: "transient" };
+    }
+  }
+  const snapshot = await options.store.readContextSnapshot();
+  const publicDigest = computeRepositoryDigest(options.config.repository.provider, options.config.repository.canonicalUrl);
+  const resolution = resolveMarkedFindingThread({
+    event: item.event,
+    thread,
+    findings: snapshot.findings,
+    repository: options.store.repositoryBinding,
+    markerRepositoryDigest: publicDigest,
+  });
+  if (resolution.status === "scope-error") return { status: "ready", plan: { kind: "scope" } };
+  if (resolution.status === "unsupported-history") return { status: "ready", plan: { kind: "history" } };
+
+  const metadata = await loadReviewMetadata(item.event.reviewNumber, options);
+  if (metadata === undefined) return { status: "transient" };
+
+  const prior = (await options.store.readFindingOutcomes())
+    .filter((entry) => entry.findingId === resolution.ledger.id)
+    .at(-1);
+  const disposition = command.kind === "accept" ? "accepted" as const : "deferred" as const;
+  const outcome = prepareFindingOutcome({
+    repository: options.store.repositoryBinding,
+    id: `outcome_${createHash("sha256")
+      .update(`disposition\0${item.identity.actionId}`, "utf8").digest("hex").slice(0, 32)}`,
+    findingId: resolution.ledger.id,
+    reviewNumber: resolution.ledger.reviewNumber,
+    headSha: metadata.headSha,
+    ruleName: resolution.ledger.finding.ruleName,
+    category: resolution.ledger.finding.category,
+    severity: resolution.ledger.finding.severity,
+    ...(resolution.ledger.finding.effort === undefined ? {} : { effort: resolution.ledger.finding.effort }),
+    verdict: prior?.verdict ?? "confirmed",
+    trigger: "thread-comment",
+    anchorChanged: false,
+    at: options.now(),
+    disposition,
+    actor: item.event.authorLogin ?? "unknown",
+    file: resolution.ledger.finding.file,
+    ...(resolution.ledger.finding.line === undefined ? {} : { line: resolution.ledger.finding.line }),
+  });
+  return {
+    status: "ready",
+    plan: { kind: "disposition", disposition, finding: resolution.ledger.finding, outcome },
+  };
+}
+
 async function planMemoryCommand(
   item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult },
   options: { readonly store: ConversationStateStore; readonly now: () => string },
@@ -1159,6 +1259,7 @@ async function publishReplyPlan(input: {
     if (latest?.state === "completed") return "completed";
     const actionIdentity = latest === undefined ? identity : { actionId: latest.actionId, identityDigest: latest.identityDigest };
     const memoryOperation = plan.kind === "memory" ? plan.operation : undefined;
+    const dispositionOutcome = plan.kind === "disposition" ? plan.outcome : undefined;
     const capturedHead = plan.kind === "explain" || plan.kind === "reconsider" ||
       (plan.kind === "clarification" && plan.outcome !== "stale")
       ? plan.headSha
@@ -1214,6 +1315,7 @@ async function publishReplyPlan(input: {
         now: input.options.now,
         hooks: {
           beforeFreeze: capturedHead === undefined && memoryOperation === undefined
+            && dispositionOutcome === undefined
             ? undefined
             : async (session, current) => {
             // `remember`/`forget` must land locally BEFORE the acknowledgement is
@@ -1225,6 +1327,12 @@ async function publishReplyPlan(input: {
               const applied = session.snapshot().memoryLedger.some((entry) =>
                 entry.operation === memoryOperation.operation && entry.id === memoryOperation.id);
               if (!applied) await session.commit((tx) => { tx.appendMemory(memoryOperation); });
+            }
+            // Same contract for accept/defer: a completed action is recoverably
+            // terminal, so the outcome has to already be in the sidecar before
+            // that state is reachable (#86 review).
+            if (dispositionOutcome !== undefined) {
+              await session.commit((tx) => { tx.appendOutcome(dispositionOutcome); });
             }
             if (capturedHead === undefined) return;
             const metadata = await loadReviewMetadata(input.event.reviewNumber, input.options);
@@ -1389,6 +1497,16 @@ function buildReplyChild(input: {
       }, marker);
     }
     if (input.plan.kind === "usage") return renderUsageReply(marker);
+    if (input.plan.kind === "disposition") {
+      return renderDispositionReply({
+        disposition: input.plan.disposition,
+        file: input.plan.finding.file,
+        ...(input.plan.finding.line === undefined ? {} : { line: input.plan.finding.line }),
+        ruleName: input.plan.finding.ruleName,
+        severity: input.plan.finding.severity,
+        ...(input.botLogin === undefined ? {} : { botLogin: input.botLogin }),
+      }, marker);
+    }
     if (input.plan.kind === "clarification-unavailable") return renderClarificationUnavailableReply(marker);
     if (input.plan.kind === "memory") return renderMemoryReply(input.plan.reply, marker);
     if (input.plan.kind === "scope") return renderScopeErrorReply(marker);
