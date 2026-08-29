@@ -32,8 +32,10 @@ import type {
 } from "../../../src/vcs/conversation-adapter.js";
 import type { ConversationItemIdentity, ReviewIdentity } from "../../../src/conversation/types.js";
 import {
+  MAX_OUTCOME_CHECKPOINT,
   bindFindingLedgerIdentity,
   prepareFindingLedgerEntry,
+  prepareFindingOutcome,
   type ConversationEventEntry,
   type FindingLedgerEntry,
 } from "../../../src/conversation/state-schema.js";
@@ -2391,6 +2393,69 @@ describe("automatic verification", () => {
     adapter.replaceEvents(events);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
     expect(adapter.postedThreadIds.filter((threadId) => threadId === "B0")).toHaveLength(1);
+  });
+
+  // The outcome checkpoint is BOUNDED at 500. Once a repository passes that,
+  // an older outcome falls out of it while its finding sits at the same head,
+  // and a checkpoint-only dedupe answers a second time. The action ledger is
+  // unbounded and its identity already encodes exactly (finding, head).
+  it("does not verify twice after the outcome ages out of the checkpoint", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+
+    // Push the real outcome out of the checkpoint window entirely.
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const binding = store.repositoryBinding;
+    // One transaction: the checkpoint keeps the last N however they arrived.
+    await store.transact((tx) => {
+      for (let batch = 0; batch < MAX_OUTCOME_CHECKPOINT + 5; batch += 1) {
+        tx.appendOutcome(prepareFindingOutcome({
+          repository: binding,
+          id: `outcome_${String(batch).padStart(32, "7")}`,
+          findingId: `finding_${String(batch).padStart(32, "8")}`,
+          reviewNumber: 1,
+          headSha: "c".repeat(40),
+          verdict: "confirmed",
+          trigger: "thread-comment",
+          ruleName: "no-token-logs",
+          category: "security",
+          severity: "blocking",
+          anchorChanged: false,
+          at: "2026-08-14T00:00:00.000Z",
+        }));
+      }
+    });
+    const remaining = await store.readFindingOutcomes();
+    expect(remaining.some((entry) => entry.findingId === FINDING_ID)).toBe(false);
+
+    // A SECOND, distinct reply. Replaying the first proves nothing: the event
+    // cursor drops it before the queue sees it, so only a fresh event reaches
+    // the layer under test. The checkpoint has forgotten this finding; the
+    // action ledger has not.
+    const again = installFindingThread(
+      adapter, findingMarker!, threadComment("human-2", "and one more thing", {
+        updatedAt: "2026-08-14T00:00:09.000Z",
+      }),
+    );
+    adapter.replaceEvents([again]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
   });
 
   // A dry run previews; it does not buy anything. Reporting the VERDICT meant

@@ -2077,12 +2077,36 @@ async function queueVerifications(input: {
     return [{ pending, ledger, threadId, event: trigger.event }];
   });
 
+  // The DURABLE idempotency check, on the action ledger rather than the outcome
+  // checkpoint. The checkpoint keeps only the most recent
+  // `MAX_OUTCOME_CHECKPOINT` records, so once a repository passes that count an
+  // older outcome falls out of it while the finding sits at the same head — and
+  // the queue would answer a second time (PR #74 review). The action identity
+  // already encodes exactly (finding, head), and the ledger is unbounded.
+  //
+  // I removed this check in an earlier round because the outcome record covered
+  // it and no test failed without it. The record covers it only up to the
+  // checkpoint bound; this is the case that survives past it.
+  const identityFor = (candidate: { ledger: FindingLedgerEntry; event: ReviewActivityEvent }) =>
+    conversationActionIdentity({
+      provider: candidate.event.provider,
+      repositoryDigest: candidate.event.repositoryDigest,
+      reviewNumber: input.reviewNumber,
+      eventId: candidate.ledger.id,
+      commandKey: `verify:${metadata.headSha}`,
+    });
+  const answered = candidates.length === 0
+    ? new Map()
+    : await input.options.store.findTerminalActions(candidates.map(identityFor));
+  const unanswered = candidates.filter((candidate) =>
+    answered.get(identityFor(candidate).actionId)?.state !== "completed");
+
   const items: QueuedVerification[] = [];
   // Everything past the budget, named so the caller can hold it back.
-  const deferredEvents: ReviewActivityEvent[] = candidates.slice(input.budget)
+  const deferredEvents: ReviewActivityEvent[] = unanswered.slice(input.budget)
     .map((candidate) => candidate.event);
   let deferred = deferredEvents.length > 0;
-  for (const { pending, ledger, threadId, event } of candidates.slice(0, input.budget)) {
+  for (const { pending, ledger, threadId, event } of unanswered.slice(0, input.budget)) {
     let thread: ReviewThreadSnapshot | undefined;
     try {
       thread = await input.options.adapter.getReviewThread(input.reviewIdentity, threadId);
