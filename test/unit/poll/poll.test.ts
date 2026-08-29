@@ -40,7 +40,7 @@ import {
   type ConversationEventEntry,
   type FindingLedgerEntry,
 } from "../../../src/conversation/state-schema.js";
-import type { ConversationStateStore } from "../../../src/conversation/state-store.js";
+import type { ConversationStateStore, ConversationStateTransaction } from "../../../src/conversation/state-store.js";
 import { decodeReviewProgress } from "../../../src/poll/discovery.js";
 import {
   createPreparedClarification,
@@ -2179,6 +2179,60 @@ describe("automatic verification", () => {
     expect(posted).toHaveLength(1);
     expect(await createConversationStateStore({ root: stateDir, repository: repo })
       .readFindingOutcomes()).toHaveLength(1);
+  });
+
+  // Issue #89: the outcome used to be a SECOND transaction after publication
+  // completed. findTerminalActions then suppressed a retry, so a crash between
+  // the two lost the row permanently. The completed action event and the
+  // outcome must share a commit.
+  it("records the verification outcome in the same transaction that completes the reply", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    adapter.replaceEvents([reply]);
+    const batches: Array<{ completed: boolean; outcomes: number }> = [];
+    const wrap = <T>(fn: (tx: ConversationStateTransaction) => T) => (tx: ConversationStateTransaction) => {
+      const batch = { completed: false, outcomes: 0 };
+      const appendEvent = tx.appendEvent.bind(tx);
+      const appendOutcome = tx.appendOutcome.bind(tx);
+      tx.appendEvent = (entry) => {
+        if (entry.state === "completed") batch.completed = true;
+        appendEvent(entry);
+      };
+      tx.appendOutcome = (entry) => {
+        batch.outcomes += 1;
+        appendOutcome(entry);
+      };
+      const result = fn(tx);
+      batches.push(batch);
+      return result;
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: async () => createPiSessionStub(verdict("withdrawn")).session,
+      }),
+      createStateStore: (opts) => {
+        const store = createConversationStateStore(opts);
+        const transact = store.transact.bind(store);
+        store.transact = (fn) => transact(wrap(fn) as typeof fn);
+        const lock = store.withExclusiveLock.bind(store);
+        store.withExclusiveLock = (fn) => lock(async (session) => {
+          const commit = session.commit.bind(session);
+          session.commit = (txFn) => commit(wrap(txFn) as typeof txFn);
+          return fn(session);
+        });
+        return store;
+      },
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect(batches.some((batch) => batch.completed && batch.outcomes > 0)).toBe(true);
+    expect(batches.filter((batch) => batch.outcomes > 0).every((batch) => batch.completed)).toBe(true);
   });
 
   // Resolving a thread is not a COMMENT, so the event carries no `commentId`
