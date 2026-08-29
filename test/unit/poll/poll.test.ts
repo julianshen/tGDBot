@@ -2270,6 +2270,109 @@ describe("automatic verification", () => {
     expect(adapter.threadReads).toBe(1);
   });
 
+  // Issue #85: a finding whose publication crashed after the provider write
+  // but before the identity was bound has NO threadId in the ledger. Its
+  // comment is visible to everyone, so a human reply lands in its thread — and
+  // before recovery, the event matched no bound finding, was consumed as
+  // classified-and-ignored, and the reply was never answered.
+  it("verifies a crash-orphaned finding by its marker, and repairs the binding", async () => {
+    const adapter = new ExecutionAdapter([]);
+    // Deliberately UNBOUND: the ledger state a crash between the provider
+    // write and `bindPublishedFindingIdentities` leaves behind.
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const repaired = (await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID);
+    // The repair is the deliverable beyond the reply: the ordinary path
+    // matches this thread from now on, with no recovery read.
+    expect(repaired?.identity?.threadId).toBe("T1");
+    expect(repaired?.identity?.provider).toBe("github");
+  });
+
+  // The recovery reads cost provider calls; the ordinary path — every reply in
+  // a finding whose identity is already bound — must perform none beyond the
+  // thread read verification itself needs (issue #85 acceptance).
+  it("adds no recovery round-trip when the identity is already bound", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    // Exactly one thread read: the verification's own. Recovery never looked
+    // at the thread because the binding already matched it.
+    expect(adapter.threadReads).toBe(1);
+  });
+
+  // Recovery must not let a marker turn someone else's thread into a finding
+  // the bot will answer. The root's author is the bot-refusal gate the command
+  // path already applies, and it applies here too.
+  it("refuses to recover a finding from a thread the bot did not root", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+      { rootAuthorIsBot: false },
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    expect((await store.readContextSnapshot())
+      .findings.find((entry) => entry.id === FINDING_ID)?.identity).toBeUndefined();
+  });
+
+  // A recovery read outage is a transport failure, not an answer. Consuming
+  // the event on one would lose the reply for good — the exact failure
+  // recovery exists to repair.
+  it("defers instead of consuming when the recovery thread read fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    adapter.failNextThreadRead = true;
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
   // Metadata is a provider round-trip like any other, and failing it is an
   // outage rather than an answer.
   it("retries after review metadata fails to load", async () => {
