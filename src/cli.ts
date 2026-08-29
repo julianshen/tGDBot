@@ -1517,38 +1517,38 @@ export async function review(
       && (finding.decision ?? "new") !== "addressed";
     if (dispatchResult.findings.some((finding) => hasCheckableClaim(finding, isSuppressed))) {
       try {
-      const prepared = await prepareStructuralWorkspaceFn({
-        // The SAME managed workspace context mapping uses, so a repository
-        // is mirrored once whichever feature asked for it first.
-        root: contextRoots(selectContextRoot({
-          ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
-        })).workspaceRoot,
-        repo: repository,
-        baseSha: pr.baseSha,
-        rejectPreviouslySharedRoot: true,
-      });
-      if (prepared.baseSha !== pr.baseSha) {
-        throw new Error("prepared worktree does not sit at the requested base commit");
-      }
-      dispatchResult.findings = await runStructuralChecksFn({
-        findings: dispatchResult.findings,
-        baseRoot: prepared.baseWorktreePath,
-        // A finding names its HEAD path; the base tree holds a renamed file
-        // under the old one, and without this the symbol's own declaration
-        // reads as a reference from elsewhere.
-        renamedFrom: renameSourcesByHeadPath(diff),
-        // Lets the checker drop occurrences whose base-side lines may be
-        // precisely the ones this PR deletes — per file, so an untouched
-        // caller elsewhere survives.
-        removedLinesByFile: removedLinesByFile(diff),
-        // `orchestrate` drops an actionable finding whose dedup key matches an
-        // `addressed` one, so checking those spends budget on results no reader
-        // sees. Wired HERE, at the composition root, using orchestrate's own
-        // `dedupeKey` — the checker stays independent of the orchestrator and
-        // there is only one definition of the rule.
-        isSuppressed,
-      });
-    } catch (error) {
+        const prepared = await prepareStructuralWorkspaceFn({
+          // The SAME managed workspace context mapping uses, so a repository
+          // is mirrored once whichever feature asked for it first.
+          root: contextRoots(selectContextRoot({
+            ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
+          })).workspaceRoot,
+          repo: repository,
+          baseSha: pr.baseSha,
+          rejectPreviouslySharedRoot: true,
+        });
+        if (prepared.baseSha !== pr.baseSha) {
+          throw new Error("prepared worktree does not sit at the requested base commit");
+        }
+        dispatchResult.findings = await runStructuralChecksFn({
+          findings: dispatchResult.findings,
+          baseRoot: prepared.baseWorktreePath,
+          // A finding names its HEAD path; the base tree holds a renamed file
+          // under the old one, and without this the symbol's own declaration
+          // reads as a reference from elsewhere.
+          renamedFrom: renameSourcesByHeadPath(diff),
+          // Lets the checker drop occurrences whose base-side lines may be
+          // precisely the ones this PR deletes — per file, so an untouched
+          // caller elsewhere survives.
+          removedLinesByFile: removedLinesByFile(diff),
+          // `orchestrate` drops an actionable finding whose dedup key matches an
+          // `addressed` one, so checking those spends budget on results no reader
+          // sees. Wired HERE, at the composition root, using orchestrate's own
+          // `dedupeKey` — the checker stays independent of the orchestrator and
+          // there is only one definition of the rule.
+          isSuppressed,
+        });
+      } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the
       // claim went unverified rather than silently reading it as unchallenged.
       //
