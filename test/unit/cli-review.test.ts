@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { MockedFunction } from "vitest";
 import { parseCommandArgs } from "../../src/cli-args.js";
 import { main, parseArgs, review } from "../../src/cli.js";
 import { selectClarification } from "../../src/conversation/clarification.js";
@@ -291,13 +292,13 @@ interface Harness {
     getReviewThread?: ReturnType<typeof vi.fn>;
     resolveReviewIdentity?: ReturnType<typeof vi.fn>;
   };
-  resolveConfig: ReturnType<typeof vi.fn>;
-  loadRules: ReturnType<typeof vi.fn>;
-  dispatchRules: ReturnType<typeof vi.fn>;
-  orchestrate: ReturnType<typeof vi.fn>;
-  prepareContext: ReturnType<typeof vi.fn>;
-  runStructuralChecks: ReturnType<typeof vi.fn>;
-  prepareStructuralWorkspace: ReturnType<typeof vi.fn>;
+  resolveConfig: MockedFunction<ReviewDependencies["resolveConfig"]>;
+  loadRules: MockedFunction<ReviewDependencies["loadRules"]>;
+  dispatchRules: MockedFunction<ReviewDependencies["dispatchRules"]>;
+  orchestrate: MockedFunction<ReviewDependencies["orchestrate"]>;
+  prepareContext: MockedFunction<ReviewDependencies["prepareContext"]>;
+  runStructuralChecks: MockedFunction<ReviewDependencies["runStructuralChecks"]>;
+  prepareStructuralWorkspace: MockedFunction<ReviewDependencies["prepareStructuralWorkspace"]>;
   publicationHooks?: ReviewDependencies["publicationHooks"];
 }
 
