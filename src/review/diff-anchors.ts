@@ -75,6 +75,23 @@ export function addedLines(diff: string | DiffPositions): CommentableLines {
 }
 
 /**
+ * Origin-side (old) line numbers the increment actually removed.
+ *
+ * Head-change verification matches `placement.line` captured at the finding's
+ * origin head. New-side `+` numbers are current-head coordinates: an insert
+ * above the anchor shifts them, and a pure deletion has none. Context is
+ * still not a touch — that is the cost #57 forbids.
+ */
+export function originTouchedLines(diff: string): CommentableLines {
+  const result: CommentableLines = new Map();
+  for (const [file, removed] of removedLinesByFile(diff)) {
+    if (removed.byLine.size === 0) continue;
+    result.set(file, new Set(removed.byLine.keys()));
+  }
+  return result;
+}
+
+/**
  * True iff `file`:`line` is a valid new-side inline anchor.
  *
  * A finding with no line (`line: null`, per the JSON contract) can never be

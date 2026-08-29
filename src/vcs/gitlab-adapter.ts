@@ -1048,10 +1048,27 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       `${projectEndpoint(repo, "repository/compare")}?from=${encodeURIComponent(fromSha)}&to=${encodeURIComponent(toSha)}`,
     ]);
     const parsed: unknown = JSON.parse(stdout);
-    if (parsed === null || typeof parsed !== "object" || !("diffs" in parsed) || !Array.isArray(parsed.diffs)) {
+    if (parsed === null || typeof parsed !== "object") {
       return "";
     }
-    return parsed.diffs.map(gitlabComparePatch).filter((patch) => patch.length > 0).join("\n");
+    const body: object = parsed;
+    if ("compare_timeout" in body && body.compare_timeout === true) {
+      throw new Error("GitLab compare timed out; the returned diffs are incomplete");
+    }
+    if (!("diffs" in body) || !Array.isArray(body.diffs)) {
+      return "";
+    }
+    for (const entry of body.diffs) {
+      if (entry === null || typeof entry !== "object") continue;
+      const row: object = entry;
+      if ("collapsed" in row && row.collapsed === true) {
+        throw new Error("GitLab compare omitted a collapsed file diff");
+      }
+      if ("too_large" in row && row.too_large === true) {
+        throw new Error("GitLab compare omitted a too large file diff");
+      }
+    }
+    return body.diffs.map(gitlabComparePatch).filter((patch) => patch.length > 0).join("\n");
   }
 
   async findBotComment(locator: ReviewLocator): Promise<BotComment | null> {

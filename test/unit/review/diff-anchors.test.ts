@@ -14,6 +14,7 @@ import {
   quoteGitPathOperand,
   commentableLines,
   addedLines,
+  originTouchedLines,
   diffPositionRange,
   parseDiffPositions,
   isCommentable,
@@ -51,6 +52,42 @@ describe("addedLines", () => {
 -gone
 `;
     expect(addedLines(diff).size).toBe(0);
+  });
+});
+
+describe("originTouchedLines", () => {
+  // Head-change verification matches the finding's origin-side placement, not
+  // the current-head line numbers. A later insert above the anchor shifts every
+  // new-side `+` line, so those numbers must not be the match key.
+  it("maps removed origin-side line numbers, never new-side additions or context", () => {
+    const map = originTouchedLines(SIMPLE);
+
+    expect([...(map.get("src/a.go") ?? [])]).toEqual([11]);
+  });
+
+  it("treats deleting the anchored line as a touch", () => {
+    const diff = `diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -14,1 +13,0 @@
+-  console.log(user.token);
+`;
+    expect([...(originTouchedLines(diff).get("src/auth.ts") ?? [])]).toEqual([14]);
+  });
+
+  it("keeps the origin line when an insert above shifts the replacement", () => {
+    const diff = `diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -9,0 +10,1 @@
++inserted
+@@ -14,1 +15,1 @@
+-  console.log(user.token);
++  console.log("[redacted]");
+`;
+    expect([...(originTouchedLines(diff).get("src/auth.ts") ?? [])]).toEqual([14]);
+    expect(addedLines(diff).get("src/auth.ts")?.has(15)).toBe(true);
+    expect(addedLines(diff).get("src/auth.ts")?.has(14)).toBe(false);
   });
 });
 

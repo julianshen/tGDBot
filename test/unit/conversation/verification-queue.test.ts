@@ -107,7 +107,7 @@ describe("pendingVerifications — what makes a finding worth re-examining", () 
       events: [],
       findings: [raisedEarlier, raisedLater],
       changedLines: new Map(),
-      addedLinesByOriginHead: new Map([
+      touchedLinesByOriginHead: new Map([
         [earlier, new Map([["src/a.ts", new Set([10])]])],
         [later, new Map([["src/unrelated.ts", new Set([1])]])],
       ]),

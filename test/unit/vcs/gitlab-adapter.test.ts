@@ -190,6 +190,18 @@ describe("GitLabAdapter merge request snapshot", () => {
     expect(compareArg).toContain(`to=${toSha}`);
   });
 
+  it.each([
+    ["compare_timeout", { compare_timeout: true, diffs: [] }],
+    ["collapsed", { diffs: [{ old_path: "a.ts", new_path: "a.ts", collapsed: true, diff: "" }] }],
+    ["too_large", { diffs: [{ old_path: "a.ts", new_path: "a.ts", too_large: true, diff: "" }] }],
+  ])("rejects an incomplete compare when GitLab reports %s", async (_label, body) => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(JSON.stringify(body));
+    await expect(new GitLabAdapter(execGlab).getCompareDiff(locator(customPortRepo), fromSha, toSha))
+      .rejects.toThrow(/incomplete|timeout|collapsed|too large/i);
+  });
+
   it("rejects ambient and GitHub repository locators before invoking glab", async () => {
     const execGlab = vi.fn<ExecGlab>();
     const adapter = new GitLabAdapter(execGlab);

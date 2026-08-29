@@ -500,6 +500,7 @@ function postedInlineIdentity(commentId: string) {
 function silentReviewVcs(options: {
   readonly failNextInline?: "throw" | "accept-then-fail" | null;
   readonly compareDiff?: string;
+  readonly headSha?: () => string;
 } = {}) {
   let stored: BotComment | null = null;
   const postedInlines: Array<{ clientId: string; path: string; line: number; body: string }> = [];
@@ -547,7 +548,7 @@ function silentReviewVcs(options: {
     getPullRequest: vi.fn(async () => ({
       id: "1",
       reviewId: "PR_1",
-      headSha: "c".repeat(40),
+      headSha: options.headSha?.() ?? "c".repeat(40),
       baseSha: "b".repeat(40),
       title: "Review",
       description: "",
@@ -822,7 +823,10 @@ function executionDeps(adapter: ExecutionAdapter, extras: {
   readonly publicationHooks?: PublicationExecutorHooks;
 } = {}) {
   const heads = extras.heads === undefined ? undefined : [...extras.heads];
-  const vcs = extras.vcs ?? silentReviewVcs({ compareDiff: extras.compareDiff });
+  const vcs = extras.vcs ?? silentReviewVcs({
+    compareDiff: extras.compareDiff,
+    headSha: () => adapter.headSha,
+  });
   return {
     conversationAdapter: adapter,
     createSession: extras.createSession ?? sessionFor(JSON.stringify({ explanation: "The logger prints user.token." })),
@@ -2089,14 +2093,33 @@ describe("automatic verification", () => {
   ].join("\n");
   // The finding is anchored at src/auth.ts:14. In the full PR diff that line
   // is hunk CONTEXT (the original addition is line 13). A later push that
-  // actually touches the finding must add line 14 in the INCREMENTAL compare,
-  // which is how we prove we did not reuse the pull request's full diff.
+  // actually touches the finding must change origin-side line 14 in the
+  // INCREMENTAL compare, which is how we prove we did not reuse the pull
+  // request's full diff.
   const touchingCompareDiff = [
     "diff --git a/src/auth.ts b/src/auth.ts",
     "--- a/src/auth.ts",
     "+++ b/src/auth.ts",
-    "@@ -13,0 +14,1 @@",
-    "+  console.log(user.token);",
+    "@@ -14,1 +14,1 @@",
+    "-  console.log(user.token);",
+    "+  console.log(\"[redacted]\");",
+  ].join("\n");
+  const deletingCompareDiff = [
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -14,1 +13,0 @@",
+    "-  console.log(user.token);",
+  ].join("\n");
+  const shiftedReplacementDiff = [
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -9,0 +10,1 @@",
+    "+inserted",
+    "@@ -14,1 +15,1 @@",
+    "-  console.log(user.token);",
+    "+  console.log(\"[redacted]\");",
   ].join("\n");
 
   it("verifies a silent push that touches the anchored line and leaves a human thread unresolved", async () => {
@@ -2161,6 +2184,84 @@ describe("automatic verification", () => {
     expect(adapter.resolvedThreadIds).toEqual([]);
     await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
       .resolves.toEqual([]);
+  });
+
+  it("verifies a silent push that deletes the anchored line", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session, compareDiff: deletingCompareDiff }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+  });
+
+  it("verifies a silent push that inserts above the anchor and then replaces it", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session, compareDiff: shiftedReplacementDiff }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+  });
+
+  it("does not re-compare a head that already produced no touch", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    const deps = executionDeps(adapter, { compareDiff: unrelatedCompareDiff });
+    const compare = deps.vcs.adapter.getCompareDiff;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(compare).toHaveBeenCalled();
+    const first = compare.mock.calls.length;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(compare.mock.calls.length).toBe(first);
+  });
+
+  it("does not fetch the pull-request diff on an idle poll of a scanned head", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    const deps = executionDeps(adapter, { compareDiff: unrelatedCompareDiff });
+    const { getReviewMetadata, ...withoutMetadata } = deps;
+    void getReviewMetadata;
+    const vcs = deps.vcs.adapter;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), withoutMetadata)).resolves.toBe(0);
+    expect(vcs.getCompareDiff).toHaveBeenCalled();
+    expect(vcs.getDiff).not.toHaveBeenCalled();
+    const pulls = vcs.getPullRequest.mock.calls.length;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), withoutMetadata)).resolves.toBe(0);
+    expect(vcs.getDiff).not.toHaveBeenCalled();
+    expect(vcs.getCompareDiff.mock.calls.length).toBe(1);
+    expect(vcs.getPullRequest.mock.calls.length).toBeGreaterThan(pulls);
   });
 
   it("verifies once when a human replies, without being asked", async () => {
