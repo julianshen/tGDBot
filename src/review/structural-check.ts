@@ -607,6 +607,34 @@ function reachesAReader(finding: Finding): boolean {
 }
 
 /**
+ * Whether this finding carries a claim the production check could actually
+ * answer (issue #80).
+ *
+ * Exported so the CLI can decide whether preparing the base worktree — the
+ * feature's largest single cost, a full clone on a cold workspace — is worth
+ * anything at all, WITHOUT duplicating the eligibility rules there. "Has a
+ * claim" is much weaker than "can be checked": a claim on a Go file, or one
+ * whose finding is `addressed`/`needs-clarification`/suppressed, resolves to
+ * nothing, and the clone would buy nothing.
+ *
+ * The language half mirrors the refusal at the top of `checkStructuralClaim`
+ * — same map, same predicate, one definition. It is deliberately NOT applied
+ * by `runStructuralChecks`' own filter: an injected check (a test seam) may
+ * support more languages, and filtering those would change what injected
+ * tests see; in production the same refusal fires inside the real check
+ * anyway, so the prediction here is exact for the code that runs.
+ */
+export function hasCheckableClaim(
+  finding: Finding,
+  isSuppressed?: (finding: Finding) => boolean,
+): boolean {
+  return finding.claim !== undefined
+    && reachesAReader(finding)
+    && !(isSuppressed?.(finding) ?? false)
+    && LANG_BY_EXTENSION.has(path.extname(finding.file).toLowerCase());
+}
+
+/**
  * Matches `symbol` as a whole JavaScript identifier.
  *
  * NOT `\b`, which is wrong here in two directions and was (Codex review,
