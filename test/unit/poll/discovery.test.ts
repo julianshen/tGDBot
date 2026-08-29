@@ -9,6 +9,7 @@ import {
 } from "../../../src/conversation/state-store.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
+import type { RepositoryRef } from "../../../src/target/types.js";
 import type {
   ConversationAdapter,
   OpenReviewPage,
@@ -169,6 +170,10 @@ class FakeConversationAdapter implements ConversationAdapter {
 
   async getAuthenticatedBotIdentity() {
     return bot;
+  }
+
+  async resolveReviewIdentity(_repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
+    return identity(reviewNumber);
   }
 
   async listOpenReviews(

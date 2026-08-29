@@ -4,8 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { withRepositoryLock } from "../../../src/workspace/lock.js";
 
+type FsOpen = typeof import("node:fs/promises").open;
+
 const mockedFs = vi.hoisted(() => ({
-  open: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
+  open: undefined as undefined | ((...args: Parameters<FsOpen>) => Promise<unknown>),
   rename: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
   unlink: undefined as undefined | ((...args: unknown[]) => Promise<unknown>),
 }));
@@ -15,7 +17,7 @@ vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return {
     ...actual,
-    open: (...args: unknown[]) => mockedFs.open === undefined ? actual.open(...args as Parameters<typeof actual.open>) : mockedFs.open(...args),
+    open: (...args: Parameters<typeof actual.open>) => mockedFs.open === undefined ? actual.open(...args) : mockedFs.open(...args),
     rename: (...args: unknown[]) => mockedFs.rename === undefined ? actual.rename(...args as Parameters<typeof actual.rename>) : mockedFs.rename(...args),
     unlink: (...args: unknown[]) => mockedFs.unlink === undefined ? actual.unlink(...args as Parameters<typeof actual.unlink>) : mockedFs.unlink(...args),
   };
@@ -108,7 +110,7 @@ describe("withRepositoryLock", () => {
     const work = vi.fn(async () => "must not run");
     const firstContention = deferred();
     const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
-    mockedFs.open = async (...args) => {
+    mockedFs.open = async (...args: Parameters<typeof realOpen>) => {
       try {
         return await realOpen(...args);
       } catch (error) {
@@ -288,7 +290,7 @@ describe("withRepositoryLock", () => {
   it("releases its lock when closing after metadata creation fails", async () => {
     const lockPath = await tempLockPath();
     const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
-    mockedFs.open = async (...args) => {
+    mockedFs.open = async (...args: Parameters<typeof realOpen>) => {
       const handle = await realOpen(...args);
       return Object.assign(Object.create(handle), {
         close: async () => {
@@ -316,7 +318,7 @@ describe("withRepositoryLock", () => {
       throw writeFailure;
     });
     const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
-    mockedFs.open = async (...args) => {
+    mockedFs.open = async (...args: Parameters<typeof realOpen>) => {
       const handle = await realOpen(...args);
       return Object.assign(Object.create(handle), {
         close: async () => {
@@ -426,7 +428,7 @@ describe("withRepositoryLock", () => {
     const lockPath = await tempLockPath();
     const identityFailure = new Error("fstat failed");
     const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
-    mockedFs.open = async (...args) => {
+    mockedFs.open = async (...args: Parameters<typeof realOpen>) => {
       const handle = await realOpen(...args);
       return Object.assign(Object.create(handle), {
         stat: async () => { throw identityFailure; },
@@ -445,7 +447,7 @@ describe("withRepositoryLock", () => {
     const lockPath = await tempLockPath();
     const closeFailure = new Error("close failed");
     const realOpen = (await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises")).open;
-    mockedFs.open = async (...args) => {
+    mockedFs.open = async (...args: Parameters<typeof realOpen>) => {
       const handle = await realOpen(...args);
       return Object.assign(Object.create(handle), {
         close: async () => {

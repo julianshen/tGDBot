@@ -80,25 +80,57 @@ function selectedId(findings: readonly Finding[], extras: Partial<typeof BINDING
   return selected.selected.id;
 }
 
+type GeneralCommentEvent = Extract<ReviewActivityEvent, { kind: "general-comment" }>;
+type ThreadCommentEvent = Extract<ReviewActivityEvent, { kind: "thread-comment" }>;
+
 function commentEvent(
-  extras: Partial<ReviewActivityEvent> & Pick<ReviewActivityEvent, "eventId" | "body">,
+  extras: Partial<ThreadCommentEvent> & Pick<ThreadCommentEvent, "eventId" | "body" | "threadId"> & {
+    kind: "thread-comment";
+  },
+): ThreadCommentEvent;
+function commentEvent(
+  extras: Partial<GeneralCommentEvent> & Pick<GeneralCommentEvent, "eventId" | "body">,
+): GeneralCommentEvent;
+function commentEvent(
+  extras:
+    | (Partial<GeneralCommentEvent> & Pick<GeneralCommentEvent, "eventId" | "body">)
+    | (Partial<ThreadCommentEvent> & Pick<ThreadCommentEvent, "eventId" | "body" | "threadId"> & {
+      kind: "thread-comment";
+    }),
 ): ReviewActivityEvent {
-  return {
-    kind: extras.kind ?? "general-comment",
-    provider: "github",
+  const eventId = extras.eventId;
+  const body = extras.body;
+  const shared = {
+    provider: "github" as const,
     repositoryDigest: extras.repositoryDigest ?? publicDigest,
     reviewNumber: extras.reviewNumber ?? 7,
-    eventId: extras.eventId,
-    revisionId: extras.revisionId ?? `${extras.eventId}:1`,
-    orderKey: extras.orderKey ?? `2026-08-14T00:00:00.000Z|${extras.eventId}`,
+    revisionId: extras.revisionId ?? `${eventId}:1`,
+    orderKey: extras.orderKey ?? `2026-08-14T00:00:00.000Z|${eventId}`,
     authorLogin: extras.authorLogin ?? "alice",
     authorIsBot: extras.authorIsBot ?? false,
     createdAt: extras.createdAt ?? "2026-08-14T00:00:00.000Z",
     updatedAt: extras.updatedAt ?? "2026-08-14T00:00:00.000Z",
-    body: extras.body,
-    url: extras.url ?? `https://github.com/acme/app/pull/7#issuecomment-${extras.eventId}`,
-    commentId: extras.commentId ?? extras.eventId,
+    url: extras.url ?? `https://github.com/acme/app/pull/7#issuecomment-${eventId}`,
+    commentId: extras.commentId ?? eventId,
+  };
+  if (extras.kind === "thread-comment") {
+    return {
+      ...shared,
+      ...extras,
+      kind: "thread-comment" as const,
+      eventId,
+      body,
+      commentId: extras.commentId ?? eventId,
+      threadId: extras.threadId,
+    };
+  }
+  return {
+    ...shared,
     ...extras,
+    kind: "general-comment" as const,
+    eventId,
+    body,
+    commentId: extras.commentId ?? eventId,
   };
 }
 
@@ -731,8 +763,10 @@ describe("effort survives persistence", () => {
     const pending = { version: 1, repository, clarifications: [prepared], directions: [] };
 
     const validated = validatePendingSnapshot(pending, repository);
-
-    expect(validated.clarifications[0]?.finding.effort).toBe("heavy");
+    const clarification = validated.clarifications[0];
+    expect(clarification).toBeDefined();
+    if (clarification === undefined) throw new Error("expected clarification");
+    expect(clarification.finding?.effort).toBe("heavy");
   });
 
   // Unlike reviewer OUTPUT — where an unrecognized value is dropped so the
@@ -785,7 +819,10 @@ describe("persisted suggestions keep their indentation", () => {
   it("round-trips an indented suggestion", () => {
     const suggestion = "\tif stale(entry) {\n\t\treturn revalidate(ctx)\n\t}";
 
-    expect(persist({ suggestion })().clarifications[0]?.finding.suggestion).toBe(suggestion);
+    const clarification = persist({ suggestion })().clarifications[0];
+    expect(clarification).toBeDefined();
+    if (clarification === undefined) throw new Error("expected clarification");
+    expect(clarification.finding?.suggestion).toBe(suggestion);
   });
 
   // The scope of the change: everything else still has to be trimmed, or an

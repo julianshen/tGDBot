@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { ConcurrentGitHubMutationError, GitHubAdapter } from "../../../src/vcs/github-adapter.js";
+import { ConcurrentGitHubMutationError, GitHubAdapter, type ExecGh } from "../../../src/vcs/github-adapter.js";
+import type { ReviewEventCursor } from "../../../src/vcs/conversation-adapter.js";
 import { INLINE_COMMENT_MARKER } from "../../../src/review/comment-format.js";
 import {
   validateInlinePublishOutcomes,
@@ -1271,7 +1272,7 @@ describe("GitHub conversation activity", () => {
     const open = { ...template, id: 1, node_id: "PR_1", number: 1, html_url: `${repo.canonicalUrl}/pull/1` };
     const closed = { ...template, id: 2, node_id: "PR_2", number: 2, state: "closed", html_url: `${repo.canonicalUrl}/pull/2` };
     let completeScans = 0;
-    const execGh = vi.fn(async () => {
+    const execGh = vi.fn<ExecGh>(async () => {
       completeScans += 1;
       if (completeScans === 1) return JSON.stringify([open]);
       return JSON.stringify([open, closed]);
@@ -1373,7 +1374,7 @@ describe("GitHub conversation activity", () => {
     const boundary = { at: "2027-01-01T00:00:00.000Z", seen: [] as string[] };
     const cursor = { scope: "review-events" as const, provider: "github" as const, repositoryDigest, reviewNumber: 42, opaque: JSON.stringify(boundary), orderKey: boundary.at };
     let token: import("../../../src/vcs/conversation-adapter.js").ReviewEventPageToken | undefined;
-    let last = cursor;
+    let last: ReviewEventCursor = cursor;
     do {
       const page = await new GitHubAdapter(execGh, repo).listReviewEvents(review, cursor, token);
       expect(page.events).toHaveLength(0);

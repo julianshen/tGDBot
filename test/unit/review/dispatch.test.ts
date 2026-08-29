@@ -13,7 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RuleDefinition } from "../../../src/rules/types.js";
+import type { EffectiveRule, RuleDefinition } from "../../../src/rules/types.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 
 const hoisted = vi.hoisted(() => {
@@ -57,7 +57,7 @@ const hoisted = vi.hoisted(() => {
   // hasConfiguredAuth is THE credential gate (review: getModel() is a pure name
   // lookup with no auth check). Takes a provider id. Default true; tests flip
   // it to prove an un-credentialed model is never handed to the session.
-  const hasConfiguredAuthMock = vi.fn(() => true);
+  const hasConfiguredAuthMock = vi.fn((_provider: string) => true);
   // Design-review #6: resolveEffectiveRules falls back to the runtime's
   // auth-aware getAvailableSnapshot() when no --model/settings default
   // resolves for UNPINNED rules. Default empty (no credentialed provider);
@@ -126,15 +126,20 @@ import {
 } from "../../../src/review/dispatch-results.js";
 import { renderInlineComment } from "../../../src/review/comment-format.js";
 
-function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
+function makeRule(
+  overrides: Partial<Omit<EffectiveRule, "provider" | "model">> & {
+    provider?: string;
+    model?: string;
+  } = {},
+): EffectiveRule {
   return {
     name: "rule-a",
-    provider: "anthropic",
-    model: "claude-opus-4-5",
     dependsOn: [],
     body: "Check for bugs.",
     sourcePath: "/rules/rule-a.md",
     ...overrides,
+    provider: overrides.provider ?? "anthropic",
+    model: overrides.model ?? "claude-opus-4-5",
   };
 }
 
@@ -1218,15 +1223,15 @@ describe("issue #1: credential-free agent dir is diagnosable", () => {
   }
 
   function warnings(spy: ReturnType<typeof vi.spyOn>): string {
-    return spy.mock.calls.map((c) => String(c[0])).join("\n");
+    return spy.mock.calls.map((c: readonly unknown[]) => String(c[0])).join("\n");
   }
 
   // The pi auth error is itself MULTI-LINE, so the appended hint lands after a
   // newline — inspect each console.warn call whole rather than splitting.
   function promptWarn(spy: ReturnType<typeof vi.spyOn>): string | undefined {
     return spy.mock.calls
-      .map((c) => String(c[0]))
-      .find((m) => m.includes("session.prompt() threw"));
+      .map((c: readonly unknown[]) => String(c[0]))
+      .find((m: string) => m.includes("session.prompt() threw"));
   }
 
   // (a) The SDK signal we used to throw away. This is the EARLY diagnosis —
@@ -1427,7 +1432,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
     return args?.model;
   }
   const warnings = (spy: ReturnType<typeof vi.spyOn>): string =>
-    spy.mock.calls.map((c) => String(c[0])).join("\n");
+    spy.mock.calls.map((c: readonly unknown[]) => String(c[0])).join("\n");
 
   // Healthy machines must keep the model they already had. Rule models are
   // chosen for their RULE's job (someone may pin a cheap model to a style rule);
@@ -1448,7 +1453,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
   it("falls through to the RULES when pi's settings default has no credentials (the cron-box bug)", async () => {
     AGENT_DIR_WITH_DEFAULT("openai-codex/gpt-5.6-luna"); // the cron box's broken default
     okSession();
-    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string) => provider === "xai");
+    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string): boolean => provider === "xai");
     const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
 
     const result = await dispatchRules(rules, "diff", false);
@@ -1464,7 +1469,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
     AGENT_DIR_WITH_DEFAULT(undefined); // no settings default
     okSession();
     hoisted.hasConfiguredAuthMock.mockImplementation(
-      (provider: string) => provider === "anthropic",
+      (provider: string): boolean => provider === "anthropic",
     );
     const rules = [
       makeRule({ name: "rule-a", provider: "openai-codex", model: "gpt-5.6-terra" }), // no key here
@@ -1508,7 +1513,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
   it("an unusable --model warns and falls through to the other candidates (never straight to the ambient default)", async () => {
     AGENT_DIR_WITH_DEFAULT(undefined);
     okSession();
-    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string) => provider === "xai");
+    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string): boolean => provider === "xai");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const rules = [makeRule({ name: "rule-a", provider: "xai", model: "grok-4.5" })];
 
@@ -1549,7 +1554,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
   it("dedupes candidates, so a rejected model is reported once, not once per duplicate", async () => {
     AGENT_DIR_WITH_DEFAULT("anthropic/claude-opus-4-5"); // settings default == --model below
     okSession();
-    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string) => provider === "xai");
+    hoisted.hasConfiguredAuthMock.mockImplementation((provider: string): boolean => provider === "xai");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await dispatchRules(
@@ -1561,8 +1566,8 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
     );
 
     const hits = warn.mock.calls
-      .map((c) => String(c[0]))
-      .filter((m) => m.includes("has no configured credentials"));
+      .map((c: readonly unknown[]) => String(c[0]))
+      .filter((m: string) => m.includes("has no configured credentials"));
     expect(hits).toHaveLength(1); // exactly once, despite the duplicate
     expect(chosen()).toMatchObject({ provider: "xai", id: "grok-4.5" }); // still falls through
     warn.mockRestore();
@@ -1574,7 +1579,7 @@ describe("issue #1 (round 2): orchestrator model — explicit → settings → r
     AGENT_DIR_WITH_DEFAULT(undefined);
     okSession();
     hoisted.hasConfiguredAuthMock.mockImplementation(
-      (provider: string) => provider === "anthropic",
+      (provider: string): boolean => provider === "anthropic",
     );
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -2624,7 +2629,7 @@ describe("the citation limit is the one the reader sees", () => {
     const kept = findings[0]?.references ?? [];
     expect(kept.length).toBe(MAX_REFERENCES_PER_FINDING);
     // Every kept citation is printed: nothing is dropped at the last step.
-    const body = renderInlineComment(findings[0]!, "abc1234", { suggestions: false });
+    const body = renderInlineComment(findings[0]!, { suggestions: false });
     for (const url of kept) expect(body).toContain(url);
   });
 });
