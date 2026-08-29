@@ -4,6 +4,7 @@
 // per-task results, suggestion provenance (ADR-007), and failure
 // classification. Split out of dispatch.ts (design-review #8) — pure and
 // synchronous, no SDK, no I/O beyond console.warn.
+import { parseStructuralClaim } from "./structural-check.js";
 import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 
@@ -229,6 +230,11 @@ export function normalizeUnknownFinding(
     )].slice(0, MAX_REFERENCES_PER_FINDING);
     if (cited.length > 0) finding.references = cited;
   }
+  // Issue #75. Strict: an unknown kind or a symbol that is not
+  // identifier-shaped yields nothing, because the host would otherwise run a
+  // search whose "no references" answer was meaningless.
+  const claim = parseStructuralClaim(candidate.claim);
+  if (claim !== undefined) finding.claim = claim;
   const suggestion = stateSafeSuggestion(candidate.suggestion);
   if (suggestion !== undefined) finding.suggestion = suggestion;
   if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;

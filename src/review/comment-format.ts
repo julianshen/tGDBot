@@ -7,6 +7,7 @@
 //      failed-rule reasons, and any finding that could NOT be anchored.
 //
 // Both are plain string builders: pure, synchronous, no I/O.
+import { describeCheck, describeCheckCompact } from "./structural-check.js";
 import { crossFileGroups } from "./finding-clusters.js";
 import type { Finding } from "./types.js";
 import type { HunkSnippet } from "./diff-anchors.js";
@@ -343,6 +344,13 @@ export function renderInlineComment(
     parts.push("", renderSuggestionBlock(suggestion, options.suggestions !== false));
   }
 
+  // Issue #75. Rendered as a blockquote, immediately under the finding it
+  // qualifies, and worded so the HOST is the subject of every sentence: this is
+  // the one line in a finding a reader is invited to trust without re-deriving
+  // it, so it must be unmistakably not the reviewer talking about itself.
+  const hostCheck = renderHostCheck(finding);
+  if (hostCheck) parts.push("", hostCheck);
+
   const citations = emitsReferences(finding) ? renderReferences(finding) : undefined;
   if (citations) parts.push("", citations);
   if (options.alsoReported && options.alsoReported.length > 0) {
@@ -659,6 +667,20 @@ export function emitsReferences(finding: Finding): boolean {
   return finding.references !== undefined && finding.references.length > 0;
 }
 
+/**
+ * The host's answer to a claim the reviewer made, or nothing.
+ *
+ * `describeCheck` owns the wording — in particular that a clean result says
+ * what was searched rather than "there are no callers". Sanitized like every
+ * other interpolated value: the symbol reaches here from reviewer output, and
+ * although `parseStructuralClaim` already constrains it to an identifier, the
+ * escape is a property of the container rather than of the source.
+ */
+function renderHostCheck(finding: Finding): string | undefined {
+  if (finding.claim === undefined || finding.hostCheck === undefined) return undefined;
+  return `> ${describeCheck(finding.claim, finding.hostCheck, sanitizeInline)}`;
+}
+
 function renderReferences(finding: Finding): string | undefined {
   if (!finding.references || finding.references.length === 0) return undefined;
   const items = finding.references
@@ -707,6 +729,27 @@ function compactReferenceBullets(finding: Finding, indent: string): string[] {
   return shown === undefined ? [] : [`${indent}- Reference: ${sanitizeInline(shown)}`];
 }
 
+/**
+ * The host's answer to a claim, as an indented bullet for a list-shaped section.
+ *
+ * This is the SIXTH rendering path to need it (Codex review, round 5 — the
+ * disputed section). Each earlier fix patched the site that had been named, and
+ * a new one surfaced next round; enumerating them is evidently not how this
+ * converges. So it is a shared helper rather than a sixth inline copy: a
+ * bulleted section that renders a finding gets the check by calling one
+ * function, and the wording cannot drift between them.
+ *
+ * Empty unless BOTH halves are present. A claim without the host's answer
+ * renders nothing at all — publishing the reviewer's raw assertion beside
+ * host-authored prose is the confusion the reviewer/host split exists to avoid.
+ */
+function hostCheckBullets(finding: Finding, indent: string, compact: boolean): string[] {
+  if (finding.claim === undefined || finding.hostCheck === undefined) return [];
+  return [`${indent}- ${compact
+    ? describeCheckCompact(finding.hostCheck, sanitizeInline)
+    : describeCheck(finding.claim, finding.hostCheck, sanitizeInline)}`];
+}
+
 function referenceBullets(finding: Finding, indent: string): string[] {
   if (!finding.references || finding.references.length === 0) return [];
   return finding.references
@@ -724,9 +767,14 @@ function renderAlsoReported(members: readonly Finding[]): string {
     // and a one-click commit should never rest on one.
     const suggestion = member.suggestion?.trim() ? capSuggestion(member.suggestion) : undefined;
     const cited = referenceBullets(member, "  ");
+    // A merged member's own structural claim keeps its own answer. Rendering
+    // the representative's check alone published every other member's
+    // assertion unqualified — the same defect as the relocated path, one level
+    // down (Codex review, round 2).
+    const check = hostCheckBullets(member, "  ", true);
     return suggestion === undefined
-      ? [line, ...cited]
-      : [line, ...cited, "", renderSuggestionBlock(suggestion, false), ""];
+      ? [line, ...check, ...cited]
+      : [line, ...check, ...cited, "", renderSuggestionBlock(suggestion, false), ""];
   });
   return detailsBlock(
     `Also reported by ${members.length} other rule${members.length === 1 ? "" : "s"}`,
@@ -773,6 +821,15 @@ function renderUnanchoredFinding(
         : "> Proposed fix omitted because the summary size budget was exhausted.",
     );
   }
+  // Issue #75, review round 1: a finding without a commentable line is
+  // RELOCATED here rather than posted inline, and rendering the check only in
+  // the inline path silently dropped it — publishing the reviewer's claim with
+  // the host's answer to it removed. A contradiction that goes missing is the
+  // worst version of that: the reader sees an unchallenged assertion the host
+  // had already disproved.
+  const hostCheck = renderHostCheck(finding);
+  if (hostCheck) parts.push("", hostCheck);
+
   const references = renderReferences(finding);
   if (references) parts.push("", references);
   if (context?.alsoReported && context.alsoReported.length > 0) {
@@ -944,9 +1001,13 @@ function renderDisputedSection(input: SummaryInput, compact = false): string | u
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
     const message = sanitizeText(finding.message);
-    // A disputed finding is precisely the one whose evidence a reader needs.
+    // A disputed finding is precisely the one whose evidence a reader needs —
+    // which is why the host check belongs here most of all. A finding the
+    // reviewer itself marked disputed, published with the host's answer to its
+    // structural claim removed, leaves the reader the weakest version of both.
     return [
       `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`,
+      ...hostCheckBullets(finding, "  ", compact),
       ...(compact
         ? compactReferenceBullets(finding, "  ")
         : referenceBullets(finding, "  ")),
@@ -1123,10 +1184,19 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     // declared missing in the notice above rather than quietly discarded.
     const citation = compactShownReference(finding);
     const reference = citation === undefined ? "" : `\n  - Reference: ${sanitizeInline(citation)}`;
+    // Compact mode is a SIZE fallback, not a TRUTH fallback. A claimed finding
+    // whose check went missing here would publish an unqualified assertion on
+    // exactly the large reviews where a reader has least context — the same
+    // reasoning that keeps the first citation and the publication reason. It
+    // rides in the prefix, so it is charged against the fixed budget and
+    // shrinks the message allowance rather than overflowing the limit.
+    const check = finding.claim !== undefined && finding.hostCheck !== undefined
+      ? `\n  - ${describeCheckCompact(finding.hostCheck, sanitizeInline)}`
+      : "";
     return {
       prefix: `- ${SEVERITY_BADGE[finding.severity]}${effort}${group} \`${loc}\` (\`${rule}\`): `,
       message,
-      reference,
+      reference: `${check}${reference}`,
     };
   });
   const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]

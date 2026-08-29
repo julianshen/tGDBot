@@ -373,6 +373,16 @@ tgd-review-agent review \
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
+  --structural-checks on|off     # default: OFF. Checks a finding's structural claim against the
+                                  # BASE branch and publishes the host result beside it. Results are
+                                  # unresolved LEXICAL matches, not resolved references: ast-grep
+                                  # has no symbol resolution, so a same-named member of an unrelated
+                                  # type is indistinguishable from a real caller. Only claims a rule
+                                  # explicitly makes ("this symbol is referenced nowhere else") are
+                                  # checked; nothing is inferred from prose. TypeScript, TSX and
+                                  # JavaScript only. Needs a base worktree, so the first run on a
+                                  # cold workspace pays for a clone; it shares that workspace with
+                                  # --context, so a repository is mirrored once.
   --dependency-facts on|off      # default: OFF. The only outbound request this tool makes: when a
                                   # pull request changes a package.json, the host asks
                                   # registry.npmjs.org about each changed package and puts the
@@ -565,6 +575,74 @@ map can drop whole evidence entries and report the omission counts while a list
 of dependency facts cannot be cut mid-claim. The repository map keeps a floor of
 4000 characters, so a very large dependency section is the one case where the
 combined text exceeds the ceiling.
+
+### Checking a finding's structural claim
+
+The confident false positive this exists for is *"this function is never
+called"* — written about code the reviewer cannot see, because the only caller
+sits outside the diff. The context pack above helps the reviewer reason; it
+does not check the reviewer afterwards.
+
+With `--structural-checks on`, a rule may attach a claim to a finding, and the
+host answers it by parsing the base branch with
+[ast-grep](https://ast-grep.github.io/) in-process:
+
+```text
+- `src/retry.ts:41` — budget() is never called outside tests
+  > Host check: the name `budget` occurs 2 time(s) outside this file, across
+  > 214 file(s) of the base branch — `src/http.ts:88`, `src/queue.ts:12`. These
+  > are LEXICAL matches: the host did not resolve whether they refer to this
+  > `budget`. Worth checking before relying on the claim above.
+```
+
+**It reports occurrences, and nothing else.** Two halves of the obvious feature
+are deliberately missing, and both absences are the point.
+
+There is no "clean" verdict. "No reference exists" is an assertion of *absence*,
+and absence is only sound with total coverage — which is unreachable: dynamic
+references, reflection, generated code, other repositories and every language
+outside the supported set are permanently invisible. An occurrence is the
+opposite: the host parsed a file and found the name, and no gap elsewhere makes
+that untrue. So the check keeps the half that is robust and drops the half that
+cannot be.
+
+And it never calls an occurrence a *reference*. ast-grep matches syntax, not
+meaning: it has no symbol resolution, so `wallet.budget()` on an unrelated class
+and `{ budget: 1 }` in a config object are indistinguishable from a real caller.
+Reporting either as a resolved contradiction would manufacture exactly the
+confident false fact this whole design exists to prevent. The wording therefore
+says what was actually established — this name occurs here — and leaves the
+identity question to the reader, who can answer it in one click. Real resolution
+needs a type checker, which is a much larger dependency than a parser.
+
+Four properties worth knowing, because they are what make it trustworthy:
+
+- **The claim is the reviewer's; the check is the host's.** A reviewer cannot
+  fabricate a check result — findings are rebuilt field by field from an
+  allowlist, so a forged one is dropped like any other unknown key.
+- **A host check never suppresses the finding.** Both are published and a
+  human weighs them. Silently dropping a finding because a mechanical check
+  disagreed would trade one confident wrong answer for another.
+- **Where it found nothing it says what it covered**, never "there is nothing".
+- **It reads only the base branch**, never a PR checkout — the same rule
+  mapping follows, for the same reason. When the pull request renames the file a
+  claim is about, the base-side path is passed too, so the symbol's own
+  declaration is not mistaken for a reference from somewhere else.
+- **The base/head gap is reconciled rather than ignored.** The search reads the
+  base commit while the finding is about the head, so a pull request that
+  deletes the last caller is *right* to call the symbol unused even though the
+  base still contains that caller. An occurrence is dropped when the diff removes
+  *the line it sits on* — base line numbers and the diff's old-side numbers are
+  the same coordinates — so a file that loses one call site and keeps another
+  keeps the second, and editing the claimed function's own body discards nothing
+  elsewhere. Where a hunk header cannot be parsed the positions are not
+  trustworthy, and it falls back to the whole file: over-suppressing beats
+  accusing a line the pull request already deleted.
+
+Nothing is inferred from prose: "never called", "no other caller" and "nothing
+else implements this" are one claim in three phrasings, and a matcher over them
+would both miss real claims and invent ones that were never made. A rule opts
+in per finding or not at all.
 
 `--dry-run` prepares context exactly as a real run would, so the preview it
 prints is the review you would actually get. That means a dry run on a cold

@@ -70,7 +70,7 @@ the whole review unusable.
   be `]`.
 - Each element is one finding, in exactly this shape:
 
-  `{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null }`
+  `{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "claim": { "kind": "no-other-references", "symbol": string } | null }`
 
   - `file`: the repo-relative path the finding is about (must be a real path
     from the diff/files you inspected — never null, never a placeholder).

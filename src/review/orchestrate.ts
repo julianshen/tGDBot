@@ -96,7 +96,7 @@ function normalizeMessage(message: string): string {
 // appear in a file path or message) and, unlike a NUL-byte-delimited
 // string, keeps this file plain text -- a NUL byte anywhere in the file can
 // make diff tooling and review UIs treat the whole file as binary.
-function dedupeKey(finding: Finding): string {
+export function dedupeKey(finding: Finding): string {
   return JSON.stringify([finding.file, finding.line ?? null, normalizeMessage(finding.message)]);
 }
 

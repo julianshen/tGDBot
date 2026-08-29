@@ -28,7 +28,8 @@ const FINDING_SHAPE = `{
   "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification",
   "question": string | null,
   "effort": "quick" | "heavy" | null,
-  "references": string[] | null
+  "references": string[] | null,
+  "claim": { "kind": "no-other-references", "symbol": string } | null
 }`;
 
 const FINDING_FIELD_NOTES = `- "title": a SHORT one-line headline for the finding (<= 80 chars, no newlines),
@@ -77,6 +78,18 @@ const FINDING_FIELD_NOTES = `- "title": a SHORT one-line headline for the findin
       a contiguous line range (design changes, "add a test elsewhere", etc.).
 - "endLine": the last line the suggestion replaces (inclusive). Omit/null when
   the suggestion replaces only "line", or when there is no suggestion.
+- "claim": set this ONLY when your finding depends on the assertion that a
+  symbol is not referenced anywhere else — "this function is never called",
+  "this is the only caller", "nothing else uses this". Give the bare symbol
+  name in "symbol" (an identifier: no dots, spaces or parentheses).
+  The host will then search the base branch for that symbol and publish what it
+  found next to your finding, INCLUDING when it contradicts you. So:
+    * Set it when you mean it. A claim the host confirms is stronger evidence
+      than the same sentence unchecked.
+    * Do not set it to make a finding look verified. You are pointing a check
+      at yourself, and a contradiction is published.
+    * Leave it null for every finding that does not rest on that assertion —
+      which is most of them. It is not a general "check my work" field.
 - "decision": optional. Omit it (or use "new") for a fresh finding. Use
   "still-valid" when prior discussion still applies, "addressed" when the
   concern is fixed, "disputed" when discussion exists but the violation remains,
@@ -340,7 +353,7 @@ export function buildDispatchPrompt(
 
   parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
-    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
+    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "claim": { "kind": "no-other-references", "symbol": string } | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
     // ADR-007/ADR-008: the orchestrator MERGES the subagents' findings and re-emits
     // them, so every field it is not told to keep is silently dropped at this last
     // hop. That is exactly what happened on the first live run: the reviewers were
@@ -349,7 +362,7 @@ export function buildDispatchPrompt(
     // Copy them through VERBATIM; never rewrite a suggestion (it is literal code
     // destined for the file, and a paraphrase would commit something the reviewer
     // never proposed).
-    `Copy each finding's "title", "message", "suggestion", "endLine", "decision", "question", "effort" and "references" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
+    `Copy each finding's "title", "message", "suggestion", "endLine", "decision", "question", "effort", "references" and "claim" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
     // Attribution fix (see order-mapping note above): the old wording defined
     // rulesFailed as tasks that "produced no usable output", which the
     // orchestrator wrongly applied to a task that RAN and returned an empty or

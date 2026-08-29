@@ -213,6 +213,224 @@ export function changedFilesWithRenameSources(diff: string): string[] {
   return collectChangedPaths(diff, (header) => [header.b, header.a]);
 }
 
+/**
+ * Head path -> base path, for the files this diff renames.
+ *
+ * Anything that compares a finding's file against the BASE tree needs this: the
+ * finding names the head path, and the base holds the same code under the old
+ * one. Only genuine renames are included — an unchanged path maps to itself and
+ * is left out, so the map is empty for the common case.
+ */
+export function renameSourcesByHeadPath(diff: string): Map<string, string> {
+  const renames = new Map<string, string>();
+  let pending: { readonly a: string; readonly b: string } | undefined;
+  let from: string | undefined;
+
+  for (const line of diff.split("\n")) {
+    const header = parseDiffGitHeader(line);
+    if (header !== undefined) {
+      pending = header.a && header.b && header.a !== header.b ? header : undefined;
+      from = undefined;
+      continue;
+    }
+    if (pending === undefined) continue;
+
+    // Differing paths are NOT enough. A COPY diff also has two paths, and
+    // treating the source as "this file at the base commit" excludes the
+    // original — still present, still referencing the symbol — from external
+    // matches, hiding the clearest evidence against a "no other references"
+    // claim (Codex review, round 8). Only `rename from`/`rename to` means the
+    // base tree holds this same file under the other name.
+    //
+    // Safe on the oversized-diff path too: `reconstructDiffFromFiles` emits
+    // `rename`/`copy` metadata from GitHub's own file status, so a real rename
+    // is still recognised there.
+    if (line.startsWith("rename from ")) {
+      from = line.slice("rename from ".length);
+      continue;
+    }
+    if (line.startsWith("rename to ")) {
+      const to = line.slice("rename to ".length);
+      // The ENDPOINTS come from the metadata, not the header, because the
+      // header is genuinely ambiguous for a legal path containing ` b/`.
+      // `git diff` writes a rename to `foo b/bar.ts` as
+      // `diff --git a/old.ts b/foo b/bar.ts` — verified against git — and a
+      // greedy split yields `bar.ts` as the head path. The mapping then does
+      // not match the finding's file, and the base file's OWN declaration is
+      // published as an external match: a false accusation (Codex, round 12).
+      //
+      // Each metadata line holds exactly one path to end of line, so it cannot
+      // be misread the same way. The one case it does not cover is a path git
+      // C-quotes (non-ASCII, a quote, a backslash) — there the header operands
+      // are already parsed correctly by `parseDiffGitHeader`, which handles
+      // quoting, so fall back to them rather than mis-unquoting here.
+      const quoted = from?.startsWith('"') === true || to.startsWith('"');
+      if (from !== undefined && !quoted && from !== to) renames.set(to, from);
+      else if (quoted) renames.set(pending.b, pending.a);
+      pending = undefined;
+      from = undefined;
+    }
+  }
+  return renames;
+}
+
+/**
+ * What a reviewed diff DELETES from each file, positioned where it can be.
+ *
+ * The structural check reads the BASE commit while the finding is about the
+ * head, so an occurrence it found may be one of the very lines this pull
+ * request removes. This is the evidence for deciding that.
+ *
+ * Keyed by BOTH sides of the `diff --git` header, because a rename makes them
+ * differ and a caller may hold either. `checkStructuralClaim` reports
+ * BASE-relative paths while the header's right-hand side is the HEAD path, so
+ * keying by one alone silently missed every renamed file — the reconciliation
+ * failing on a superset of its own motivating case (CodeRabbit review).
+ */
+export interface RemovedLines {
+  /**
+   * Base-side line number -> the text removed from it.
+   *
+   * Base line numbers and the diff's old-side numbers are the same coordinates
+   * by construction: both count lines in the file at the base commit. That is
+   * what lets a single untouched caller survive in a file that also loses one.
+   */
+  readonly byLine: ReadonlyMap<number, string>;
+  /** Every removed line in the file, joined. The fallback when `positioned` is false. */
+  readonly text: string;
+  /**
+   * False when a hunk header could not be parsed, so `byLine` is incomplete.
+   *
+   * The oversized-diff path reconstructs headers itself, so untrustworthy
+   * positions are a real possibility rather than a theoretical one. Callers
+   * fall back to the whole-file text there, which over-suppresses instead of
+   * publishing an accusation about a line the pull request deleted.
+   */
+  readonly positioned: boolean;
+}
+
+export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
+  interface Accumulator {
+    readonly byLine: Map<number, string>;
+    text: string;
+    positioned: boolean;
+  }
+  const removed = new Map<string, Accumulator>();
+  // Aliasing is gated on real rename metadata, not merely differing paths: a
+  // COPY's removed lines belong to the new file, and recording them under the
+  // source path would suppress occurrences in a file the diff never touched.
+  const renameSources = renameSourcesByHeadPath(diff);
+  let keys: readonly string[] = [];
+  let oldLine: number | undefined;
+  let minus: string | undefined;
+  let plus: string | undefined;
+  // `---`/`+++` are FILE HEADERS only BEFORE the first hunk. Inside a hunk they
+  // are content: a removed line whose text starts with `--` — a decrement, say
+  // `--budget;` — is written `---budget;`, and skipping it both lost the
+  // removal AND slid every later base line number in that file by one (Codex
+  // review, round 7). Tracked separately from `oldLine`, which is undefined
+  // when a hunk header could not be parsed even though we are inside a hunk.
+  let inHunk = false;
+
+  const each = (visit: (entry: Accumulator) => void): void => {
+    for (const key of keys) {
+      let entry = removed.get(key);
+      if (entry === undefined) {
+        entry = { byLine: new Map(), text: "", positioned: true };
+        removed.set(key, entry);
+      }
+      visit(entry);
+    }
+  };
+
+  for (const line of diff.split("\n")) {
+    const header = parseDiffGitHeader(line);
+    if (header !== undefined) {
+      const head = header.b || header.a;
+      const base = renameSources.get(head);
+      keys = (base === undefined ? [head] : [base, head]).filter((value) => value !== "");
+      oldLine = undefined;
+      inHunk = false;
+      minus = undefined;
+      plus = undefined;
+      continue;
+    }
+    if (keys.length === 0) continue;
+
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      const hunk = HUNK_RE.exec(line);
+      if (hunk === null) {
+        // Unparseable header: every later position in this file is a guess.
+        oldLine = undefined;
+        each((entry) => { entry.positioned = false; });
+      } else {
+        oldLine = Number(hunk[1]);
+      }
+      continue;
+    }
+    // The `---`/`+++` lines are the UNAMBIGUOUS source for this file's paths,
+    // and outside a hunk that is all they are. The `diff --git` header is not:
+    // a legal unquoted path containing ` b/` makes it unsplittable, and git
+    // writes an edit to `foo b/bar.ts` as
+    // `diff --git a/foo b/bar.ts b/foo b/bar.ts` — verified against git. A
+    // greedy split yields `bar.ts`, so removals were stored under a key nothing
+    // looks up, reconciliation kept the stale occurrence, and the host
+    // published an accusation against a correct finding (Codex, round 13).
+    //
+    // Round 12 fixed the same ambiguity for RENAME endpoints; this is the
+    // ordinary-modification route it did not cover.
+    if (!inHunk && (line.startsWith("--- ") || line.startsWith("+++ "))) {
+      const side = line.startsWith("--- ") ? "a/" : "b/";
+      const rest = line.slice(4);
+      // Git terminates these lines with a TAB when the path contains a space,
+      // which is exactly the case this fix is about.
+      const value = rest.split("\t")[0] ?? "";
+      // A quoted path needs unquoting, which `parseDiffGitHeader` already does
+      // correctly and unambiguously; leave those to the header operands rather
+      // than writing a second unquoter (the same split as round 12).
+      if (value !== "/dev/null" && !value.startsWith('"')) {
+        const bare = value.startsWith(side) ? value.slice(side.length) : value;
+        if (bare !== "") {
+          if (side === "b/") plus = bare;
+          else minus = bare;
+        }
+      }
+      const head = plus ?? minus;
+      if (head !== undefined) {
+        const base = renameSources.get(head);
+        keys = (base === undefined ? [head] : [base, head]).filter((value) => value !== "");
+      }
+      continue;
+    }
+    if (!inHunk && (line.startsWith("---") || line.startsWith("+++"))) continue;
+    // "\ No newline at end of file" belongs to the line before it.
+    if (line.startsWith("\\")) continue;
+
+    if (line.startsWith("-")) {
+      const text = line.slice(1);
+      const at = oldLine;
+      each((entry) => {
+        entry.text = `${entry.text}\n${text}`;
+        if (at === undefined) entry.positioned = false;
+        else entry.byLine.set(at, text);
+      });
+      if (oldLine !== undefined) oldLine += 1;
+      continue;
+    }
+    if (line.startsWith("+")) continue;
+    // A context line advances the base side; so does the blank line git writes
+    // for an empty context line.
+    if (oldLine !== undefined) oldLine += 1;
+  }
+
+  return new Map([...removed].map(([key, entry]) => [key, {
+    byLine: entry.byLine,
+    text: entry.text,
+    positioned: entry.positioned,
+  }]));
+}
+
 function collectChangedPaths(
   diff: string,
   select: (header: { readonly a: string; readonly b: string }) => readonly string[],

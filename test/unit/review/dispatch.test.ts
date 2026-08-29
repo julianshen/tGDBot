@@ -2303,6 +2303,48 @@ describe("finding decision contract", () => {
   });
 });
 
+// Issue #75: the claim is the reviewer's; the CHECK is the host's. The parser
+// is where that separation is actually enforced.
+describe("structural claim contract", () => {
+  it("carries a well-formed claim through to the finding", () => {
+    const parsed = parseDispatchResult(
+      dispatchJson([{ ...coreFinding, claim: { kind: "no-other-references", symbol: "budget" } }]),
+      [makeRule()],
+    );
+
+    expect(parsed.findings[0]?.claim).toEqual({ kind: "no-other-references", symbol: "budget" });
+  });
+
+  it.each([
+    ["an unknown kind", { kind: "no-callers", symbol: "budget" }],
+    ["a non-identifier symbol", { kind: "no-other-references", symbol: "budget()" }],
+    ["a non-object", "budget"],
+  ])("drops %s, and still posts the finding", (_label, claim) => {
+    const parsed = parseDispatchResult(dispatchJson([{ ...coreFinding, claim }]), [makeRule()]);
+
+    expect(parsed.findings).toHaveLength(1);
+    expect(parsed.findings[0]?.claim).toBeUndefined();
+  });
+
+  // The forgery guarantee. A verification a reader is invited to trust without
+  // re-deriving it is the worst thing a reviewer could fabricate, so the
+  // defence is structural: the parser builds a finding from an allowlist of
+  // fields, and `hostCheck` is not one of them.
+  it("cannot have a host check forged by reviewer output", () => {
+    const parsed = parseDispatchResult(
+      dispatchJson([{
+        ...coreFinding,
+        claim: { kind: "no-other-references", symbol: "budget" },
+        hostCheck: { status: "consistent", references: [], filesSearched: 999 },
+      }]),
+      [makeRule()],
+    );
+
+    expect(parsed.findings[0]?.claim).toBeDefined();
+    expect(parsed.findings[0]?.hostCheck).toBeUndefined();
+  });
+});
+
 // Issue #38: the effort estimate is advisory metadata. It must never be able
 // to cost us a finding — a rule returning no parseable findings array is
 // already a live failure mode (#30), and a new optional field is not worth

@@ -21,6 +21,8 @@ export interface SharedReviewOptions {
    * not start talking to a third party because someone upgraded the CLI.
    */
   dependencyFacts: "on" | "off";
+  /** Issue #75: check a finding's structural claim against the base tree. */
+  structuralChecks: "on" | "off";
   /** Controls whether findings may render committable suggestion blocks. */
   suggestions: "on" | "off";
   dryRun: boolean;
@@ -64,6 +66,9 @@ const DEFAULTS = {
   disableBuiltinRule: false,
   advisor: "on" as const,
   dependencyFacts: "off" as const,
+  // Off for v1: it needs a base worktree, which on a cold managed workspace
+  // means a clone. Opt in until that cost is measured rather than assumed.
+  structuralChecks: "off" as const,
   suggestions: "on" as const,
   dryRun: false,
   trustLocalRules: false,
@@ -90,6 +95,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "disable-builtin-rule": { type: "boolean" },
       advisor: { type: "string" },
       "dependency-facts": { type: "string" },
+      "structural-checks": { type: "string" },
       suggestions: { type: "string" },
       model: { type: "string" },
       "dry-run": { type: "boolean" },
@@ -147,6 +153,14 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
   if (dependencyFacts !== "on" && dependencyFacts !== "off") {
     throw new Error(
       `Invalid --dependency-facts value: "${dependencyFacts}" (expected "on" or "off")`,
+    );
+  }
+
+  const structuralChecks =
+    (values["structural-checks"] as string | undefined) ?? DEFAULTS.structuralChecks;
+  if (structuralChecks !== "on" && structuralChecks !== "off") {
+    throw new Error(
+      `Invalid --structural-checks value: "${structuralChecks}" (expected "on" or "off")`,
     );
   }
 
@@ -230,6 +244,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
     dependencyFacts,
+    structuralChecks,
     suggestions,
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
     trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,

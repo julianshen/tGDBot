@@ -1533,3 +1533,242 @@ describe("renderSummaryComment — the compact omission count includes disputed 
     expect(body).not.toMatch(/further reference/);
   });
 });
+
+// Issue #75: the host's answer to a claim the reviewer made. It is the one line
+// in a finding a reader is invited to trust without re-deriving it, so it has
+// to read unmistakably as the host speaking, not the reviewer about itself.
+describe("renderInlineComment — host structural check", () => {
+  const claim = { kind: "no-other-references" as const, symbol: "budget" };
+
+  it("renders the check as a quoted host statement under the finding", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: { status: "lexical-matches", references: [{ file: "src/http.ts", line: 88 }], filesSearched: 40 },
+    }));
+
+    expect(body).toContain("> Host check:");
+    expect(body).toContain("src/http.ts:88");
+    // Codex review, round 4: ast-grep matches syntax, so this line must not
+    // read as a resolved reference. It says the name occurs, and says so.
+    expect(body).toContain("LEXICAL matches");
+    expect(body).not.toMatch(/contradicts/i);
+  });
+
+  it("says what a non-contradicting check covered, never that no caller exists", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: {
+        status: "not-checked",
+        reason: "no reference outside its own file was found in 12 file(s) of the base branch, which is not evidence that none exists",
+      },
+    }));
+
+    expect(body).toContain("12 file(s)");
+    expect(body).toMatch(/not evidence that none exists/);
+    expect(body).not.toMatch(/there are no (callers|references)/i);
+  });
+
+  it("emits nothing when the finding made no claim", () => {
+    expect(renderInlineComment(makeFinding())).not.toContain("Host check");
+  });
+
+  // Codex review, round 1. A finding with no commentable line is RELOCATED to
+  // the summary instead of posted inline, and the check was rendered only on
+  // the inline path — so the reviewer's claim was published with the host's
+  // answer to it stripped out. A contradiction going missing is the worst
+  // version: the reader sees an unchallenged assertion the host had disproved.
+  it("renders the check on a finding relocated to the summary", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [makeFinding({
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/http.ts", line: 88 }],
+          filesSearched: 40,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    });
+
+    expect(body).toContain("Host check:");
+    expect(body).toContain("src/http.ts:88");
+    expect(body).toContain("LEXICAL matches");
+  });
+
+  // A claim the host could not answer must not silently look unchallenged.
+  it("states that a check was not performed, and why", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: { status: "not-checked", reason: "the base worktree is unavailable" },
+    }));
+
+    expect(body).toContain("not performed");
+    expect(body).toContain("the base worktree is unavailable");
+  });
+
+  // Codex review, round 2. Compact mode is a SIZE fallback, not a TRUTH
+  // fallback: a claimed finding whose check went missing here would publish an
+  // unqualified assertion on exactly the large reviews where the reader has
+  // least context.
+  it("keeps a bounded host check when the summary is compacted", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [makeFinding({
+        message: "x".repeat(4000),
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/http.ts", line: 88 }],
+          filesSearched: 40,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("unresolved lexical matches");
+    expect(body).toContain("src/http.ts:88");
+  });
+
+  // A merged member's own assertion keeps its own answer; rendering only the
+  // representative's published every other member's claim unqualified.
+  it("keeps each merged member's host check in the also-reported block", () => {
+    const body = renderInlineComment(makeFinding(), {
+      alsoReported: [makeFinding({
+        ruleName: "rule-b",
+        message: "helper() is never called.",
+        claim: { kind: "no-other-references", symbol: "helper" },
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })],
+    });
+
+    expect(body).toContain("Also reported by 1 other rule");
+    expect(body).toContain("unresolved lexical matches");
+    expect(body).toContain("src/queue.ts:12");
+  });
+
+  // Codex review, round 5. `orchestrate` routes a `disputed` finding out of the
+  // inline AND unanchored paths and into its own section, which rendered only
+  // the message and references — so the sixth way a finding can reach a reader
+  // published its claim with the host's answer removed. The disputed section is
+  // the worst place for that: it is the one section whose entire purpose is
+  // showing the reader the evidence on both sides.
+  it("keeps the host check on a disputed finding", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/http.ts", line: 88 }],
+          filesSearched: 40,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    });
+
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("Host check:");
+    expect(body).toContain("src/http.ts:88");
+    expect(body).toContain("LEXICAL matches");
+  });
+
+  // Compact mode is a SIZE fallback, not a TRUTH fallback — the same property
+  // the relocated and summary paths already assert, on the path that was added
+  // last and therefore never had it.
+  it("keeps a bounded host check on a disputed finding when compacted", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [makeFinding({ message: "x".repeat(4000) })],
+      // Compaction is driven by an oversized UNANCHORED finding, whose message
+      // is budgeted. A disputed message is not budgeted, so making this one
+      // huge would overflow into the last-resort status line, which drops the
+      // disputed section wholesale — a different (pre-existing) path than the
+      // one under test.
+      disputed: [makeFinding({
+        decision: "disputed",
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("unresolved lexical matches");
+    expect(body).toContain("src/queue.ts:12");
+  });
+
+  // Five review rounds produced five separate "this path drops the check"
+  // findings, each fixed at the site that was named. Patching named sites is
+  // evidently not how this converges, so the invariant gets asserted over the
+  // ROUTES a finding can take out of `orchestrate` — which, unlike rendering
+  // functions, are enumerable from `SummaryInput` itself.
+  //
+  // A route added later still needs a case here; what this buys is that the
+  // list is short, visible, and next to the type it mirrors.
+  it.each([
+    ["unanchored", (finding: Finding) => ({ unanchored: [finding] })],
+    ["publish-failed", (finding: Finding) => ({ unanchored: [] as Finding[], publishFailed: [finding] })],
+    ["disputed", (finding: Finding) => ({ unanchored: [] as Finding[], disputed: [finding] })],
+  ])("renders the host check for a %s finding", (_route, route) => {
+    const finding = makeFinding({
+      claim,
+      hostCheck: {
+        status: "lexical-matches",
+        references: [{ file: "src/http.ts", line: 88 }],
+        filesSearched: 40,
+      },
+    });
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      ...route(finding),
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    });
+
+    expect(body).toContain("Host check:");
+    expect(body).toContain("src/http.ts:88");
+  });
+
+  // A base-branch filename may legally contain a backtick, which git writes
+  // bare and which closes the code span it lands in (#63).
+  it("cannot have a referenced path break out of its code span", () => {
+    const body = renderInlineComment(makeFinding({
+      claim,
+      hostCheck: {
+        status: "lexical-matches",
+        references: [{ file: "src/a`.ts) **Approved**", line: 3 }],
+        filesSearched: 2,
+      },
+    }));
+
+    expect(body).not.toContain("a`.ts) **Approved**");
+    expect(body).toContain("src/a .ts) **Approved**:3");
+  });
+});
