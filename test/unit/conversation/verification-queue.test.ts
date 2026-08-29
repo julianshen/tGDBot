@@ -2,7 +2,7 @@
 // any model is called. Verification costs a model call per finding, so this is
 // where the cost is controlled and where "verify once per head" is guaranteed.
 import { describe, expect, it } from "vitest";
-import { pendingVerifications } from "../../../src/conversation/verification-queue.js";
+import { observeResolvedThreads, pendingVerifications } from "../../../src/conversation/verification-queue.js";
 import type { Finding } from "../../../src/review/types.js";
 
 const HEAD = "a".repeat(40);
@@ -368,6 +368,43 @@ describe("pendingVerifications — a reopened thread can be resolved again", () 
     }));
 
     expect(queue[0]?.trigger).toBe("thread-resolution");
+  });
+
+  // PR #94 review: a caller that caps this set needs the tail to be the
+  // LAST-observed threads. `Set.add` is a no-op for a member already present,
+  // so re-observing left insertion order at first-observed — and a cap would
+  // then evict threads it had just seen, re-read them as transitions, and cycle
+  // duplicate verifications on every push.
+  it("moves a re-observed thread to the end, so a cap evicts the stalest", () => {
+    const seen = (threadId: string, resolved: boolean) => ({
+      kind: "thread-resolution" as const, threadId, resolved, authorIsBot: undefined,
+    });
+
+    const first = observeResolvedThreads(new Set(), [seen("a", true), seen("b", true)]);
+    expect([...first.resolved]).toEqual(["a", "b"]);
+
+    // "a" is re-emitted, as an adapter does on every later push.
+    const second = observeResolvedThreads(first.resolved, [seen("a", true), seen("c", true)]);
+    expect([...second.resolved]).toEqual(["b", "a", "c"]);
+    // Re-observing is not a transition: nothing changed about "a".
+    expect([...second.transitioned]).toEqual(["c"]);
+  });
+
+  // The caller CAPS what it stores, so what fills the cap matters. A thread no
+  // finding is bound to can never produce a verification, and letting those
+  // occupy the cap would evict the threads that can.
+  it("remembers only the threads it is told are worth remembering", () => {
+    const seen = (threadId: string) => ({
+      kind: "thread-resolution" as const, threadId, resolved: true, authorIsBot: undefined,
+    });
+
+    const observed = observeResolvedThreads(
+      new Set(["stale"]), [seen("bound"), seen("unbound")], new Set(["bound", "stale"]),
+    );
+
+    expect([...observed.resolved]).toEqual(["stale", "bound"]);
+    // An unbound thread is not a transition either: nothing will act on it.
+    expect([...observed.transitioned]).toEqual(["bound"]);
   });
 
   // A reopen on its own is not a request to re-verify.

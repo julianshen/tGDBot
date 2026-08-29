@@ -118,18 +118,34 @@ const TRIGGER_RANK: Record<FindingVerificationTrigger, number> = {
 export function observeResolvedThreads(
   previous: ReadonlySet<string>,
   events: readonly VerificationEvent[],
+  /**
+   * Threads worth REMEMBERING — those a finding is bound to.
+   *
+   * A thread with no finding can never produce a verification, so its state is
+   * dead weight, and the caller caps what it stores: letting those fill the cap
+   * would evict the threads that can (PR #94 review). Absent, everything is
+   * remembered, which is what a caller with no findings loaded wants.
+   */
+  remembered?: ReadonlySet<string>,
 ): { readonly resolved: ReadonlySet<string>; readonly transitioned: ReadonlySet<string> } {
-  const resolved = new Set(previous);
+  const keep = (threadId: string): boolean => remembered === undefined || remembered.has(threadId);
+  const resolved = new Set([...previous].filter(keep));
   const transitioned = new Set<string>();
   for (const event of events) {
     if (event.kind !== "thread-resolution" || event.threadId === undefined) continue;
     // A reopen CLEARS the thread, so the next `true` reads as a real transition
     // even in a later poll.
     if (event.resolved === false) { resolved.delete(event.threadId); continue; }
-    if (event.resolved === true && !resolved.has(event.threadId)) {
-      resolved.add(event.threadId);
-      transitioned.add(event.threadId);
-    }
+    if (event.resolved !== true || !keep(event.threadId)) continue;
+    const known = resolved.has(event.threadId);
+    // DELETE then add, so re-observing moves the thread to the end. `Set.add`
+    // is a no-op for a member already present, so insertion order was
+    // first-observed rather than last — and a caller capping the tail would
+    // evict threads it had just seen, re-read them as transitions, and cycle
+    // (PR #94 review).
+    resolved.delete(event.threadId);
+    resolved.add(event.threadId);
+    if (!known) transitioned.add(event.threadId);
   }
   return { resolved, transitioned };
 }

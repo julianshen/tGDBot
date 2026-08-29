@@ -350,7 +350,10 @@ async function classifyOpenReviewEvents(options: {
         authorIsBot: item.event.authorIsBot,
         resolved: item.event.kind === "thread-resolution" ? item.event.resolved : undefined,
       })),
-    ).resolved].slice(-MAX_RESOLVED_THREADS); // newest-last, so the cap drops the longest untouched
+      boundThreads,
+    ).resolved]
+      // Last-observed at the end, now that the fold refreshes order.
+      .slice(-MAX_RESOLVED_THREADS);
 
     // THE INVARIANT: an event taken off the page must either complete its
     // verification this poll or hold the cursor. Removal and the cursor
