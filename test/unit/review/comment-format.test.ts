@@ -38,6 +38,29 @@ function makeFinding(overrides: Partial<Finding> = {}): Finding {
   };
 }
 
+/**
+ * CommonMark fence balance, asserted independently of the implementation's
+ * helper: a closer must match the opener's character, be at least as long,
+ * and carry no info string — run parity alone accepts a ``` decoy inside a
+ * ```` fence, which is the defect being pinned.
+ */
+function unclosedFenceIn(value: string): { char: string; length: number } | undefined {
+  let open: { char: string; length: number } | undefined;
+  for (const line of value.split("\n")) {
+    const match = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (match === null) continue;
+    const marker = match[1]!;
+    const rest = match[2]!;
+    if (open === undefined) {
+      if (marker[0] === "`" && rest.includes("`")) continue;
+      open = { char: marker[0]!, length: marker.length };
+    } else if (marker[0] === open.char && marker.length >= open.length && rest.trim() === "") {
+      open = undefined;
+    }
+  }
+  return open;
+}
+
 describe("renderInlineComment — structure", () => {
   it("leads with a scannable metadata line: category | severity | rule", () => {
     const body = renderInlineComment(makeFinding({ severity: "blocking", category: "security" }));
@@ -1790,9 +1813,65 @@ describe("renderInlineComment — host structural check", () => {
       rulesFailed: [] as string[],
     }, 1200);
 
-    const fences = body.match(/^[ \t]*`{3,}/gm) ?? [];
-    expect(fences.length).toBeGreaterThan(0);
-    expect(fences.length % 2).toBe(0);
+    expect(unclosedFenceIn(body)).toBeUndefined();
+    expect(body).toContain("### Disputed");
+  });
+
+  // Codex review of PR #84, round two: run PARITY is not balance. A ````
+  // opener cannot be closed by the shorter ``` line the message contains
+  // before its real closer — the cut lands after the decoy, the fence is
+  // still open, and everything after it renders as code.
+  it("does not accept a shorter fence run as the closer of a longer open fence", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: [
+          "prose before the block",
+          "",
+          "````go",
+          "x".repeat(100),
+          "```",
+          "y".repeat(4000),
+          "````",
+        ].join("\n"),
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(unclosedFenceIn(body)).toBeUndefined();
+    expect(body).toContain("### Disputed");
+  });
+
+  // Same rule for tilde fences: a backtick run is content inside a tilde
+  // fence, never its closer.
+  it("does not let a backtick run close a tilde fence", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: [
+          "prose before the block",
+          "",
+          "~~~go",
+          "x".repeat(100),
+          "```",
+          "y".repeat(4000),
+          "~~~",
+        ].join("\n"),
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(unclosedFenceIn(body)).toBeUndefined();
     expect(body).toContain("### Disputed");
   });
 

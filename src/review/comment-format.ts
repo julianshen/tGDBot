@@ -287,9 +287,32 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
-/** Every line that opens or closes a fenced code block, with its fence run. */
-function fenceRuns(value: string): string[] {
-  return [...value.matchAll(/^[ \t]*(`{3,}|~{3,})/gm)].map((match) => match[1]!);
+/**
+ * The fence `value` opens and never closes, under CommonMark rules.
+ *
+ * A closer must match the opener's character, be at least as long as the
+ * opener's run, and carry no info string. A shorter or different-character run
+ * inside a fence is CONTENT, not a closer — counting run parity instead let a
+ * ``` line inside a ```` fence pass as balanced while the fence stayed open
+ * (Codex review of PR #84, round two), and every later compact section then
+ * rendered inside that block. A backtick run whose info string contains a
+ * backtick is not a fence opener at all.
+ */
+function unclosedFence(value: string): { char: string; length: number } | undefined {
+  let open: { char: string; length: number } | undefined;
+  for (const line of value.split("\n")) {
+    const match = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (match === null) continue;
+    const marker = match[1]!;
+    const rest = match[2]!;
+    if (open === undefined) {
+      if (marker[0] === "`" && rest.includes("`")) continue;
+      open = { char: marker[0]!, length: marker.length };
+    } else if (marker[0] === open.char && marker.length >= open.length && rest.trim() === "") {
+      open = undefined;
+    }
+  }
+  return open;
 }
 
 /**
@@ -306,12 +329,11 @@ function fenceRuns(value: string): string[] {
 function truncateCompactProse(text: string, max: number): string {
   if (max <= 0) return "";
   const first = truncate(text, max);
-  const runs = fenceRuns(first);
-  if (runs.length % 2 === 0) return first;
-  const marker = runs[runs.length - 1]!;
-  const close = marker[0] === "~" ? "~".repeat(marker.length) : "`".repeat(marker.length);
+  const open = unclosedFence(first);
+  if (open === undefined) return first;
+  const close = open.char.repeat(open.length);
   const retry = truncate(text, max - close.length - 1);
-  return fenceRuns(retry).length % 2 === 0 ? retry : `${retry}\n${close}`;
+  return unclosedFence(retry) === undefined ? retry : `${retry}\n${close}`;
 }
 
 function splitHeadline(message: string): { headline: string; body: string } {
