@@ -1598,7 +1598,7 @@ export async function review(
   ];
   const waivedKeys = stateStore === undefined
     ? new Set<string>()
-    : new Set((await stateStore.readFindingOutcomes())
+    : new Set((await stateStore.readDispositionOutcomes())
       .filter((entry) => entry.reviewNumber === Number(pr.id))
       .flatMap((entry) => {
         const key = acceptanceKeyFromOutcome(entry);

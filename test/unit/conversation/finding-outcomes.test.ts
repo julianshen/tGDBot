@@ -135,6 +135,13 @@ describe("validateFindingOutcomeEntries", () => {
     })], repository)).toThrow(/actor/i);
   });
 
+  it("refuses an accepted outcome without a file digest", () => {
+    expect(() => validateFindingOutcomeEntries([outcome({
+      disposition: "accepted",
+      actorDigest: "e".repeat(64),
+    })], repository)).toThrow(/file/i);
+  });
+
   it("refuses an actor login in place of a digest", () => {
     expect(() => validateFindingOutcomeEntries([outcome({
       disposition: "accepted",

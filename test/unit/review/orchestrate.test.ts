@@ -816,6 +816,31 @@ describe("finding decisions", () => {
     expect(result.inlineComments.some((comment) => comment.body.includes("Different issue"))).toBe(true);
   });
 
+  it("does not surface an accepted finding as disputed or as a clarification", () => {
+    const waived = makeFinding({
+      message: "Tokens must not be logged.",
+      ruleName: "no-token-logs",
+      line: 14,
+      decision: "disputed",
+    });
+    const clarify = makeFinding({
+      message: "Tokens must not be logged.",
+      ruleName: "no-token-logs",
+      line: 14,
+      decision: "needs-clarification",
+      question: "Is logging the token intentional?",
+    });
+    const result = orchestrate(
+      makeDispatchResult({ findings: [waived, clarify] }),
+      DIFF,
+      { waivedKeys: new Set([acceptanceKey(waived)]) },
+    );
+
+    expect(result.commentBody).not.toMatch(/### Disputed/i);
+    expect(result.commentBody).not.toContain("Tokens must not be logged.");
+    expect(result.commentBody).not.toMatch(/clarif/i);
+  });
+
   it("suppresses a repeated finding once any copy is addressed", () => {
     const result = orchestrate(
       makeDispatchResult({

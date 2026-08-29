@@ -107,6 +107,8 @@ export interface ConversationExclusiveSession {
 export interface ConversationStateStore {
   /** Recorded verification outcomes, for the per-head idempotency check (#57). */
   readFindingOutcomes(): Promise<readonly FindingOutcomeEntry[]>;
+  /** Accept/defer records, not truncated with the verification checkpoint. */
+  readDispositionOutcomes(): Promise<readonly FindingOutcomeEntry[]>;
   readonly repositoryBinding: Readonly<RepositoryBinding>;
   readContextSnapshot(): Promise<ConversationContextSnapshot>;
   readAuditPage(journal: AuditJournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{
@@ -1267,6 +1269,15 @@ class FileConversationStateStore implements ConversationStateStore {
     });
   }
 
+  async readDispositionOutcomes(): Promise<readonly FindingOutcomeEntry[]> {
+    return this.withLock(async (parentIdentity) => {
+      const head = await this.readOutcomeHead(parentIdentity);
+      const records = head.dispositions
+        ?? head.checkpoint.filter((entry) => entry.disposition !== undefined);
+      return records.map((entry) => clone(entry));
+    });
+  }
+
   async findTerminalActionById(actionId: string): Promise<TerminalActionSummary | undefined> {
     return this.withLock(async (parentIdentity) => {
       const loaded = await this.loadState(parentIdentity);
@@ -1470,16 +1481,41 @@ class FileConversationStateStore implements ConversationStateStore {
       if (addedOutcomes.length > 0) {
         // Its own head file, staged in the SAME replacement set, so the outcome
         // and the action that produced it land together or not at all.
-        const outcomeHead = this.stageJournal(
-          "outcomes", addedOutcomes, loadedOutcomeHead.outcomes, transactionId, replacements,
-        );
-        const checkpoint = [...loadedOutcomeHead.checkpoint, ...addedOutcomes]
-          .slice(-MAX_OUTCOME_CHECKPOINT);
-        replacements.push(this.replacement(
-          "outcomes-head.json",
-          serializeSnapshot({ version: 1, repository: this.binding, outcomes: outcomeHead, checkpoint }),
-          transactionId,
-        ));
+        const knownIds = new Set([
+          ...loadedOutcomeHead.checkpoint.map((entry) => entry.id),
+          ...(loadedOutcomeHead.dispositions ?? []).map((entry) => entry.id),
+        ]);
+        const uniqueAdded = addedOutcomes.filter((entry) => !knownIds.has(entry.id));
+        if (uniqueAdded.length > 0) {
+          const outcomeHead = this.stageJournal(
+            "outcomes", uniqueAdded, loadedOutcomeHead.outcomes, transactionId, replacements,
+          );
+          const checkpoint = [...loadedOutcomeHead.checkpoint, ...uniqueAdded]
+            .slice(-MAX_OUTCOME_CHECKPOINT);
+          const pinnedIds = new Set<string>();
+          const pinned: FindingOutcomeEntry[] = [];
+          for (const entry of [
+            ...(loadedOutcomeHead.dispositions
+              ?? loadedOutcomeHead.checkpoint.filter((entry) => entry.disposition !== undefined)),
+            ...uniqueAdded.filter((entry) => entry.disposition !== undefined),
+          ]) {
+            if (pinnedIds.has(entry.id)) continue;
+            pinnedIds.add(entry.id);
+            pinned.push(entry);
+          }
+          if (pinned.length > MAX_OUTCOME_CHECKPOINT) pinned.splice(0, pinned.length - MAX_OUTCOME_CHECKPOINT);
+          replacements.push(this.replacement(
+            "outcomes-head.json",
+            serializeSnapshot({
+              version: 1,
+              repository: this.binding,
+              outcomes: outcomeHead,
+              checkpoint,
+              dispositions: pinned,
+            }),
+            transactionId,
+          ));
+        }
       }
       if (addedMemories.length > 0) {
         memoriesHead = this.stageJournal("memories", addedMemories, memoriesHead, transactionId, replacements);

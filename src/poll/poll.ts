@@ -409,6 +409,7 @@ async function classifyOpenReviewEvents(options: {
       const outcome = await executeConversationEvent({
         item,
         reviewIdentity: identity,
+        ...(botIdentity.login === undefined ? {} : { botLogin: botIdentity.login }),
         options,
       });
       if (outcome === "transient") {
@@ -739,6 +740,7 @@ type ReplyPlan =
 async function executeConversationEvent(input: {
   readonly item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult; readonly identity: { actionId: string; identityDigest: string } };
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  readonly botLogin?: string;
   readonly options: {
     readonly adapter: ConversationAdapter;
     readonly store: ConversationStateStore;
@@ -775,22 +777,14 @@ async function executeConversationEvent(input: {
 
   const planned = await planConversationReply({ item, reviewIdentity, options });
   if (planned.status === "transient") return "transient";
-  const published = await publishReplyPlan({
+  return publishReplyPlan({
     event: item.event,
     identity,
     plan: planned.plan,
+    ...(input.botLogin === undefined ? {} : { botLogin: input.botLogin }),
     reviewIdentity,
     options,
   });
-  if (published === "completed" && planned.plan.kind === "disposition") {
-    const recorded = planned.plan.outcome;
-    const already = (await options.store.readFindingOutcomes())
-      .some((entry) => entry.id === recorded.id);
-    if (!already) {
-      await options.store.transact((tx) => { tx.appendOutcome(recorded); });
-    }
-  }
-  return published;
 }
 
 /** Commands that re-run the review itself rather than posting a composed reply. */
@@ -1250,6 +1244,7 @@ async function publishReplyPlan(input: {
     if (latest?.state === "completed") return "completed";
     const actionIdentity = latest === undefined ? identity : { actionId: latest.actionId, identityDigest: latest.identityDigest };
     const memoryOperation = plan.kind === "memory" ? plan.operation : undefined;
+    const dispositionOutcome = plan.kind === "disposition" ? plan.outcome : undefined;
     const capturedHead = plan.kind === "explain" || plan.kind === "reconsider" ||
       (plan.kind === "clarification" && plan.outcome !== "stale")
       ? plan.headSha
@@ -1305,6 +1300,7 @@ async function publishReplyPlan(input: {
         now: input.options.now,
         hooks: {
           beforeFreeze: capturedHead === undefined && memoryOperation === undefined
+            && dispositionOutcome === undefined
             ? undefined
             : async (session, current) => {
             // `remember`/`forget` must land locally BEFORE the acknowledgement is
@@ -1316,6 +1312,12 @@ async function publishReplyPlan(input: {
               const applied = session.snapshot().memoryLedger.some((entry) =>
                 entry.operation === memoryOperation.operation && entry.id === memoryOperation.id);
               if (!applied) await session.commit((tx) => { tx.appendMemory(memoryOperation); });
+            }
+            // Same contract for accept/defer: a completed action is recoverably
+            // terminal, so the outcome has to already be in the sidecar before
+            // that state is reachable (#86 review).
+            if (dispositionOutcome !== undefined) {
+              await session.commit((tx) => { tx.appendOutcome(dispositionOutcome); });
             }
             if (capturedHead === undefined) return;
             const metadata = await loadReviewMetadata(input.event.reviewNumber, input.options);

@@ -2512,6 +2512,31 @@ describe("automatic verification", () => {
 // Issue #57 remaining: accept/defer are parser decisions, recorded as
 // mechanical outcomes, and they never write a memory.
 describe("finding dispositions", () => {
+  it("records the waiver even if publication crashes after the provider write", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    adapter.replaceEvents([command]);
+    adapter.failNextWrite = "accept-then-fail";
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(1);
+
+    adapter.replaceEvents([command]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    expect((await store.readDispositionOutcomes()).some((entry) => entry.disposition === "accepted")).toBe(true);
+    expect([...adapter.postedBodies, ...adapter.acceptedBodies].filter((body) => /## Accepted/.test(body)))
+      .toHaveLength(1);
+  });
+
   it("accepts a finding without calling a model", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
@@ -2554,6 +2579,8 @@ describe("finding dispositions", () => {
 
     const body = adapter.postedBodies.find((entry) => /## Deferred/.test(entry)) ?? "";
     expect(body).toMatch(/not filed/i);
+    expect(body).toContain("@tgdbot accept");
+    expect(body).not.toContain("@bot accept");
     const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
       .readFindingOutcomes();
     expect(outcomes[0]!.disposition).toBe("deferred");
@@ -2578,5 +2605,45 @@ describe("finding dispositions", () => {
     const after = await store.readContextSnapshot();
     expect(after.memories).toEqual(before.memories);
     expect(after.memoryLedger).toEqual(before.memoryLedger);
+  });
+
+  it("keeps an accepted waiver after the verification checkpoint rolls", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const command = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "@tgdbot accept"),
+    );
+    adapter.replaceEvents([command]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter),
+    })).resolves.toBe(0);
+
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const binding = store.repositoryBinding;
+    await store.transact((tx) => {
+      for (let batch = 0; batch < MAX_OUTCOME_CHECKPOINT + 5; batch += 1) {
+        tx.appendOutcome(prepareFindingOutcome({
+          repository: binding,
+          id: `outcome_${String(batch).padStart(32, "7")}`,
+          findingId: `finding_${String(batch).padStart(32, "8")}`,
+          reviewNumber: 1,
+          headSha: "c".repeat(40),
+          verdict: "confirmed",
+          trigger: "thread-comment",
+          ruleName: "no-token-logs",
+          category: "security",
+          severity: "blocking",
+          anchorChanged: false,
+          at: "2026-08-14T00:00:00.000Z",
+        }));
+      }
+    });
+
+    const checkpoint = await store.readFindingOutcomes();
+    expect(checkpoint.some((entry) => entry.disposition === "accepted")).toBe(false);
+    const waivers = await store.readDispositionOutcomes();
+    expect(waivers.some((entry) => entry.disposition === "accepted")).toBe(true);
   });
 });

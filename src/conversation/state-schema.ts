@@ -1461,6 +1461,9 @@ export function validateFindingOutcomeEntries(
     if (disposition !== undefined && object.actorDigest === undefined) {
       throw new Error(`outcomes[${index}].actorDigest is required when a disposition is set`);
     }
+    if (disposition === "accepted" && object.fileDigest === undefined) {
+      throw new Error(`outcomes[${index}].fileDigest is required when a disposition is accepted`);
+    }
     const actorDigest = object.actorDigest === undefined
       ? undefined
       : digest(object.actorDigest, `outcomes[${index}] actor digest`);
@@ -1579,6 +1582,12 @@ export interface ConversationOutcomeHead {
   readonly outcomes: JournalFileReference | null;
   /** The most recent records, for the idempotency check without a full scan. */
   readonly checkpoint: readonly FindingOutcomeEntry[];
+  /**
+   * Accept/defer records. Not truncated with the verification checkpoint —
+   * a waiver that falls out of the last 500 outcomes would raise again on
+   * the same PR (#86 review).
+   */
+  readonly dispositions?: readonly FindingOutcomeEntry[];
 }
 
 /** How many recent outcomes the head keeps inline. */
@@ -1592,15 +1601,19 @@ export function validateOutcomeHead(
   value: unknown,
   expected: RepositoryBinding,
 ): ConversationOutcomeHead {
-  const object = exact(value, "outcome head", ["version", "repository", "outcomes", "checkpoint"]);
+  const object = exact(value, "outcome head", ["version", "repository", "outcomes", "checkpoint"], ["dispositions"]);
   const repository = validateVersionAndBinding(object, expected, "outcome head");
   const outcomes = object.outcomes === null
     ? null
     : journalReference(object.outcomes, "outcome head outcomes", "outcomes");
+  const dispositions = object.dispositions === undefined
+    ? undefined
+    : validateFindingOutcomeEntries(object.dispositions, expected, MAX_OUTCOME_CHECKPOINT);
   return {
     version: 1,
     repository,
     outcomes,
     checkpoint: validateFindingOutcomeEntries(object.checkpoint, expected, MAX_OUTCOME_CHECKPOINT),
+    ...(dispositions === undefined ? {} : { dispositions }),
   };
 }

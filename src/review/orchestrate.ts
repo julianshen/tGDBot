@@ -181,18 +181,17 @@ export function orchestrate(
     dispatchResult.findings.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
   );
   const waivedKeys = options.waivedKeys ?? new Set<string>();
-  const actionable = dispatchResult.findings.filter(
-    (finding) => isActionableDecision(decisionOf(finding))
-      && !addressedKeys.has(dedupeKey(finding))
-      && !waivedKeys.has(acceptanceKey(finding)),
+  const remaining = dispatchResult.findings.filter((finding) => !waivedKeys.has(acceptanceKey(finding)));
+  const actionable = remaining.filter(
+    (finding) => isActionableDecision(decisionOf(finding)) && !addressedKeys.has(dedupeKey(finding)),
   );
-  const disputed = dispatchResult.findings.filter((finding) => decisionOf(finding) === "disputed");
+  const disputed = remaining.filter((finding) => decisionOf(finding) === "disputed");
   const clarification = options.clarification === undefined
     ? selectClarification({
         repositoryDigest: options.reviewBinding?.repositoryDigest ?? "0".repeat(64),
         reviewNumber: options.reviewBinding?.reviewNumber ?? 1,
         headSha: options.reviewBinding?.headSha ?? "0".repeat(40),
-        findings: dispatchResult.findings,
+        findings: remaining,
         ruleOrder: options.ruleOrder ?? dispatchResult.rulesRun,
         excludeIds: options.excludeClarificationIds,
       })
