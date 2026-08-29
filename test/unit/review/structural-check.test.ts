@@ -252,6 +252,148 @@ describe("checkStructuralClaim — what counts as a reference", () => {
   });
 });
 
+describe("checkStructuralClaim — bounded retention with an exact census (issue #83)", () => {
+  const removedAt = (...lines: [number, string][]) => ({
+    byLine: new Map(lines),
+    text: lines.map(([, text]) => text).join("\n"),
+    positioned: true,
+  });
+
+  // THE point of the rework. The old shape retained every match before
+  // counting, so a generated file dense with one identifier pushed ~10⁵ pairs
+  // into memory; capping that list made the published count wrong, because
+  // reconciliation subtracts from the retained list. Now the census is taken
+  // at collection and only a display sample is retained.
+  it("counts every occurrence exactly while retaining only a display sample", async () => {
+    // Fifty external occurrences of `budget`, one per line.
+    const dense = Array.from({ length: 50 }, (_, index) => `export const v${index} = budget(${index});`);
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "src/dense.ts": dense.join("\n") + "\n",
+    });
+
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/retry.ts" });
+
+    expect(result.status).toBe("lexical-matches");
+    if (result.status === "not-checked") throw new Error("unreachable");
+    // The census is exact; the sample is capped at MAX_RETAINED_REFERENCES.
+    expect(result.occurrences).toBe(50);
+    expect(result.references.length).toBe(8);
+    // Every retained location is a real occurrence of the symbol.
+    expect(result.references.every((reference) => reference.file === "src/dense.ts")).toBe(true);
+    // And the published sentence carries the CENSUS, not the sample length.
+    const text = describeCheck(claim, result);
+    expect(text).toContain("occurs 50 time(s)");
+    expect(text).toContain("and 45 more");
+  });
+
+  // Reconciliation happens DURING collection, so the census is already the
+  // post-reconciliation figure — and the sample contains only survivors.
+  it("counts reconciliation into the census, discarding suppressed matches at collection", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "src/other.ts": [
+        "export const v1 = budget(1);",
+        "export const v2 = budget(2);",
+        "export const v3 = budget(3);",
+        "export const v4 = budget(4);",
+        "export const v5 = budget(5);",
+      ].join("\n") + "\n",
+    });
+
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLinesByFile: new Map([
+        ["src/other.ts", removedAt([1, "export const v1 = budget(1);"])],
+      ]),
+    });
+
+    const check = output[0]?.hostCheck;
+    expect(check?.status).toBe("lexical-matches");
+    if (check?.status !== "lexical-matches") throw new Error("unreachable");
+    // Line 1 was suppressed at collection: the census counts only the four
+    // survivors, and the sample contains none of the suppressed.
+    expect(check.occurrences).toBe(4);
+    expect(check.references).toHaveLength(4);
+    expect(check.references.every((reference) => reference.line !== 1)).toBe(true);
+    expect(describeCheck(claim, check)).toContain("occurs 4 time(s)");
+  });
+
+  it("reports the every-file-removed answer from the census, not a sample", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "src/other.ts": [
+        "export const v1 = budget(1);",
+        "export const v2 = budget(2);",
+      ].join("\n") + "\n",
+    });
+
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLinesByFile: new Map([
+        ["src/other.ts", removedAt(
+          [1, "export const v1 = budget(1);"],
+          [2, "export const v2 = budget(2);"],
+        )],
+      ]),
+    });
+
+    expect(output[0]?.hostCheck?.status).toBe("not-checked");
+    expect((output[0]?.hostCheck as { reason: string }).reason)
+      .toMatch(/every file where it was found/);
+  });
+
+  // The second half of issue #83: the deadline was consulted only between
+  // files, so one dense file could run the whole budget inside its own match
+  // list. Per-node consultation stops mid-file; the count is partial, and
+  // undercounting is the safe direction.
+  it("consults the deadline for each candidate node, not once per file", async () => {
+    const dense = Array.from({ length: 30 }, (_, index) => `export const v${index} = budget(${index});`);
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "src/dense.ts": dense.join("\n") + "\n",
+    });
+    let calls = 0;
+    const now = (): number => {
+      calls += 1;
+      return 0; // Never expires, so the walk completes and only the COUNT varies.
+    };
+
+    const result = await checkStructuralClaim(
+      claim, { baseRoot: root, findingFile: "src/retry.ts" }, { now });
+
+    expect(result.status).toBe("lexical-matches");
+    // Thirty candidate nodes in one file: per-file consultation costs a
+    // handful of clock calls; per-node costs at least one per candidate.
+    expect(calls).toBeGreaterThan(30);
+  });
+
+  // The diff must actually REACH the collection loop — the reconciliation
+  // moved inside the check, so the option has to travel through
+  // `runStructuralChecks` for the inline path to ever fire in production.
+  it("passes the removed lines into the check's options", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
+    });
+    const removed = new Map([["src/other.ts", removedAt([1, "export const a = budget(1);"])]]);
+    let seen: unknown;
+    const output = await runStructuralChecks({
+      findings: [finding({ claim })],
+      baseRoot: root,
+      removedLinesByFile: removed,
+      check: async (_claim, _input, options) => {
+        seen = options?.removedLinesByFile;
+        return { status: "lexical-matches", references: [{ file: "src/other.ts", line: 1 }], filesSearched: 1 };
+      },
+    });
+
+    expect(seen).toBe(removed);
+    void output;
+  });
+});
+
 describe("checkStructuralClaim — refusing rather than guessing", () => {
   // Codex found the oversized-file skip. The unreadable-file and parse-failure
   // skips beside it had the identical hazard, so the counter sits at every
