@@ -32,7 +32,10 @@ import type {
 } from "../../../src/vcs/conversation-adapter.js";
 import type { ConversationItemIdentity, ReviewIdentity } from "../../../src/conversation/types.js";
 import {
+  MAX_OUTCOME_CHECKPOINT,
+  bindFindingLedgerIdentity,
   prepareFindingLedgerEntry,
+  prepareFindingOutcome,
   type ConversationEventEntry,
   type FindingLedgerEntry,
 } from "../../../src/conversation/state-schema.js";
@@ -180,9 +183,12 @@ class ClassificationAdapter implements ConversationAdapter {
       : JSON.parse(pageToken.opaque) as { page: number; after: string | null };
     if (continuation.after !== startAfter) throw new Error("continuation cursor binding mismatch");
     this.eventCalls.push({ after: after?.opaque, pageToken: pageToken?.opaque });
+    // Scoped to the review being asked about. A stub that answers every review
+    // with every event cannot exercise round-robin fairness at all.
+    const mine = this.events.filter((event) => event.reviewNumber === _review.reviewNumber);
     const remaining = after === undefined
-      ? this.events
-      : this.events.filter((event) => {
+      ? mine
+      : mine.filter((event) => {
           const boundary = JSON.parse(after.opaque) as { at: string; seen: string[] };
           return event.updatedAt > boundary.at ||
             (event.updatedAt === boundary.at && !boundary.seen.includes(event.eventId));
@@ -572,6 +578,8 @@ function threadComment(
 class ExecutionAdapter extends ClassificationAdapter {
   readonly postedBodies: string[] = [];
   readonly postedKinds: Array<"general" | "thread"> = [];
+  /** Which thread each reply landed in, so fairness across reviews is visible. */
+  readonly postedThreadIds: Array<string | undefined> = [];
   readonly publishedByMarker = new Map<string, ConversationItemIdentity>();
   readonly acceptedBodies: string[] = [];
   failNextWrite: "throw" | "accept-then-fail" | null = null;
@@ -583,6 +591,12 @@ class ExecutionAdapter extends ClassificationAdapter {
   }
 
   override async postThreadReply(_review: ReviewIdentity, input: ThreadReplyInput): Promise<ConversationItemIdentity> {
+    // BOTH real adapters refuse this, so a stub that accepts it hides a class
+    // of failure: a reply with no parent fails publication as transient and is
+    // retried on every poll forever.
+    if (input.parentCommentId === undefined || input.parentCommentId === "") {
+      throw new Error("thread replies require parentCommentId");
+    }
     return this.recordWrite("thread", input.body, input.threadId);
   }
 
@@ -591,13 +605,22 @@ class ExecutionAdapter extends ClassificationAdapter {
     return this.publishedByMarker.get(key) ?? null;
   }
 
+  failNextThreadRead = false;
+  threadReads = 0;
+
   override async getReviewThread(_review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
+    this.threadReads += 1;
+    if (this.failNextThreadRead) {
+      this.failNextThreadRead = false;
+      throw new Error("thread read is temporarily unavailable");
+    }
     const thread = this.threads.get(threadId);
     if (thread === undefined) throw new Error(`thread not found: ${threadId}`);
     return thread;
   }
 
   private recordWrite(kind: "general" | "thread", body: string, threadId?: string): ConversationItemIdentity {
+    this.postedThreadIds.push(threadId);
     const marker = lastMarker(body);
     const identity: ConversationItemIdentity = {
       provider: "github",
@@ -628,17 +651,41 @@ class ExecutionAdapter extends ClassificationAdapter {
 
 async function bootstrapAndSeed(
   adapter: ExecutionAdapter,
-  options: { readonly seedFinding?: boolean } = {},
+  // `bindThreadId` seeds the finding WITH its published thread identity, as
+  // `bindFindingLedgerIdentity` gives it after a successful inline write.
+  // Automatic verification (#57) matches a thread event to a finding through
+  // that identity, so a ledger without one is a shape production never has.
+  options: {
+    readonly seedFinding?: boolean;
+    readonly bindThreadId?: string;
+    /** A distinct finding id, so several can be seeded into one repository. */
+    readonly findingId?: string;
+    /** Seed a finding whose review recorded no model, so none can be resolved. */
+    readonly withoutModel?: boolean;
+  } = {},
 ): Promise<{ stateDir: string; ledger?: FindingLedgerEntry; findingMarker?: string }> {
   const stateDir = await tempStateDir();
   await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
   if (options.seedFinding !== true) return { stateDir };
+  const { ledger: seeded, findingMarker } = await seedFindingInto(stateDir, options);
+  return { stateDir, ledger: seeded, findingMarker };
+}
+
+/** Places one published finding into an ALREADY bootstrapped repository. */
+async function seedFindingInto(
+  stateDir: string,
+  options: {
+    readonly bindThreadId?: string;
+    readonly findingId?: string;
+    readonly reviewNumber?: number;
+  } = {},
+): Promise<{ ledger: FindingLedgerEntry; findingMarker: string }> {
   const store = createConversationStateStore({ root: stateDir, repository: repo });
   const binding = store.repositoryBinding;
   const ledger = prepareFindingLedgerEntry({
     repository: binding,
-    id: FINDING_ID,
-    reviewNumber: 1,
+    id: options.findingId ?? FINDING_ID,
+    reviewNumber: options.reviewNumber ?? 1,
     reviewId: "PR_1",
     baseSha: "b".repeat(40),
     headSha: "c".repeat(40),
@@ -658,7 +705,7 @@ async function bootstrapAndSeed(
       disableBuiltinRule: false,
       trustLocalRules: false,
       rulesDir: ".review/rules",
-      model: "anthropic/claude-opus-4-5",
+      ...(options.withoutModel === true ? {} : { model: "anthropic/claude-opus-4-5" }),
       dispatch: "direct",
     },
     placement: {
@@ -672,35 +719,45 @@ async function bootstrapAndSeed(
     body: visibleFindingBody,
     at: "2026-08-14T00:00:00.000Z",
   });
-  await store.transact((tx) => tx.appendFinding(ledger));
+  const seeded = options.bindThreadId === undefined
+    ? ledger
+    : bindFindingLedgerIdentity(ledger, {
+        provider: "github",
+        commentId: "900",
+        threadId: options.bindThreadId,
+        url: "https://github.com/octo-org/octo-repo/pull/1#discussion_r900",
+      });
+  await store.transact((tx) => tx.appendFinding(seeded));
   const findingMarker = formatChildMarker({
     kind: "finding",
     parentId: `act_${"2".repeat(32)}`,
     childId: ledger.id,
     repositoryDigest,
-    reviewNumber: 1,
+    reviewNumber: options.reviewNumber ?? 1,
     contentDigest: ledger.contentDigest,
   });
-  return { stateDir, ledger, findingMarker };
+  return { ledger: seeded, findingMarker };
 }
 
 function installFindingThread(
   adapter: ExecutionAdapter,
   findingMarker: string,
   command: ReviewActivityEvent,
-  extras: { readonly rootAuthorIsBot?: boolean } = {},
+  extras: { readonly rootAuthorIsBot?: boolean; readonly reviewNumber?: number } = {},
 ): ReviewActivityEvent {
+  const reviewNumber = extras.reviewNumber ?? 1;
   const root = threadComment("root", `${visibleFindingBody}\n${findingMarker}`, {
     authorLogin: extras.rootAuthorIsBot === false ? "mallory" : "tgdbot",
     authorIsBot: extras.rootAuthorIsBot !== false,
     updatedAt: "2026-08-13T23:00:00.000Z",
     threadId: command.threadId ?? "T1",
+    reviewNumber,
   });
-  const reply = { ...command, threadId: command.threadId ?? "T1", parentCommentId: "root" };
+  const reply = { ...command, threadId: command.threadId ?? "T1", parentCommentId: "root", reviewNumber };
   adapter.threads.set(reply.threadId ?? "T1", {
     provider: "github",
     repositoryDigest,
-    reviewNumber: 1,
+    reviewNumber,
     threadId: reply.threadId ?? "T1",
     rootCommentId: "root",
     url: "https://github.com/owner/repo/pull/1#discussion_rroot",
@@ -1060,9 +1117,14 @@ describe("event-to-action poll", () => {
     expect(adapter.postedBodies).toHaveLength(2);
   });
 
+  // Seeded WITH the thread identity, so this covers automatic verification (#57)
+  // too: that path acts without a command to parse, so the thread being rooted
+  // by someone other than the bot is the only thing left to refuse on.
   it("treats a spoofed finding marker as a scope error without model work", async () => {
     const adapter = new ExecutionAdapter([]);
-    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
     const spoofed = installFindingThread(
       adapter,
       findingMarker!,
@@ -1103,7 +1165,9 @@ describe("event-to-action poll", () => {
 
   it("re-executes a material edit and ignores a formatting-only edit", async () => {
     const adapter = new ExecutionAdapter([]);
-    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
     const original = installFindingThread(adapter, findingMarker!, threadComment("cmd", "@tgdbot explain"));
     adapter.replaceEvents([original]);
     await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), executionDeps(adapter)))
@@ -1159,7 +1223,9 @@ describe("event-to-action poll", () => {
 
   it("treats a model transient failure as incomplete and exits nonzero", async () => {
     const adapter = new ExecutionAdapter([]);
-    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true });
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
     const command = installFindingThread(adapter, findingMarker!, threadComment("fail", "@tgdbot explain"));
     adapter.replaceEvents([command]);
     const createSession = vi.fn(sessionFor(undefined));
@@ -1932,5 +1998,511 @@ describe("clarification answer lifecycle", () => {
     expect(changedSession).not.toHaveBeenCalled();
     expect(adapter.postedBodies.at(-1)).toMatch(/Confirmed/);
     expect(adapter.postedBodies.at(-1)).not.toMatch(/Withdrawn/);
+  });
+});
+
+// Issue #57: a human reply in a finding's thread produces exactly one
+// automatic verification and exactly one bot reply — with no command issued.
+describe("automatic verification", () => {
+  // These seed with `bindThreadId`, because a published finding carries the
+  // thread identity `bindFindingLedgerIdentity` gives it after a successful
+  // inline write — and automatic verification finds the finding behind a
+  // thread event through exactly that identity.
+
+  const verdict = (outcome: "confirmed" | "withdrawn") => JSON.stringify(
+    outcome === "withdrawn"
+      ? { outcome, rationale: "The logger redacts the token now." }
+      : {
+          outcome,
+          rationale: "The token is still written on line 14.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+          },
+        },
+  );
+
+  it("verifies once when a human replies, without being asked", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    // Ordinary prose: not a command, and nobody mentioned the bot.
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    // The record itself is the deliverable: calibration has nothing to read
+    // from if the reply lands and the outcome does not.
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("withdrawn");
+    expect(outcomes[0]!.trigger).toBe("thread-comment");
+    expect(outcomes[0]!.headSha).toBe("c".repeat(40));
+    // Labels are never stored — only digests of them (#57 design).
+    expect(JSON.stringify(outcomes[0])).not.toContain("no-token-logs");
+  });
+
+  // THE idempotency criterion: the same page seen twice must not verify twice.
+  it("does not verify the same finding again at the same head", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    // A SECOND, distinct reply in the same thread. Replaying the first one
+    // proves nothing here: the poll's event cursor drops it before the queue
+    // ever sees it, so only a genuinely fresh event reaches the layer under
+    // test. Recorded outcomes are what make this one verification, not two.
+    const again = installFindingThread(
+      adapter, findingMarker!, threadComment("human-2", "and here is why", {
+        updatedAt: "2026-08-14T00:00:05.000Z",
+      }),
+    );
+    adapter.replaceEvents([again]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  it("says the finding still stands when it does", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "I think this one is wrong"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("confirmed")).session;
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    const body = adapter.postedBodies.find((entry) => /## Verification/.test(entry)) ?? "";
+    expect(body).toMatch(/still stands/i);
+    expect(body).toContain("still written on line 14");
+    // Never restates the finding the thread already carries above it.
+    expect(body).not.toContain("Tokens must not be logged");
+    // A verdict the reader cannot argue with is worse than no verdict. The
+    // invitation names the AUTHENTICATED account, so the mention resolves.
+    expect(body).toContain("`@tgdbot reconsider <why>`");
+  });
+
+  // A transient provider failure must not consume the reply. The poll marks an
+  // ordinary comment classified-and-ignored as soon as it reads it, so an event
+  // left on the page is spent whether or not the verification it asked for ever
+  // posted.
+  it("still answers after a transient failure eats the first attempt", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    // Accepted by the provider, then failed before the local record: the
+    // orphan case. The reply IS live in the thread.
+    adapter.failNextWrite = "accept-then-fail";
+    // A transient failure is a non-zero exit: the run did not finish its work.
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(1);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    // Exactly one reply reaches the thread. The event survived the first poll,
+    // so the second could finish the work rather than skip it as spent.
+    const posted = [...adapter.postedBodies, ...adapter.acceptedBodies]
+      .filter((body) => /## Verification/.test(body));
+    expect(posted).toHaveLength(1);
+    expect(await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes()).toHaveLength(1);
+  });
+
+  // Resolving a thread is not a COMMENT, so the event carries no `commentId`
+  // and there is nothing to reply under. Both adapters refuse a thread reply
+  // without a parent, so this failed publication as transient and was retried
+  // on every poll forever, spending a model call each time.
+  it("replies under the thread root when a resolution triggers it", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    // Install the thread, then resolve it.
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    const resolution = {
+      kind: "thread-resolution" as const,
+      provider: "github" as const,
+      repositoryDigest,
+      reviewNumber: 1,
+      eventId: "thread-resolution:T1",
+      revisionId: "thread-resolution:T1:1",
+      orderKey: "2026-08-14T00:00:02.000Z|thread-resolution:T1",
+      createdAt: "2026-08-14T00:00:02.000Z",
+      updatedAt: "2026-08-14T00:00:02.000Z",
+      body: "",
+      url: "https://github.com/owner/repo/pull/1#discussion_rroot",
+      threadId: "T1",
+      resolved: true,
+      outdated: false,
+    } as unknown as ReviewActivityEvent;
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([resolution]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    // It landed. Without a parent the provider refuses it outright.
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // A provider READ outage is not an answer. The event has already been taken
+  // off the page by then, so dropping it consumed the reply for good.
+  it("retries after a thread read fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    adapter.failNextThreadRead = true;
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // A transient VERDICT failure, as opposed to a transient publication.
+  it("retries after the verifier fails transiently", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let attempts = 0;
+    const session: ConversationSessionFactory = async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("the model is temporarily unavailable");
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // A verification that can NEVER succeed must be spent DURABLY. Released from
+  // memory only, the next poll re-queues it, and with the budget full of such
+  // findings everything behind them starves forever.
+  it("spends a finding whose rule is gone, so it never queues again", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    adapter.replaceEvents([reply]);
+    // Rules load fine, but the one this finding was raised under is gone. An
+    // EMPTY set is a load error, which defers rather than settling — a
+    // distinction that made an earlier version of this test vacuous.
+    const deps = executionDeps(adapter, {
+      rules: [{ ...currentRule, name: "some-other-rule", sourcePath: "/rules/some-other-rule.md" }],
+    });
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    expect(await store.readFindingOutcomes()).toEqual([]);
+    expect(adapter.threadReads).toBe(1);
+
+    // Seen again, as a held cursor would show it.
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    // THE point: no second look. The event was taken off the page, so the
+    // record the page would have written had to be written when it settled.
+    // Without it the finding is queued again on every poll — forever, taking
+    // budget from everything behind it.
+    expect(adapter.threadReads).toBe(1);
+  });
+
+  // Metadata is a provider round-trip like any other, and failing it is an
+  // outage rather than an answer.
+  it("retries after review metadata fails to load", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents([reply]);
+    let failMetadata = true;
+    const base = executionDeps(adapter, { createSession: session });
+    const deps = {
+      ...base,
+      getReviewMetadata: async (reviewNumber: number) => {
+        if (failMetadata) throw new Error("the pull request is temporarily unavailable");
+        return base.getReviewMetadata(reviewNumber);
+      },
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+
+    failMetadata = false;
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // The cost ceiling is ONE allowance for the poll. It was passed fresh into
+  // every loop iteration, so a busy repository could spend five model calls per
+  // iteration against a documented five per poll.
+  it("spends at most five model calls per poll, and answers the rest next poll", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const replies: ReviewActivityEvent[] = [];
+    // SEVEN, not six. Six is exactly the old one-past-the-budget lookahead, so
+    // a fixture of six passed against an implementation that could not name the
+    // seventh candidate at all (PR #74 review).
+    for (let index = 0; index < 7; index += 1) {
+      const { findingMarker } = await seedFindingInto(stateDir, {
+        findingId: `finding_${String(index).repeat(32)}`,
+        bindThreadId: `T${index}`,
+      });
+      replies.push(installFindingThread(
+        adapter,
+        findingMarker,
+        threadComment(`human-${index}`, "fixed this in the latest push", { threadId: `T${index}` }),
+      ));
+    }
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents(replies);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(5);
+
+    // The remaining two are not lost. Nothing persists "this reply is still
+    // owed", so the poll takes them off the page and holds the cursor.
+    adapter.replaceEvents(replies);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(7);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(7);
+  });
+
+  // Two reviews is the ONLY shape that separates a poll-wide budget from a
+  // per-iteration one: they differ solely across loop iterations, so every
+  // single-review fixture passes against either. I claimed this held by
+  // construction two rounds ago; this is the test that actually shows it.
+  it("spends one poll-wide budget across reviews, not one per review", async () => {
+    const adapter = new ExecutionAdapter([], [summary(1), summary(2)]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    const events: ReviewActivityEvent[] = [];
+    // Review 1: more candidates than the poll-wide budget of five.
+    for (let index = 0; index < 7; index += 1) {
+      const { findingMarker } = await seedFindingInto(stateDir, {
+        findingId: `finding_${String(index).repeat(32)}`,
+        bindThreadId: `A${index}`,
+        reviewNumber: 1,
+      });
+      events.push(installFindingThread(adapter, findingMarker, threadComment(
+        `one-${index}`, "fixed this in the latest push", { threadId: `A${index}` },
+      ), { reviewNumber: 1 }));
+    }
+    // Review 2: one reply, behind all of them.
+    const { findingMarker: second } = await seedFindingInto(stateDir, {
+      findingId: `finding_${"9".repeat(32)}`,
+      bindThreadId: "B0",
+      reviewNumber: 2,
+    });
+    events.push(installFindingThread(
+      adapter,
+      second,
+      threadComment("two-0", "fixed this in the latest push", { threadId: "B0", reviewNumber: 2 }),
+      { reviewNumber: 2 },
+    ));
+
+    const session: ConversationSessionFactory = async () =>
+      createPiSessionStub(verdict("withdrawn")).session;
+    adapter.replaceEvents(events);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    // Exactly the poll-wide budget, spent entirely on review 1 — which is also
+    // the only fixture that separates a poll-wide budget from a per-iteration
+    // one, since with two reviews the latter would spend ten.
+    expect(adapter.postedThreadIds.filter((id) => id !== undefined)).toHaveLength(5);
+
+    // NOT asserted here: which review the next poll starts with. When every
+    // classified event is deferred the cursor transaction is skipped entirely,
+    // so the round-robin key is not written in either direction and no fixture
+    // I built can tell the rotation change from its absence.
+
+    adapter.replaceEvents(events);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(adapter.postedThreadIds.filter((threadId) => threadId === "B0")).toHaveLength(1);
+  });
+
+  // The outcome checkpoint is BOUNDED at 500. Once a repository passes that,
+  // an older outcome falls out of it while its finding sits at the same head,
+  // and a checkpoint-only dedupe answers a second time. The action ledger is
+  // unbounded and its identity already encodes exactly (finding, head).
+  it("does not verify twice after the outcome ages out of the checkpoint", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+
+    // Push the real outcome out of the checkpoint window entirely.
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const binding = store.repositoryBinding;
+    // One transaction: the checkpoint keeps the last N however they arrived.
+    await store.transact((tx) => {
+      for (let batch = 0; batch < MAX_OUTCOME_CHECKPOINT + 5; batch += 1) {
+        tx.appendOutcome(prepareFindingOutcome({
+          repository: binding,
+          id: `outcome_${String(batch).padStart(32, "7")}`,
+          findingId: `finding_${String(batch).padStart(32, "8")}`,
+          reviewNumber: 1,
+          headSha: "c".repeat(40),
+          verdict: "confirmed",
+          trigger: "thread-comment",
+          ruleName: "no-token-logs",
+          category: "security",
+          severity: "blocking",
+          anchorChanged: false,
+          at: "2026-08-14T00:00:00.000Z",
+        }));
+      }
+    });
+    const remaining = await store.readFindingOutcomes();
+    expect(remaining.some((entry) => entry.findingId === FINDING_ID)).toBe(false);
+
+    // A SECOND, distinct reply. Replaying the first proves nothing: the event
+    // cursor drops it before the queue sees it, so only a fresh event reaches
+    // the layer under test. The checkpoint has forgotten this finding; the
+    // action ledger has not.
+    const again = installFindingThread(
+      adapter, findingMarker!, threadComment("human-2", "and one more thing", {
+        updatedAt: "2026-08-14T00:00:09.000Z",
+      }),
+    );
+    adapter.replaceEvents([again]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+  });
+
+  // A dry run previews; it does not buy anything. Reporting the VERDICT meant
+  // asking the model for it, which is a provider charge for a preview the
+  // operator asked to be free.
+  it("costs no model call in a dry run", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, {
+      seedFinding: true, bindThreadId: "T1",
+    });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    const createSession = vi.fn(sessionFor("{}"));
+    adapter.replaceEvents([reply]);
+    const store = createConversationStateStore({ root: stateDir, repository: repo });
+    const before = await store.readContextSnapshot();
+
+    await expect(poll(pollArgs(stateDir, { dryRun: true, model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession }),
+    })).resolves.toBe(0);
+
+    expect(createSession).not.toHaveBeenCalled();
+    expect(adapter.postedBodies).toEqual([]);
+    expect(await store.readFindingOutcomes()).toEqual([]);
+    expect((await store.readContextSnapshot()).events).toEqual(before.events);
+  });
+
+  // The bot's own replies must not trigger it, or a run answers itself forever.
+  it("is not triggered by its own reply", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const own = installFindingThread(
+      adapter, findingMarker!,
+      threadComment("self", "## Verification", { authorLogin: "tgdbot", authorIsBot: true }),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([own]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(0);
   });
 });

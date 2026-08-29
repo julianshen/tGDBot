@@ -19,7 +19,12 @@ import {
   validateCursorSnapshot,
   validateEventEntries,
   validateEventEntry,
+  emptyOutcomeHead,
+  MAX_OUTCOME_CHECKPOINT,
   validateFindingEntries,
+  validateFindingOutcomeEntries,
+  validateOutcomeHead,
+  type ConversationOutcomeHead,
   validateJournalHead,
   validateJournalManifestNode,
   validateMemoryEntries,
@@ -34,6 +39,7 @@ import {
   type ConversationTransactionIntent,
   type FindingLedgerEntry,
   type JournalFileReference,
+  type AuditJournalKind,
   type JournalKind,
   type MemoryCreateEntry,
   type MemoryEntry,
@@ -44,6 +50,7 @@ import {
   type MemoryIndexSummary,
   type FindingIndexSummary,
 } from "./state-schema.js";
+import type { FindingOutcomeEntry } from "./state-schema.js";
 import type { RepositoryBinding } from "./types.js";
 import {
   createDefaultProcessInspector,
@@ -79,6 +86,14 @@ export interface ConversationStateTransaction {
   appendEvent(entry: ConversationEventEntry): void;
   appendMemory(entry: MemoryEntry): void;
   appendFinding(entry: FindingLedgerEntry): void;
+  /**
+   * Records what became of one finding (#57).
+   *
+   * In the SAME transaction as the action record that posted the reply, so a
+   * crash between the two cannot leave a reply posted with no outcome — which
+   * would make the next poll verify and reply again.
+   */
+  appendOutcome(entry: FindingOutcomeEntry): void;
   replaceCursor(snapshot: ConversationCursorSnapshot): void;
   replacePending(snapshot: ConversationPendingSnapshot): void;
 }
@@ -90,9 +105,11 @@ export interface ConversationExclusiveSession {
 }
 
 export interface ConversationStateStore {
+  /** Recorded verification outcomes, for the per-head idempotency check (#57). */
+  readFindingOutcomes(): Promise<readonly FindingOutcomeEntry[]>;
   readonly repositoryBinding: Readonly<RepositoryBinding>;
   readContextSnapshot(): Promise<ConversationContextSnapshot>;
-  readAuditPage(journal: JournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{
+  readAuditPage(journal: AuditJournalKind, cursor?: ConversationAuditCursor | null, limit?: number): Promise<{
     readonly entries: readonly unknown[];
     readonly nextCursor: ConversationAuditCursor | null;
   }>;
@@ -1112,7 +1129,10 @@ class FileConversationStateStore implements ConversationStateStore {
     let committed = false;
     try {
       for (const replacement of sorted) {
-        if (!new Set(["cursor.json", "pending.json", "journal-head.json"]).has(replacement.target) &&
+        // Head files are REPLACED; journal segments and manifests are
+        // immutable and content-addressed. The outcome sidecar is a head, so it
+        // belongs in the first group (#57).
+        if (!new Set(["cursor.json", "pending.json", "journal-head.json", "outcomes-head.json"]).has(replacement.target) &&
           await this.pathExists(replacement.targetPath)) {
           throw new Error(`Immutable conversation journal target already exists: ${replacement.target}`);
         }
@@ -1220,6 +1240,33 @@ class FileConversationStateStore implements ConversationStateStore {
     return found.get(identity.actionId);
   }
 
+  /**
+   * The outcome head, or an empty one when the sidecar does not exist yet.
+   *
+   * A missing file is the normal state for every repository that has not
+   * verified a finding, so it is an answer rather than an error.
+   */
+  private async readOutcomeHead(parentIdentity: unknown): Promise<ConversationOutcomeHead> {
+    const contents = await this.readOptional(this.paths.outcomeHeadPath, parentIdentity as never);
+    if (contents === undefined) return emptyOutcomeHead(this.binding);
+    const head = validateOutcomeHead(parseJson(contents, this.paths.outcomeHeadPath), this.binding);
+    // The SAME check `loadState` makes for every main journal. Validating only
+    // the head accepted a corrupt manifest or segment and let the next append
+    // extend the chain from the broken reference, so the damage stayed in a
+    // durable audit trail with nothing ever noticing (PR #74 review). A sidecar
+    // is not a lesser record.
+    await this.validateCurrentJournal("outcomes", head.outcomes, parentIdentity as { dev: number; ino: number });
+    return head;
+  }
+
+  /** Every outcome the head keeps inline, for the per-head idempotency check. */
+  async readFindingOutcomes(): Promise<readonly FindingOutcomeEntry[]> {
+    return this.withLock(async (parentIdentity) => {
+      const head = await this.readOutcomeHead(parentIdentity);
+      return head.checkpoint.map((entry) => clone(entry));
+    });
+  }
+
   async findTerminalActionById(actionId: string): Promise<TerminalActionSummary | undefined> {
     return this.withLock(async (parentIdentity) => {
       const loaded = await this.loadState(parentIdentity);
@@ -1262,7 +1309,7 @@ class FileConversationStateStore implements ConversationStateStore {
     });
   }
 
-  async readAuditPage(journal: JournalKind, cursor: ConversationAuditCursor | null = null, limit = 100): Promise<{
+  async readAuditPage(journal: AuditJournalKind, cursor: ConversationAuditCursor | null = null, limit = 100): Promise<{
     readonly entries: readonly unknown[]; readonly nextCursor: ConversationAuditCursor | null;
   }> {
     if (!["events", "memories", "findings"].includes(journal) || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
@@ -1349,6 +1396,7 @@ class FileConversationStateStore implements ConversationStateStore {
       const addedEvents: ConversationEventEntry[] = [];
       const addedMemories: MemoryEntry[] = [];
       const addedFindings: FindingLedgerEntry[] = [];
+      const addedOutcomes: FindingOutcomeEntry[] = [];
       let initialized = loaded.cursorExists && loaded.pendingExists;
 
       const tx: ConversationStateTransaction = {
@@ -1379,6 +1427,11 @@ class FileConversationStateStore implements ConversationStateStore {
           const validated = validateFindingEntries(candidate, this.binding, candidate.length);
           addedFindings.push(validated[validated.length - 1]!);
         },
+        appendOutcome: (entry) => {
+          const candidate = [...addedOutcomes, entry];
+          const validated = validateFindingOutcomeEntries(candidate, this.binding, candidate.length);
+          addedOutcomes.push(validated[validated.length - 1]!);
+        },
         replaceCursor: (value) => { cursor = validateCursorSnapshot(value, this.binding); writeCursor = true; },
         replacePending: (value) => { pending = validatePendingSnapshot(value, this.binding); writePending = true; },
       };
@@ -1397,6 +1450,11 @@ class FileConversationStateStore implements ConversationStateStore {
       const findings = validateFindingEntries(findingCandidates, this.binding, findingCandidates.length);
       cursor = validateCursorSnapshot(cursor, this.binding);
       pending = validatePendingSnapshot(pending, this.binding);
+      // Read only when something was appended: an ordinary transaction never
+      // opens the sidecar, so the cost of the feature is zero when unused.
+      const loadedOutcomeHead = addedOutcomes.length === 0
+        ? emptyOutcomeHead(this.binding)
+        : await this.readOutcomeHead(parentIdentity);
       const transactionId = this.randomId();
       const replacements: PreparedReplacement[] = [];
       if (writeCursor) replacements.push(this.replacement("cursor.json", serializeSnapshot(cursor), transactionId));
@@ -1408,6 +1466,20 @@ class FileConversationStateStore implements ConversationStateStore {
       }
       if (addedFindings.length > 0) {
         findingsHead = this.stageJournal("findings", addedFindings, findingsHead, transactionId, replacements);
+      }
+      if (addedOutcomes.length > 0) {
+        // Its own head file, staged in the SAME replacement set, so the outcome
+        // and the action that produced it land together or not at all.
+        const outcomeHead = this.stageJournal(
+          "outcomes", addedOutcomes, loadedOutcomeHead.outcomes, transactionId, replacements,
+        );
+        const checkpoint = [...loadedOutcomeHead.checkpoint, ...addedOutcomes]
+          .slice(-MAX_OUTCOME_CHECKPOINT);
+        replacements.push(this.replacement(
+          "outcomes-head.json",
+          serializeSnapshot({ version: 1, repository: this.binding, outcomes: outcomeHead, checkpoint }),
+          transactionId,
+        ));
       }
       if (addedMemories.length > 0) {
         memoriesHead = this.stageJournal("memories", addedMemories, memoriesHead, transactionId, replacements);
