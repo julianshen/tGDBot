@@ -21,6 +21,7 @@ import {
 import { clusterFindings } from "./finding-clusters.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
+import { acceptanceKey } from "../conversation/disposition.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./existing-discussion.js";
 
 export type { InlineComment } from "./comment-format.js";
@@ -72,6 +73,8 @@ export type OrchestrateOptions = {
   deferredClarificationCount?: number;
   existingIssues?: readonly ExistingReviewIssue[];
   discussionMemories?: readonly DiscussionMemory[];
+  /** Acceptance keys (`acceptanceKey`) for findings waived on this review. */
+  waivedKeys?: ReadonlySet<string>;
 } & RenderOptions;
 
 function decisionOf(finding: Finding): FindingDecision {
@@ -177,16 +180,18 @@ export function orchestrate(
   const addressedKeys = new Set(
     dispatchResult.findings.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
   );
-  const actionable = dispatchResult.findings.filter(
+  const waivedKeys = options.waivedKeys ?? new Set<string>();
+  const remaining = dispatchResult.findings.filter((finding) => !waivedKeys.has(acceptanceKey(finding)));
+  const actionable = remaining.filter(
     (finding) => isActionableDecision(decisionOf(finding)) && !addressedKeys.has(dedupeKey(finding)),
   );
-  const disputed = dispatchResult.findings.filter((finding) => decisionOf(finding) === "disputed");
+  const disputed = remaining.filter((finding) => decisionOf(finding) === "disputed");
   const clarification = options.clarification === undefined
     ? selectClarification({
         repositoryDigest: options.reviewBinding?.repositoryDigest ?? "0".repeat(64),
         reviewNumber: options.reviewBinding?.reviewNumber ?? 1,
         headSha: options.reviewBinding?.headSha ?? "0".repeat(40),
-        findings: dispatchResult.findings,
+        findings: remaining,
         ruleOrder: options.ruleOrder ?? dispatchResult.rulesRun,
         excludeIds: options.excludeClarificationIds,
       })

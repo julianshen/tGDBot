@@ -140,7 +140,7 @@ describe("conversational review and local memory documentation", () => {
   });
 
   it("documents the exact command grammar including which commands are unimplemented", () => {
-    for (const command of ["explain", "reconsider", "remember", "forget", "memories", "check latest", "answer"]) {
+    for (const command of ["explain", "accept", "defer", "reconsider", "remember", "forget", "memories", "check latest", "answer"]) {
       expect(pollSection).toContain(command);
     }
     expect(pollSection).toMatch(/one command per comment/i);

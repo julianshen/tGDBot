@@ -315,6 +315,8 @@ export function parseConversationCommand(input: CommandParseInput): CommandParse
   const canonicalMention = asciiFold(mention);
 
   if (foldedAction === "explain") return commandResult({ kind: "explain" }, `${canonicalMention} explain`);
+  if (foldedAction === "accept") return commandResult({ kind: "accept" }, `${canonicalMention} accept`);
+  if (foldedAction === "defer") return commandResult({ kind: "defer" }, `${canonicalMention} defer`);
   if (/^check[ \t]+latest$/u.test(foldedAction)) return commandResult({ kind: "check-latest" }, `${canonicalMention} check latest`);
   if (foldedAction === "memories") return commandResult({ kind: "memories" }, `${canonicalMention} memories`);
 
@@ -361,7 +363,7 @@ export function parseConversationCommand(input: CommandParseInput): CommandParse
   }
 
   const keyword = /^([^ \t]+)/u.exec(foldedAction)?.[1];
-  if (keyword && !["explain", "check", "memories", "reconsider", "review", "remember", "forget", "answer"].includes(keyword)) {
+  if (keyword && !["explain", "accept", "defer", "check", "memories", "reconsider", "review", "remember", "forget", "answer"].includes(keyword)) {
     return { kind: "invalid", reason: "unknown" };
   }
   return malformed();

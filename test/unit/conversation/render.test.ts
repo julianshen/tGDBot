@@ -11,6 +11,7 @@ import {
   flattenExcerpt,
   publicationBody,
   renderClarificationReply,
+  renderDispositionReply,
   renderExplainReply,
   renderFocusReply,
   renderInactiveRuleReply,
@@ -254,6 +255,9 @@ describe("conversation reply rendering", () => {
   it("signs every reply visibly, immediately before the marker", () => {
     const replies = [
       renderExplainReply({ explanation: "because" }, marker, githubBinding),
+      renderDispositionReply({
+        disposition: "accepted", file: "src/a.ts", line: 1, ruleName: "r", severity: "warning",
+      }, marker),
       renderUsageReply(marker),
       renderScopeErrorReply(marker),
       renderUnsupportedHistoryReply(marker),

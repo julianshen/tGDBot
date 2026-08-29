@@ -14,6 +14,8 @@ const pending = `clar_${"b".repeat(12)}`;
 describe("conversation command parser", () => {
   it.each([
     ["@tGDBot explain", { kind: "explain" }, "@tgdbot explain"],
+    ["@tGDBot accept", { kind: "accept" }, "@tgdbot accept"],
+    ["@tGDBot defer", { kind: "defer" }, "@tgdbot defer"],
     ["@tGDBot check latest", { kind: "check-latest" }, "@tgdbot check latest"],
     ["@tGDBot memories", { kind: "memories" }, "@tgdbot memories"],
     ["@tGDBot reconsider because This is safe", { kind: "reconsider", reason: "because This is safe" }, "@tgdbot reconsider because This is safe"],
@@ -23,6 +25,11 @@ describe("conversation command parser", () => {
     [`@tGDBot answer ${pending}: It is intentional`, { kind: "answer", pendingId: pending, answer: "It is intentional" }, `@tgdbot answer ${pending}: It is intentional`],
   ])("parses %s", (body, command, normalized) => {
     expect(parse(body)).toEqual({ kind: "command", command, normalized });
+  });
+
+  it("refuses a reason on accept or defer — the parser, not a model, decides", () => {
+    expect(parse("@tGDBot accept because it is intentional")).toEqual({ kind: "invalid", reason: "malformed" });
+    expect(parse("@tGDBot defer until next sprint")).toEqual({ kind: "invalid", reason: "malformed" });
   });
 
   it("matches authenticated mentions and keywords case-insensitively", () => {

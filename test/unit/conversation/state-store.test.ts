@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
+import { MAX_OUTCOME_CHECKPOINT } from "../../../src/conversation/state-schema.js";
 import {
   createConversationStateStore as createStoreRaw,
   type ConversationStateStoreOptions,
@@ -887,6 +888,31 @@ describe("finding outcomes", () => {
     // does not even write, since no ordinary journal changed.
     expect(JSON.parse(await readFile(paths.outcomeHeadPath, "utf8"))).toMatchObject({ version: 1 });
     expect((await readdir(paths.repositoryRoot))).toContain("outcomes-head.json");
+  });
+
+  test("keeps a disposition after the verification checkpoint rolls", async () => {
+    const stateRoot = await root();
+    const store = createStore({ root: stateRoot, repository: repo });
+    const binding = store.repositoryBinding;
+    const accepted = {
+      ...outcome(binding, 1),
+      disposition: "accepted" as const,
+      actorDigest: "a".repeat(64),
+      fileDigest: "b".repeat(64),
+      line: 14,
+    };
+    await store.transact((tx) => {
+      tx.initializeIfAbsent();
+      tx.appendOutcome(accepted);
+    });
+    await store.transact((tx) => {
+      for (let index = 2; index < MAX_OUTCOME_CHECKPOINT + 7; index += 1) {
+        tx.appendOutcome(outcome(binding, index));
+      }
+    });
+
+    expect((await store.readFindingOutcomes()).some((entry) => entry.id === accepted.id)).toBe(false);
+    expect((await store.readDispositionOutcomes()).some((entry) => entry.id === accepted.id)).toBe(true);
   });
 
   test("reads as empty before anything is recorded", async () => {
