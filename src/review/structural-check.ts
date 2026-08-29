@@ -441,7 +441,6 @@ export async function checkStructuralClaim(
       // could not make the per-file cost deadline-aware anyway. Everything
       // JS-side below IS per-node deadline-bounded.
       if (expired()) {
-        console.error(`DBG between-kind kind=${kind} callsSoFar~`);
         walkExpired = true;
         break walk;
       }
@@ -452,11 +451,9 @@ export async function checkStructuralClaim(
         // undercounting is the safe direction — the same trade the per-file
         // break above already made.
         if (expired()) {
-          console.error(`DBG node-expired kind=${kind} line=${node.range().start.line + 1}`);
           walkExpired = true;
           break walk;
         }
-        console.error(`DBG node kind=${kind} line=${node.range().start.line + 1} text=${node.text()}`);
         if (node.text() !== claim.symbol) continue;
         // The finding's own files are filtered HERE rather than after the
         // walk: reconciliation and the census are per-match decisions, and a
