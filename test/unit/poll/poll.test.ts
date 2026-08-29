@@ -2475,7 +2475,9 @@ describe("automatic verification", () => {
       findingId: `finding_${"2".repeat(32)}`,
     });
     const events = [
-      installFindingThread(adapter, boundMarker, threadComment(
+      // `bootstrapAndSeed` types the marker optional; `seedFinding: true` above
+      // is what makes it present, as everywhere else in this file.
+      installFindingThread(adapter, boundMarker!, threadComment(
         "human-1", "fixed this in the latest push", { threadId: "T1" },
       )),
       installFindingThread(adapter, orphanMarker, threadComment(
