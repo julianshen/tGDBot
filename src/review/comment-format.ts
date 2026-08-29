@@ -1000,7 +1000,9 @@ function renderDisputedSection(input: SummaryInput, compact = false): string | u
   const items = disputed.flatMap((finding) => {
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
-    const message = sanitizeText(finding.message);
+    const message = compact
+      ? truncate(sanitizeText(finding.message), 240)
+      : sanitizeText(finding.message);
     // A disputed finding is precisely the one whose evidence a reader needs —
     // which is why the host check belongs here most of all. A finding the
     // reviewer itself marked disputed, published with the host's answer to its

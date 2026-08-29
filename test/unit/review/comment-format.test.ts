@@ -1721,6 +1721,34 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).toContain("src/queue.ts:12");
   });
 
+  // Issue #82: A compact summary containing one very long disputed finding
+  // still shows the Disputed section, with that message truncated.
+  it("keeps the Disputed section with truncated message when a disputed finding is very long", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: "x".repeat(4000),
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("unresolved lexical matches");
+    expect(body).toContain("src/queue.ts:12");
+  });
+
   // Five review rounds produced five separate "this path drops the check"
   // findings, each fixed at the site that was named. Patching named sites is
   // evidently not how this converges, so the invariant gets asserted over the
