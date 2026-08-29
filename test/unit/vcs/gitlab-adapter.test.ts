@@ -162,6 +162,34 @@ describe("GitLabAdapter merge request snapshot", () => {
     ]);
   });
 
+  it("rebuilds a unified incremental diff from the repository compare API", async () => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const hunk = "@@ -1,1 +1,2 @@\n keep\n+added\n";
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(JSON.stringify({
+      diffs: [{
+        old_path: "src/other.ts",
+        new_path: "src/other.ts",
+        new_file: false,
+        deleted_file: false,
+        diff: hunk,
+      }],
+    }));
+
+    const diff = await new GitLabAdapter(execGlab).getCompareDiff(locator(customPortRepo), fromSha, toSha);
+    expect(diff).toContain("diff --git a/src/other.ts b/src/other.ts");
+    expect(diff).toContain(hunk);
+    expect(execGlab).toHaveBeenCalledWith(expect.arrayContaining([
+      "api",
+      "--hostname",
+      customPortRepo.host,
+      expect.stringContaining("repository/compare"),
+    ]));
+    const compareArg = execGlab.mock.calls[0]?.[0].find((arg) => arg.includes("repository/compare"));
+    expect(compareArg).toContain(`from=${fromSha}`);
+    expect(compareArg).toContain(`to=${toSha}`);
+  });
+
   it("rejects ambient and GitHub repository locators before invoking glab", async () => {
     const execGlab = vi.fn<ExecGlab>();
     const adapter = new GitLabAdapter(execGlab);

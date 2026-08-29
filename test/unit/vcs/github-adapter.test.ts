@@ -936,6 +936,25 @@ describe("GitHubAdapter", () => {
     });
   });
 
+  describe("getCompareDiff", () => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const patch = "diff --git a/src/auth.ts b/src/auth.ts\n+touched\n";
+
+    it("asks the compare API for the raw incremental diff", async () => {
+      const execGh = vi.fn(async () => patch);
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getCompareDiff(locator42, fromSha, toSha)).resolves.toBe(patch);
+      expect(execGh).toHaveBeenCalledWith(expect.arrayContaining([
+        "api",
+        `repos/{owner}/{repo}/compare/${fromSha}...${toSha}`,
+        "-H",
+        "Accept: application/vnd.github.diff",
+      ]));
+    });
+  });
+
   // --- getFileAtRef (issue #56) ---
   //
   // The general form of the machinery getRuleFilesFromBase already used, so

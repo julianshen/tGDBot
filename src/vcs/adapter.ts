@@ -66,6 +66,19 @@ export interface VcsAdapter {
     locator: ReviewLocator,
     options?: { expectedHeadSha?: string; expectedBaseSha?: string },
   ): Promise<string>;
+  /**
+   * Unified diff of what `toSha` changed since `fromSha` (three-dot compare).
+   *
+   * `getDiff` is the pull request's full base..head, which still contains
+   * every finding line as context or as the original addition. Head-change
+   * verification needs the increment between the finding's own head and the
+   * current one, otherwise any later push re-verifies every open finding.
+   */
+  getCompareDiff(
+    locator: ReviewLocator,
+    fromSha: string,
+    toSha: string,
+  ): Promise<string>;
   findBotComment(locator: ReviewLocator): Promise<BotComment | null>;
   /**
    * Creates or updates the summary and returns the exact provider-confirmed

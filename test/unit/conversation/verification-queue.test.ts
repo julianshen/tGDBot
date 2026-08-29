@@ -97,6 +97,24 @@ describe("pendingVerifications — what makes a finding worth re-examining", () 
 
     expect(queue).toEqual([]);
   });
+
+  it("scopes a touch to the finding's own origin head, not a union of incrementals", () => {
+    const earlier = "c".repeat(40);
+    const later = "d".repeat(40);
+    const raisedEarlier = ledger({ id: "finding_earlier", headSha: earlier });
+    const raisedLater = ledger({ id: "finding_later", headSha: later, identity: { threadId: "t2" } });
+    const queue = pendingVerifications(input({
+      events: [],
+      findings: [raisedEarlier, raisedLater],
+      changedLines: new Map(),
+      addedLinesByOriginHead: new Map([
+        [earlier, new Map([["src/a.ts", new Set([10])]])],
+        [later, new Map([["src/unrelated.ts", new Set([1])]])],
+      ]),
+    }));
+
+    expect(queue).toEqual([expect.objectContaining({ findingId: "finding_earlier", trigger: "head-change" })]);
+  });
 });
 
 describe("pendingVerifications — one verdict per finding per head", () => {

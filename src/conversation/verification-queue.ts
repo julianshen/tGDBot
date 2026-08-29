@@ -63,6 +63,13 @@ export interface VerificationQueueInput {
   /** Lines the new head touched, by path. Empty when the head did not move. */
   readonly changedLines: ReadonlyMap<string, ReadonlySet<number>>;
   /**
+   * Added lines between a finding's origin head and the current head, keyed
+   * by that origin SHA (lowercased). When present, a finding is matched only
+   * against its own increment — unioning every origin would treat a later
+   * finding as touched by commits that landed before it was raised.
+   */
+  readonly addedLinesByOriginHead?: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>>;
+  /**
    * Threads the caller last observed RESOLVED, from durable state.
    *
    * A resolution is a state both adapters re-emit, not an event, so acting on
@@ -209,9 +216,13 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
     // what the review was reading. Verifying it against the commit that
     // produced it spends the ceiling and posts a reply nobody prompted
     // (PR #73 review).
+    const originLines = input.addedLinesByOriginHead === undefined
+      ? input.changedLines
+      : input.addedLinesByOriginHead.get(candidate.headSha.toLowerCase());
     const touched = candidate.placement !== null
       && candidate.headSha.toLowerCase() !== input.headSha.toLowerCase()
-      && anchorTouched(candidate.placement, input.changedLines);
+      && originLines !== undefined
+      && anchorTouched(candidate.placement, originLines);
 
     const trigger = humanTrigger ?? (touched ? "head-change" : undefined);
     if (trigger === undefined) continue;

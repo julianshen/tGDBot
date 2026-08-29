@@ -13,6 +13,7 @@ import {
   renameSourcesByHeadPath,
   quoteGitPathOperand,
   commentableLines,
+  addedLines,
   diffPositionRange,
   parseDiffPositions,
   isCommentable,
@@ -30,6 +31,28 @@ index 111..222 100644
 +added2
  ctx2
 `;
+
+describe("addedLines", () => {
+  // Head-change verification must not treat hunk context as a touch: a later
+  // push that leaves the finding's line as surrounding context would otherwise
+  // re-verify every finding still in the pull request's full diff.
+  it("maps only added (+) lines, never context or removals", () => {
+    const map = addedLines(SIMPLE);
+
+    expect([...(map.get("src/a.go") ?? [])].sort((a, b) => a - b)).toEqual([11, 12]);
+  });
+
+  it("returns an empty map for a diff with no additions", () => {
+    const diff = `diff --git a/t.ts b/t.ts
+--- a/t.ts
++++ b/t.ts
+@@ -1,2 +1,1 @@
+ keep
+-gone
+`;
+    expect(addedLines(diff).size).toBe(0);
+  });
+});
 
 describe("commentableLines", () => {
   it("maps added and context lines to their NEW-file line numbers", () => {

@@ -250,6 +250,23 @@ export function projectEndpoint(repo: GitLabRepositoryRef, suffix: string): stri
   return `projects/${encodeURIComponent(projectPath)}/${suffix}`;
 }
 
+function gitlabComparePatch(entry: unknown): string {
+  if (entry === null || typeof entry !== "object") return "";
+  const row: object = entry;
+  const newPath = "new_path" in row && typeof row.new_path === "string" ? row.new_path : undefined;
+  const oldPath = "old_path" in row && typeof row.old_path === "string" ? row.old_path : newPath;
+  const hunk = "diff" in row && typeof row.diff === "string" ? row.diff : "";
+  if (newPath === undefined || hunk.length === 0) return "";
+  const deleted = "deleted_file" in row && row.deleted_file === true;
+  const created = "new_file" in row && row.new_file === true;
+  return [
+    `diff --git a/${oldPath ?? newPath} b/${newPath}`,
+    `--- ${created ? "/dev/null" : `a/${oldPath ?? newPath}`}`,
+    `+++ ${deleted ? "/dev/null" : `b/${newPath}`}`,
+    hunk.endsWith("\n") ? hunk.slice(0, -1) : hunk,
+  ].join("\n") + (hunk.endsWith("\n") ? "\n" : "");
+}
+
 export function decodeNdjsonRecords<T>(stdout: string): T[] {
   const records: T[] = [];
   for (const [index, line] of stdout.split(/\r?\n/u).entries()) {
@@ -1011,6 +1028,30 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
   async getDiff(locator: ReviewLocator): Promise<string> {
     const { repo, iid } = resolveMergeRequestLocator(locator);
     return this.execGlab(["mr", "diff", iid, "--repo", repo.canonicalUrl]);
+  }
+
+  async getCompareDiff(
+    locator: ReviewLocator,
+    fromSha: string,
+    toSha: string,
+  ): Promise<string> {
+    if (!isCommitSha(fromSha) || !isCommitSha(toSha)) {
+      throw new Error("compare requires commit SHAs");
+    }
+    const { repo } = resolveMergeRequestLocator(locator);
+    const stdout = await this.execGlab([
+      "api",
+      "--method",
+      "GET",
+      "--hostname",
+      repo.host,
+      `${projectEndpoint(repo, "repository/compare")}?from=${encodeURIComponent(fromSha)}&to=${encodeURIComponent(toSha)}`,
+    ]);
+    const parsed: unknown = JSON.parse(stdout);
+    if (parsed === null || typeof parsed !== "object" || !("diffs" in parsed) || !Array.isArray(parsed.diffs)) {
+      return "";
+    }
+    return parsed.diffs.map(gitlabComparePatch).filter((patch) => patch.length > 0).join("\n");
   }
 
   async findBotComment(locator: ReviewLocator): Promise<BotComment | null> {

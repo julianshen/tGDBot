@@ -55,6 +55,26 @@ export function commentableLines(diff: string | DiffPositions): CommentableLines
 }
 
 /**
+ * New-side lines the diff actually added (`+`), keyed by head-side path.
+ *
+ * `commentableLines` also includes hunk context (` `). Using that as "this
+ * commit touched the line" re-verifies every finding still sitting in a
+ * pull request's full diff, which is exactly the cost #57 forbids.
+ */
+export function addedLines(diff: string | DiffPositions): CommentableLines {
+  const result: CommentableLines = new Map();
+  const positions = typeof diff === "string" ? parseDiffPositions(diff) : diff;
+  for (const [file, lines] of positions) {
+    const added = new Set<number>();
+    for (const [line, position] of lines) {
+      if (position.endpoint.type === "new") added.add(line);
+    }
+    if (added.size > 0) result.set(file, added);
+  }
+  return result;
+}
+
+/**
  * True iff `file`:`line` is a valid new-side inline anchor.
  *
  * A finding with no line (`line: null`, per the JSON contract) can never be

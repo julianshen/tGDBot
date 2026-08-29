@@ -1308,6 +1308,24 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     }
   }
 
+  async getCompareDiff(
+    locator: ReviewLocator,
+    fromSha: string,
+    toSha: string,
+  ): Promise<string> {
+    if (!isCommitSha(fromSha) || !isCommitSha(toSha)) {
+      throw new Error("compare requires commit SHAs");
+    }
+    const { repo } = resolvePullLocator(locator);
+    return this.execGh([
+      "api",
+      `${apiRepo(repo)}/compare/${encodeURIComponent(fromSha)}...${encodeURIComponent(toSha)}`,
+      ...apiHost(repo),
+      "-H",
+      "Accept: application/vnd.github.diff",
+    ]);
+  }
+
   /**
    * Reads the PR's current head SHA and its own changed-file tally, validated.
    *

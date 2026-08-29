@@ -499,6 +499,7 @@ function postedInlineIdentity(commentId: string) {
 
 function silentReviewVcs(options: {
   readonly failNextInline?: "throw" | "accept-then-fail" | null;
+  readonly compareDiff?: string;
 } = {}) {
   let stored: BotComment | null = null;
   const postedInlines: Array<{ clientId: string; path: string; line: number; body: string }> = [];
@@ -553,6 +554,7 @@ function silentReviewVcs(options: {
       url: "https://github.com/owner/repo/pull/1",
     })),
     getDiff: vi.fn(async () => commentableAuthDiff),
+    getCompareDiff: vi.fn(async () => options.compareDiff ?? ""),
     getRuleFilesFromBase: vi.fn(async () => []),
     resolveRelatedWork: vi.fn(async (references: unknown) => references),
   };
@@ -815,11 +817,12 @@ function executionDeps(adapter: ExecutionAdapter, extras: {
   readonly rules?: readonly RuleDefinition[];
   readonly ruleLoadError?: Error;
   readonly diff?: string;
+  readonly compareDiff?: string;
   readonly vcs?: ReturnType<typeof silentReviewVcs>;
   readonly publicationHooks?: PublicationExecutorHooks;
 } = {}) {
   const heads = extras.heads === undefined ? undefined : [...extras.heads];
-  const vcs = extras.vcs ?? silentReviewVcs();
+  const vcs = extras.vcs ?? silentReviewVcs({ compareDiff: extras.compareDiff });
   return {
     conversationAdapter: adapter,
     createSession: extras.createSession ?? sessionFor(JSON.stringify({ explanation: "The logger prints user.token." })),
@@ -2075,6 +2078,90 @@ describe("automatic verification", () => {
           },
         },
   );
+
+  const unrelatedCompareDiff = [
+    "diff --git a/src/other.ts b/src/other.ts",
+    "--- a/src/other.ts",
+    "+++ b/src/other.ts",
+    "@@ -1,1 +1,2 @@",
+    " keep",
+    "+added",
+  ].join("\n");
+  // The finding is anchored at src/auth.ts:14. In the full PR diff that line
+  // is hunk CONTEXT (the original addition is line 13). A later push that
+  // actually touches the finding must add line 14 in the INCREMENTAL compare,
+  // which is how we prove we did not reuse the pull request's full diff.
+  const touchingCompareDiff = [
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -13,0 +14,1 @@",
+    "+  console.log(user.token);",
+  ].join("\n");
+
+  it("verifies a silent push that touches the anchored line and leaves a human thread unresolved", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    installFindingThread(
+      adapter, findingMarker!, threadComment("human-root", "looking at this", { threadId: "T-human" }),
+      { rootAuthorIsBot: false },
+    );
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    const deps = executionDeps(adapter, {
+      createSession: session,
+      diff: commentableAuthDiff,
+      compareDiff: touchingCompareDiff,
+    });
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("withdrawn");
+    expect(outcomes[0]!.trigger).toBe("head-change");
+    expect(outcomes[0]!.headSha).toBe("d".repeat(40));
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+  });
+
+  it("does not verify a silent push that only changes an unrelated file", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: session,
+        diff: commentableAuthDiff,
+        compareDiff: unrelatedCompareDiff,
+      }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+    await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
+      .resolves.toEqual([]);
+  });
 
   it("verifies once when a human replies, without being asked", async () => {
     const adapter = new ExecutionAdapter([]);
