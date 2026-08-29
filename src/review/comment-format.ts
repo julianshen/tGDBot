@@ -322,18 +322,28 @@ function unclosedFence(value: string): { char: string; length: number } | undefi
  * section — the host check, the references, the rules that failed — then
  * renders inside that code block.
  *
+ * @param linePrefix - what the rendered first line already carries before the
+ * text. A disputed item renders its message after the list-item text and em
+ * dash, so a fence run opening the message's first line is MID-LINE — not a
+ * fence at all. Balancing the message in isolation treated that run as an
+ * opener, appended a "closer" that lands on a real line start, and THAT run
+ * opened the fence that swallowed the later sections (Codex review of PR #84,
+ * round three). The check therefore runs on the composed first line.
+ *
  * Never exceeds the budget: an over-budget body is what pushes the summary
  * into the emergency form that drops the Disputed section wholesale, so the
  * close fence is bought by cutting the prose shorter, not by spending more.
  */
-function truncateCompactProse(text: string, max: number): string {
+function truncateCompactProse(text: string, max: number, linePrefix = ""): string {
   if (max <= 0) return "";
   const first = truncate(text, max);
-  const open = unclosedFence(first);
+  // The prefix shares the first line only; the text's later lines stand alone,
+  // so composing prefix + candidate reproduces the rendered shape exactly.
+  const open = unclosedFence(`${linePrefix}${first}`);
   if (open === undefined) return first;
   const close = open.char.repeat(open.length);
   const retry = truncate(text, max - close.length - 1);
-  return unclosedFence(retry) === undefined ? retry : `${retry}\n${close}`;
+  return unclosedFence(`${linePrefix}${retry}`) === undefined ? retry : `${retry}\n${close}`;
 }
 
 function splitHeadline(message: string): { headline: string; body: string } {
@@ -1066,15 +1076,20 @@ function renderDisputedSection(
   const items = disputed.flatMap((finding, index) => {
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
+    // The head shares the message's first rendered line: `- \`loc\` (\`rule\`) — `.
+    // Truncation must balance fences against THIS line, not the message alone —
+    // a fence run opening the message is mid-line here and therefore not a
+    // fence at all (Codex review of PR #84, round three).
+    const head = `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — `;
     const message = compact
-      ? truncateCompactProse(sanitizeText(finding.message), messageBudgets?.[index] ?? MAX_COMPACT_DISPUTED_MESSAGE_CHARS)
+      ? truncateCompactProse(sanitizeText(finding.message), messageBudgets?.[index] ?? MAX_COMPACT_DISPUTED_MESSAGE_CHARS, head)
       : sanitizeText(finding.message);
     // A disputed finding is precisely the one whose evidence a reader needs —
     // which is why the host check belongs here most of all. A finding the
     // reviewer itself marked disputed, published with the host's answer to its
     // structural claim removed, leaves the reader the weakest version of both.
     return [
-      `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`,
+      `${head}${message}`,
       ...hostCheckBullets(finding, "  ", compact),
       ...(compact
         ? compactReferenceBullets(finding, "  ")

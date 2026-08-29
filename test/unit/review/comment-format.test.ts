@@ -1875,6 +1875,32 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).toContain("### Disputed");
   });
 
+  // Codex review of PR #84, round three: the message renders INLINE after the
+  // list-item text and em dash, so a fence run OPENING the message is
+  // mid-line — not a fence at all. Balancing the message in isolation treated
+  // that run as an opener, appended a "closer" that landed on a real line
+  // start, and THAT run opened the fence the check existed to prevent.
+  it("does not treat a fence run opening a truncated message as a fence", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: `\`\`\`\`go\n${"x".repeat(4000)}`,
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(unclosedFenceIn(body)).toBeUndefined();
+    expect(body).toContain("### Disputed");
+    // With the bug, the appended closer sits on its own line and opens a real
+    // fence; with the fix the body contains no standalone fence line at all.
+    expect(body).not.toMatch(/^[ \t]*`{3,}[ \t]*$/m);
+  });
+
   // Five review rounds produced five separate "this path drops the check"
   // findings, each fixed at the site that was named. Patching named sites is
   // evidently not how this converges, so the invariant gets asserted over the
