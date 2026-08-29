@@ -391,11 +391,17 @@ export async function checkStructuralClaim(
   let occurrences = 0;
   let suppressedOccurrences = 0;
   let filesSearched = 0;
+  // Whether the walk stopped early on the clock. A PARTIAL scan cannot make
+  // the complete-scan claim below — see the `occurrences === 0` branch.
+  let walkExpired = false;
 
   walk: for (const file of files) {
     // Stop, but evaluate what was already found rather than discarding it: a
     // reference read before the deadline is still a reference.
-    if (expired()) break;
+    if (expired()) {
+      walkExpired = true;
+      break;
+    }
     const language = LANG_BY_EXTENSION.get(path.extname(file).toLowerCase());
     const kinds = language === undefined ? undefined : REFERENCE_KINDS.get(language);
     const astLangName = language === undefined ? undefined : AST_LANG.get(language);
@@ -423,13 +429,34 @@ export async function checkStructuralClaim(
 
     const relative = canonicalRelative(path.relative(input.baseRoot, file));
     for (const kind of kinds) {
+      // Never START a discovery after the deadline (CodeRabbit review of
+      // PR #93): the overshoot is then bounded by one kind's discovery in one
+      // file. `findAll` itself is atomic — it materializes every match of one
+      // kind in Rust before JS sees the first node, and napi 0.45.2 offers no
+      // streaming or cancellation API (SgNode.findAll → Array; there is no
+      // iterator). Measured on the pathological file from issue #83 (2 MiB,
+      // ~190k matches): discovery ≈ 200ms, which the budget absorbs; the
+      // 2 MiB parse BEFORE it is also atomic and three-halves the cost, so a
+      // manual `children()` walk — thousands of FFI calls per ordinary file —
+      // could not make the per-file cost deadline-aware anyway. Everything
+      // JS-side below IS per-node deadline-bounded.
+      if (expired()) {
+        console.error(`DBG between-kind kind=${kind} callsSoFar~`);
+        walkExpired = true;
+        break walk;
+      }
       for (const node of root.findAll({ rule: { kind } })) {
         // Issue #83: the deadline is consulted MID-FILE, not only between
         // files. One dense file could otherwise run the whole budget after
         // the last file boundary. Stopping here yields a PARTIAL count, and
         // undercounting is the safe direction — the same trade the per-file
         // break above already made.
-        if (expired()) break walk;
+        if (expired()) {
+          console.error(`DBG node-expired kind=${kind} line=${node.range().start.line + 1}`);
+          walkExpired = true;
+          break walk;
+        }
+        console.error(`DBG node kind=${kind} line=${node.range().start.line + 1} text=${node.text()}`);
         if (node.text() !== claim.symbol) continue;
         // The finding's own files are filtered HERE rather than after the
         // walk: reconciliation and the census are per-match decisions, and a
@@ -453,10 +480,15 @@ export async function checkStructuralClaim(
     }
   }
 
-  if (occurrences === 0 && suppressedOccurrences > 0) {
-    // Every base occurrence the search found may already be deleted by this
-    // pull request. Same answer, same wording, as the post-hoc path — but
-    // computed over the FULL census, not a capped sample.
+  // The every-file-removed claim is a statement about the WHOLE walk, so it
+  // must never fire on a partial one (CodeRabbit review of PR #93): the
+  // deadline may have stopped the scan after the last suppressed match but
+  // before an unread survivor, and publishing "removes lines mentioning it
+  // from every file" over a half-read tree would be the host asserting more
+  // than it read. A partial scan falls back to the ordinary not-checked
+  // reason, which overclaims nothing. A partial scan that DID find survivors
+  // still publishes them — undercounting is the safe direction.
+  if (occurrences === 0 && suppressedOccurrences > 0 && !walkExpired) {
     return { status: "not-checked", reason: REMOVED_EVERYWHERE_REASON };
   }
   if (occurrences === 0) {

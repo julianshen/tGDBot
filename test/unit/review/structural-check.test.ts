@@ -370,6 +370,46 @@ describe("checkStructuralClaim — bounded retention with an exact census (issue
     expect(calls).toBeGreaterThan(30);
   });
 
+  // CodeRabbit review of PR #93: the every-file-removed claim is about the
+  // WHOLE walk, so a partial scan must never make it. One file: line 1 is a
+  // suppressed match, line 2 is a survivor. The deadline — calibrated to this
+  // fixture, where a never-expiring clock makes exactly 13 calls — expires
+  // between them, so the scan dies having seen only the suppressed match.
+  // Publishing "removes lines mentioning it from every file where it was
+  // found" would assert more than the host read.
+  it("does not report complete removal when the deadline stopped the scan early", async () => {
+    const root = await tree({
+      "src/a.ts": "budget;\nbudget;\n",
+    });
+    let calls = 0;
+    const now = (): number => {
+      calls += 1;
+      // Calibrated for THIS fixture: line 1's candidate node sees clock call 8
+      // (processed, suppressed), line 2's sees call 9 — hard-expired, so the
+      // survivor is never read.
+      return calls <= 8 ? 0 : Number.MAX_SAFE_INTEGER;
+    };
+
+    const result = await checkStructuralClaim(
+      claim,
+      { baseRoot: root, findingFile: "src/retry.ts" },
+      {
+        now,
+        timeBudgetMs: 60_000,
+        removedLinesByFile: new Map([
+          ["src/a.ts", removedAt([1, "budget;"])],
+        ]),
+      },
+    );
+
+    expect(result.status).toBe("not-checked");
+    if (result.status !== "not-checked") throw new Error("unreachable");
+    expect(result.reason).not.toMatch(/every file where it was found/);
+    // The ordinary reason: it claims only what was searched, never that the
+    // PR removed every occurrence.
+    expect(result.reason).toMatch(/not evidence that no reference exists/);
+  });
+
   // The diff must actually REACH the collection loop — the reconciliation
   // moved inside the check, so the option has to travel through
   // `runStructuralChecks` for the inline path to ever fire in production.
