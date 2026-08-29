@@ -78,6 +78,7 @@ import {
 } from "../conversation/state-store.js";
 import {
   prepareFindingLedgerEntry,
+  bindFindingLedgerIdentity,
   prepareFindingOutcome,
   type ConversationEventEntry,
   type FindingSnapshot,
@@ -303,7 +304,17 @@ async function classifyOpenReviewEvents(options: {
         item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
         item.event.threadId !== undefined && boundThreads.has(item.event.threadId))
       .map((item) => item.event);
-    const queued = candidateEvents.length === 0
+    // Threads with NO bound finding are recovery candidates (issue #85): a
+    // finding published before a crash bound its identity is matched by its
+    // marker instead. Named here so the queue is entered even when no bound
+    // candidate exists — otherwise the page would consume the reply before the
+    // queue ever saw it — and held on a queue failure, same as candidates.
+    const recoveryEvents = classified
+      .filter((item) => item.parsed.kind === "irrelevant" &&
+        item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
+        item.event.threadId !== undefined && !boundThreads.has(item.event.threadId))
+      .map((item) => item.event);
+    const queued = candidateEvents.length === 0 && recoveryEvents.length === 0
       ? { items: [], deferred: false, deferredEvents: [] } as VerificationQueue
       : await queueVerifications({
       events: classified.filter((item) => item.parsed.kind === "irrelevant"),
@@ -315,7 +326,11 @@ async function classifyOpenReviewEvents(options: {
       // Hold everything: which of these were really owed is exactly what the
       // failed call was going to tell us.
       console.warn(`tgd-review-agent: could not queue verifications (${redactedMessage(error)})`);
-      return { items: [], deferred: true, deferredEvents: candidateEvents } as VerificationQueue;
+      return {
+        items: [],
+        deferred: true,
+        deferredEvents: [...candidateEvents, ...recoveryEvents],
+      } as VerificationQueue;
     });
     // THE INVARIANT: an event taken off the page must either complete its
     // verification this poll or hold the cursor. Removal and the cursor
@@ -2048,6 +2063,22 @@ export const MAX_POLL_VERIFICATIONS = 5;
 const MAX_VERIFICATION_CANDIDATES = 200;
 
 /**
+ * How many UNMATCHED thread events one page may spend a thread read on while
+ * recovering findings whose publication crashed before identity binding
+ * (issue #85). Scoped to unmatched events only, so the ordinary path — every
+ * reply in a bound finding's thread — performs no additional provider
+ * round-trip.
+ *
+ * Events past the cap are DEFERRED, not consumed (Codex review of PR #87,
+ * round two): a genuine crash orphan sitting behind unrelated threads would
+ * otherwise be consumed unread and lost for good. Each poll still consumes
+ * durably every non-match it inspects and recovers every match, so the tail
+ * drains and the cursor hold terminates — only after an INSPECTION finds an
+ * event unmatchable is it consumed.
+ */
+const MAX_IDENTITY_RECOVERY_READS = 4;
+
+/**
  * Plans the automatic verifications this poll should perform for one review.
  *
  * Ordered cheapest-first on purpose: the QUEUE runs on data already in hand —
@@ -2114,6 +2145,7 @@ async function queueVerifications(input: {
     readonly now: () => string;
     readonly config: ResolvedPollConfig;
     readonly deps: PollDependencies;
+    readonly dryRun: boolean;
   };
 }): Promise<VerificationQueue> {
   // Store reads FIRST, and no provider call until there is something to ask
@@ -2122,24 +2154,111 @@ async function queueVerifications(input: {
   // return of "nothing" is indistinguishable from "nothing is owed" and the
   // page consumes the reply (PR #74 review).
   const snapshot = await input.options.store.readContextSnapshot();
-  const findings = snapshot.findings.filter((entry) => entry.reviewNumber === input.reviewNumber);
+  let findings = snapshot.findings.filter((entry) => entry.reviewNumber === input.reviewNumber);
   const bound = new Set(findings
     .map((entry) => entry.identity?.threadId)
     .filter((threadId): threadId is string => threadId !== undefined));
+  const replyShape = (item: { readonly event: ReviewActivityEvent }): boolean =>
+    item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
+    item.event.threadId !== undefined;
   // The cheap superset: a human event in a published finding's own thread.
   // Costs nothing, needs no head, and is what every early return defers. A
   // candidate the real queue would have dismissed is simply dismissed on the
   // next poll instead, which terminates.
   const waiting = input.events
-    .filter((item) => item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
-      item.event.threadId !== undefined && bound.has(item.event.threadId))
+    .filter((item) => replyShape(item) && bound.has(item.event.threadId!))
     .map((item) => item.event);
-  if (waiting.length === 0) return { items: [], deferred: false, deferredEvents: [] };
-  const holdAll = { items: [], deferred: true, deferredEvents: waiting };
+  // Threads with NO bound finding (issue #85): a finding whose publication
+  // crashed after the provider write but before the identity was bound has no
+  // threadId in the ledger, so the set above cannot match replies in its
+  // thread — and an unmatched event is consumed as classified-and-ignored,
+  // spending the human's reply forever. The thread's root is the bot's own
+  // comment carrying the authenticated finding marker, so the finding is
+  // recognisable WITHOUT the binding: the recovery below loads the thread,
+  // parses the marker against the ledger, and repairs the binding.
+  const unmatched = input.events
+    .filter((item) => replyShape(item) && !bound.has(item.event.threadId!))
+    .map((item) => item.event);
+  if (waiting.length === 0 && unmatched.length === 0) {
+    return { items: [], deferred: false, deferredEvents: [] };
+  }
+
+  // Identity recovery for crash-orphaned findings (issue #85). Only unmatched
+  // events are read, and only up to the cap — the ordinary path performs no
+  // additional provider round-trip (issue #85 acceptance). A read outage
+  // DEFERS the event rather than consuming it: dropping it here would lose the
+  // reply for good, the exact failure being repaired.
+  //
+  // This runs BEFORE the budget gate deliberately (Codex review of PR #87):
+  // recovery needs a provider thread read, not a model call, so a budget
+  // exhausted by earlier verifications is no reason to consume a crash
+  // orphan's reply — the scarcest thing this path handles.
+  const recoveryDeferred: ReviewActivityEvent[] = [];
+  // Threads already read during recovery: the verification loop re-reads each
+  // candidate's thread, and a recovered finding's thread is already in hand —
+  // spending a second read on it would double the recovery path's cost for no
+  // information.
+  const recoveredThreads = new Map<string, ReviewThreadSnapshot>();
+  // The uninspected tail is DEFERRED, not consumed: a genuine crash orphan
+  // sitting behind unrelated threads must be inspected on a later poll, not
+  // lost unread (Codex review of PR #87, round two). Each poll still consumes
+  // durably every non-match it inspects, so the tail drains.
+  recoveryDeferred.push(...unmatched.slice(MAX_IDENTITY_RECOVERY_READS));
+  for (const event of unmatched.slice(0, MAX_IDENTITY_RECOVERY_READS)) {
+    let thread: ReviewThreadSnapshot;
+    try {
+      thread = await input.options.adapter.getReviewThread(input.reviewIdentity, event.threadId!);
+    } catch (error) {
+      console.warn(`tgd-review-agent: could not load a thread to recover a finding identity (${redactedMessage(error)})`);
+      recoveryDeferred.push(event);
+      continue;
+    }
+    // The same gate the command path applies: the thread must be the bot's OWN
+    // and its root must carry an authenticated finding marker naming a ledger
+    // record in THIS repository and review. A thread failing either is not
+    // ours to recover, and falls out consumed, as before.
+    const resolution = resolveMarkedFindingThread({
+      event,
+      thread,
+      findings,
+      repository: input.options.store.repositoryBinding,
+      markerRepositoryDigest: computeRepositoryDigest(
+        input.options.config.repository.provider,
+        input.options.config.repository.canonicalUrl,
+      ),
+    });
+    if (resolution.status !== "marked" || resolution.ledger.identity !== undefined) continue;
+    // The marker's ledger record is PREPARED but UNBOUND — the crash gap. Bind
+    // the identity the thread itself proves: the bot's root comment in the
+    // thread the human replied to, the same fields a successful publication
+    // write would have recorded.
+    const boundEntry = bindFindingLedgerIdentity(resolution.ledger, {
+      provider: event.provider,
+      commentId: thread.rootCommentId,
+      threadId: event.threadId!,
+      url: resolution.root.url,
+    });
+    if (!input.options.dryRun) {
+      await input.options.store.transact((tx) => { tx.appendFinding(boundEntry); });
+    }
+    findings = findings.map((entry) => entry.id === boundEntry.id ? boundEntry : entry);
+    bound.add(event.threadId!);
+    waiting.push(event);
+    recoveredThreads.set(event.threadId!, thread);
+  }
 
   // Nothing may run, but everything waiting must still be NAMED. Enumerating
   // through the full path spent a thread read per review on a poll that could
   // not afford to verify anything (PR #74 review).
+  //
+  // Recovered events are in `waiting` now: their binding is repaired, so they
+  // are held here and reached through the ordinary bound path once model
+  // budget returns — never re-read, never re-recovered. Unmatched events that
+  // did NOT recover (no marker, not the bot's thread) are not held: there is
+  // no way to ever match them, and holding unmatchable events pins the cursor
+  // forever. Read failures and the unread past-the-cap tail ARE held — both
+  // may still resolve on a later poll.
+  const holdAll = { items: [], deferred: true, deferredEvents: [...waiting, ...recoveryDeferred] };
   if (input.budget <= 0) return holdAll;
 
   const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
@@ -2172,7 +2291,12 @@ async function queueVerifications(input: {
     changedLines: new Map(),
     ceiling: MAX_VERIFICATION_CANDIDATES,
   });
-  if (queue.length === 0) return { items: [], deferred: false, deferredEvents: [] };
+  if (queue.length === 0) {
+    // A recovery read outage defers its event even when no candidate emerged:
+    // the event is off the page either way, and the reply it carries must not
+    // be spent on a transport failure.
+    return { items: [], deferred: recoveryDeferred.length > 0, deferredEvents: recoveryDeferred };
+  }
 
   const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
   if (rules.error !== undefined) {
@@ -2227,15 +2351,20 @@ async function queueVerifications(input: {
   let deferred = deferredEvents.length > 0;
   for (const { pending, ledger, threadId, event } of unanswered.slice(0, input.budget)) {
     let thread: ReviewThreadSnapshot | undefined;
-    try {
-      thread = await input.options.adapter.getReviewThread(input.reviewIdentity, threadId);
-    } catch (error) {
-      // A READ OUTAGE, not an answer. Deferring retries it next poll; dropping
-      // it let the page consume the reply for good (PR #74 review).
-      console.warn(`tgd-review-agent: could not load a thread to verify (${redactedMessage(error)})`);
-      deferredEvents.push(event);
-      deferred = true;
-      continue;
+    const recoveredThread = recoveredThreads.get(threadId);
+    if (recoveredThread !== undefined) {
+      thread = recoveredThread;
+    } else {
+      try {
+        thread = await input.options.adapter.getReviewThread(input.reviewIdentity, threadId);
+      } catch (error) {
+        // A READ OUTAGE, not an answer. Deferring retries it next poll; dropping
+        // it let the page consume the reply for good (PR #74 review).
+        console.warn(`tgd-review-agent: could not load a thread to verify (${redactedMessage(error)})`);
+        deferredEvents.push(event);
+        deferred = true;
+        continue;
+      }
     }
 
     // The thread must be the bot's OWN. A published finding's identity is bound
@@ -2264,7 +2393,12 @@ async function queueVerifications(input: {
       }),
     });
   }
-  return { items, deferred, deferredEvents, context: { metadata, rules } };
+  return {
+    items,
+    deferred,
+    deferredEvents: [...deferredEvents, ...recoveryDeferred],
+    context: { metadata, rules },
+  };
 }
 
 /**
