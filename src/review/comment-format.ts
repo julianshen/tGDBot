@@ -297,17 +297,24 @@ function truncate(text: string, max: number): string {
  * (Codex review of PR #84, round two), and every later compact section then
  * rendered inside that block. A backtick run whose info string contains a
  * backtick is not a fence opener at all.
+ *
+ * `indent` is the opener line's leading whitespace: the synthetic closer must
+ * repeat it, because a closer at column zero when the opener was indented as
+ * list-item content leaves the list container — under CommonMark that ends
+ * the nested block and the line opens a new ROOT-LEVEL fence instead (Codex
+ * review of PR #84, round four).
  */
-function unclosedFence(value: string): { char: string; length: number } | undefined {
-  let open: { char: string; length: number } | undefined;
+function unclosedFence(value: string): { char: string; length: number; indent: string } | undefined {
+  let open: { char: string; length: number; indent: string } | undefined;
   for (const line of value.split("\n")) {
-    const match = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    const match = /^([ \t]*)(`{3,}|~{3,})(.*)$/.exec(line);
     if (match === null) continue;
-    const marker = match[1]!;
-    const rest = match[2]!;
+    const indent = match[1]!;
+    const marker = match[2]!;
+    const rest = match[3]!;
     if (open === undefined) {
       if (marker[0] === "`" && rest.includes("`")) continue;
-      open = { char: marker[0]!, length: marker.length };
+      open = { char: marker[0]!, length: marker.length, indent };
     } else if (marker[0] === open.char && marker.length >= open.length && rest.trim() === "") {
       open = undefined;
     }
@@ -341,7 +348,10 @@ function truncateCompactProse(text: string, max: number, linePrefix = ""): strin
   // so composing prefix + candidate reproduces the rendered shape exactly.
   const open = unclosedFence(`${linePrefix}${first}`);
   if (open === undefined) return first;
-  const close = open.char.repeat(open.length);
+  // The closer repeats the opener's indentation: a column-zero closer when the
+  // opener was indented as list-item content leaves the list container and
+  // opens a root-level fence instead of closing the nested one.
+  const close = `${open.indent}${open.char.repeat(open.length)}`;
   const retry = truncate(text, max - close.length - 1);
   return unclosedFence(`${linePrefix}${retry}`) === undefined ? retry : `${retry}\n${close}`;
 }

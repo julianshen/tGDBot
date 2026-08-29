@@ -1901,6 +1901,31 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).not.toMatch(/^[ \t]*`{3,}[ \t]*$/m);
   });
 
+  // Codex review of PR #84, round four: a column-zero closer does not close a
+  // fence opened on a line indented as list-item content — leaving the list
+  // container implicitly ends the nested block, so the closer OPENS a new
+  // root-level fence instead. The synthetic closer must repeat the opener's
+  // indentation to stay inside the same container.
+  it("emits the synthetic closer at the opener's indentation", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: `intro\n  \`\`\`\`go\n${"x".repeat(4000)}`,
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("### Disputed");
+    // The opener is indented two spaces; its closer must be too.
+    expect(body).toMatch(/^  ````[ \t]*$/m);
+    expect(body).not.toMatch(/^````[ \t]*$/m);
+  });
+
   // Five review rounds produced five separate "this path drops the check"
   // findings, each fixed at the site that was named. Patching named sites is
   // evidently not how this converges, so the invariant gets asserted over the
