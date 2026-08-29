@@ -287,6 +287,75 @@ function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1).trimEnd()}…`;
 }
 
+/**
+ * The fence `value` opens and never closes, under CommonMark rules.
+ *
+ * A closer must match the opener's character, be at least as long as the
+ * opener's run, and carry no info string. A shorter or different-character run
+ * inside a fence is CONTENT, not a closer — counting run parity instead let a
+ * ``` line inside a ```` fence pass as balanced while the fence stayed open
+ * (Codex review of PR #84, round two), and every later compact section then
+ * rendered inside that block. A backtick run whose info string contains a
+ * backtick is not a fence opener at all.
+ *
+ * `indent` is the opener line's leading whitespace: the synthetic closer must
+ * repeat it, because a closer at column zero when the opener was indented as
+ * list-item content leaves the list container — under CommonMark that ends
+ * the nested block and the line opens a new ROOT-LEVEL fence instead (Codex
+ * review of PR #84, round four).
+ */
+function unclosedFence(value: string): { char: string; length: number; indent: string } | undefined {
+  let open: { char: string; length: number; indent: string } | undefined;
+  for (const line of value.split("\n")) {
+    const match = /^([ \t]*)(`{3,}|~{3,})(.*)$/.exec(line);
+    if (match === null) continue;
+    const indent = match[1]!;
+    const marker = match[2]!;
+    const rest = match[3]!;
+    if (open === undefined) {
+      if (marker[0] === "`" && rest.includes("`")) continue;
+      open = { char: marker[0]!, length: marker.length, indent };
+    } else if (marker[0] === open.char && marker.length >= open.length && rest.trim() === "") {
+      open = undefined;
+    }
+  }
+  return open;
+}
+
+/**
+ * Truncate prose that may quote a fenced code block, without leaving a fence
+ * open (Codex review of PR #84, P2). Findings legitimately quote code; a naive
+ * cut can keep the opening fence and drop its close, and every later compact
+ * section — the host check, the references, the rules that failed — then
+ * renders inside that code block.
+ *
+ * @param linePrefix - what the rendered first line already carries before the
+ * text. A disputed item renders its message after the list-item text and em
+ * dash, so a fence run opening the message's first line is MID-LINE — not a
+ * fence at all. Balancing the message in isolation treated that run as an
+ * opener, appended a "closer" that lands on a real line start, and THAT run
+ * opened the fence that swallowed the later sections (Codex review of PR #84,
+ * round three). The check therefore runs on the composed first line.
+ *
+ * Never exceeds the budget: an over-budget body is what pushes the summary
+ * into the emergency form that drops the Disputed section wholesale, so the
+ * close fence is bought by cutting the prose shorter, not by spending more.
+ */
+function truncateCompactProse(text: string, max: number, linePrefix = ""): string {
+  if (max <= 0) return "";
+  const first = truncate(text, max);
+  // The prefix shares the first line only; the text's later lines stand alone,
+  // so composing prefix + candidate reproduces the rendered shape exactly.
+  const open = unclosedFence(`${linePrefix}${first}`);
+  if (open === undefined) return first;
+  // The closer repeats the opener's indentation: a column-zero closer when the
+  // opener was indented as list-item content leaves the list container and
+  // opens a root-level fence instead of closing the nested one.
+  const close = `${open.indent}${open.char.repeat(open.length)}`;
+  const retry = truncate(text, max - close.length - 1);
+  return unclosedFence(`${linePrefix}${retry}`) === undefined ? retry : `${retry}\n${close}`;
+}
+
 function splitHeadline(message: string): { headline: string; body: string } {
   const trimmed = message.trim();
 
@@ -707,6 +776,16 @@ function renderReferences(finding: Finding): string | undefined {
 const MAX_COMPACT_REFERENCE_CHARS = 200;
 
 /**
+ * The longest disputed message compact mode will REQUEST.
+ *
+ * A ceiling on demand, not a guarantee of supply: the request goes through the
+ * shared compact allocator (see `renderCompactSummary`), so a dispute gets 240
+ * characters only when there is room. Stated once because a rule expressed in
+ * two places eventually disagrees with itself.
+ */
+const MAX_COMPACT_DISPUTED_MESSAGE_CHARS = 240;
+
+/**
  * The compact budget: the first citation, and only if it fits WHOLE.
  *
  * The single definition on purpose. It was briefly stated twice — once for
@@ -993,20 +1072,34 @@ function renderClarificationSection(input: SummaryInput): string | undefined {
  * disputed citations kept the compact body oversized, dropped it into the
  * emergency status-only form, and took the whole disputed section with it —
  * silently (PR #54 review, round six).
+ * @param messageBudgets - per-finding message allowance in compact mode, from
+ * the shared compact allocator. Absent entries fall back to
+ * `MAX_COMPACT_DISPUTED_MESSAGE_CHARS`. Ignored when `compact` is false.
  */
-function renderDisputedSection(input: SummaryInput, compact = false): string | undefined {
+function renderDisputedSection(
+  input: SummaryInput,
+  compact = false,
+  messageBudgets?: readonly number[],
+): string | undefined {
   const disputed = input.disputed ?? [];
   if (disputed.length === 0) return undefined;
-  const items = disputed.flatMap((finding) => {
+  const items = disputed.flatMap((finding, index) => {
     const file = sanitizeInline(finding.file);
     const loc = typeof finding.line === "number" ? `${file}:${finding.line}` : file;
-    const message = sanitizeText(finding.message);
+    // The head shares the message's first rendered line: `- \`loc\` (\`rule\`) — `.
+    // Truncation must balance fences against THIS line, not the message alone —
+    // a fence run opening the message is mid-line here and therefore not a
+    // fence at all (Codex review of PR #84, round three).
+    const head = `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — `;
+    const message = compact
+      ? truncateCompactProse(sanitizeText(finding.message), messageBudgets?.[index] ?? MAX_COMPACT_DISPUTED_MESSAGE_CHARS, head)
+      : sanitizeText(finding.message);
     // A disputed finding is precisely the one whose evidence a reader needs —
     // which is why the host check belongs here most of all. A finding the
     // reviewer itself marked disputed, published with the host's answer to its
     // structural claim removed, leaves the reader the weakest version of both.
     return [
-      `- \`${loc}\` (\`${sanitizeInline(finding.ruleName)}\`) — ${message}`,
+      `${head}${message}`,
       ...hostCheckBullets(finding, "  ", compact),
       ...(compact
         ? compactReferenceBullets(finding, "  ")
@@ -1144,7 +1237,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
       : "");
   const contextUnavailable = renderContextUnavailable(input);
   const clarification = renderClarificationSection(input);
-  const disputed = renderDisputedSection(input, true);
+  const disputedFindings = input.disputed ?? [];
   const failedRules = input.rulesFailed.length > 0
     ? `### ⚠️ Rules that failed (${input.rulesFailed.length})\n\n${input.rulesFailed
         .map((name) => {
@@ -1199,14 +1292,33 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
       reference: `${check}${reference}`,
     };
   });
-  const fixed = [header, notice, contextUnavailable, clarification, disputed, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
+  // Disputed messages draw from the SAME pool as the relocated findings'
+  // messages. The first fix gave each dispute a fixed 240-character cap, but
+  // enough disputes at the cap still pushed the body past the limit —
+  // `available` hit zero and the emergency fallback took the whole Disputed
+  // section, the exact failure this path exists to prevent (Codex review of
+  // PR #84, P1). The skeleton below prices the section WITHOUT its messages;
+  // the messages then compete for the remaining space through the shared
+  // allocator, so the section shrinks instead of vanishing.
+  const disputedSkeleton = renderDisputedSection(input, true, disputedFindings.map(() => 0));
+  const fixed = [header, notice, contextUnavailable, clarification, disputedSkeleton, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
   const messageBudgets = allocateCompactMessageBudgets(
-    findings.map(({ message }) => message.length),
+    [
+      ...findings.map(({ message }) => message.length),
+      // Demand is capped, not granted: a dispute requests at most
+      // MAX_COMPACT_DISPUTED_MESSAGE_CHARS and receives whatever the shared
+      // allocator grants from what is left after the fixed parts.
+      ...disputedFindings.map((finding) =>
+        Math.min(sanitizeText(finding.message).length, MAX_COMPACT_DISPUTED_MESSAGE_CHARS)),
+    ],
     available,
   );
+  const disputed = disputedFindings.length > 0
+    ? renderDisputedSection(input, true, messageBudgets.slice(findings.length))
+    : undefined;
   const body = [
     header,
     notice,

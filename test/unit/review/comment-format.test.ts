@@ -38,6 +38,29 @@ function makeFinding(overrides: Partial<Finding> = {}): Finding {
   };
 }
 
+/**
+ * CommonMark fence balance, asserted independently of the implementation's
+ * helper: a closer must match the opener's character, be at least as long,
+ * and carry no info string — run parity alone accepts a ``` decoy inside a
+ * ```` fence, which is the defect being pinned.
+ */
+function unclosedFenceIn(value: string): { char: string; length: number } | undefined {
+  let open: { char: string; length: number } | undefined;
+  for (const line of value.split("\n")) {
+    const match = /^[ \t]*(`{3,}|~{3,})(.*)$/.exec(line);
+    if (match === null) continue;
+    const marker = match[1]!;
+    const rest = match[2]!;
+    if (open === undefined) {
+      if (marker[0] === "`" && rest.includes("`")) continue;
+      open = { char: marker[0]!, length: marker.length };
+    } else if (marker[0] === open.char && marker.length >= open.length && rest.trim() === "") {
+      open = undefined;
+    }
+  }
+  return open;
+}
+
 describe("renderInlineComment — structure", () => {
   it("leads with a scannable metadata line: category | severity | rule", () => {
     const body = renderInlineComment(makeFinding({ severity: "blocking", category: "security" }));
@@ -1719,6 +1742,188 @@ describe("renderInlineComment — host structural check", () => {
     expect(body).toContain("compacted to fit the provider limit");
     expect(body).toContain("unresolved lexical matches");
     expect(body).toContain("src/queue.ts:12");
+  });
+
+  // Issue #82: A compact summary containing one very long disputed finding
+  // still shows the Disputed section, with that message truncated.
+  it("keeps the Disputed section with truncated message when a disputed finding is very long", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: "x".repeat(4000),
+        claim,
+        hostCheck: {
+          status: "lexical-matches",
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("compacted to fit the provider limit");
+    expect(body).toContain("### Disputed");
+    expect(body).toContain("unresolved lexical matches");
+    expect(body).toContain("src/queue.ts:12");
+    expect(body.length).toBeLessThanOrEqual(1200);
+  });
+
+  // Codex review of PR #84, P1: the first fix capped each disputed message at
+  // 240 characters, but enough disputes AT the cap still overflowed the limit,
+  // and the emergency fallback took the whole section again. The messages must
+  // draw from the shared compact budget so the section shrinks, not vanishes.
+  it("keeps the Disputed section when many long disputed messages exceed the limit together", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: Array.from({ length: 40 }, (_unused, index) => makeFinding({
+        decision: "disputed",
+        ruleName: `rule-${index}`,
+        message: "x".repeat(4000),
+      })),
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 4000);
+
+    expect(body).toContain("### Disputed");
+    expect(body.length).toBeLessThanOrEqual(4000);
+  });
+
+  // Codex review of PR #84, P2: a truncated disputed message must not leave a
+  // code fence open — the unclosed fence swallows the host check, the
+  // references, and every later section into a code block when rendered.
+  it("does not leave an unclosed code fence when a disputed message is truncated", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: `prose before the block\n\n\`\`\`go\n${"x".repeat(4000)}`,
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(unclosedFenceIn(body)).toBeUndefined();
+    expect(body).toContain("### Disputed");
+  });
+
+  // Codex review of PR #84, round two: run PARITY is not balance. A ````
+  // opener cannot be closed by the shorter ``` line the message contains
+  // before its real closer — the cut lands after the decoy, the fence is
+  // still open, and everything after it renders as code.
+  it("does not accept a shorter fence run as the closer of a longer open fence", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: [
+          "prose before the block",
+          "",
+          "````go",
+          "x".repeat(100),
+          "```",
+          "y".repeat(4000),
+          "````",
+        ].join("\n"),
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(unclosedFenceIn(body)).toBeUndefined();
+    expect(body).toContain("### Disputed");
+  });
+
+  // Same rule for tilde fences: a backtick run is content inside a tilde
+  // fence, never its closer.
+  it("does not let a backtick run close a tilde fence", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: [
+          "prose before the block",
+          "",
+          "~~~go",
+          "x".repeat(100),
+          "```",
+          "y".repeat(4000),
+          "~~~",
+        ].join("\n"),
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(unclosedFenceIn(body)).toBeUndefined();
+    expect(body).toContain("### Disputed");
+  });
+
+  // Codex review of PR #84, round three: the message renders INLINE after the
+  // list-item text and em dash, so a fence run OPENING the message is
+  // mid-line — not a fence at all. Balancing the message in isolation treated
+  // that run as an opener, appended a "closer" that landed on a real line
+  // start, and THAT run opened the fence the check existed to prevent.
+  it("does not treat a fence run opening a truncated message as a fence", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: `\`\`\`\`go\n${"x".repeat(4000)}`,
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(unclosedFenceIn(body)).toBeUndefined();
+    expect(body).toContain("### Disputed");
+    // With the bug, the appended closer sits on its own line and opens a real
+    // fence; with the fix the body contains no standalone fence line at all.
+    expect(body).not.toMatch(/^[ \t]*`{3,}[ \t]*$/m);
+  });
+
+  // Codex review of PR #84, round four: a column-zero closer does not close a
+  // fence opened on a line indented as list-item content — leaving the list
+  // container implicitly ends the nested block, so the closer OPENS a new
+  // root-level fence instead. The synthetic closer must repeat the opener's
+  // indentation to stay inside the same container.
+  it("emits the synthetic closer at the opener's indentation", () => {
+    const body = renderSummaryComment({
+      allFindings: [] as Finding[],
+      inlineCount: 0,
+      unanchored: [] as Finding[],
+      disputed: [makeFinding({
+        decision: "disputed",
+        message: `intro\n  \`\`\`\`go\n${"x".repeat(4000)}`,
+      })],
+      filesReviewed: ["src/a.ts"],
+      rulesRun: ["rule-a"],
+      rulesFailed: [] as string[],
+    }, 1200);
+
+    expect(body).toContain("### Disputed");
+    // The opener is indented two spaces; its closer must be too.
+    expect(body).toMatch(/^  ````[ \t]*$/m);
+    expect(body).not.toMatch(/^````[ \t]*$/m);
   });
 
   // Five review rounds produced five separate "this path drops the check"
