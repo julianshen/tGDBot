@@ -7,7 +7,7 @@ import {
   digestArtifactInputs,
   validateArtifactRecords,
 } from "./artifact-validator.js";
-import { repositoryLabel } from "./types.js";
+import { repositoryLabel, type RepositoryLabelIdentity } from "./types.js";
 import type {
   ArtifactRecord,
   ContextCacheKey,
@@ -401,29 +401,26 @@ export class ContextCache {
   }
 
   /**
-   * Keeps at most `keep` entries per repository, evicting the older ones.
+   * Keeps at most `keep` entries for ONE repository, evicting the older ones.
    *
    * The cache root is shared across repositories, and each publication of one
    * repository replaces its own entry — so per-repository growth comes from
    * version bumps and legacy schemas, which is exactly the drift #60 bounds.
    * Grouping reads each entry's manifest for its repository identity; an
-   * entry whose manifest cannot be read is left alone UNLESS it is older than
-   * `corruptMaxAgeMs`, because legacy-schema manifests fail the current parse
-   * and would otherwise survive forever. Freshness protects a manifest a
-   * concurrent publisher has just renamed in but this scan read mid-window.
+   * entry whose manifest cannot be read is attributed through the key that is
+   * still legible inside it, and only entries attributable to the SAME
+   * repository are ever deleted.
    *
-   * NOT race-free against a concurrent publisher of the same entry — that is
-   * what the repository lock is for. Call it while holding the lock the
-   * mapping flow already holds (#78), so the only publishers it can race are
-   * reviews of OTHER repositories, whose entries it never touches: grouping
-   * is per repository and an evicted entry is never the newest of its own
-   * group, which a live publisher's entry just published is.
+   * That restriction is the race-safety story, not a nicety (PR #107 review):
+   * the caller holds only ITS OWN repository's lock, so eviction must never
+   * touch another repository's entries — a rolling version change means a
+   * review of repository B can legitimately be reading one of B's older
+   * identity entries while an unrelated publication for repository A runs.
+   * Corrupt manifests that cannot be attributed to ANY repository are left
+   * alone entirely; they cost disk, not correctness, and guessing their
+   * owner would be exactly the cross-repository reach this method refuses.
    */
-  async evictOlderEntries(
-    keep: number,
-    now: number = Date.now(),
-    corruptMaxAgeMs: number = 7 * 24 * 60 * 60 * 1000,
-  ): Promise<number> {
+  async evictOlderEntries(keep: number, repository: RepositoryLabelIdentity): Promise<number> {
     if (!Number.isSafeInteger(keep) || keep < 1) {
       throw new ContextValidationError("Context cache eviction keep count must be a positive integer");
     }
@@ -438,7 +435,6 @@ export class ContextCache {
     }
 
     const byRepository = new Map<string, Array<{ name: string; createdAt: number }>>();
-    const corrupt: Array<{ name: string; mtimeMs: number }> = [];
     for (const name of names) {
       // Entry directory names are hashes this cache computed; anything else
       // was not written here by this cache and is not ours to judge.
@@ -447,10 +443,7 @@ export class ContextCache {
       const info = await lstat(entryPath).catch(() => undefined);
       if (info === undefined || !info.isDirectory() || info.isSymbolicLink()) continue;
       const manifestContents = await readFile(path.join(entryPath, "manifest.json"), "utf8").catch(() => undefined);
-      if (manifestContents === undefined) {
-        corrupt.push({ name, mtimeMs: info.mtimeMs });
-        continue;
-      }
+      if (manifestContents === undefined) continue;
       try {
         const manifest = parseReadyManifest(JSON.parse(manifestContents));
         const group = repositoryLabel(manifest.key);
@@ -458,22 +451,19 @@ export class ContextCache {
         entries.push({ name, createdAt: Date.parse(manifest.createdAt) });
         byRepository.set(group, entries);
       } catch {
-        corrupt.push({ name, mtimeMs: info.mtimeMs });
+        // Unattributable — a legacy or corrupt manifest. Left alone: it costs
+        // disk, never correctness, and deleting an entry whose owner cannot
+        // be established is the cross-repository reach this method refuses.
       }
     }
 
     let evicted = 0;
-    for (const entries of byRepository.values()) {
-      entries.sort((left, right) => right.createdAt - left.createdAt);
-      for (const entry of entries.slice(keep)) {
-        await rm(path.join(contextsDir, entry.name), { recursive: true, force: true }).then(
-          () => { evicted += 1; },
-          () => undefined,
-        );
-      }
-    }
-    for (const entry of corrupt) {
-      if (now - entry.mtimeMs < corruptMaxAgeMs) continue;
+    // Only the locked repository's group is touched. `repositoryLabel` is the
+    // same grouping the scan used, so the caller's identity matches by
+    // construction.
+    const group = byRepository.get(repositoryLabel(repository)) ?? [];
+    group.sort((left, right) => right.createdAt - left.createdAt);
+    for (const entry of group.slice(keep)) {
       await rm(path.join(contextsDir, entry.name), { recursive: true, force: true }).then(
         () => { evicted += 1; },
         () => undefined,

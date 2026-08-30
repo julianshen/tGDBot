@@ -554,13 +554,22 @@ export async function prepareReviewContext(
     let incremental: {
       readonly manifest: ContextManifest;
       readonly delta: ClassifiedBaseDelta;
+      readonly zeroDomains: boolean;
     } | undefined;
     if (alreadyPublished !== undefined) {
       const entryRoot = cache.entryPath(key);
-      const hasGraphs = alreadyPublished.artifacts.some((record) => record.kind === "knowledge-graph")
-        && alreadyPublished.artifacts.some((record) => record.kind === "domain-graph");
-      const domainStepPaths = hasGraphs ? await loadDomainStepPaths(entryRoot) : undefined;
-      const viable = hasGraphs
+      // A zero-domains entry is a supported normal output, not a degenerate
+      // one (PR #107 review): it patches like any other, carrying its marker
+      // forward, and its domain-step set is legitimately empty.
+      const hasKnowledge = alreadyPublished.artifacts.some((record) => record.kind === "knowledge-graph");
+      const zeroDomains = alreadyPublished.artifacts.some((record) => record.kind === "zero-domains");
+      const hasDomain = alreadyPublished.artifacts.some((record) => record.kind === "domain-graph");
+      const domainStateReadable = hasDomain || zeroDomains;
+      const domainStepPaths = hasDomain
+        ? await loadDomainStepPaths(entryRoot)
+        : await loadDomainStepPaths(entryRoot, { zeroDomains });
+      const viable = hasKnowledge
+        && domainStateReadable
         && domainStepPaths !== undefined
         && alreadyPublished.generation < CONTEXT_GENERATION_CEILING;
       if (viable && domainStepPaths !== undefined) {
@@ -572,7 +581,7 @@ export async function prepareReviewContext(
             domainStepPaths,
           });
           if (delta.kind === "incremental") {
-            incremental = { manifest: alreadyPublished, delta };
+            incremental = { manifest: alreadyPublished, delta, zeroDomains };
           }
         } catch {
           // An unreadable mirror, a pruned old commit, a git failure — none of
@@ -645,6 +654,7 @@ export async function prepareReviewContext(
         stagingPath,
         manifest: { builtFromSha: incremental.manifest.builtFromSha },
         delta: incremental.delta.delta,
+        zeroDomains: incremental.zeroDomains,
         ...(scopedGraph === undefined ? {} : { scopedGraph }),
       });
       onProgress({ stage: "map", status: "completed" });
@@ -725,7 +735,7 @@ export async function prepareReviewContext(
   // previous entry holds its own reference to the manifest. Best-effort — an
   // eviction failure costs disk, never the review.
   try {
-    await cache.evictOlderEntries(EVICTION_KEEP_PER_REPOSITORY);
+    await cache.evictOlderEntries(EVICTION_KEEP_PER_REPOSITORY, request.repository);
   } catch {
     // Deliberately absorbed: see the comment above.
   }

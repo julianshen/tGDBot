@@ -1056,6 +1056,47 @@ describe("prepareReviewContext — the warm index (#60)", () => {
     };
   }
 
+  /** A mapper stub that writes the explicit zero-domains marker. */
+  function stubZeroDomainsMapper(): ContextMapper & { calls: ContextMapRequest[] } {
+    const calls: ContextMapRequest[] = [];
+    return {
+      calls,
+      async map(request: ContextMapRequest): Promise<MappingResult> {
+        calls.push(request);
+        const artifactPaths = [
+          "CONTEXT.md",
+          ".understand-anything/knowledge-graph.json",
+          ".understand-anything/zero-domains.json",
+          ".understand-anything/mapping-metadata.json",
+        ];
+        await mkdir(path.join(request.outputRoot, ".understand-anything"), { recursive: true });
+        await writeFile(path.join(request.outputRoot, "CONTEXT.md"), "# Trusted context\n", "utf8");
+        await writeFile(
+          path.join(request.outputRoot, ".understand-anything/knowledge-graph.json"),
+          JSON.stringify(knowledgeGraph(request.baseSha)),
+          "utf8",
+        );
+        await writeFile(
+          path.join(request.outputRoot, ".understand-anything/zero-domains.json"),
+          JSON.stringify({ version: 1, status: "zero-domains" }),
+          "utf8",
+        );
+        await writeFile(
+          path.join(request.outputRoot, ".understand-anything/mapping-metadata.json"),
+          JSON.stringify({ version: 1, status: "complete", baseSha: request.baseSha }),
+          "utf8",
+        );
+        return {
+          status: "ready",
+          manifestPath: path.join(request.outputRoot, ".understand-anything/mapping-metadata.json"),
+          artifactPaths,
+          analyzedFiles: 1,
+          degradedReasons: [],
+        };
+      },
+    };
+  }
+
   function incrementalDelta(overrides: Record<string, unknown> = {}) {
     return {
       delta: {
@@ -1206,6 +1247,39 @@ describe("prepareReviewContext — the warm index (#60)", () => {
     expect(prepared.status).toBe("ready");
     expect(mapper.calls).toHaveLength(1);
     expect(mapper.calls[0]!.scopePaths).toBeUndefined();
+  });
+
+  // PR #107 review: a zero-domains entry is a supported normal output — it
+  // must patch like any other, not be locked out by the domain-graph gate.
+  it("takes the incremental path for a zero-domains entry, carrying the marker forward", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await prepareReviewContext({ ...request, baseSha: BASE_SHA } as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => stubZeroDomainsMapper(),
+    });
+
+    const mapper = stubZeroDomainsMapper();
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.resolve(incrementalDelta()),
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(prepared.incremental).toBe(true);
+    expect(mapper.calls).toHaveLength(1);
+    expect(mapper.calls[0]!.scopePaths).toEqual(["src/index.ts"]);
+
+    const patched = await new ContextCache(request.cacheRoot as string)
+      .lookupContext(contextCacheKey({ repository }));
+    expect(patched).toBeDefined();
+    if (patched === undefined) return;
+    expect(patched.artifacts.map((artifact) => artifact.kind).sort()).toEqual([
+      "context", "knowledge-graph", "mapping-metadata", "zero-domains",
+    ]);
+    expect(patched.builtFromSha).toBe(NEW_SHA);
+    expect(patched.generation).toBe(1);
   });
 
   it("publishes the patch atomically with parent provenance and a new manifest hash", async () => {

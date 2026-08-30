@@ -66,16 +66,39 @@ interface NameStatusRow {
   readonly paths: readonly string[];
 }
 
-function parseNameStatus(stdout: string): NameStatusRow[] {
-  return stdout
-    .split("\n")
-    .filter((line) => line.length > 0)
-    .map((line) => {
-      const columns = line.split("\t");
-      const status = columns[0] ?? "";
-      const paths = columns.slice(1);
-      return { status, paths };
-    });
+/**
+ * Parses `git diff --name-status -z` output.
+ *
+ * The `-z` form is NUL-delimited and NEVER quotes pathnames — the quoted
+ * form C-escapes non-ASCII and wraps paths containing tabs or quotes in
+ * double quotes, so a parsed path would not match the repository-relative
+ * name a graph node carries, and the stale marking would silently miss it.
+ * Each record is `status`, `path`, and — for renames and copies — the second
+ * path.
+ */
+export function parseNameStatus(raw: string): NameStatusRow[] {
+  const tokens = raw.split("\0");
+  // A trailing NUL leaves an empty final token; anything else empty is a
+  // malformed record and is skipped by the walk below.
+  if (tokens.length > 0 && tokens[tokens.length - 1] === "") tokens.pop();
+  const rows: NameStatusRow[] = [];
+  let index = 0;
+  while (index < tokens.length) {
+    const status = tokens[index] ?? "";
+    const first = tokens[index + 1];
+    if (status.length === 0 || first === undefined || first.length === 0) break;
+    index += 2;
+    const twoPath = status.startsWith("R") || status.startsWith("C");
+    if (twoPath) {
+      const second = tokens[index];
+      if (second === undefined || second.length === 0) break;
+      index += 1;
+      rows.push({ status, paths: [first, second] });
+      continue;
+    }
+    rows.push({ status, paths: [first] });
+  }
+  return rows;
 }
 
 /**
@@ -169,7 +192,7 @@ export async function computeBaseDelta(
     };
   }
   const [nameStatus, commitCount] = await Promise.all([
-    runGit(["diff", "--name-status", "-M", fromSha, toSha]),
+    runGit(["diff", "--name-status", "-M", "-z", fromSha, toSha]),
     runGit(["rev-list", "--count", `${fromSha}..${toSha}`]),
   ]);
   const parsedCount = Number.parseInt(commitCount.stdout.trim(), 10);

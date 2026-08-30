@@ -195,6 +195,13 @@ async function validateContextRoot(contextRoot: unknown): Promise<string> {
   return realpath(contextRoot);
 }
 
+function validateReviewBaseSha(reviewBaseSha: unknown): void {
+  if (reviewBaseSha === undefined) return;
+  if (typeof reviewBaseSha !== "string" || !/^[0-9a-f]{40}$/iu.test(reviewBaseSha)) {
+    throw new ContextValidationError("Review base SHA must be a 40-character commit hash");
+  }
+}
+
 function normalizeRuleName(ruleName: unknown): string {
   if (typeof ruleName !== "string") return invalid("Rule name must be a string");
   const normalized = ruleName.trim();
@@ -817,6 +824,10 @@ export async function selectContext(input: SelectContextInput): Promise<ContextS
   const contextRoot = await validateContextRoot(input.contextRoot);
   const changedFiles = normalizeChangedFiles(input.changedFiles);
   validateManifestIdentity(input.manifest);
+  // The review base reaches the pack header verbatim, so it must already be
+  // the SHA shape the host resolves — never diff-derived prose (PR #107
+  // review). Undefined stays optional: the header falls back to provenance.
+  validateReviewBaseSha(input.reviewBaseSha);
   validateRenderedPaths(input.manifest);
   await validateArtifactRecords(
     contextRoot,

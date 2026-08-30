@@ -26,10 +26,11 @@ function gitRunner(responses: Record<string, string | Error>): GitRunner {
 
 describe("parseBaseDelta", () => {
   it("sorts additions, modifications and deletions into their own sets", () => {
+    // -z form: NUL-delimited records, never quoted.
     const delta = parseBaseDelta(
       FROM,
       TO,
-      ["A\tsrc/new.ts", "M\tsrc/changed.ts", "D\tsrc/old.ts", "T\tsrc/typed.ts", ""].join("\n"),
+      ["A\0src/new.ts", "M\0src/changed.ts", "D\0src/old.ts", "T\0src/typed.ts", ""].join("\0"),
       3,
     );
     expect(delta.added).toEqual(["src/new.ts"]);
@@ -39,14 +40,14 @@ describe("parseBaseDelta", () => {
   });
 
   it("treats a rename as a deletion of the old path and an addition of the new one", () => {
-    const delta = parseBaseDelta(FROM, TO, "R100\tsrc/old.ts\tsrc/renamed.ts\n", 1);
+    const delta = parseBaseDelta(FROM, TO, "R100\0src/old.ts\0src/renamed.ts\0", 1);
     expect(delta.deleted).toEqual(["src/old.ts"]);
     expect(delta.added).toEqual(["src/renamed.ts"]);
     expect(delta.changed).toEqual([]);
   });
 
   it("treats a copy as an addition only", () => {
-    const delta = parseBaseDelta(FROM, TO, "C100\tsrc/a.ts\tsrc/b.ts\n", 1);
+    const delta = parseBaseDelta(FROM, TO, "C100\0src/a.ts\0src/b.ts\0", 1);
     expect(delta.deleted).toEqual([]);
     expect(delta.added).toEqual(["src/b.ts"]);
   });
@@ -54,15 +55,15 @@ describe("parseBaseDelta", () => {
 
 describe("classifyBaseDelta", () => {
   it("classifies a small delta as incremental", () => {
-    const delta = parseBaseDelta(FROM, TO, "M\tsrc/a.ts\n", 1);
+    const delta = parseBaseDelta(FROM, TO, "M\0src/a.ts\0", 1);
     expect(classifyBaseDelta(delta, new Set()).kind).toBe("incremental");
   });
 
   it("fails to full remap past the file ceiling", () => {
     const nameStatus = Array.from(
       { length: MAX_INCREMENTAL_FILES + 1 },
-      (_, index) => `M\tsrc/file-${index}.ts`,
-    ).join("\n");
+      (_, index) => `M\0src/file-${index}.ts`,
+    ).join("\0");
     const classified = classifyBaseDelta(parseBaseDelta(FROM, TO, nameStatus, 1), new Set());
     expect(classified.kind).toBe("full");
     expect(classified.reason).toMatch(/ceiling/);
@@ -70,7 +71,7 @@ describe("classifyBaseDelta", () => {
 
   it("fails to full remap past the commit ceiling", () => {
     const classified = classifyBaseDelta(
-      parseBaseDelta(FROM, TO, "M\tsrc/a.ts\n", MAX_INCREMENTAL_COMMITS + 1),
+      parseBaseDelta(FROM, TO, "M\0src/a.ts\0", MAX_INCREMENTAL_COMMITS + 1),
       new Set(),
     );
     expect(classified.kind).toBe("full");
@@ -79,7 +80,7 @@ describe("classifyBaseDelta", () => {
 
   it("fails to full remap when a domain-graph flow step file is touched", () => {
     const classified = classifyBaseDelta(
-      parseBaseDelta(FROM, TO, "M\tsrc/checkout.ts\nM\tsrc/other.ts\n", 1),
+      parseBaseDelta(FROM, TO, "M\0src/checkout.ts\0M\0src/other.ts\0", 1),
       new Set(["src/checkout.ts"]),
     );
     expect(classified.kind).toBe("full");
@@ -92,7 +93,7 @@ describe("computeBaseDelta", () => {
     const classified = await computeBaseDelta(
       gitRunner({
         [`merge-base --is-ancestor ${FROM} ${TO}`]: "",
-        [`diff --name-status -M ${FROM} ${TO}`]: "M\tsrc/a.ts\n",
+        [`diff --name-status -M -z ${FROM} ${TO}`]: "M\0src/a.ts\0",
         [`rev-list --count ${FROM}..${TO}`]: "2\n",
       }),
       FROM,
@@ -125,5 +126,23 @@ describe("computeBaseDelta", () => {
       TO,
       new Set(),
     )).rejects.toThrow(/not found/);
+  });
+});
+
+describe("parseNameStatus — the -z contract", () => {
+  it("keeps a path containing a tab or newline verbatim instead of C-quoting it", () => {
+    const delta = parseBaseDelta(FROM, TO, "M\0src/weird\tname.ts\0", 1);
+    expect(delta.changed).toEqual(["src/weird\tname.ts"]);
+  });
+
+  it("keeps a non-ASCII path unquoted", () => {
+    const delta = parseBaseDelta(FROM, TO, "M\0src/\u6587\u4ef6.ts\0", 1);
+    expect(delta.changed).toEqual(["src/\u6587\u4ef6.ts"]);
+  });
+
+  it("stops cleanly at a truncated record", () => {
+    const delta = parseBaseDelta(FROM, TO, "M\0src/a.ts\0R100\0src/truncated", 1);
+    expect(delta.changed).toEqual(["src/a.ts"]);
+    expect(delta.added).toEqual([]);
   });
 });

@@ -29,7 +29,7 @@
 
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { CONTEXT_PATH, DOMAIN_PATH, KNOWLEDGE_PATH, METADATA_PATH } from "./artifact-paths.js";
+import { CONTEXT_PATH, DOMAIN_PATH, KNOWLEDGE_PATH, METADATA_PATH, ZERO_DOMAINS_PATH } from "./artifact-paths.js";
 import type { BaseDelta } from "./delta.js";
 
 export interface GraphNodeLike {
@@ -55,6 +55,13 @@ export interface IncrementalPatchInput {
     readonly builtFromSha: string;
   };
   readonly delta: BaseDelta;
+  /**
+   * True when the cached entry carries the explicit zero-domains marker
+   * instead of a domain graph (#60 — PR #107 review). The patch then carries
+   * the marker forward untouched: there is no domain statement to gate or
+   * repin, and the knowledge graph is patched exactly as always.
+   */
+  readonly zeroDomains?: boolean;
   /**
    * The scoped sub-map's knowledge graph — nodes and edges the mapper produced
    * for the delta paths at the NEW base. May be undefined when the scoped
@@ -110,10 +117,16 @@ export function domainStepPaths(graph: GraphLike): Set<string> {
 
 /**
  * The domain-graph flow-step paths of a cached entry, for the delta gate.
- * `undefined` means the domain graph could not be read — the caller cannot
- * verify the gate and must take the full-map path rather than assume it.
+ * An EMPTY set is a valid answer — a zero-domains entry names no flow steps,
+ * so nothing can cross the gate. `undefined` means the domain state could not
+ * be read — the caller cannot verify the gate and must take the full-map path
+ * rather than assume it.
  */
-export async function loadDomainStepPaths(entryRoot: string): Promise<Set<string> | undefined> {
+export async function loadDomainStepPaths(
+  entryRoot: string,
+  options: { readonly zeroDomains?: boolean } = {},
+): Promise<Set<string> | undefined> {
+  if (options.zeroDomains === true) return new Set();
   try {
     return domainStepPaths(await readGraph(path.join(entryRoot, DOMAIN_PATH)));
   } catch {
@@ -169,8 +182,13 @@ export function patchKnowledgeGraph(
   const staleMarked = nodes.filter((node) => node.stale === true).length;
   const edgeKey = (edge: { source: string; target: string; type: string }): string =>
     `${edge.source}\u0000${edge.target}\u0000${edge.type}`;
-  const seenEdges = new Set(cached.edges.map(edgeKey));
+  // Seeded from the RETAINED edges, not all cached ones: an edge that touched
+  // a dropped node has been removed, and a scoped session that re-creates the
+  // dropped node under the same id must be able to reconnect it — seeding
+  // from the cached set would treat the new edge as a duplicate and silently
+  // leave the remapped node disconnected (PR #107 review).
   const edges = cached.edges.filter((edge) => !droppedIds.has(edge.source) && !droppedIds.has(edge.target));
+  const seenEdges = new Set(edges.map(edgeKey));
 
   // Merge the scoped sub-map: only nodes naming a delta path enter, so an
   // overreaching scoped session cannot widen the graph beyond the delta.
@@ -255,18 +273,31 @@ export async function patchEntryArtifacts(
   knowledgeDocument.nodes = patched.graph.nodes;
   knowledgeDocument.edges = patched.graph.edges;
   repinGraphDocument(knowledgeDocument, input.delta.toSha, droppedIds);
-  const domainDocument = JSON.parse(
-    await readFile(path.join(input.entryRoot, DOMAIN_PATH), "utf8"),
-  ) as Record<string, unknown>;
-  if (!isRecord(domainDocument)) {
-    throw new Error("Cached domain graph is not a JSON object");
-  }
-  repinGraphDocument(domainDocument, input.delta.toSha, new Set());
-
-  // The knowledge graph is written from the FULL document — project, layers
-  // and tour travel with it — not the trimmed nodes/edges pair.
+  // Written from the FULL document — project, layers and tour travel with it
+  // — not the trimmed nodes/edges pair.
   await writeGraph(path.join(input.stagingPath, KNOWLEDGE_PATH), knowledgeDocument as unknown as GraphLike);
-  await writeGraph(path.join(input.stagingPath, DOMAIN_PATH), domainDocument as unknown as GraphLike);
+
+  // The domain half is carried, not patched: with a domain graph the
+  // classification gate guarantees no flow-step file changed, so the document
+  // is content-identical and only its provenance pin moves. A zero-domains
+  // entry has no domain statement at all — the marker travels verbatim
+  // (PR #107 review: zero-domain repositories must not be locked out of the
+  // incremental path).
+  if (input.zeroDomains === true) {
+    await copyFile(
+      path.join(input.entryRoot, ZERO_DOMAINS_PATH),
+      path.join(input.stagingPath, ZERO_DOMAINS_PATH),
+    );
+  } else {
+    const domainDocument = JSON.parse(
+      await readFile(path.join(input.entryRoot, DOMAIN_PATH), "utf8"),
+    ) as Record<string, unknown>;
+    if (!isRecord(domainDocument)) {
+      throw new Error("Cached domain graph is not a JSON object");
+    }
+    repinGraphDocument(domainDocument, input.delta.toSha, new Set());
+    await writeGraph(path.join(input.stagingPath, DOMAIN_PATH), domainDocument as unknown as GraphLike);
+  }
   await copyFile(path.join(input.entryRoot, CONTEXT_PATH), path.join(input.stagingPath, CONTEXT_PATH));
   await writeFile(
     path.join(input.stagingPath, METADATA_PATH),
@@ -278,7 +309,9 @@ export async function patchEntryArtifacts(
     ? ["incremental-patch: the scoped re-map did not produce a usable graph; changed files are represented only by stale marks"]
     : [];
   return {
-    artifactPaths: [CONTEXT_PATH, DOMAIN_PATH, KNOWLEDGE_PATH, METADATA_PATH],
+    artifactPaths: input.zeroDomains === true
+      ? [CONTEXT_PATH, ZERO_DOMAINS_PATH, KNOWLEDGE_PATH, METADATA_PATH]
+      : [CONTEXT_PATH, DOMAIN_PATH, KNOWLEDGE_PATH, METADATA_PATH],
     degradedReasons,
     staleMarked: patched.staleMarked,
     merged: patched.merged,

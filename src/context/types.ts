@@ -40,7 +40,7 @@ export type ContextCacheVersionIdentity = Pick<
   "schemaVersion" | "tgdVersion" | "policyVersion"
 >;
 
-type RepositoryLabelIdentity =
+export type RepositoryLabelIdentity =
   | Pick<Extract<RepositoryRef | ContextCacheKey, { provider: "github" }>, "provider" | "host" | "owner" | "repo">
   | Pick<
       Extract<RepositoryRef | ContextCacheKey, { provider: "gitlab" }>,

@@ -12,6 +12,7 @@ import {
   DOMAIN_PATH,
   KNOWLEDGE_PATH,
   METADATA_PATH,
+  ZERO_DOMAINS_PATH,
 } from "../../../src/context/artifact-paths.js";
 import type { BaseDelta } from "../../../src/context/delta.js";
 
@@ -227,5 +228,59 @@ describe("patchEntryArtifacts", () => {
 
     expect(result.merged).toBe(0);
     expect(result.degradedReasons.join(" ")).toMatch(/scoped re-map/i);
+  });
+});
+
+describe("patchKnowledgeGraph — review round two (PR #107)", () => {
+  it("reconnects a scoped re-creation of a dropped node whose cached edge was removed", () => {
+    const cached = {
+      nodes: [node("fn:caller", "src/kept.ts"), node("fn:dropped", "src/changed.ts")],
+      edges: [edge("fn:caller", "fn:dropped")],
+    };
+    // The scoped session re-maps the changed file and re-creates the node
+    // under the SAME id, with the same relationship.
+    const scoped = {
+      nodes: [node("fn:dropped", "src/changed.ts")],
+      edges: [edge("fn:caller", "fn:dropped")],
+    };
+    const patched = patchKnowledgeGraph(
+      cached as unknown as GraphLike,
+      delta({ changed: ["src/changed.ts"] }),
+      scoped as unknown as GraphLike,
+    );
+    const ids = patched.graph.nodes.map((n) => n.id).sort();
+    expect(ids).toEqual(["fn:caller", "fn:dropped"]);
+    // THE point: the replacement edge is not swallowed as a duplicate of the
+    // removed cached edge.
+    expect(patched.graph.edges).toEqual([edge("fn:caller", "fn:dropped")]);
+  });
+
+  it("carries a zero-domains marker forward instead of reading a domain graph", async () => {
+    const entryRoot = await tempRoot("incremental-zero-");
+    const stagingPath = await tempRoot("incremental-zero-stage-");
+    await mkdir(path.join(entryRoot, ".understand-anything"), { recursive: true });
+    await writeFile(path.join(entryRoot, KNOWLEDGE_PATH), JSON.stringify(
+      knowledgeGraph([node("fn:kept", "src/kept.ts")], []),
+    ));
+    await writeFile(
+      path.join(entryRoot, ZERO_DOMAINS_PATH),
+      JSON.stringify({ version: 1, status: "zero-domains" }),
+      "utf8",
+    );
+    await writeFile(path.join(entryRoot, CONTEXT_PATH), "# Trusted context\n", "utf8");
+
+    const result = await patchEntryArtifacts({
+      entryRoot,
+      stagingPath,
+      manifest: { builtFromSha: FROM },
+      delta: delta({ changed: ["src/kept.ts"] }),
+      zeroDomains: true,
+    });
+
+    expect(result.artifactPaths).toEqual([CONTEXT_PATH, ZERO_DOMAINS_PATH, KNOWLEDGE_PATH, METADATA_PATH]);
+    const marker = JSON.parse(await readFile(path.join(stagingPath, ZERO_DOMAINS_PATH), "utf8"));
+    expect(marker).toEqual({ version: 1, status: "zero-domains" });
+    const metadata = JSON.parse(await readFile(path.join(stagingPath, METADATA_PATH), "utf8"));
+    expect(metadata.baseSha).toBe(TO);
   });
 });

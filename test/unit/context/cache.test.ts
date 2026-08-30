@@ -1847,7 +1847,7 @@ describe("ContextCache — CAS replacement of the living entry (#60)", () => {
       createdAt: "2026-07-19T08:00:00.000Z",
     });
 
-    const evicted = await cache.evictOlderEntries(1);
+    const evicted = await cache.evictOlderEntries(1, key);
     expect(evicted).toBe(1);
     // The newest of the group (schemaVersion 2) survived.
     await expect(cache.lookupContext(cacheKey)).resolves.toBeDefined();
@@ -1860,8 +1860,62 @@ describe("ContextCache — CAS replacement of the living entry (#60)", () => {
     const parent = await publishFull(root);
 
     // A reader mid-review holds THIS manifest; eviction must not remove it.
-    const evicted = await cache.evictOlderEntries(3);
+    const evicted = await cache.evictOlderEntries(3, key);
     expect(evicted).toBe(0);
     await expect(cache.lookupContext(key)).resolves.toEqual(parent);
+  });
+});
+
+describe("ContextCache — eviction stays inside the locked repository (PR #107 review)", () => {
+  it("never touches another repository's entries, even its older ones", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+
+    // Two publications for a DIFFERENT repository, so it has an older entry
+    // a concurrent review of that repository could legitimately be reading.
+    const otherKey = { ...key, owner: "other-owner" } as ContextCacheKey;
+    const otherCache = new ContextCache(root);
+    const otherFirstStaging = await createStaging(root);
+    await otherCache.promoteContext(otherFirstStaging, { ...input(), key: otherKey });
+    const otherSecondStaging = await createStaging(root);
+    // A full-map replace: no expected parent, so the previous entry retires.
+    await otherCache.promoteContext(otherSecondStaging, {
+      ...input(),
+      key: otherKey,
+      createdAt: "2026-07-19T08:00:00.000Z",
+    }, { expectedExistingManifestHash: null });
+
+    // OUR repository publishes and evicts — holding only OUR lock.
+    const ourStaging = await createStaging(root);
+    const ours = await cache.promoteContext(ourStaging, input());
+    const evicted = await cache.evictOlderEntries(1, key);
+
+    expect(evicted).toBe(0);
+    // The other repository's BOTH entries survive, old one included.
+    await expect(otherCache.lookupContext(otherKey)).resolves.toBeDefined();
+    const manifest = JSON.parse(
+      await readFile(path.join(otherCache.entryPath(otherKey), "manifest.json"), "utf8"),
+    ) as ContextManifest;
+    expect(manifest.createdAt).toBe("2026-07-19T08:00:00.000Z");
+    await expect(cache.lookupContext(key)).resolves.toEqual(ours);
+  });
+
+  it("still evicts the locked repository's own surplus entries", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const firstStaging = await createStaging(root);
+    await cache.promoteContext(firstStaging, input());
+    const secondKey = { ...key, schemaVersion: 2 } as ContextCacheKey;
+    const secondStaging = await createStaging(root);
+    await cache.promoteContext(secondStaging, {
+      ...input(),
+      key: secondKey,
+      createdAt: "2026-07-19T08:00:00.000Z",
+    }, { expectedExistingManifestHash: null });
+
+    const evicted = await cache.evictOlderEntries(1, key);
+    expect(evicted).toBe(1);
+    await expect(cache.lookupContext(secondKey)).resolves.toBeDefined();
+    await expect(cache.lookupContext(key)).resolves.toBeUndefined();
   });
 });
