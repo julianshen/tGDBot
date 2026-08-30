@@ -1345,20 +1345,21 @@ export async function review(
     ...extraction.unreadable,
     ...skippedManifests,
   ];
+  const registryChanges = dependencyChanges.filter((change) => change.registryEligible);
   // Opt-in, and the only outbound request the tool makes. Without it the pack
   // still ships the parsed versions and says plainly that nothing was checked —
   // which is why leaving this unwired shipped a rule that could never see the
   // facts it exists to check (PR #54 review).
   const dependencyFacts =
-    args.dependencyFacts === "on" && dependencyChanges.length > 0
-      ? await fetchDependencyFacts(dependencyChanges, fetchJsonFn)
+    args.dependencyFacts === "on" && registryChanges.length > 0
+      ? await fetchDependencyFacts(registryChanges, fetchJsonFn)
       : [];
   // Issue #50's second endpoint. Independent of the registry pass, so an
   // advisory outage costs the advisory answers and nothing else — the two
   // failures are reported separately because they mean different things.
   const dependencyAdvisories =
-    args.dependencyFacts === "on" && dependencyChanges.length > 0
-      ? await fetchDependencyAdvisories(dependencyChanges, fetchJsonFn)
+    args.dependencyFacts === "on" && registryChanges.length > 0
+      ? await fetchDependencyAdvisories(registryChanges, fetchJsonFn)
       : [];
   // Issue #69: two identifiers and a distance, computed from names already in
   // the parsed manifests. No registry. The names stay in the untrusted half.

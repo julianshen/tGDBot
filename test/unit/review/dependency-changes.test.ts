@@ -44,7 +44,12 @@ function changesFrom(diff: string) {
   const emptyBase = new Map(
     manifests.flatMap(({ basePath }) => basePath === undefined ? [] : [[basePath, "{}"] as const]),
   );
-  return dependencyChanges(manifests, agreeingManifests(diff), emptyBase).changes;
+  return dependencyChanges(manifests, agreeingManifests(diff), emptyBase).changes
+    .filter((c) => c.registryEligible !== false)
+    .map((c) => {
+      const { registryEligible, ...rest } = c;
+      return rest;
+    });
 }
 
 describe("dependencyChangesFromDiff", () => {
@@ -1391,5 +1396,33 @@ describe("dependencyContextPack — typosquat facts", () => {
     const pack = dependencyContextPack([change], [], [], [], [transposition]);
 
     expect(pack?.text).toMatch(/same manifest/i);
+  });
+});
+
+describe("dependencyChanges — non-semver dependencies", () => {
+  it("extracts non-semver specs as registryEligible: false", () => {
+    const head = new Map([
+      [
+        "package.json",
+        JSON.stringify({
+          dependencies: {
+            "lodahs": "workspace:*",
+            "expres": "npm:express@4.17.21",
+            "chalkk": "git+https://github.com/chalk/chalk.git",
+          },
+        }),
+      ],
+    ]);
+    const result = dependencyChanges(
+      [{ path: "package.json", basePath: undefined }],
+      head,
+      new Map()
+    );
+
+    expect(result.changes).toEqual([
+      { name: "lodahs", version: "workspace:*", spec: "workspace:*", manifest: "package.json", pinned: false, section: "dependencies", registryEligible: false },
+      { name: "expres", version: "npm:express@4.17.21", spec: "npm:express@4.17.21", manifest: "package.json", pinned: false, section: "dependencies", registryEligible: false },
+      { name: "chalkk", version: "git+https://github.com/chalk/chalk.git", spec: "git+https://github.com/chalk/chalk.git", manifest: "package.json", pinned: false, section: "dependencies", registryEligible: false },
+    ]);
   });
 });

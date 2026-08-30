@@ -55,6 +55,8 @@ export interface DependencyChange {
    * with the answer the file gives directly.
    */
   readonly section: string;
+  /** Whether the spec can be queried against a registry. */
+  readonly registryEligible?: boolean;
 }
 
 /** The one host queried. Not configurable: an allowlist of exactly one. */
@@ -413,12 +415,21 @@ export function dependencyChanges(
       // review, round two).
       const before = baseDeps.get(key);
       if (before !== undefined && before.spec === spec && before.section === section) continue;
+      if (!isValidPackageName(name)) continue;
       const version = stripRange(spec);
-      if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
+      const registryEligible = VERSION_RE.test(version);
       const identity = `${section}\u0000${name}@${spec}`;
       if (seen.has(identity)) continue;
       seen.add(identity);
-      changes.push({ name, version, spec, manifest: path, pinned: isPinnedSpec(spec), section });
+      changes.push({
+        name,
+        version,
+        spec,
+        manifest: path,
+        pinned: isPinnedSpec(spec),
+        section,
+        registryEligible,
+      });
     }
   }
   return { changes, unreadable, namesByManifest };

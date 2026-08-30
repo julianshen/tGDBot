@@ -133,4 +133,27 @@ describe("typosquatFacts", () => {
     expect(facts[0]?.matches).toEqual([]);
     expect(facts[0]?.skipped).toBeUndefined();
   });
+
+  it("compares non-semver candidates correctly", () => {
+    const facts = typosquatFacts(
+      [
+        { name: "lodahs", manifest: "package.json" },
+        { name: "expres", manifest: "package.json" },
+      ],
+      new Map([["package.json", ["lodash", "express", "lodahs", "expres"]]]),
+    );
+
+    expect(facts).toEqual([
+      {
+        candidateName: "lodahs",
+        manifest: "package.json",
+        matches: [{ existing: "lodash", distance: 1, kind: "transposition" }],
+      },
+      {
+        candidateName: "expres",
+        manifest: "package.json",
+        matches: [{ existing: "express", distance: 1, kind: "deletion" }],
+      },
+    ]);
+  });
 });
