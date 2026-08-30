@@ -102,7 +102,7 @@ import {
 } from "../review/diff-anchors.js";
 import { CompareNotDirectError } from "../vcs/adapter.js";
 import { hasCheckableClaim, runStructuralChecks as runStructuralChecksReal } from "../review/structural-check.js";
-import { prepareWorkspace as prepareWorkspaceReal } from "../workspace/manager.js";
+import { withPreparedWorkspace as withPreparedWorkspaceReal } from "../workspace/manager.js";
 import type { Finding } from "../review/types.js";
 import type { PendingVerification } from "../conversation/verification-queue.js";
 import { verifyFinding } from "../conversation/verification.js";
@@ -166,7 +166,7 @@ export interface PollDependencies {
    * `prepareStructuralWorkspace` is in cli.ts — a poll test must never walk a
    * real git worktree with a real parser.
    */
-  readonly prepareStructuralWorkspace?: typeof prepareWorkspaceReal;
+  readonly prepareStructuralWorkspace?: typeof withPreparedWorkspaceReal;
   readonly runStructuralChecks?: typeof runStructuralChecksReal;
   /**
    * Injected rather than imported: cli.ts already imports poll(), so importing
@@ -2101,7 +2101,6 @@ async function executeClarificationAnswer(input: {
         // from the review-time check and the snapshot strips the claim. Run a
         // FRESH check HERE, at answer time, against the base as it is now —
         // never a stale one replayed from the snapshot.
-        console.error(`DBG reassess reached, outcome=${result.result.outcome}`);
         const reassessed: Finding = result.result.finding;
         // Freeze WITHOUT hostCheck. FindingSnapshot deliberately omits it — a
         // stale verification must never be replayed against a newer base — and
@@ -2157,18 +2156,28 @@ async function executeClarificationAnswer(input: {
       // Gating on the raw decision would skip the check and annotate a claim
       // that publishes anyway.
       findingForPublication = actionableClarificationFinding(findingForPublication);
+      // One base value for BOTH the check and the publication identity (Codex
+      // review of PR #100, round three): the manifest is only replayed when its
+      // checked base is still current, because the identity folds this value
+      // into its digest.
+      const baseSha = input.metadata.baseSha ?? "0".repeat(40);
+      const answerDiff = input.metadata.diff;
       if (input.options.config.structuralChecks === "on" && findingForPublication.claim !== undefined) {
+        // Callback API (Codex review of PR #100, round three): preparation and
+        // the scan must share ONE repository lock — `prepareWorkspace` releases
+        // the lock before the checker reads the worktree, so a concurrent job
+        // could reset the tree mid-scan and the finding would publish
+        // host-authored matches from an inconsistent checkout.
         const prepareStructuralWorkspaceFn =
-          input.options.deps.prepareStructuralWorkspace ?? prepareWorkspaceReal;
+          input.options.deps.prepareStructuralWorkspace ?? withPreparedWorkspaceReal;
         const runStructuralChecksFn =
           input.options.deps.runStructuralChecks ?? runStructuralChecksReal;
-        const baseSha = input.metadata.baseSha ?? "0".repeat(40);
         // Same eligibility gate as the review path (issue #80): a claim the
         // checker cannot evaluate — an unsupported language — must not pay
         // for a full clone on a cold workspace.
         if (hasCheckableClaim(findingForPublication)) {
           try {
-            const prepared = await prepareStructuralWorkspaceFn({
+            const verified = await prepareStructuralWorkspaceFn({
               // The SAME managed workspace the review path uses, so a
               // repository is mirrored once whichever feature asked first.
               root: contextRoots(selectContextRoot({
@@ -2179,16 +2188,18 @@ async function executeClarificationAnswer(input: {
               repo: input.options.config.repository,
               baseSha,
               rejectPreviouslySharedRoot: true,
-            });
-            if (prepared.baseSha !== baseSha) {
-              throw new Error("prepared worktree does not sit at the requested base commit");
-            }
-            const [verified] = await runStructuralChecksFn({
-              findings: [findingForPublication],
-              baseRoot: prepared.baseWorktreePath,
-              // The same base/head reconciliation the review path applies.
-              renamedFrom: renameSourcesByHeadPath(input.metadata.diff),
-              removedLinesByFile: removedLinesFromDiff(input.metadata.diff),
+            }, async (prepared) => {
+              if (prepared.baseSha !== baseSha) {
+                throw new Error("prepared worktree does not sit at the requested base commit");
+              }
+              const [checked] = await runStructuralChecksFn({
+                findings: [findingForPublication],
+                baseRoot: prepared.baseWorktreePath,
+                // The same base/head reconciliation the review path applies.
+                renamedFrom: renameSourcesByHeadPath(answerDiff),
+                removedLinesByFile: removedLinesFromDiff(answerDiff),
+              });
+              return checked;
             });
             if (verified !== undefined) findingForPublication = verified;
           } catch (error) {
@@ -2232,6 +2243,11 @@ async function executeClarificationAnswer(input: {
               clarificationId: observed.id,
               answerEventId: input.item.event.eventId,
               headSha: input.metadata.headSha,
+              // A base advance with an unchanged head must NOT replay the
+              // stored manifest: its host check describes a base that no
+              // longer exists. Folding the checked base into the digest makes
+              // any base change build a fresh action from the fresh check.
+              baseSha,
             }),
             reviewIdentity: input.reviewIdentity,
             context: {
@@ -2257,7 +2273,7 @@ async function executeClarificationAnswer(input: {
             now: input.options.now,
             hooks: input.options.deps.publicationHooks,
           });
-          if (publishedFinding !== 0) { console.error(`DBG publishedFinding=${publishedFinding}`); return "transient"; }
+          if (publishedFinding !== 0) return "transient";
         } catch (error) {
           console.warn(`tgd-review-agent: could not publish clarified finding (${redactedMessage(error)})`);
           return "transient";
@@ -2272,7 +2288,6 @@ async function executeClarificationAnswer(input: {
     reviewIdentity: input.reviewIdentity,
     options: input.options,
   });
-  console.error(`DBG publishReplyPlan=${published}`);
   if (published === "completed") {
     const current = (await input.options.store.readContextSnapshot()).pending.clarifications.find((entry) =>
       entry.id === observed.id) ?? observed;

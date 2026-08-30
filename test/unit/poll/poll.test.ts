@@ -1716,11 +1716,15 @@ describe("clarification answer lifecycle", () => {
       threadComment("human-1", "Audit does not require raw tokens."),
     );
     adapter.replaceEvents([reply]);
-    const prepare = vi.fn().mockResolvedValue({
+    const prepared = {
       root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
       ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
-    });
+    };
+    // Callback API: the consumer (the structural check) runs INSIDE the
+    // preparation, under one repository lock (Codex review, round three).
+    const prepare = vi.fn().mockImplementation((_request: unknown, use: (value: typeof prepared) => Promise<unknown>) =>
+      use(prepared));
     const check = vi.fn().mockImplementation(async (input: { findings: readonly { id?: string }[] }) =>
       input.findings.map((entry) => ({
         ...entry,
@@ -1757,7 +1761,7 @@ describe("clarification answer lifecycle", () => {
     expect(prepare).toHaveBeenCalledWith(expect.objectContaining({
       baseSha: "b".repeat(40),
       rejectPreviouslySharedRoot: true,
-    }));
+    }), expect.any(Function));
     expect(check).toHaveBeenCalledTimes(1);
     expect((check.mock.calls[0]?.[0] as { findings: { claim?: unknown }[] }).findings[0]?.claim)
       .toMatchObject({ symbol: "token" });
@@ -1835,11 +1839,15 @@ describe("clarification answer lifecycle", () => {
       threadComment("human-1", "Audit does not require raw tokens."),
     );
     adapter.replaceEvents([reply]);
-    const prepare = vi.fn().mockResolvedValue({
+    const prepared = {
       root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
       ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
-    });
+    };
+    // Callback API: the consumer (the structural check) runs INSIDE the
+    // preparation, under one repository lock (Codex review, round three).
+    const prepare = vi.fn().mockImplementation((_request: unknown, use: (value: typeof prepared) => Promise<unknown>) =>
+      use(prepared));
     const check = vi.fn().mockImplementation(async (input: { findings: readonly Record<string, unknown>[] }) =>
       input.findings.map((entry) => ({
         ...entry,
@@ -1850,8 +1858,6 @@ describe("clarification answer lifecycle", () => {
         },
       })));
     const vcs = silentReviewVcs();
-    // The FIRST publication attempt dies before its manifest is durable.
-    let findBotCommentCalls = 0;
     // The FIRST publication attempt dies before its manifest is durable.
     let findBotCommentCalled = false;
     vcs.adapter.findBotComment = vi.fn(async () => {
@@ -1907,6 +1913,105 @@ describe("clarification answer lifecycle", () => {
     expect(inline).toContain("src/queue.ts:12");
   });
 
+  // Codex review of PR #100, round three: the publication identity folds in
+  // the CHECKED base. A base advance with an unchanged head must not replay
+  // the stored manifest — its host check describes a base that no longer
+  // exists — so the retry must publish the FRESH check's evidence.
+  it("rebuilds the manifest when the base advances between publication attempts", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    const preparedShape = {
+      root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
+      worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
+      ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
+    };
+    // Echo the REQUESTED base: the prepared worktree must sit where the poll
+    // asked, and the poll asks for the base it will fold into the identity.
+    const prepare = vi.fn().mockImplementation((request: { baseSha: string }, use: (value: typeof preparedShape) => Promise<unknown>) =>
+      use({ ...preparedShape, baseSha: request.baseSha }));
+    // Each attempt checks a DIFFERENT base, so the evidence differs: the
+    // stale replay would publish the first attempt's reference.
+    const check = vi.fn().mockImplementation(async (input: { findings: readonly Record<string, unknown>[] }) =>
+      input.findings.map((entry) => ({
+        ...entry,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [check.mock.calls.length === 1
+            ? { file: "src/queue.ts", line: 12 }
+            : { file: "src/auth.ts", line: 5 }],
+          filesSearched: 9,
+        },
+      })));
+    const vcs = silentReviewVcs();
+    let base = "b".repeat(40);
+    // The FIRST attempt freezes its manifest, then dies on the finding's own
+    // summary write — a transient AFTER the manifest is durable.
+    const originalUpsert = vcs.adapter.upsertComment.bind(vcs.adapter);
+    let upsertFailed = false;
+    (vcs.adapter as { upsertComment: unknown }).upsertComment = vi.fn(
+      async (locator: unknown, body: string, existing: BotComment | null) => {
+        if (!upsertFailed) {
+          upsertFailed = true;
+          throw new Error("crash after freeze");
+        }
+        return originalUpsert(locator, body, existing);
+      },
+    );
+
+    const deps = () => ({
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The current hunk still logs the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+            claim: { kind: "no-other-references", symbol: "token" },
+          },
+        })),
+      }),
+      prepareStructuralWorkspace: prepare,
+      runStructuralChecks: check,
+      getReviewMetadata: async () => ({
+        headSha: adapter.headSha,
+        baseSha: base,
+        diff: commentableAuthDiff,
+      }),
+    });
+
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), deps())).resolves.toBe(1);
+    expect(check).toHaveBeenCalledTimes(1);
+
+    // The base advances while the head stays put.
+    base = "c".repeat(40);
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), deps())).resolves.toBe(0);
+    // The retry re-checked against the NEW base and published a FRESH
+    // manifest — the stored one was never replayed.
+    expect(check).toHaveBeenCalledTimes(2);
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(vcs.postedInlines).toHaveLength(1);
+    const inline = vcs.postedInlines.map((entry) => entry.body).join("\n");
+    expect(inline).toMatch(/LEXICAL matches/);
+    expect(inline).toContain("src/auth.ts:5");
+    expect(inline).not.toContain("src/queue.ts:12");
+  });
+
   // Codex review of PR #100, round two: the publication normalizes an
   // `addressed`/`needs-clarification` decision to `still-valid`, so gating on
   // the RAW decision skipped the check and annotated a claim that published
@@ -1920,11 +2025,15 @@ describe("clarification answer lifecycle", () => {
       threadComment("human-1", "Audit does not require raw tokens."),
     );
     adapter.replaceEvents([reply]);
-    const prepare = vi.fn().mockResolvedValue({
+    const prepared = {
       root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
       ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
-    });
+    };
+    // Callback API: the consumer (the structural check) runs INSIDE the
+    // preparation, under one repository lock (Codex review, round three).
+    const prepare = vi.fn().mockImplementation((_request: unknown, use: (value: typeof prepared) => Promise<unknown>) =>
+      use(prepared));
     const check = vi.fn().mockImplementation(async (input: { findings: readonly Record<string, unknown>[] }) =>
       input.findings.map((entry) => ({
         ...entry,
