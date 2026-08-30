@@ -88,7 +88,10 @@ import {
   prepareReviewContext as prepareReviewContextReal,
 } from "./context/prepare.js";
 import { contextRoots, selectContextRoot } from "./context/root.js";
-import { runStructuralChecks as runStructuralChecksReal } from "./review/structural-check.js";
+import {
+  hasCheckableClaim,
+  runStructuralChecks as runStructuralChecksReal,
+} from "./review/structural-check.js";
 import { withPreparedWorkspace as withPreparedWorkspaceReal } from "./workspace/manager.js";
 import {
   combineContextPacks,
@@ -1497,47 +1500,65 @@ export async function review(
   // because that only builds one on a cache MISS. Reusing it would mean the
   // same review got checks or not depending on cache state, which is a worse
   // property than paying for the worktree.
-  if (config.structuralChecks === "on" && dispatchResult.findings.some((f) => f.claim !== undefined)) {
-    try {
-      const addressedKeys = new Set(
-        dispatchResult.findings
-          .filter((finding) => finding.decision === "addressed")
-          .map(dedupeKey),
-      );
-      dispatchResult.findings = await prepareStructuralWorkspaceFn({
-        // The SAME managed workspace context mapping uses, so a repository
-        // is mirrored once whichever feature asked for it first.
-        root: contextRoots(selectContextRoot({
-          ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
-        })).workspaceRoot,
-        repo: repository,
-        baseSha: pr.baseSha,
-        rejectPreviouslySharedRoot: true,
-      }, async (prepared) => {
-      if (prepared.baseSha !== pr.baseSha) {
-        throw new Error("prepared worktree does not sit at the requested base commit");
-      }
-      return runStructuralChecksFn({
-        findings: dispatchResult.findings,
-        baseRoot: prepared.baseWorktreePath,
-        // A finding names its HEAD path; the base tree holds a renamed file
-        // under the old one, and without this the symbol's own declaration
-        // reads as a reference from elsewhere.
-        renamedFrom: renameSourcesByHeadPath(diff),
-        // Lets the checker drop occurrences whose base-side lines may be
-        // precisely the ones this PR deletes — per file, so an untouched
-        // caller elsewhere survives.
-        removedLinesByFile: removedLinesByFile(diff),
-        // `orchestrate` drops an actionable finding whose dedup key matches an
-        // `addressed` one, so checking those spends budget on results no reader
-        // sees. Wired HERE, at the composition root, using orchestrate's own
-        // `dedupeKey` — the checker stays independent of the orchestrator and
-        // there is only one definition of the rule.
-        isSuppressed: (finding) => addressedKeys.has(dedupeKey(finding))
-          && (finding.decision ?? "new") !== "addressed",
-      });
-      });
-    } catch (error) {
+  //
+  // Issue #80: the gate is ELIGIBILITY, not mere presence of a claim. On a
+  // cold workspace the preparation is a full clone — the feature's largest
+  // single cost — and "has a claim" is much weaker than "can be checked": a
+  // claim on a Go file, or one whose finding no reader will ever see, resolves
+  // to nothing and the clone buys nothing. `hasCheckableClaim` is the SAME
+  // predicate the checker applies, exported from the same module — not a copy
+  // that can drift. When nothing is eligible, claims are still annotated with
+  // why they went unchecked: a claim that reads unchallenged is exactly what
+  // this feature exists to stop.
+  if (config.structuralChecks === "on") {
+    // Everything below is gated on the feature, so a review with it off pays
+    // nothing — not even the dedupe-key pass for the suppression predicate.
+    const addressedKeys = new Set(
+      dispatchResult.findings
+        .filter((finding) => finding.decision === "addressed")
+        .map(dedupeKey),
+    );
+    const isSuppressed = (finding: Finding): boolean =>
+      addressedKeys.has(dedupeKey(finding))
+      && (finding.decision ?? "new") !== "addressed";
+    if (dispatchResult.findings.some((finding) => hasCheckableClaim(finding, isSuppressed))) {
+      try {
+        // Issue #78: the check runs INSIDE the repository lock. Reading the
+        // shared worktree after the lock is released lets another job reset it
+        // mid-read, and this derives a host-authored fact from what it reads.
+        dispatchResult.findings = await prepareStructuralWorkspaceFn({
+          // The SAME managed workspace context mapping uses, so a repository
+          // is mirrored once whichever feature asked for it first.
+          root: contextRoots(selectContextRoot({
+            ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
+          })).workspaceRoot,
+          repo: repository,
+          baseSha: pr.baseSha,
+          rejectPreviouslySharedRoot: true,
+        }, async (prepared) => {
+          if (prepared.baseSha !== pr.baseSha) {
+            throw new Error("prepared worktree does not sit at the requested base commit");
+          }
+          return runStructuralChecksFn({
+            findings: dispatchResult.findings,
+            baseRoot: prepared.baseWorktreePath,
+            // A finding names its HEAD path; the base tree holds a renamed file
+            // under the old one, and without this the symbol's own declaration
+            // reads as a reference from elsewhere.
+            renamedFrom: renameSourcesByHeadPath(diff),
+            // Lets the checker drop occurrences whose base-side lines may be
+            // precisely the ones this PR deletes — per file, so an untouched
+            // caller elsewhere survives.
+            removedLinesByFile: removedLinesByFile(diff),
+            // `orchestrate` drops an actionable finding whose dedup key matches
+            // an `addressed` one, so checking those spends budget on results no
+            // reader sees. Wired HERE, at the composition root, using
+            // orchestrate's own `dedupeKey` — the checker stays independent of
+            // the orchestrator and there is only one definition of the rule.
+            isSuppressed,
+          });
+        });
+      } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the
       // claim went unverified rather than silently reading it as unchallenged.
       //
@@ -1551,6 +1572,14 @@ export async function review(
       dispatchResult.findings = dispatchResult.findings.map((finding) =>
         finding.claim === undefined ? finding : { ...finding, hostCheck: { status: "not-checked" as const, reason } });
       console.warn(`tgd-review-agent: structural checks skipped (${reason}: ${redactedMessage(error)})`);
+      }
+    } else {
+      // Issue #80: nothing was checkable, so no worktree was prepared — but
+      // the claims must not read unchallenged anyway. The same annotation the
+      // failure path above gives, with a reason that says WHY nothing ran.
+      const reason = "no claim in this review was checkable, so no base worktree was prepared";
+      dispatchResult.findings = dispatchResult.findings.map((finding) =>
+        finding.claim === undefined ? finding : { ...finding, hostCheck: { status: "not-checked" as const, reason } });
     }
   }
 

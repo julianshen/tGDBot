@@ -270,6 +270,14 @@ class ClassificationAdapter implements ConversationAdapter {
   async resolveReviewIdentity(_repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
     return identity(reviewNumber);
   }
+
+  async resolveReviewThread(
+    ..._args: Parameters<ConversationAdapter["resolveReviewThread"]>
+  ): Promise<void> {
+    void _args;
+    this.writes.push("resolve");
+    throw new Error("provider writes are not implemented");
+  }
 }
 
 async function journalEvents(store: ConversationStateStore): Promise<ConversationEventEntry[]> {
@@ -631,6 +639,18 @@ class ExecutionAdapter extends ClassificationAdapter {
 
   failNextThreadRead = false;
   threadReads = 0;
+  readonly resolvedThreadIds: string[] = [];
+  failNextResolve = false;
+
+  override async resolveReviewThread(_review: ReviewIdentity, threadId: string): Promise<void> {
+    if (this.failNextResolve) {
+      this.failNextResolve = false;
+      throw new Error("resolve is temporarily unavailable");
+    }
+    this.resolvedThreadIds.push(threadId);
+    const thread = this.threads.get(threadId);
+    if (thread !== undefined) this.threads.set(threadId, { ...thread, resolved: true });
+  }
 
   override async getReviewThread(_review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
     this.threadReads += 1;
@@ -2089,6 +2109,75 @@ describe("automatic verification", () => {
     expect(outcomes[0]!.headSha).toBe("c".repeat(40));
     // Labels are never stored — only digests of them (#57 design).
     expect(JSON.stringify(outcomes[0])).not.toContain("no-token-logs");
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+  });
+
+  it("does not resolve the thread when the finding still stands", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "this is still wrong"),
+    );
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: async () => createPiSessionStub(verdict("confirmed")).session,
+      }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+  });
+
+  it("does not resolve a thread the bot did not root", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this"),
+      { rootAuthorIsBot: false },
+    );
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: async () => createPiSessionStub(verdict("withdrawn")).session,
+      }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+  });
+
+  it("does not consume the verification when resolving the thread fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    adapter.failNextResolve = true;
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+    await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
+      .resolves.toEqual([]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("withdrawn");
   });
 
   // THE idempotency criterion: the same page seen twice must not verify twice.
@@ -2145,6 +2234,62 @@ describe("automatic verification", () => {
     // A verdict the reader cannot argue with is worse than no verdict. The
     // invitation names the AUTHENTICATED account, so the mention resolves.
     expect(body).toContain("`@tgdbot reconsider <why>`");
+  });
+
+  it("records a confirmed outcome when recovery completes a posted reply", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "I think this one is wrong"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("confirmed")).session;
+    };
+    adapter.replaceEvents([reply]);
+    let crashOnce = true;
+    const crashComplete = <T>(fn: (tx: ConversationStateTransaction) => T) =>
+      (tx: ConversationStateTransaction) => {
+        const appendEvent = tx.appendEvent.bind(tx);
+        tx.appendEvent = (entry) => {
+          if (crashOnce && entry.state === "completed") {
+            crashOnce = false;
+            throw new Error("crash before complete persist");
+          }
+          appendEvent(entry);
+        };
+        return fn(tx);
+      };
+    const deps = {
+      ...executionDeps(adapter, { createSession: session }),
+      createStateStore: (opts: Parameters<typeof createConversationStateStore>[0]) => {
+        const store = createConversationStateStore(opts);
+        const transact = store.transact.bind(store);
+        store.transact = ((fn: Parameters<ConversationStateStore["transact"]>[0]) =>
+          transact(crashComplete(fn) as typeof fn)) as typeof store.transact;
+        const lock = store.withExclusiveLock.bind(store);
+        store.withExclusiveLock = (fn) => lock(async (session) => {
+          const commit = session.commit.bind(session);
+          session.commit = ((txFn: Parameters<typeof commit>[0]) =>
+            commit(crashComplete(txFn) as typeof txFn)) as typeof commit;
+          return fn(session);
+        });
+        return store;
+      },
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
+      .resolves.toEqual([]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("confirmed");
   });
 
   // A transient provider failure must not consume the reply. The poll marks an

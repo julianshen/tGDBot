@@ -359,4 +359,10 @@ export interface ConversationAdapter {
   postGeneralReply(review: ReviewIdentity, input: GeneralReplyInput): Promise<ConversationItemIdentity>;
   postThreadReply(review: ReviewIdentity, input: ThreadReplyInput): Promise<ConversationItemIdentity>;
   findBotChildMarker(review: ReviewIdentity, marker: ChildMarkerLookup): Promise<ConversationItemIdentity | null>;
+  /**
+   * Resolve one review thread. Callers must only pass a thread this tool
+   * rooted; implementations perform the provider write and do not re-decide
+   * that policy.
+   */
+  resolveReviewThread(review: ReviewIdentity, threadId: string): Promise<void>;
 }

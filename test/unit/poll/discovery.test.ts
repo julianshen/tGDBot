@@ -287,6 +287,11 @@ class FakeConversationAdapter implements ConversationAdapter {
   async findBotChildMarker() {
     return null;
   }
+
+  async resolveReviewThread(): Promise<never> {
+    this.writes.push("resolve");
+    throw new Error("provider writes are not implemented");
+  }
 }
 
 async function journalEvents(store: ConversationStateStore): Promise<ConversationEventEntry[]> {

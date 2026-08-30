@@ -5193,6 +5193,52 @@ describe("review — structural checks", () => {
     expect(h.runStructuralChecks).not.toHaveBeenCalled();
   });
 
+  // Issue #80: "has a claim" is much weaker than "can be checked", and on a
+  // cold workspace the worktree preparation is a FULL CLONE — the feature's
+  // largest single cost. Each case below resolves to nothing today, so the
+  // clone would buy nothing.
+  it.each([
+    ["every claim is on an unsupported language", [{ ...claimed, file: "src/retry.go" }]],
+    ["every claimed finding is addressed", [{ ...claimed, decision: "addressed" as const }]],
+    ["every claimed finding needs clarification", [{ ...claimed, decision: "needs-clarification" as const }]],
+    ["every claimed finding is suppressed by an addressed duplicate",
+      [{ ...claimed, ruleName: "rule-b" }, { ...claimed, decision: "addressed" as const }]],
+  ])("prepares no worktree when %s", async (_name, findings) => {
+    const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
+    h.dispatchRules.mockResolvedValue({ findings, rulesRun: ["rule-a"], rulesFailed: [] });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.prepareStructuralWorkspace).not.toHaveBeenCalled();
+    expect(h.runStructuralChecks).not.toHaveBeenCalled();
+    // Skipping the clone must not leave a claim reading unchallenged: the
+    // annotation says why nothing ran.
+    const passed = h.orchestrate.mock.calls[0]?.[0] as {
+      findings: { claim?: unknown; hostCheck?: { status: string; reason: string } }[];
+    };
+    for (const finding of passed.findings.filter((entry) => entry.claim !== undefined)) {
+      expect(finding.hostCheck).toMatchObject({ status: "not-checked" });
+      expect(finding.hostCheck?.reason).toContain("no claim in this review was checkable");
+    }
+  });
+
+  // The gate is per-review ("some"), not per-finding: one eligible claim pays
+  // for the clone, and the ineligible ones ride along to the checker, which
+  // annotates each with its own precise refusal (e.g. the language one).
+  it("still prepares the worktree when one eligible claim rides with ineligible ones", async () => {
+    const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
+    h.dispatchRules.mockResolvedValue({
+      findings: [{ ...claimed, file: "src/retry.go" }, claimed],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    });
+
+    await review(h.args, depsFrom(h));
+
+    expect(h.prepareStructuralWorkspace).toHaveBeenCalledTimes(1);
+    expect(h.runStructuralChecks).toHaveBeenCalledTimes(1);
+  });
+
   it("checks a claim against the base worktree when the feature is on", async () => {
     const h = makeHarness({ botComment: null, args: makeArgs({ structuralChecks: "on" }) });
     h.dispatchRules.mockResolvedValue({ findings: [claimed], rulesRun: ["rule-a"], rulesFailed: [] });
