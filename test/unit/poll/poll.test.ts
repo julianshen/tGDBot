@@ -271,7 +271,10 @@ class ClassificationAdapter implements ConversationAdapter {
     return identity(reviewNumber);
   }
 
-  async resolveReviewThread(_review: ReviewIdentity, _threadId: string): Promise<void> {
+  async resolveReviewThread(
+    ..._args: Parameters<ConversationAdapter["resolveReviewThread"]>
+  ): Promise<void> {
+    void _args;
     this.writes.push("resolve");
     throw new Error("provider writes are not implemented");
   }
