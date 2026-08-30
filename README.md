@@ -376,15 +376,18 @@ tgd-review-agent review \
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
   --structural-checks on|off     # default: OFF. Checks a finding's structural claim against the
-                                  # BASE branch and publishes the host result beside it. Results are
-                                  # unresolved LEXICAL matches, not resolved references: ast-grep
-                                  # has no symbol resolution, so a same-named member of an unrelated
-                                  # type is indistinguishable from a real caller. Only claims a rule
-                                  # explicitly makes ("this symbol is referenced nowhere else") are
-                                  # checked; nothing is inferred from prose. TypeScript, TSX and
-                                  # JavaScript only. Needs a base worktree, so the first run on a
-                                  # cold workspace pays for a clone; it shares that workspace with
-                                  # --context, so a repository is mirrored once.
+                                  # BASE branch and publishes the host result beside it. When the
+                                  # base tree has a root tsconfig.json, occurrences are RESOLVED
+                                  # with the TypeScript compiler — a match means it binds to the
+                                  # symbol the finding's file declares, not merely a same-named
+                                  # spelling. Files the checker does not cover keep the LEXICAL
+                                  # answer; a repository without a root tsconfig gets lexical
+                                  # results only. Only claims a rule explicitly makes ("this
+                                  # symbol is referenced nowhere else") are checked; nothing is
+                                  # inferred from prose. TypeScript, TSX and JavaScript only.
+                                  # Needs a base worktree, so the first run on a cold workspace
+                                  # pays for a clone; it shares that workspace with --context,
+                                  # so a repository is mirrored once.
   --dependency-facts on|off      # default: OFF. The only outbound request this tool makes: when a
                                   # pull request changes a package.json, the host asks
                                   # registry.npmjs.org about each changed package and puts the
@@ -587,7 +590,26 @@ does not check the reviewer afterwards.
 
 With `--structural-checks on`, a rule may attach a claim to a finding, and the
 host answers it by parsing the base branch with
-[ast-grep](https://ast-grep.github.io/) in-process:
+[ast-grep](https://ast-grep.github.io/) in-process — and, when the base tree
+has a root `tsconfig.json`, by resolving each occurrence with the TypeScript
+compiler (in-process, read-only: the config is parsed as data, no project code
+is ever executed, and only the base worktree is read):
+
+```text
+- `src/retry.ts:41` — budget() is never called outside tests
+  > Host check: the name `budget` resolves to 2 reference(s) outside this
+  > file, across 214 type-checked file(s) of the base branch — `src/http.ts:88`,
+  > `src/queue.ts:12`. These are RESOLVED references: the type checker matched
+  > them to the declaration of `budget` in this file. 3 other occurrence(s) of
+  > the name in those files do NOT resolve to this `budget` — different symbols
+  > that share the spelling.
+```
+
+The lexical answer is the floor, not a relic. A repository without a root
+`tsconfig.json`, files the program does not cover (plain-JS directories, other
+languages' neighbours), a finding whose file does not declare the symbol, or a
+checker that could not finish in budget — all of those get the LEXICAL result,
+stated as unresolved:
 
 ```text
 - `src/retry.ts:41` — budget() is never called outside tests
