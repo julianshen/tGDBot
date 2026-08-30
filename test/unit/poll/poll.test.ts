@@ -50,6 +50,8 @@ import { extractFileHunk, poll } from "../../../src/poll/poll.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
+import type { Finding } from "../../../src/review/types.js";
+import type { PreparedWorkspace, WorkspaceRequest } from "../../../src/workspace/types.js";
 import { parseBotMarker } from "../../../src/review/comment-marker.js";
 import { validateConversationItemIdentity } from "../../../src/vcs/adapter.js";
 import type { BotComment } from "../../../src/vcs/adapter.js";
@@ -2061,6 +2063,302 @@ describe("clarification answer lifecycle", () => {
     expect(changedSession).not.toHaveBeenCalled();
     expect(adapter.postedBodies.at(-1)).toMatch(/Confirmed/);
     expect(adapter.postedBodies.at(-1)).not.toMatch(/Withdrawn/);
+  });
+
+  // Issue #79. A reassessment runs the model under the SAME contract the review
+  // dispatcher uses, so it can return a `claim` — and `normalizeUnknownFinding`
+  // parses that field unconditionally, with no flag to turn it off.
+  const claimingFinding = {
+    ...confirmedFinding,
+    claim: { kind: "no-other-references" as const, symbol: "dump" },
+  };
+
+  const claimingSession = () => vi.fn(sessionFor(JSON.stringify({
+    outcome: "confirmed",
+    rationale: "The logger still prints the token.",
+    finding: claimingFinding,
+  })));
+
+  async function answerWithAClaim(
+    stateDir: string,
+    adapter: ExecutionAdapter,
+    extras: {
+      readonly args?: Partial<PollArgs>;
+      readonly vcs?: ReturnType<typeof silentReviewVcs>;
+      readonly deps?: Record<string, unknown>;
+    } = {},
+  ) {
+    adapter.replaceEvents([commentEvent("claim-answer", `answer ${CLAR_ID}: keep the current logger`)]);
+    return poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5", ...extras.args }), {
+      ...executionDeps(adapter, {
+        diff: commentableAuthDiff,
+        createSession: claimingSession(),
+        ...(extras.vcs === undefined ? {} : { vcs: extras.vcs }),
+      }),
+      ...extras.deps,
+    });
+  }
+
+  /**
+   * A workspace preparer that records its requests.
+   *
+   * Written out rather than wrapped in `vi.fn`, because the real
+   * `withPreparedWorkspace` is generic in its callback's return and a `Mock`
+   * collapses that to `unknown` — which the dependency slot then rejects.
+   */
+  function recordingWorkspace(): {
+    readonly requests: WorkspaceRequest[];
+    readonly prepare: <T>(
+      request: WorkspaceRequest,
+      use: (prepared: PreparedWorkspace) => Promise<T>,
+    ) => Promise<T>;
+  } {
+    const requests: WorkspaceRequest[] = [];
+    return {
+      requests,
+      prepare: async (request, use) => {
+        requests.push(request);
+        return use(preparedWorkspaceAt(request.baseSha));
+      },
+    };
+  }
+
+  /** A prepared workspace standing at `baseSha`, with the paths never read. */
+  function preparedWorkspaceAt(baseSha: string): PreparedWorkspace {
+    return {
+      baseSha,
+      root: "/workspace",
+      repositoryRoot: "/workspace/owner-repo",
+      mirrorPath: "/workspace/owner-repo/mirror.git",
+      worktreesRoot: "/workspace/owner-repo/worktrees",
+      baseWorktreePath: "/base",
+      ownerMarkerPath: "/workspace/owner-repo/owner.json",
+    };
+  }
+
+  /** The body of the inline finding comment this publication posted. */
+  function inlineFindingBody(vcs: ReturnType<typeof silentReviewVcs>): string {
+    const comments = vcs.adapter.createInlineReview.mock.calls[0]?.[2] as
+      | ReadonlyArray<{ readonly body: string }>
+      | undefined;
+    return comments?.[0]?.body ?? "";
+  }
+
+  // The regression that made this path unusable rather than merely unchecked.
+  // `Finding` is structurally assignable to `FindingSnapshot`, so freezing the
+  // raw reassessment compiled — but the store validates keys nominally and
+  // rejects the ones it does not know, and the throw escapes every catch
+  // between the freeze and the poll loop.
+  it("freezes a reassessment that carries a claim instead of throwing on the write", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+
+    await expect(answerWithAClaim(stateDir, adapter)).resolves.toBe(0);
+
+    expect(adapter.postedBodies.at(-1)).toMatch(/Confirmed/);
+    const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
+    expect(snapshot.pending.clarifications[0]?.state).toBe("terminal");
+    // The claim survives BESIDE the snapshot, never inside it: the snapshot's
+    // exclusion is about a stale CHECK, and the claim is re-checked against the
+    // current base on every attempt.
+    expect(snapshot.pending.clarifications[0]?.frozenOutcome?.finding)
+      .not.toHaveProperty("claim");
+    expect(snapshot.pending.clarifications[0]?.frozenOutcome?.claim)
+      .toEqual(claimingFinding.claim);
+    expect(snapshot.pending.clarifications[0]?.frozenOutcome?.finding)
+      .not.toHaveProperty("hostCheck");
+  });
+
+  it("checks the claim against a base worktree prepared at publication time", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const vcs = silentReviewVcs();
+    const workspace = recordingWorkspace();
+    const runStructuralChecks = vi.fn(async (checkInput: { readonly findings: readonly Finding[] }) =>
+      checkInput.findings.map((finding) => ({
+        ...finding,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [{ file: "src/other.ts", line: 3 }],
+          filesSearched: 2,
+          occurrences: 1,
+        },
+      })));
+
+    await expect(answerWithAClaim(stateDir, adapter, {
+      args: { structuralChecks: "on" },
+      vcs,
+      deps: { prepareStructuralWorkspace: workspace.prepare, runStructuralChecks },
+    })).resolves.toBe(0);
+
+    // The claim reached the checker, against the base the publication names —
+    // not one carried over from the review that first raised the question.
+    expect(workspace.requests).toHaveLength(1);
+    expect(workspace.requests[0]).toMatchObject({
+      baseSha: "b".repeat(40),
+      rejectPreviouslySharedRoot: true,
+    });
+    expect(runStructuralChecks).toHaveBeenCalledOnce();
+    expect(runStructuralChecks.mock.calls[0]?.[0]).toMatchObject({
+      baseRoot: "/base",
+      findings: [expect.objectContaining({ claim: claimingFinding.claim })],
+    });
+    // And the host's answer is what the reader actually sees.
+    expect(inlineFindingBody(vcs)).toMatch(/Host check: the name `dump` occurs 1 time\(s\) outside this file/);
+  });
+
+  it("degrades to a host-authored not-checked reason when the worktree fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const vcs = silentReviewVcs();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const runStructuralChecks = vi.fn();
+
+    await expect(answerWithAClaim(stateDir, adapter, {
+      args: { structuralChecks: "on" },
+      vcs,
+      deps: {
+        prepareStructuralWorkspace: async () => {
+          throw new Error("clone failed under /Users/someone/private/path");
+        },
+        runStructuralChecks,
+      },
+    })).resolves.toBe(0);
+
+    expect(runStructuralChecks).not.toHaveBeenCalled();
+    const body = inlineFindingBody(vcs);
+    expect(body).toMatch(/Host check: not performed/);
+    // HOST-AUTHORED. The comment is world-readable on a public repository and
+    // the raw failure names an absolute path; that detail belongs on stderr.
+    expect(body).not.toMatch(/private\/path/);
+    expect(warn.mock.calls.flat().join("\n")).toMatch(/structural check skipped/);
+  });
+
+  // Issue #80's gate, applied here too: preparing the base worktree is a full
+  // clone on a cold workspace, and a claim the checker would refuse anyway buys
+  // nothing for it. The claim still gets an explicit answer — reading
+  // unchallenged is the outcome this feature exists to prevent.
+  it("skips the clone for a claim the host could not check, and says so", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const vcs = silentReviewVcs();
+    const prepareStructuralWorkspace = vi.fn();
+
+    adapter.replaceEvents([commentEvent("go-answer", `answer ${CLAR_ID}: keep the current logger`)]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5", structuralChecks: "on" }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The logger still prints the token.",
+          // A language the check has no parser for, so `hasCheckableClaim`
+          // refuses it before any workspace is touched.
+          finding: { ...claimingFinding, file: "src/auth.go", line: undefined },
+        })),
+      }),
+      prepareStructuralWorkspace,
+    })).resolves.toBe(0);
+
+    expect(prepareStructuralWorkspace).not.toHaveBeenCalled();
+    expect(vcs.summaries.some((body) => body.includes("Host check: not performed"))).toBe(true);
+  });
+
+  // The publication falls back to a zero SHA when metadata carries no base, and
+  // no tree sits at that commit. Saying which fact was missing beats reporting
+  // a workspace failure for what is really absent metadata.
+  it("names the missing base rather than attempting a worktree at a zero SHA", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const vcs = silentReviewVcs();
+    const prepareStructuralWorkspace = vi.fn();
+
+    adapter.replaceEvents([commentEvent("no-base", `answer ${CLAR_ID}: keep the current logger`)]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5", structuralChecks: "on" }), {
+      ...executionDeps(adapter, { vcs, diff: commentableAuthDiff, createSession: claimingSession() }),
+      getReviewMetadata: async () => ({ headSha: adapter.headSha, diff: commentableAuthDiff }),
+      prepareStructuralWorkspace,
+    })).resolves.toBe(0);
+
+    expect(prepareStructuralWorkspace).not.toHaveBeenCalled();
+    expect(inlineFindingBody(vcs)).toMatch(/Host check: not performed — the review base commit was not available/);
+  });
+
+  // Codex review of PR #101. The freeze commits before the publication runs, so
+  // a failure BELOW it — `findBotComment` throwing, or the process exiting —
+  // leaves a frozen outcome and no manifest. The next poll must still be able to
+  // check the claim the reassessment made; it may not silently publish a finding
+  // that asserts nothing, having promised a check.
+  it("re-checks the frozen claim after a publication that stored no manifest", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const vcs = silentReviewVcs();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const workspace = recordingWorkspace();
+    const runStructuralChecks = vi.fn(async (checkInput: { readonly findings: readonly Finding[] }) =>
+      checkInput.findings.map((finding) => ({
+        ...finding,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [{ file: "src/other.ts", line: 3 }],
+          filesSearched: 2,
+          occurrences: 1,
+        },
+      })));
+
+    // Fails AFTER the check has run and BEFORE any manifest is stored.
+    vcs.adapter.findBotComment.mockRejectedValueOnce(new Error("summary lookup failed"));
+    const first = claimingSession();
+    adapter.replaceEvents([commentEvent("crash-answer", `answer ${CLAR_ID}: keep the current logger`)]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5", structuralChecks: "on" }), {
+      ...executionDeps(adapter, { vcs, diff: commentableAuthDiff, createSession: first }),
+      prepareStructuralWorkspace: workspace.prepare,
+      runStructuralChecks,
+    })).resolves.toBe(1);
+
+    // The retry must not re-run the model: the frozen outcome exists precisely
+    // so a nondeterministic second opinion cannot replace the first.
+    const second = vi.fn(sessionFor(JSON.stringify({
+      outcome: "withdrawn",
+      rationale: "A nondeterministic retry changed its mind.",
+    })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5", structuralChecks: "on" }), {
+      ...executionDeps(adapter, { vcs, diff: commentableAuthDiff, createSession: second }),
+      prepareStructuralWorkspace: workspace.prepare,
+      runStructuralChecks,
+    })).resolves.toBe(0);
+
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).not.toHaveBeenCalled();
+    // The point of the test: the SECOND attempt still had a claim to check.
+    expect(runStructuralChecks).toHaveBeenCalledTimes(2);
+    expect(runStructuralChecks.mock.calls[1]?.[0]).toMatchObject({
+      findings: [expect.objectContaining({ claim: claimingFinding.claim })],
+    });
+    expect(inlineFindingBody(vcs)).toMatch(/Host check: the name `dump` occurs 1 time\(s\) outside this file/);
+  });
+
+  it("prepares no worktree when structural checks are off", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const vcs = silentReviewVcs();
+    const prepareStructuralWorkspace = vi.fn();
+
+    await expect(answerWithAClaim(stateDir, adapter, {
+      vcs,
+      deps: { prepareStructuralWorkspace },
+    })).resolves.toBe(0);
+
+    expect(prepareStructuralWorkspace).not.toHaveBeenCalled();
+    expect(adapter.postedBodies.at(-1)).toMatch(/Confirmed/);
+    expect(inlineFindingBody(vcs)).not.toMatch(/Host check/);
   });
 });
 

@@ -868,6 +868,28 @@ export async function publishConfirmedClarificationFinding(options: {
   readonly diff: string;
   readonly now: () => string;
   readonly hooks?: PublicationExecutorHooks;
+  /**
+   * Issue #79: the host's structural check on the finding about to be
+   * published, run against the base as it is NOW.
+   *
+   * A clarification reassessment returns a freshly generated finding under the
+   * same contract the review dispatcher uses, so it may carry a `claim` nobody
+   * has checked. The CLI review path checks its claims after dispatch; this
+   * path had no equivalent, and a claim with no check simply renders nothing —
+   * a missing verification rather than a false one, but still the whole point
+   * of the feature going unserved.
+   *
+   * INJECTED rather than performed here for two reasons. A check needs a base
+   * worktree, a repository lock and a filesystem, none of which belong in a
+   * module that otherwise only composes and posts comments. And the call sits
+   * BELOW the replay-from-manifest return above, so a publication that already
+   * exists is re-posted without paying for a clone — the feature's largest
+   * single cost (#80) — to recompute a check whose result the manifest already
+   * froze.
+   *
+   * Never throws: the caller degrades a failure to `not-checked` with a reason.
+   */
+  readonly checkClaim?: (finding: Finding) => Promise<Finding>;
 }): Promise<number> {
   const existing = loadPublicationAction(
     (await options.store.readContextSnapshot()).events,
@@ -894,7 +916,11 @@ export async function publishConfirmedClarificationFinding(options: {
     });
   }
 
-  const finding = actionableClarificationFinding(options.finding);
+  const actionable = actionableClarificationFinding(options.finding);
+  // AFTER `actionableClarificationFinding`, so the check sees the finding as it
+  // will be published — its decision settled and its question dropped — rather
+  // than the reassessment's intermediate form.
+  const finding = options.checkClaim === undefined ? actionable : await options.checkClaim(actionable);
   const orchestration = orchestrate({
     findings: [finding],
     rulesRun: [finding.ruleName],

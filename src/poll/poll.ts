@@ -51,7 +51,15 @@ import {
 } from "../conversation/publication-manifest.js";
 import {
   publishConfirmedClarificationFinding,
+  toFindingSnapshot,
 } from "../review/review-publication.js";
+import {
+  hasCheckableClaim,
+  runStructuralChecks as runStructuralChecksReal,
+} from "../review/structural-check.js";
+import type { Finding } from "../review/types.js";
+import { contextRoots, selectContextRoot } from "../context/root.js";
+import { withPreparedWorkspace as withPreparedWorkspaceReal } from "../workspace/manager.js";
 import {
   childMarkerSuffix,
   createConversationPublicationChild,
@@ -92,7 +100,12 @@ import type {
   RepositoryBinding,
 } from "../conversation/types.js";
 import { observeResolvedThreads, pendingVerifications } from "../conversation/verification-queue.js";
-import { originInsertAfterLines, originTouchedLines } from "../review/diff-anchors.js";
+import {
+  originInsertAfterLines,
+  originTouchedLines,
+  removedLinesByFile,
+  renameSourcesByHeadPath,
+} from "../review/diff-anchors.js";
 import { CompareNotDirectError } from "../vcs/adapter.js";
 import type { PendingVerification } from "../conversation/verification-queue.js";
 import { verifyFinding } from "../conversation/verification.js";
@@ -158,6 +171,9 @@ export interface PollDependencies {
     args: ReviewCommandArgs,
     deps: { readonly invocation: ReviewInvocation },
   ) => Promise<number>;
+  /** Issue #79 seams, named as in cli.ts so both paths read the same. */
+  readonly prepareStructuralWorkspace?: typeof withPreparedWorkspaceReal;
+  readonly runStructuralChecks?: typeof runStructuralChecksReal;
 }
 
 /** The subset of review CliArgs poll constructs from its own resolved options. */
@@ -1976,6 +1992,97 @@ async function completeEmptyPrepared(input: {
   }
 }
 
+/**
+ * The host's structural check for a clarification-confirmed finding (#79).
+ *
+ * A reassessment re-runs the model against the CURRENT diff and head and
+ * returns a freshly generated finding, so it can carry a claim that has never
+ * been checked. Nothing false is published without this — `renderHostCheck`
+ * needs both a claim and a check, so an unchecked claim renders as ordinary
+ * prose — but the claim then reads unchallenged, which is exactly what the
+ * feature exists to stop.
+ *
+ * The check is computed HERE, at publication time, against the base as it is
+ * now. Persisting the one the original review computed would attach a
+ * verification of an older base to a finding regenerated against a newer one:
+ * a stale answer presented as current, and worse than none. That is why
+ * `FindingSnapshot` holds neither `claim` nor `hostCheck`.
+ *
+ * Every failure degrades to `not-checked` WITH A REASON rather than to
+ * silence, and the reason is HOST-AUTHORED: it is rendered into a comment that
+ * is world-readable on a public repository, and a workspace failure quotes the
+ * absolute path it failed on. Same rule the CLI path follows, arrived at the
+ * same way; the raw error goes to stderr, which is private.
+ */
+function clarificationClaimChecker(input: {
+  readonly config: ResolvedPollConfig;
+  readonly deps: PollDependencies;
+  readonly baseSha: string | undefined;
+  readonly diff: string;
+}): (finding: Finding) => Promise<Finding> {
+  const { config, deps, baseSha, diff } = input;
+  return async (finding) => {
+    if (finding.claim === undefined) return finding;
+    const notChecked = (reason: string): Finding =>
+      ({ ...finding, hostCheck: { status: "not-checked" as const, reason } });
+    // The SAME predicate the checker applies, exported from the same module so
+    // it cannot drift (#80). Preparing a base worktree is a full clone on a
+    // cold workspace, and a claim the check would refuse anyway — one on a Go
+    // file, say — buys nothing for it.
+    if (!hasCheckableClaim(finding)) {
+      return notChecked("this claim was not one the host could check");
+    }
+    // The publication falls back to a zero SHA when the metadata carries no
+    // base, and no tree sits at that commit. Refusing here says so plainly
+    // instead of letting the clone fail and reporting a workspace problem for
+    // what is really missing metadata.
+    if (baseSha === undefined || baseSha.length === 0) {
+      return notChecked("the review base commit was not available");
+    }
+    try {
+      // Issue #78: the check runs INSIDE the repository lock. Reading the
+      // shared worktree after the lock is released lets another job reset it
+      // mid-read, and this derives a host-authored fact from what it reads.
+      return await (deps.prepareStructuralWorkspace ?? withPreparedWorkspaceReal)({
+        // The SAME managed workspace context mapping uses, so a repository is
+        // mirrored once whichever feature asked for it first.
+        root: contextRoots(selectContextRoot({
+          ...(config.contextDir === undefined ? {} : { explicitContextDir: config.contextDir }),
+        })).workspaceRoot,
+        repo: config.repository,
+        baseSha,
+        rejectPreviouslySharedRoot: true,
+      }, async (prepared) => {
+        if (prepared.baseSha !== baseSha) {
+          throw new Error("prepared worktree does not sit at the requested base commit");
+        }
+        // `runStructuralChecks` never throws and returns one finding per input,
+        // so the single element is always there.
+        return (await (deps.runStructuralChecks ?? runStructuralChecksReal)({
+          findings: [finding],
+          baseRoot: prepared.baseWorktreePath,
+          // A finding names its HEAD path; the base tree holds a renamed file
+          // under the old one, and without this the symbol's own declaration
+          // reads as a reference from elsewhere.
+          renamedFrom: renameSourcesByHeadPath(diff),
+          // Lets the checker drop occurrences whose base-side lines may be
+          // precisely the ones this PR deletes — per file, so an untouched
+          // caller elsewhere survives.
+          removedLinesByFile: removedLinesByFile(diff),
+          // No `isSuppressed`: this path publishes exactly one finding, so
+          // there is nothing for the orchestrator to drop it in favour of.
+        }))[0]!;
+      });
+    } catch (error) {
+      const reason = "the base worktree could not be prepared";
+      console.warn(
+        `tgd-review-agent: structural check skipped for a clarified finding (${reason}: ${redactedMessage(error)})`,
+      );
+      return notChecked(reason);
+    }
+  };
+}
+
 async function executeClarificationAnswer(input: {
   readonly item: { readonly event: ReviewActivityEvent; readonly parsed: CommandParseResult; readonly identity: { actionId: string; identityDigest: string } };
   readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
@@ -2051,6 +2158,17 @@ async function executeClarificationAnswer(input: {
       at: observed.createdAt,
     });
     let frozenOutcome = observed.frozenOutcome;
+    // The reassessment's finding IN FULL, kept only for this pass.
+    //
+    // What gets frozen is a `FindingSnapshot`, which holds neither `claim` nor
+    // `hostCheck` — deliberately, so a verification of an older base can never
+    // be attached to a finding regenerated against a newer one. Publishing
+    // from the snapshot alone would therefore throw away a claim the model
+    // just made, before the check that answers it ever ran, so the publication
+    // below prefers this while it exists. A pass that resumes from a frozen
+    // outcome written by an earlier poll has no claim to check and publishes
+    // exactly the prose it would have published before.
+    let reassessedFinding: Finding | undefined;
     if (frozenOutcome === undefined) {
       const model = input.options.config.model ?? currentRule?.model;
       if (model === undefined) {
@@ -2077,10 +2195,29 @@ async function executeClarificationAnswer(input: {
         frozenOutcome = { outcome: "withdrawn", rationale: `The trusted rule ${result.ruleName} is no longer active.` };
       } else if (result.result.outcome === "confirmed" || result.result.outcome === "revised") {
         if (!("finding" in result.result) || result.result.finding === undefined) return "transient";
+        reassessedFinding = result.result.finding;
         frozenOutcome = {
           outcome: result.result.outcome,
           rationale: result.result.rationale,
-          finding: result.result.finding,
+          // SNAPSHOT, not the finding itself. `Finding` is structurally
+          // assignable to `FindingSnapshot`, so the compiler accepted the raw
+          // value — but the store validates keys nominally and rejects any it
+          // does not know. A reassessment that returned a `claim` therefore
+          // threw inside `replacePending`, and the throw escapes every catch
+          // between here and the poll loop: the answer could never be
+          // completed, and the cursor it holds never advanced. `claim` is
+          // parsed unconditionally from reviewer output, so this needed no
+          // flag to be set to happen.
+          finding: toFindingSnapshot(result.result.finding),
+          // Beside the snapshot, not inside it. The claim must outlive a
+          // publication that fails before its manifest is stored — otherwise
+          // the next poll resumes from a claim-less snapshot and the assertion
+          // is dropped without a word (Codex review of PR #101). The CHECK is
+          // still never persisted: it is recomputed against the current base on
+          // every attempt.
+          ...(result.result.finding.claim === undefined
+            ? {}
+            : { claim: result.result.finding.claim }),
         };
       } else {
         frozenOutcome = { outcome: "withdrawn", rationale: result.result.rationale };
@@ -2103,7 +2240,23 @@ async function executeClarificationAnswer(input: {
         try {
           const publishedFinding = await publishConfirmedClarificationFinding({
             store: input.options.store,
-            finding: frozenOutcome.finding,
+            // A resumed pass rebuilds the finding from the snapshot plus the
+            // claim frozen beside it, so it is checked on exactly the terms the
+            // first attempt would have been.
+            finding: reassessedFinding ?? {
+              ...frozenOutcome.finding,
+              ...(frozenOutcome.claim === undefined ? {} : { claim: frozenOutcome.claim }),
+            },
+            ...(input.options.config.structuralChecks === "on"
+              ? {
+                  checkClaim: clarificationClaimChecker({
+                    config: input.options.config,
+                    deps: input.options.deps,
+                    baseSha: input.metadata.baseSha,
+                    diff: input.metadata.diff,
+                  }),
+                }
+              : {}),
             rules: rules.rules,
             reviewOptions: {
               advisor: input.options.config.advisor,
@@ -2507,7 +2660,6 @@ async function queueVerifications(input: {
   if (input.budget <= 0) return holdAll;
 
   const outcomes = await input.options.store.readFindingOutcomes();
-  let metadata: Awaited<ReturnType<typeof loadReviewMetadata>>;
   const currentHead = await loadReviewHead(input.reviewNumber, input.options);
   if (currentHead === undefined) return holdAll;
 
@@ -2590,7 +2742,7 @@ async function queueVerifications(input: {
     };
   }
 
-  metadata = await loadReviewMetadata(input.reviewNumber, input.options);
+  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
   if (metadata === undefined) return holdAll;
 
   const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);

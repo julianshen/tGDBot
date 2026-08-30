@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ConversationItemIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
 import { computeContentDigest, parseChildMarker } from "./markers.js";
+import { parseStructuralClaim, type StructuralClaim } from "../review/structural-check.js";
 
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{7,64}$/iu;
@@ -69,6 +70,26 @@ export interface FrozenClarificationOutcome {
   readonly outcome: Exclude<ClarificationTerminalOutcome, "stale">;
   readonly rationale: string;
   readonly finding?: FindingSnapshot;
+  /**
+   * Issue #79: the structural assertion the reassessment made, if any.
+   *
+   * A SIBLING of the snapshot rather than a field inside it, deliberately.
+   * `FindingSnapshot` omits `claim` and `hostCheck` together, and the reason
+   * recorded for that is staleness: a check computed against one base must
+   * never be reattached to a finding regenerated against another. That
+   * reasoning is about the CHECK. A claim is the model's assertion about the
+   * finding itself, carries no verification, and is re-checked against the
+   * current base on every publication attempt — so persisting it asserts
+   * nothing that could go stale.
+   *
+   * Without it, a publication that failed after the freeze but before its
+   * manifest was stored resumed from a claim-less snapshot, and the claim was
+   * silently dropped: `--structural-checks on` then published a finding that
+   * made no structural assertion at all (Codex review of PR #101). Nothing
+   * false — every render site requires the claim AND the check — but the
+   * feature quietly did not happen.
+   */
+  readonly claim?: StructuralClaim;
 }
 
 export interface PendingClarification {
@@ -787,7 +808,8 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
       const answerIdentity = item.answerIdentity === undefined ? undefined :
         conversationItemIdentity(item.answerIdentity, "pending clarification answer identity");
       const frozenOutcome = item.frozenOutcome === undefined ? undefined : (() => {
-        const frozen = exact(item.frozenOutcome, "pending clarification frozenOutcome", ["outcome", "rationale"], ["finding"]);
+        const frozen = exact(item.frozenOutcome, "pending clarification frozenOutcome",
+          ["outcome", "rationale"], ["finding", "claim"]);
         if (frozen.outcome !== "confirmed" && frozen.outcome !== "revised" && frozen.outcome !== "withdrawn") {
           throw new Error("pending clarification frozenOutcome.outcome is invalid");
         }
@@ -799,10 +821,23 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
         if (frozen.outcome === "withdrawn" && finding !== undefined) {
           throw new Error("withdrawn clarification frozenOutcome cannot contain a finding");
         }
+        // The parser the reviewer output goes through, not a second copy of its
+        // rules — a claim we wrote ourselves must survive read-back on exactly
+        // the terms it was accepted on.
+        const claim = frozen.claim === undefined ? undefined : parseStructuralClaim(frozen.claim);
+        if (frozen.claim !== undefined && claim === undefined) {
+          throw new Error("pending clarification frozenOutcome.claim is invalid");
+        }
+        // A claim belongs to a finding. One without is a record no writer
+        // produces, so it is corruption rather than something to carry.
+        if (claim !== undefined && finding === undefined) {
+          throw new Error("clarification frozenOutcome.claim requires a finding");
+        }
         return {
           outcome: frozen.outcome,
           rationale: text(frozen.rationale, "pending clarification frozenOutcome.rationale"),
           ...(finding === undefined ? {} : { finding }),
+          ...(claim === undefined ? {} : { claim }),
         } satisfies FrozenClarificationOutcome;
       })();
       if (validatedIdentity !== undefined && validatedIdentity.provider !== expected.provider) {
