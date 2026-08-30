@@ -28,6 +28,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { RuleDefinition } from "../rules/types.js";
 import { buildDispatchPrompt } from "./dispatch-prompt.js";
+import type { PrIntent } from "./pr-intent.js";
 import { validateDispatchContext } from "./dispatch-context.js";
 import {
   enforceSuggestionProvenance,
@@ -219,6 +220,8 @@ export async function dispatchRules(
    * both engines reject the same malformed input for the same reason.
    */
   contextPacks?: RuleContextPacks,
+  /** Issue #59: the PR's stated intent as untrusted evidence; see pr-intent.ts. */
+  prIntent?: PrIntent,
 ): Promise<DispatchResult> {
   // SINGLE-FLIGHT GUARD (design-review item #5). runDispatch mutates a
   // process-global — process.env.PI_CODING_AGENT_DIR — for the duration of a
@@ -246,6 +249,7 @@ export async function dispatchRules(
       orchestratorModel,
       conversationContext,
       validatedContext.packsByRule,
+      prIntent,
     ),
   );
   dispatchChain = run.catch(() => undefined);
@@ -263,6 +267,7 @@ async function runDispatch(
   orchestratorModel?: string,
   conversationContext?: ReviewConversationContext,
   packsByRule?: ReadonlyMap<string, ContextPackResult>,
+  prIntent?: PrIntent,
 ): Promise<DispatchResult> {
   // Hermetic agent dir + PI_CODING_AGENT_DIR override (intercom-bridge fix,
   // see createIsolatedAgentDir) are set up ONLY for the real session factory.
@@ -369,7 +374,7 @@ async function runDispatch(
     };
 
     const session = await createSession(useAdvisor, sessionCwd, modelRequest);
-    const prompt = buildDispatchPrompt(effective, diff, useAdvisor, conversationContext, packsByRule);
+    const prompt = buildDispatchPrompt(effective, diff, useAdvisor, conversationContext, packsByRule, prIntent);
 
     // Capture the subagent tool's structured per-task results (details.results)
     // so we can deterministically reconcile the orchestrator's self-reported

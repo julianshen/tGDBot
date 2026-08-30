@@ -1,4 +1,5 @@
 import type { ContextPackResult } from "../context/context-pack.js";
+import type { PrIntent } from "./pr-intent.js";
 import type { StructuralCheck, StructuralClaim } from "./structural-check.js";
 import type { RuleDefinition } from "../rules/types.js";
 
@@ -183,4 +184,12 @@ export interface ReviewDispatchInput {
   contextPacks?: RuleContextPacks;
   orchestratorModel?: string;
   conversationContext?: ReviewConversationContext;
+  /**
+   * Issue #59: the PR's title/description/linked-reference identities as
+   * UNTRUSTED evidence, already sanitized by `sanitizePrIntent`. Both engines
+   * embed it in every task text next to the diff, under the same boundary
+   * token. Absent when `--pr-intent off` (or nothing to say), which keeps the
+   * task text byte-identical to the pre-#59 output.
+   */
+  prIntent?: PrIntent;
 }

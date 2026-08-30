@@ -44,6 +44,15 @@ export interface ReviewConfigForDedup {
    */
   structuralChecks?: "on" | "off";
   /**
+   * Issue #59: whether the PR's stated intent reaches the reviewer. Read by
+   * the CLI caller to decide whether the intent digest joins the fingerprint
+   * argument — the flag itself is deliberately NOT hashed: with no prose to
+   * embed, on and off produce identical task text and identical reviews, so
+   * flipping it need not re-trigger. What IS hashed (when on) is the
+   * normalized title + description digest, so EDITING the prose re-reviews.
+   */
+  prIntent?: "on" | "off";
+  /**
    * The structural-check parser identity. Defaults to `STRUCTURAL_CHECK_ENGINE`
    * and exists as a field only so a test can vary it; production callers should
    * leave it unset so there is one source of truth.

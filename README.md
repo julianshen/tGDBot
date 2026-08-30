@@ -375,6 +375,16 @@ tgd-review-agent review \
                                   # filesystem path), unless --trust-local-rules is also passed
   --disable-builtin-rule         # optional: skip the vendored tGD-review rule
   --advisor on|off               # default: on
+  --pr-intent on|off             # default: on. Gives the reviewer the PR title, description and
+                                  # linked-issue titles/states as UNTRUSTED evidence (bounded,
+                                  # control-character-stripped, inside its own attack-proof
+                                  # section), so a deliberate behaviour change explained in the
+                                  # body is not reported as a regression. A claim in the body is
+                                  # never evidence of correctness — the reviewer is instructed
+                                  # to report the finding anyway and say the description
+                                  # asserts otherwise. Editing the description re-triggers a
+                                  # review on an unchanged head. `off` sends the reviewer the
+                                  # diff alone, byte-identical to before the feature existed.
   --structural-checks on|off     # default: OFF. Checks a finding's structural claim against the
                                   # BASE branch and publishes the host result beside it. When the
                                   # base tree has a root tsconfig.json, occurrences are RESOLVED

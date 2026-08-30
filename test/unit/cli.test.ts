@@ -41,6 +41,7 @@ describe("parseCommandArgs", () => {
       // private repository starts telling npm what it depends on (PR #54).
       dependencyFacts: "off",
       structuralChecks: "off",
+      prIntent: "on",
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
@@ -91,6 +92,7 @@ describe("parseArgs", () => {
       // private repository starts telling npm what it depends on (PR #54).
       dependencyFacts: "off",
       structuralChecks: "off",
+      prIntent: "on",
       suggestions: "on",
       dryRun: false,
       trustLocalRules: false,
@@ -130,6 +132,8 @@ describe("parseArgs", () => {
       "--allow-degraded-context",
       "--context-dir",
       "/srv/ctx",
+      "--pr-intent",
+      "off",
       "--structural-checks",
       "on",
     ]);
@@ -142,6 +146,7 @@ describe("parseArgs", () => {
       advisor: "off",
       dependencyFacts: "on",
       structuralChecks: "on",
+      prIntent: "off",
       suggestions: "on",
       dryRun: true,
       trustLocalRules: true,
@@ -403,6 +408,24 @@ describe("describeCommandFailure", () => {
       "Command failed: gh api https://user:sup3rs3cret@github.com/o/r\nerror connecting to api.github.com",
     ));
     expect(described).not.toContain("sup3rs3cret");
+  });
+});
+
+// Issue #59: the PR's stated intent is untrusted evidence for the reviewer;
+// on by default, off for anyone who would rather the reviewer never read it.
+describe("--pr-intent", () => {
+  it("defaults to on", () => {
+    expect(parseArgs(["review", "--pr", "7"]).prIntent).toBe("on");
+  });
+
+  it.each(["on", "off"] as const)("accepts %s", (value) => {
+    expect(parseArgs(["review", "--pr", "7", "--pr-intent", value]).prIntent).toBe(value);
+  });
+
+  it("rejects anything else, naming what it expected", () => {
+    expect(() => parseArgs(["review", "--pr", "7", "--pr-intent", "maybe"])).toThrow(
+      'Invalid --pr-intent value: "maybe" (expected "on" or "off")',
+    );
   });
 });
 

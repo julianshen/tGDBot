@@ -100,6 +100,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     rulesDir: ".review/rules",
     disableBuiltinRule: false,
     advisor: "on",
+    prIntent: "on",
     suggestions: "on",
     dependencyFacts: "off",
     structuralChecks: "off",
@@ -223,6 +224,8 @@ describe("review — default dependency wiring", () => {
         diff: "diff --git a/x b/x",
         useAdvisor: true,
         orchestratorModel: undefined,
+        // Issue #59: the PR's stated intent rides along as untrusted evidence.
+        prIntent: { title: "Real wiring PR", description: "desc" },
       },
       {},
     );
@@ -292,6 +295,7 @@ describe("review — default dependency wiring", () => {
       "x/y", // orchestratorModel
       undefined, // conversationContext when none was loaded
       undefined, // contextPacks — --context off prepares none
+      { title: "Real wiring PR", description: "desc" }, // prIntent (issue #59)
     );
     expect(dispatchRulesDirect).not.toHaveBeenCalled();
     logSpy.mockRestore();
