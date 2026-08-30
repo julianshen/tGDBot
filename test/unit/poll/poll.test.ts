@@ -48,6 +48,7 @@ import {
 } from "../../../src/conversation/clarification.js";
 import { extractFileHunk, poll } from "../../../src/poll/poll.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
+import { createFastConversationStateStore } from "../../helpers/fast-state-store.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 import type { Finding } from "../../../src/review/types.js";
@@ -320,8 +321,13 @@ describe("classification-only poll", () => {
 
   it("stops after 200 events, exits 0, and continues on the next invocation", async () => {
     const stateDir = await tempStateDir();
+    // Volume fixture (#103): the page bound and cursor resumption are what is
+    // under test, not platter durability, so the fixture substitutes the
+    // flush and keeps the wall clock proportional to the logic. See
+    // test/helpers/fast-state-store.ts for what is and is not safe to swap.
+    const deps = { createStateStore: createFastConversationStateStore };
     const adapter = new ClassificationAdapter([]);
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     const startAfter = decodeReviewProgress(
       (await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot())
         .cursor.reviews[0]?.cursor ?? null,
@@ -331,7 +337,7 @@ describe("classification-only poll", () => {
       commentEvent(`n${index}`, `comment ${index}`, "2026-08-14T00:00:00.000Z")));
     adapter.eventCalls.length = 0;
     adapter.emittedEventIds.length = 0;
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     const firstStore = createConversationStateStore({ root: stateDir, repository: repo });
     const first = await firstStore.readContextSnapshot();
     expect((await journalEvents(firstStore)).filter((entry) => entry.state === "observed")).toHaveLength(200);
@@ -342,7 +348,7 @@ describe("classification-only poll", () => {
 
     adapter.eventCalls.length = 0;
     adapter.emittedEventIds.length = 0;
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.eventCalls[0]).toEqual(
       expect.objectContaining({ pageToken: first.cursor.reviews[0]?.eventPageToken }),
     );
@@ -432,8 +438,14 @@ describe("classification-only poll", () => {
 
   it("does not throw or stall after more than 1000 irrelevant events across polls", async () => {
     const stateDir = await tempStateDir();
+    // Volume fixture (#103): the bounded-checkpoint-vs-unbounded-journal
+    // property is logic, not durability — 1100 real transactions reached the
+    // platter in dedicated durability tests. Substituting the flush keeps the
+    // wall clock proportional to the logic being asserted. See
+    // test/helpers/fast-state-store.ts for what is and is not safe to swap.
+    const deps = { createStateStore: createFastConversationStateStore };
     const adapter = new ClassificationAdapter([], [summary(1)], 1200);
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     const bootstrapped = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
     const startAfter = decodeReviewProgress(bootstrapped.cursor.reviews[0]?.cursor ?? null)?.eventOpaque;
 
@@ -445,7 +457,7 @@ describe("classification-only poll", () => {
       )));
 
     for (let invocation = 0; invocation < 8; invocation += 1) {
-      await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+      await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     }
 
     const store = createConversationStateStore({ root: stateDir, repository: repo });
