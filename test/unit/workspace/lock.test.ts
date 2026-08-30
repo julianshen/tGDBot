@@ -87,11 +87,15 @@ describe("withRepositoryLock — the timeout means no progress, not no turn", ()
       { lockPath, timeoutMs, maxWaitMs: 5_000, pollMs: 5, owner: { runId: "waiter" } },
       async () => "got it",
     );
+    // Handler attached before any further await (#103): a rejection that lands
+    // while the holder promises are still pending must be handled, not left to
+    // fail the whole run as an unhandled rejection.
+    const waiterDone = expect(waiter).resolves.toBe("got it");
 
     await Promise.all([first, second]);
     // The waiter outlasted 2 x 80ms of legitimate holding on a 120ms timeout,
     // because each change of owner is evidence the queue is moving.
-    await expect(waiter).resolves.toBe("got it");
+    await waiterDone;
   });
 
   // Codex's case, and the one owner-change renewal cannot reach: a SINGLE
@@ -223,11 +227,15 @@ describe("withRepositoryLock", () => {
     };
 
     const waiting = withRepositoryLock({ lockPath, timeoutMs: 20, pollMs: 5, owner }, work);
+    // Attached synchronously, before any await: the waiter's rejection must
+    // never spend time unhandled, or a loaded machine (the exact condition
+    // this suite is sized for) turns a passing test into an unhandled
+    // rejection that fails the run (#103).
+    const rejection = expect(waiting).rejects.toThrow(/Timed out acquiring repository lock/);
     await firstContention.promise;
     await vi.advanceTimersByTimeAsync(0);
     now = 60;
     await rm(lockPath);
-    const rejection = expect(waiting).rejects.toThrow(/Timed out acquiring repository lock/);
     await vi.advanceTimersByTimeAsync(5);
 
     await rejection;
@@ -501,9 +509,13 @@ describe("withRepositoryLock", () => {
     await writeFile(lockPath, "sensitive malformed lock contents");
 
     const waiting = withRepositoryLock({ lockPath, timeoutMs: 1, pollMs: 1, owner }, async () => "unreachable");
+    // Handler attached before the first await: the 1ms budget is measured in
+    // real time here, so under load the rejection can fire inside the timer
+    // advance below, and an unhandled rejection fails the whole run (#103).
+    const rejection = expect(waiting).rejects.toThrow(/metadata is unavailable/i);
     await vi.advanceTimersByTimeAsync(1);
 
-    await expect(waiting).rejects.toThrow(/metadata is unavailable/i);
+    await rejection;
     await expect(waiting).rejects.not.toThrow(/sensitive malformed/i);
     await expect(readFile(lockPath, "utf8")).resolves.toBe("sensitive malformed lock contents");
   });

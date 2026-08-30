@@ -23,6 +23,7 @@ import type {
 import type { ReviewIdentity } from "../../../src/conversation/types.js";
 import { decodeReviewProgress, nextRoundRobinIndex } from "../../../src/poll/discovery.js";
 import { poll } from "../../../src/poll/poll.js";
+import { createFastConversationStateStore } from "../../helpers/fast-state-store.js";
 import type { PollArgs } from "../../../src/cli-args.js";
 import type { ConversationEventEntry, ReviewCursorRecord } from "../../../src/conversation/state-schema.js";
 import type { ConversationStateStore } from "../../../src/conversation/state-store.js";
@@ -596,13 +597,17 @@ describe("poll discovery and bootstrap", () => {
 
   it("visits known reviews round-robin and resumes from the saved next key", async () => {
     const stateDir = await tempStateDir();
+    // Volume fixture (#103): what is under test is the round-robin cursor,
+    // not platter durability; the flush is substituted so the wall clock
+    // stays proportional to the logic. See test/helpers/fast-state-store.ts.
+    const deps = { createStateStore: createFastConversationStateStore };
     const eventsByReview = new Map<number, ReviewActivityEvent[]>();
     const adapter = new FakeConversationAdapter({
       openReviewPages: [[summary(1), summary(2), summary(3)]],
       eventsByReview,
       eventPageSize: 100,
     });
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
 
     for (const reviewNumber of [1, 2, 3]) {
       eventsByReview.set(
@@ -612,26 +617,28 @@ describe("poll discovery and bootstrap", () => {
       );
     }
     adapter.eventCalls.length = 0;
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.eventCalls.map((call) => call.reviewNumber)).toEqual([1, 2]);
 
     const mid = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
     expect(mid.cursor.nextRoundRobinKey).toBe("3");
 
     adapter.eventCalls.length = 0;
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.eventCalls[0]?.reviewNumber).toBe(3);
   });
 
   it("resumes after review 9 at review 10, not review 8", async () => {
     const stateDir = await tempStateDir();
+    // Volume fixture (#103): same substitution as the round-robin test above.
+    const deps = { createStateStore: createFastConversationStateStore };
     const eventsByReview = new Map<number, ReviewActivityEvent[]>();
     const adapter = new FakeConversationAdapter({
       openReviewPages: [[summary(8), summary(9), summary(10)]],
       eventsByReview,
       eventPageSize: 100,
     });
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
 
     for (const reviewNumber of [8, 9, 10]) {
       eventsByReview.set(
@@ -641,14 +648,14 @@ describe("poll discovery and bootstrap", () => {
       );
     }
     adapter.eventCalls.length = 0;
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.eventCalls.map((call) => call.reviewNumber)).toEqual([8, 9]);
 
     const mid = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
     expect(mid.cursor.nextRoundRobinKey).toBe("10");
 
     adapter.eventCalls.length = 0;
-    await expect(poll(pollArgs(stateDir), { conversationAdapter: adapter })).resolves.toBe(0);
+    await expect(poll(pollArgs(stateDir), { ...deps, conversationAdapter: adapter })).resolves.toBe(0);
     expect(adapter.eventCalls[0]?.reviewNumber).toBe(10);
   });
 
