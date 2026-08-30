@@ -57,10 +57,12 @@ function extraIndex(longer: string, shorter: string): number | undefined {
 /**
  * A one-keystroke edit from `existing` to `candidate`, or undefined.
  *
- * Prefix/suffix additions of a letter that is not a repeat of its neighbour
- * are the legitimate near-neighbours the issue names (`preact`/`react`,
- * `vuex`/`vue`). Truncations that drop a repeated letter (`expres`/`express`)
- * and doubled letters (`chalkk`/`chalk`) still match.
+ * Every single edit flags here — truncations that drop a repeated letter
+ * (`expres`/`express`), doubled letters (`chalkk`/`chalk`), and affix edits
+ * alike (`lodas`, `lodashs`, `xlodash` vs `lodash`). A blanket affix exemption
+ * was tried and was wrong: it suppressed those real typosquats along with the
+ * legitimate pairs. The legitimate pairs (`preact`/`react`, `vuex`/`vue`)
+ * are a closed list checked by the caller instead.
  */
 function classify(candidate: string, existing: string): TyposquatKind | undefined {
   if (candidate === existing) return undefined;
@@ -90,15 +92,22 @@ function classify(candidate: string, existing: string): TyposquatKind | undefine
 
   const longer = delta === 1 ? candidate : existing;
   const shorter = delta === 1 ? existing : candidate;
-  const at = extraIndex(longer, shorter);
-  if (at === undefined) return undefined;
-  const extra = longer[at];
-  const left = at > 0 ? longer[at - 1] : undefined;
-  const right = at < longer.length - 1 ? longer[at + 1] : undefined;
-  const repeat = extra === left || extra === right;
-  const affix = at === 0 || at === longer.length - 1;
-  if (affix && !repeat) return undefined;
-  return delta === 1 ? "insertion" : "deletion";
+  return extraIndex(longer, shorter) === undefined ? undefined : delta === 1 ? "insertion" : "deletion";
+}
+
+/**
+ * Near-neighbour pairs that are real, distinct packages, not typosquats.
+ *
+ * The closed list the issue names. Without a popularity corpus there is no way
+ * to tell `preact` from `lodas` locally, so the exemption has to enumerate the
+ * pairs it means rather than guess from the shape of the edit (PR #102 review).
+ */
+const LEGITIMATE_NEIGHBOURS = new Set(
+  [["react", "preact"], ["vue", "vuex"]].flatMap(([a, b]) => [`${a}\u0000${b}`, `${b}\u0000${a}`]),
+);
+
+function isLegitimatePair(a: string, b: string): boolean {
+  return LEGITIMATE_NEIGHBOURS.has(`${a}\u0000${b}`);
 }
 
 function pairKind(candidate: string, existing: string): TyposquatKind | undefined {
@@ -113,7 +122,12 @@ function pairKind(candidate: string, existing: string): TyposquatKind | undefine
     }
     return undefined;
   }
-  return classify(left.local, right.local) ?? classify(candidate, existing);
+  const kind = classify(left.local, right.local) ?? classify(candidate, existing);
+  if (kind === undefined) return undefined;
+  if (isLegitimatePair(left.local, right.local) || isLegitimatePair(candidate, existing)) {
+    return undefined;
+  }
+  return kind;
 }
 
 /** Matches of `candidate` against other names already declared. */

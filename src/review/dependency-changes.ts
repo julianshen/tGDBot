@@ -126,6 +126,19 @@ const MANIFEST_PATH_RE = /^[A-Za-z0-9._@\/-]{1,512}$/u;
  */
 const MAX_PACKAGES_PER_DIFF = 200;
 
+/**
+ * How many NON-registry declarations one diff may keep for the same-manifest
+ * name check (issue #69).
+ *
+ * The registry ceiling above counts only specs a registry could answer: a
+ * workspace, file, git or alias spec used to be skipped without consuming it,
+ * and keeping it in `changes` must not let two hundred such entries starve the
+ * semver entry behind them of its registry lookups. This is the separate bound
+ * those entries spend — it also keeps the pack itself bounded, at the sum of
+ * the two ceilings.
+ */
+const MAX_NAME_CHECKS_PER_DIFF = 200;
+
 /** How many manifest paths the pack will name before summarising the rest. */
 const MAX_LISTED_MANIFESTS = 20;
 
@@ -357,6 +370,8 @@ export function dependencyChanges(
   const unreadable: string[] = [];
   const seen = new Set<string>();
   const namesByManifest = new Map<string, string[]>();
+  let registryCount = 0;
+  let nameCheckCount = 0;
 
   const recordNames = (
     path: string,
@@ -407,7 +422,6 @@ export function dependencyChanges(
     recordNames(path, baseDeps);
 
     for (const [key, { section, name, spec }] of headDeps) {
-      if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
       // Unchanged is not a change. This is the whole comparison — and SECTION
       // counts as much as spec: a package moving from devDependencies to
       // dependencies at the same version enters the production tree, which is
@@ -418,6 +432,16 @@ export function dependencyChanges(
       if (!isValidPackageName(name)) continue;
       const version = stripRange(spec);
       const registryEligible = VERSION_RE.test(version);
+      // Each kind spends its own budget: a wall of workspace entries must not
+      // consume the registry ceiling any more than a wall of version bumps
+      // should consume the name-check one.
+      if (registryEligible) {
+        if (registryCount >= MAX_PACKAGES_PER_DIFF) continue;
+        registryCount += 1;
+      } else {
+        if (nameCheckCount >= MAX_NAME_CHECKS_PER_DIFF) continue;
+        nameCheckCount += 1;
+      }
       const identity = `${section}\u0000${name}@${spec}`;
       if (seen.has(identity)) continue;
       seen.add(identity);

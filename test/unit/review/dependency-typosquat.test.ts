@@ -71,6 +71,24 @@ describe("typosquatMatches", () => {
     expect(typosquatMatches("vue", ["vuex"])).toEqual([]);
   });
 
+  // The legitimate pairs are a closed list, not an edit shape: an affix edit
+  // that is not one of the listed pairs is a normal typosquat and must flag
+  // (PR #102 review, round two).
+  it("flags an affix edit that is not a listed legitimate pair", () => {
+    expect(typosquatMatches("lodashs", ["lodash"])).toEqual([
+      { existing: "lodash", distance: 1, kind: "insertion" },
+    ]);
+    expect(typosquatMatches("lodas", ["lodash"])).toEqual([
+      { existing: "lodash", distance: 1, kind: "deletion" },
+    ]);
+    expect(typosquatMatches("xlodash", ["lodash"])).toEqual([
+      { existing: "lodash", distance: 1, kind: "insertion" },
+    ]);
+    expect(typosquatMatches("reacts", ["react"])).toEqual([
+      { existing: "react", distance: 1, kind: "insertion" },
+    ]);
+  });
+
   it("does not flag scoped and unscoped names of the same local package", () => {
     expect(typosquatMatches("@angular/core", ["core"])).toEqual([]);
     expect(typosquatMatches("core", ["@angular/core"])).toEqual([]);

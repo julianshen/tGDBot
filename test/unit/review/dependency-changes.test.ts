@@ -46,9 +46,12 @@ function changesFrom(diff: string) {
   );
   return dependencyChanges(manifests, agreeingManifests(diff), emptyBase).changes
     .filter((c) => c.registryEligible !== false)
+    // The pre-existing expectations predate the registryEligible field; every
+    // change below still asserts the exact object, minus this one field.
     .map((c) => {
-      const { registryEligible, ...rest } = c;
-      return rest;
+      const stripped: Record<string, unknown> = { ...c };
+      delete stripped.registryEligible;
+      return stripped;
     });
 }
 
@@ -1424,5 +1427,43 @@ describe("dependencyChanges — non-semver dependencies", () => {
       { name: "expres", version: "npm:express@4.17.21", spec: "npm:express@4.17.21", manifest: "package.json", pinned: false, section: "dependencies", registryEligible: false },
       { name: "chalkk", version: "git+https://github.com/chalk/chalk.git", spec: "git+https://github.com/chalk/chalk.git", manifest: "package.json", pinned: false, section: "dependencies", registryEligible: false },
     ]);
+  });
+
+  // PR #102 review, round two: the registry ceiling exists to bound outbound
+  // requests. Non-registry entries kept for the name check spend a separate
+  // budget, so a wall of workspace entries cannot starve the semver entry
+  // behind them of its registry lookups.
+  it("does not let non-registry entries consume the registry ceiling", () => {
+    const workspace: Record<string, string> = {};
+    for (let i = 0; i < 200; i += 1) workspace[`ws-${i}`] = "workspace:*";
+    workspace["lodahs"] = "4.17.21";
+    const head = new Map([
+      ["package.json", JSON.stringify({ dependencies: workspace })],
+    ]);
+    const result = dependencyChanges(
+      [{ path: "package.json", basePath: undefined }],
+      head,
+      new Map(),
+    );
+
+    const semver = result.changes.filter((change) => change.registryEligible);
+    expect(semver).toEqual([
+      { name: "lodahs", version: "4.17.21", spec: "4.17.21", manifest: "package.json", pinned: true, section: "dependencies", registryEligible: true },
+    ]);
+  });
+
+  it("still bounds the non-registry candidates it keeps for the name check", () => {
+    const workspace: Record<string, string> = {};
+    for (let i = 0; i < 205; i += 1) workspace[`ws-${i}`] = "workspace:*";
+    const head = new Map([
+      ["package.json", JSON.stringify({ dependencies: workspace })],
+    ]);
+    const result = dependencyChanges(
+      [{ path: "package.json", basePath: undefined }],
+      head,
+      new Map(),
+    );
+
+    expect(result.changes).toHaveLength(200);
   });
 });
