@@ -1880,6 +1880,65 @@ describe("clarification answer lifecycle", () => {
     expect(inline).toContain("src/queue.ts:12");
   });
 
+  // Codex review of PR #100, round two: the publication normalizes an
+  // `addressed`/`needs-clarification` decision to `still-valid`, so gating on
+  // the RAW decision skipped the check and annotated a claim that published
+  // anyway. The gate must see the publication decision.
+  it("checks a claim whose finding decision normalizes at publication", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    const prepare = vi.fn().mockResolvedValue({
+      root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
+      worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
+      ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
+    });
+    const check = vi.fn().mockImplementation(async (input: { findings: readonly unknown[] }) =>
+      input.findings.map((entry) => ({
+        ...entry,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })));
+    const vcs = silentReviewVcs();
+
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The current hunk still logs the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "needs-clarification",
+            question: "Which audit rule requires raw tokens?",
+            claim: { kind: "no-other-references", symbol: "token" },
+          },
+        })),
+      }),
+      prepareStructuralWorkspace: prepare,
+      runStructuralChecks: check,
+    })).resolves.toBe(0);
+
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenCalledTimes(1);
+    const inline = vcs.postedInlines.map((entry) => entry.body).join("\n");
+    expect(inline).toMatch(/LEXICAL matches/);
+    expect(inline).not.toContain("no checkable claim in this publication");
+  });
+
   it("prepares no worktree for a clarified claim when the feature is off", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir } = await bootstrapAndSeed(adapter);

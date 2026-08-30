@@ -50,6 +50,7 @@ import {
   type PublicationWriter,
 } from "../conversation/publication-manifest.js";
 import {
+  actionableClarificationFinding,
   publishConfirmedClarificationFinding,
 } from "../review/review-publication.js";
 import {
@@ -1990,6 +1991,7 @@ async function executeClarificationAnswer(input: {
         // from the review-time check and the snapshot strips the claim. Run a
         // FRESH check HERE, at answer time, against the base as it is now —
         // never a stale one replayed from the snapshot.
+        console.error(`DBG reassess reached, outcome=${result.result.outcome}`);
         const reassessed: Finding = result.result.finding;
         // Freeze WITHOUT hostCheck. FindingSnapshot deliberately omits it — a
         // stale verification must never be replayed against a newer base — and
@@ -2037,6 +2039,14 @@ async function executeClarificationAnswer(input: {
       let findingForPublication: Finding = frozenOutcome.claim === undefined
         ? frozenOutcome.finding
         : { ...frozenOutcome.finding, claim: frozenOutcome.claim };
+      // Normalize to the PUBLICATION decision before gating (Codex review of
+      // PR #100, round two): `actionableClarificationFinding` — which
+      // `publishConfirmedClarificationFinding` applies downstream — converts
+      // an `addressed`/`needs-clarification` decision to `still-valid`, so a
+      // confirmed finding always publishes with a reader-visible decision.
+      // Gating on the raw decision would skip the check and annotate a claim
+      // that publishes anyway.
+      findingForPublication = actionableClarificationFinding(findingForPublication);
       if (input.options.config.structuralChecks === "on" && findingForPublication.claim !== undefined) {
         const prepareStructuralWorkspaceFn =
           input.options.deps.prepareStructuralWorkspace ?? prepareWorkspaceReal;
@@ -2137,7 +2147,7 @@ async function executeClarificationAnswer(input: {
             now: input.options.now,
             hooks: input.options.deps.publicationHooks,
           });
-          if (publishedFinding !== 0) return "transient";
+          if (publishedFinding !== 0) { console.error(`DBG publishedFinding=${publishedFinding}`); return "transient"; }
         } catch (error) {
           console.warn(`tgd-review-agent: could not publish clarified finding (${redactedMessage(error)})`);
           return "transient";
@@ -2152,6 +2162,7 @@ async function executeClarificationAnswer(input: {
     reviewIdentity: input.reviewIdentity,
     options: input.options,
   });
+  console.error(`DBG publishReplyPlan=${published}`);
   if (published === "completed") {
     const current = (await input.options.store.readContextSnapshot()).pending.clarifications.find((entry) =>
       entry.id === observed.id) ?? observed;
