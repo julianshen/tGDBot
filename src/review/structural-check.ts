@@ -23,6 +23,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Lang, parseAsync } from "@ast-grep/napi";
 import type { RemovedLines } from "./diff-anchors.js";
+import { createSymbolResolver, type SymbolResolver } from "./symbol-resolution.js";
 import type { Finding } from "./types.js";
 
 /**
@@ -117,6 +118,53 @@ export type StructuralCheck =
      */
     readonly occurrences?: number;
   }
+  /**
+   * The checker RESOLVED occurrences of the name to the symbol the finding's
+   * own file declares (issue #77): the TypeScript compiler bound each match
+   * to that declaration, directly or through an import alias. This is the
+   * evidence a lexical match cannot be — a same-named member of an unrelated
+   * type does not resolve.
+   *
+   * The result is a union of three counts, because honesty here means saying
+   * what became of every occurrence the walk found:
+   *
+   * - `references`/`occurrences` — resolved references. The accusation.
+   * - `unresolved`/`unresolvedOccurrences` — same-named occurrences in
+   *   type-checked files that bound to OTHER symbols (or could not be
+   *   attributed at all, e.g. an import whose package the base tree does not
+   *   vendor). Not an accusation in either direction, but published so the
+   *   wording can account for the full census rather than silently dropping
+   *   the noise it filtered.
+   * - `lexicalFallback`/`lexicalFallbackOccurrences` — occurrences in files
+   *   the checker does not type-check (a file outside the tsconfig program).
+   *   For those, the lexical answer is all there is, and the wording says so
+   *   — this is the coexistence the issue asks for: a file the checker
+   *   cannot resolve still gets the lexical answer rather than nothing.
+   *
+   * Zero resolved occurrences never becomes a clean verdict — see the
+   * `not-checked` block below for why absence stays unsound even here.
+   */
+  | {
+    readonly status: "resolved";
+    readonly references: readonly SymbolReference[];
+    readonly occurrences: number;
+    readonly unresolved: readonly SymbolReference[];
+    readonly unresolvedOccurrences: number;
+    readonly lexicalFallback?: {
+      readonly references: readonly SymbolReference[];
+      readonly occurrences: number;
+    };
+    readonly filesSearched: number;
+    readonly filesResolved: number;
+    /**
+     * The per-claim deadline stopped the walk partway through the program
+     * (issue #77; Codex review of PR #104). The counts are exact for the
+     * files the checker reached — `filesResolved` IS that reached count, not
+     * the program's — and the renderer must say the walk was cut short
+     * rather than render a complete-scan number.
+     */
+    readonly partial?: true;
+  }
   /** Nothing was established. Always carries why, and never means "no callers exist". */
   | { readonly status: "not-checked"; readonly reason: string };
 
@@ -207,6 +255,13 @@ export interface StructuralCheckOptions {
    * nothing is suppressed and `occurrences` counts every external match.
    */
   readonly removedLinesByFile?: ReadonlyMap<string, RemovedLines>;
+  /**
+   * The type-checker resolver (issue #77), created once per review by
+   * `runStructuralChecks` and shared by every claim. Absent — direct calls,
+   * injected checks — the check stays lexical, which is the standing
+   * degradation path, not a special case.
+   */
+  readonly resolver?: SymbolResolver;
 }
 
 /**
@@ -321,6 +376,13 @@ export async function checkStructuralClaim(
     readonly findingFile: string;
     /** The same file's path at the base commit, when the PR renamed it. */
     readonly findingFileAtBase?: string;
+    /**
+     * The finding's anchored line (head side), used ONLY by the type checker
+     * (issue #77) to pick which same-named declaration in the finding's own
+     * file the claim is about — never as a search coordinate, for the same
+     * head/base reason the walk above states.
+     */
+    readonly findingLine?: number;
   },
   options: StructuralCheckOptions = {},
 ): Promise<StructuralCheck> {
@@ -391,6 +453,10 @@ export async function checkStructuralClaim(
   let occurrences = 0;
   let suppressedOccurrences = 0;
   let filesSearched = 0;
+  // Exact census PER FILE (issue #77): resolution needs to know how many
+  // occurrences sit in files the type checker does not cover, and the
+  // retained reference sample cannot answer that — it is capped.
+  const occurrencesByFile = new Map<string, number>();
   // Whether the walk stopped early on the clock. A PARTIAL scan cannot make
   // the complete-scan claim below — see the `occurrences === 0` branch.
   let walkExpired = false;
@@ -472,6 +538,7 @@ export async function checkStructuralClaim(
           continue;
         }
         occurrences += 1;
+        occurrencesByFile.set(relative, (occurrencesByFile.get(relative) ?? 0) + 1);
         if (references.length < MAX_RETAINED_REFERENCES) references.push(reference);
       }
     }
@@ -497,13 +564,99 @@ export async function checkStructuralClaim(
 
   references.sort((left, right) =>
     left.file === right.file ? left.line - right.line : left.file.localeCompare(right.file));
-  return {
+  const lexical: StructuralCheck = {
     status: "lexical-matches",
     references,
     // Exact even when the sample is capped: the count was taken at
     // collection, not read off the retained list.
     occurrences,
     filesSearched,
+  };
+
+  // Issue #77: with a resolver available, upgrade the lexical answer to a
+  // resolved one. Resolution runs ONLY on a non-empty walk — the zero cases
+  // above already carry their own honest wording, and a program cannot
+  // sharpen "the name did not occur" into anything sounder (absence stays
+  // unsound either way).
+  const resolver = options.resolver;
+  if (resolver === undefined) return lexical;
+  let resolution;
+  try {
+    resolution = await resolver.resolve({
+      claim,
+      findingFile: input.findingFile,
+      ...(input.findingFileAtBase === undefined ? {} : { findingFileAtBase: input.findingFileAtBase }),
+      ...(input.findingLine === undefined ? {} : { findingLine: input.findingLine }),
+      // The resolver walks the base tree independently of the lexical walk
+      // above, and without this its resolved census would resurrect callers
+      // the diff may already be deleting — the exact reconciliation the walk
+      // applies during collection (Codex review of PR #104). One predicate,
+      // the shared one below, so both passes answer identically.
+      ...(removedLinesByFile === undefined ? {} : {
+        isRemoved: (file: string, line: number): boolean =>
+          suppressedByDiff(claim.symbol, { file, line }, removedLinesByFile),
+      }),
+    }, {
+      // The walk runs inside the SAME wall-clock bound the lexical walk just
+      // respected: what remains of this check's budget. Stopping early costs
+      // attribution (unresolved), never soundness — a resolved reference
+      // found before the deadline is still one.
+      timeBudgetMs: Math.max(0, timeBudgetMs - (now() - started)),
+      now,
+    });
+  } catch {
+    // HOST-AUTHORED wording lives in the caller's rendering of the lexical
+    // result; resolution failing is the standing degradation, not an error
+    // to surface.
+    return lexical;
+  }
+  if (!resolution.available) return lexical;
+
+  // The lexical fallback: occurrences in files the program does not cover,
+  // from the per-file census — exact, not read off the capped sample.
+  let fallbackOccurrences = 0;
+  const fallbackReferences: SymbolReference[] = [];
+  for (const [file, count] of occurrencesByFile) {
+    if (resolver.covers(file)) continue;
+    fallbackOccurrences += count;
+  }
+  for (const reference of references) {
+    if (!resolver.covers(reference.file)) fallbackReferences.push(reference);
+  }
+
+  // Zero resolved references is SUPPORT for the claim, never proof of it —
+  // the same invariant the lexical walk holds. Dynamic references, string
+  // access, generated code and uncovered files stay invisible, so the check
+  // still refuses the clean verdict; the reason reports what was actually
+  // computed, which is materially more than the lexical refusal could say.
+  // When the only surviving occurrences are in files the checker cannot
+  // attribute, the lexical answer is the whole visible answer, and the
+  // published result is exactly the pre-#77 one rather than a resolution
+  // result whose resolved half is empty.
+  if (resolution.resolvedOccurrences === 0) {
+    if (fallbackOccurrences > 0) return lexical;
+    return {
+      status: "not-checked",
+      reason: resolution.unresolvedOccurrences > 0
+        ? `the type checker resolved ${resolution.unresolvedOccurrences} occurrence(s) of the name in ${resolution.filesResolved} type-checked file(s) and every one binds to a different symbol, which is not evidence that no reference exists — dynamic references and files outside the type check stay invisible`
+        : `no occurrence of the name in ${resolution.filesResolved} type-checked file(s) resolved to this symbol, which is not evidence that no reference exists`,
+    };
+  }
+
+  const lexicalFallback = fallbackOccurrences === 0 ? undefined : {
+    references: fallbackReferences,
+    occurrences: fallbackOccurrences,
+  };
+  return {
+    status: "resolved",
+    references: resolution.resolved,
+    occurrences: resolution.resolvedOccurrences,
+    unresolved: resolution.unresolved,
+    unresolvedOccurrences: resolution.unresolvedOccurrences,
+    ...(lexicalFallback === undefined ? {} : { lexicalFallback }),
+    filesSearched,
+    filesResolved: resolution.filesResolved,
+    ...(resolution.partial ? { partial: true as const } : {}),
   };
 }
 
@@ -536,6 +689,54 @@ export function describeCheck(
   if (check.status === "not-checked") {
     return `Host check: not performed — ${escape(check.reason)}.`;
   }
+  if (check.status === "resolved") {
+    // The one status allowed to sound confident, because it IS one: the
+    // compiler bound these occurrences to the declaration in the finding's
+    // own file. Everything else the walk saw is still accounted for — the
+    // same-named noise (unresolved) and the files the checker could not
+    // type-check (lexical fallback) — because a host line that silently
+    // dropped part of its own census would be overclaiming from the other
+    // direction.
+    const total = check.occurrences;
+    const shown = check.references.slice(0, 5);
+    const rendered = shown.map((reference) => `\`${escape(`${reference.file}:${reference.line}`)}\``).join(", ");
+    const more = total > shown.length ? `, and ${total - shown.length} more` : "";
+    const parts = [
+      `Host check: the name \`${escape(claim.symbol)}\` resolves to ${total} reference(s) outside this file, across ${check.filesResolved} type-checked file(s) of the base branch — ${rendered}${more}.`,
+      `These are RESOLVED references: the type checker matched them to the declaration of \`${escape(claim.symbol)}\` in this file.`,
+    ];
+    if (check.unresolvedOccurrences > 0) {
+      const unresolvedShown = check.unresolved.slice(0, 3);
+      const unresolvedRendered = unresolvedShown
+        .map((reference) => `\`${escape(`${reference.file}:${reference.line}`)}\``)
+        .join(", ");
+      const unresolvedMore = check.unresolvedOccurrences > unresolvedShown.length
+        ? `, and ${check.unresolvedOccurrences - unresolvedShown.length} more`
+        : "";
+      parts.push(
+        `${check.unresolvedOccurrences} other occurrence(s) of the name in those files do NOT resolve to this \`${escape(claim.symbol)}\` (${unresolvedRendered}${unresolvedMore}) — different symbols that share the spelling.`,
+      );
+    }
+    if (check.partial === true) {
+      parts.push(
+        `The deadline stopped the walk after ${check.filesResolved} file(s) — the counts cover what the checker reached, and a later poll may find more.`,
+      );
+    }
+    if (check.lexicalFallback !== undefined) {
+      const fallback = check.lexicalFallback;
+      const fallbackShown = fallback.references.slice(0, 3);
+      const fallbackRendered = fallbackShown
+        .map((reference) => `\`${escape(`${reference.file}:${reference.line}`)}\``)
+        .join(", ");
+      const fallbackMore = fallback.occurrences > fallbackShown.length
+        ? `, and ${fallback.occurrences - fallbackShown.length} more`
+        : "";
+      parts.push(
+        `Plus ${fallback.occurrences} occurrence(s) in file(s) the type checker does not cover (${fallbackRendered}${fallbackMore}) — LEXICAL matches only, unresolved by the host.`,
+      );
+    }
+    return parts.join(" ");
+  }
   const scope = `${check.filesSearched} file(s) of the base branch`;
   // `occurrences` is the exact census (issue #83); legacy and injected results
   // predate it, and for them `references.length` is still the whole truth.
@@ -557,20 +758,23 @@ export function describeCheck(
  * called" is most expensive there.
  */
 /**
- * The parser this check's answers came from, for the review-config hash.
+ * The parser — and, since #77, the type checker — this check's answers came
+ * from, for the review-config hash.
  *
- * A published host check is a parse by a specific ast-grep version. Upgrade the
- * parser and the same claim can get a different answer — but the dedup marker
- * is keyed on head SHA plus config hash, so without this an already-reviewed
- * head is skipped and the stale answer stands. Same reasoning as `dispatch`,
- * and the same modest price: one re-review per open pull request per upgrade.
+ * A published host check is a parse by a specific ast-grep version, and (when
+ * resolution was available) a symbol resolution by a specific typescript
+ * version. Upgrade either and the same claim can get a different answer — but
+ * the dedup marker is keyed on head SHA plus config hash, so without this an
+ * already-reviewed head is skipped and the stale answer stands. Same reasoning
+ * as `dispatch`, and the same modest price: one re-review per open pull
+ * request per upgrade.
  *
  * Kept as a constant rather than read from `package.json` at runtime, because
  * that file sits outside `rootDir` and importing it would complicate the build
  * for a value that changes once a year. `structural-check-engine.test.ts`
  * asserts it matches the dependency pin, so the two cannot drift silently.
  */
-export const STRUCTURAL_CHECK_ENGINE = "ast-grep@0.45.2";
+export const STRUCTURAL_CHECK_ENGINE = "ast-grep@0.45.2+typescript@5.9.3";
 
 export const DEFAULT_CLAIM_BUDGET = 10;
 
@@ -785,6 +989,15 @@ export interface RunStructuralChecksInput {
   readonly isSuppressed?: (finding: Finding) => boolean;
   /** Wall-clock budget shared by every check in this review. */
   readonly reviewTimeBudgetMs?: number;
+  /**
+   * Wall-clock budget for the type checker's program construction (issue
+   * #77), which is seconds against the lexical walk's milliseconds. Kept
+   * SEPARATE from `reviewTimeBudgetMs` on purpose: the shared review budget
+   * was sized for bounded walks, and one program build would consume it
+   * whole — the issue's own "would need revisiting" note. An exhausted
+   * resolution budget degrades every claim to the lexical answer.
+   */
+  readonly resolutionTimeBudgetMs?: number;
   /** Injectable clock, so the shared deadline is testable without waiting. */
   readonly now?: () => number;
 }
@@ -808,6 +1021,29 @@ export async function runStructuralChecks(
   const now = input.now ?? (() => Date.now());
   const startedAt = now();
   const reviewBudgetMs = input.reviewTimeBudgetMs ?? DEFAULT_REVIEW_TIME_BUDGET_MS;
+
+  // One resolver per review, created on the first claim that will actually
+  // be checked and shared by every claim after it. Program construction is
+  // the expensive part of resolution (seconds); building it per claim would
+  // multiply that by the claim budget. A review with no claims — or one where
+  // the resolver is unavailable — never pays for it, and an unavailable
+  // resolver degrades every claim to the lexical answer rather than failing.
+  let resolver: SymbolResolver | undefined;
+  let resolverFailed = false;
+  const ensureResolver = async (): Promise<SymbolResolver | undefined> => {
+    if (resolver !== undefined || resolverFailed) return resolver;
+    try {
+      resolver = await createSymbolResolver(input.baseRoot, {
+        now,
+        ...(input.resolutionTimeBudgetMs === undefined
+          ? {}
+          : { resolutionTimeBudgetMs: input.resolutionTimeBudgetMs }),
+      });
+    } catch {
+      resolverFailed = true;
+    }
+    return resolver;
+  };
 
   const claimed = input.findings
     .map((finding, index) => ({ finding, index }))
@@ -873,6 +1109,7 @@ export async function runStructuralChecks(
         baseRoot: input.baseRoot,
         findingFile: entry.finding.file,
         ...(findingFileAtBase === undefined ? {} : { findingFileAtBase }),
+        ...(entry.finding.line === undefined ? {} : { findingLine: entry.finding.line }),
       }, {
         // Never more than what the review has left, so the per-check bound
         // cannot multiply itself by the claim budget.
@@ -884,6 +1121,7 @@ export async function runStructuralChecks(
         // post-hoc `reconcileWithDiff` below remains for injected checks,
         // which retain everything and skip it via the `occurrences` marker.
         ...(input.removedLinesByFile === undefined ? {} : { removedLinesByFile: input.removedLinesByFile }),
+        ...(await ensureResolver() === undefined ? {} : { resolver: resolver! }),
       });
       // The base/head reconciliation lives here because this is the only layer
       // that can see the diff; `checkStructuralClaim` knows one tree.
@@ -903,10 +1141,12 @@ export async function runStructuralChecks(
     }
   }
 
-  return input.findings.map((finding, index) => {
+  const results = input.findings.map((finding, index) => {
     const result = checks.get(index);
     return result === undefined ? finding : { ...finding, hostCheck: result };
   });
+  resolver?.dispose();
+  return results;
 }
 
 /**
@@ -925,6 +1165,16 @@ export function describeCheckCompact(
   escape: (value: string) => string = (value) => value,
 ): string {
   if (check.status === "not-checked") return "Host check: not performed";
+  if (check.status === "resolved") {
+    const first = check.references[0];
+    const where = first === undefined ? "" : `, e.g. ${escape(`${first.file}:${first.line}`)}`;
+    const unresolved = check.unresolvedOccurrences > 0
+      ? `, ${check.unresolvedOccurrences} same-named but unresolved`
+      : "";
+    // The word "resolved" is the part that must not be dropped for length —
+    // the same rule the lexical branch's "unresolved" follows.
+    return `Host check: the name resolves to ${check.occurrences} reference(s) elsewhere${where}${unresolved} — resolved references`;
+  }
   // Same census rule as `describeCheck`: with retention capped, the count
   // lives in `occurrences`, never in the length of the display sample.
   const total = check.occurrences ?? check.references.length;

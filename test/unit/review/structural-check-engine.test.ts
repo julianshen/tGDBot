@@ -29,12 +29,16 @@ describe("structural-check engine identity", () => {
     const manifest = JSON.parse(
       readFileSync(path.join(repoRoot, "package.json"), "utf8"),
     ) as { dependencies: Record<string, string> };
-    const pinned = manifest.dependencies["@ast-grep/napi"];
+    const astGrep = manifest.dependencies["@ast-grep/napi"];
+    const typescript = manifest.dependencies.typescript;
 
     // An exact pin, not a range: a caret would make the constant a guess about
     // whatever npm happened to install.
-    expect(pinned).toMatch(/^\d+\.\d+\.\d+$/u);
-    expect(STRUCTURAL_CHECK_ENGINE).toBe(`ast-grep@${pinned}`);
+    expect(astGrep).toMatch(/^\d+\.\d+\.\d+$/u);
+    expect(typescript).toMatch(/^\d+\.\d+\.\d+$/u);
+    // Resolution (issue #77) is part of the engine: a typescript upgrade can
+    // change which occurrences resolve, so it belongs in the identity too.
+    expect(STRUCTURAL_CHECK_ENGINE).toBe(`ast-grep@${astGrep}+typescript@${typescript}`);
   });
 
   it("re-triggers a review when the parser version changes", () => {
