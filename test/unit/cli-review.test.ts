@@ -4180,7 +4180,7 @@ describe("repository context", () => {
         sources: [],
       };
     }
-    return { status: "ready" as const, packs, manifestHash: "b".repeat(64), degradedReasons: [], cacheHit: false };
+    return { status: "ready" as const, packs, manifestHash: "b".repeat(64), degradedReasons: [], cacheHit: false, incremental: false };
   }
 
   it("hands every rule's pack to dispatch", async () => {

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { chmod, link, lstat, mkdtemp, mkdir, open, readFile, rename, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdtemp, mkdir, open, readdir, readFile, rename, rm, symlink, truncate, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
@@ -20,12 +20,15 @@ import type {
 } from "../../../src/context/types.js";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 
+// Issue #60: the key is an identity — no baseSha. The commit the graphs were
+// built from is provenance on the manifest, shared by the graph documents'
+// own gitCommitHash pins.
+const builtFromSha = "def4567890def4567890def4567890def4567890";
 const key: ContextCacheKey = {
   provider: "github",
   host: "github.com",
   owner: "octo-org",
   repo: "octo-repo",
-  baseSha: "def4567890def4567890def4567890def4567890",
   schemaVersion: 1,
   tgdVersion: "0.1.0",
   policyVersion: "2026-07-18",
@@ -52,7 +55,7 @@ function knowledgeGraph(): Record<string, unknown> {
       frameworks: [],
       description: "Trusted test repository",
       analyzedAt: createdAt,
-      gitCommitHash: key.baseSha,
+      gitCommitHash: builtFromSha,
     },
     nodes: [
       {
@@ -103,7 +106,7 @@ function domainGraph(): Record<string, unknown> {
       frameworks: [],
       description: "Business domains",
       analyzedAt: createdAt,
-      gitCommitHash: key.baseSha,
+      gitCommitHash: builtFromSha,
     },
     nodes: [
       {
@@ -173,6 +176,9 @@ function input(overrides: Partial<ContextManifestInput> = {}): ContextManifestIn
     ],
     documents: [],
     degradedReasons: [],
+    builtFromSha,
+    generation: 0,
+    parentManifestHash: null,
     ...overrides,
   };
 }
@@ -215,7 +221,7 @@ async function createStaging(
   }
   await writeFile(
     path.join(staging, ".understand-anything/mapping-metadata.json"),
-    JSON.stringify({ version: 1, status: "complete", baseSha: options.baseSha ?? key.baseSha }),
+    JSON.stringify({ version: 1, status: "complete", baseSha: options.baseSha ?? builtFromSha }),
     "utf8",
   );
   return staging;
@@ -263,7 +269,6 @@ describe("ContextCache", () => {
       host: "github.com",
       owner: "octo-org",
       repo: "octo-repo",
-      baseSha: "a".repeat(40),
       schemaVersion: 1,
       tgdVersion: "1",
       policyVersion: "1",
@@ -274,22 +279,15 @@ describe("ContextCache", () => {
       port: gitlabRepo.port,
       namespace: gitlabRepo.namespace,
       repo: gitlabRepo.repo,
-      baseSha: githubKey.baseSha,
       schemaVersion: githubKey.schemaVersion,
       tgdVersion: githubKey.tgdVersion,
       policyVersion: githubKey.policyVersion,
     } as ContextCacheKey;
 
-    expect(cache.entryPath(githubKey)).toBe(path.join(
-      root,
-      "contexts",
-      "feb1bd747ff047615bd4a66891be80a5e99f34c4ec83a88f4492e7f852918515",
-    ));
-    expect(cache.entryPath(gitlabKey)).toBe(path.join(
-      root,
-      "contexts",
-      "89cf774341ca75513b85555ac5c3472e0d2286d46e6f138a9b49718ff88f0aae",
-    ));
+    // Deterministic directory names, pinned by the identity hash test below;
+    // here the property under test is provider isolation.
+    expect(cache.entryPath(githubKey)).toMatch(/contexts\/[0-9a-f]{64}$/);
+    expect(cache.entryPath(gitlabKey)).toMatch(/contexts\/[0-9a-f]{64}$/);
     expect(cache.entryPath(gitlabKey)).not.toBe(cache.entryPath(githubKey));
   });
 
@@ -307,7 +305,6 @@ describe("ContextCache", () => {
       port: gitlabRepo.port,
       // `namespace` comes from the override; setting it here too was dead.
       repo: gitlabRepo.repo,
-      baseSha: "a".repeat(40),
       schemaVersion: 1,
       tgdVersion: "1",
       policyVersion: "1",
@@ -340,7 +337,6 @@ describe("ContextCache", () => {
     ["host", "ghe.example.com"],
     ["owner", "another-owner"],
     ["repo", "another-repo"],
-    ["baseSha", "abc4567890abc4567890abc4567890abc4567890"],
     ["schemaVersion", 2],
     ["tgdVersion", "0.2.0"],
     ["policyVersion", "2026-08-01"],
@@ -845,7 +841,7 @@ describe("ContextCache", () => {
     },
   );
 
-  it.each(["owner", "repo", "host", "baseSha", "tgdVersion", "policyVersion"] as const)(
+  it.each(["owner", "repo", "host", "tgdVersion", "policyVersion"] as const)(
     "rejects unsafe %s key components",
     async (field) => {
       const root = await tempRoot();
@@ -997,7 +993,7 @@ describe("ContextCache", () => {
     const mappingStaging = await createStaging(root);
     await writeFile(
       path.join(mappingStaging, ".understand-anything/mapping-metadata.json"),
-      JSON.stringify({ version: 1, status: "complete", baseSha: key.baseSha, unexpected: true }),
+      JSON.stringify({ version: 1, status: "complete", baseSha: builtFromSha, unexpected: true }),
       "utf8",
     );
     await expect(new ContextCache(root).promoteContext(mappingStaging, input())).rejects.toThrow(/metadata/i);
@@ -1109,7 +1105,7 @@ describe("ContextCache", () => {
     await expect(
       digestArtifactInputs(
         directStage,
-        key,
+        builtFromSha,
         input().artifacts,
         null as unknown as ContextManifestInput["documents"],
       ),
@@ -1550,6 +1546,9 @@ describe("ContextCache", () => {
       manifestHash: first.manifestHash,
       createdAt: first.createdAt,
       key: first.key,
+      builtFromSha: first.builtFromSha,
+      generation: first.generation,
+      parentManifestHash: first.parentManifestHash,
       status: first.status,
       version: first.version,
     } as ContextManifest;
@@ -1725,5 +1724,144 @@ describe("ContextCache.reclaimStaleClaim", () => {
     // hour later, fresh under the default.
     await expect(cache.reclaimStaleClaim(key, 60 * 60 * 1000)).resolves.toBe(false);
     await expect(cache.reclaimStaleClaim(key, 1, Date.now() + 60 * 60 * 1000)).resolves.toBe(true);
+  });
+});
+
+// Issue #60: under the identity key, every publication of a repository
+// targets the same directory. Replacement of the previous entry is the
+// COMMON case, and it is safe only as a compare-and-swap on the parent hash.
+describe("ContextCache — CAS replacement of the living entry (#60)", () => {
+  async function publishFull(root: string, overrides: Partial<ContextManifestInput> = {}): Promise<ContextManifest> {
+    const cache = new ContextCache(root);
+    const staging = await createStaging(root);
+    return cache.promoteContext(staging, input(overrides));
+  }
+
+  // The graph documents pin their own base commit; a staged replacement must
+  // pin the commit its manifest claims.
+  async function repinStagedGraphs(staging: string, sha: string): Promise<void> {
+    for (const graphPath of [
+      path.join(staging, ".understand-anything/knowledge-graph.json"),
+      path.join(staging, ".understand-anything/domain-graph.json"),
+    ]) {
+      const graph = JSON.parse(await readFile(graphPath, "utf8")) as { project: { gitCommitHash: string } };
+      graph.project.gitCommitHash = sha;
+      await writeFile(graphPath, JSON.stringify(graph), "utf8");
+    }
+    await writeFile(
+      path.join(staging, ".understand-anything/mapping-metadata.json"),
+      JSON.stringify({ version: 1, status: "complete", baseSha: sha }),
+      "utf8",
+    );
+  }
+
+  it("replaces the previous entry when the CAS matches the parent hash", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const parent = await publishFull(root);
+
+    const nextStaging = await createStaging(root);
+    await repinStagedGraphs(nextStaging, "c".repeat(40));
+    const patched = await cache.promoteContext(nextStaging, input({
+      builtFromSha: "c".repeat(40),
+      generation: parent.generation + 1,
+      parentManifestHash: parent.manifestHash,
+    }), { expectedExistingManifestHash: parent.manifestHash });
+
+    expect(patched.parentManifestHash).toBe(parent.manifestHash);
+    expect(patched.generation).toBe(1);
+    expect(patched.builtFromSha).toBe("c".repeat(40));
+    await expect(cache.lookupContext(key)).resolves.toEqual(patched);
+  });
+
+  it("refuses the replacement when another publisher moved the entry forward", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const parent = await publishFull(root);
+
+    const staleStaging = await createStaging(root);
+    await repinStagedGraphs(staleStaging, "c".repeat(40));
+    await expect(cache.promoteContext(staleStaging, input({
+      builtFromSha: "c".repeat(40),
+      generation: parent.generation + 1,
+      parentManifestHash: "e".repeat(64),
+    }), { expectedExistingManifestHash: "e".repeat(64) })).rejects.toThrow(ContextCacheConflictError);
+
+    // The parent entry is untouched.
+    await expect(cache.lookupContext(key)).resolves.toEqual(parent);
+  });
+
+  it("replaces unconditionally on a full map, which names no expected parent", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    await publishFull(root);
+
+    const remapStaging = await createStaging(root);
+    await repinStagedGraphs(remapStaging, "c".repeat(40));
+    const remapped = await cache.promoteContext(
+      remapStaging,
+      input({ builtFromSha: "c".repeat(40) }),
+      { expectedExistingManifestHash: null },
+    );
+
+    expect(remapped.builtFromSha).toBe("c".repeat(40));
+    expect(remapped.generation).toBe(0);
+    expect(remapped.parentManifestHash).toBeNull();
+    await expect(cache.lookupContext(key)).resolves.toEqual(remapped);
+  });
+
+  it("leaves no retired directory behind after a successful replacement", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const parent = await publishFull(root);
+    const contextsDir = path.join(root, "contexts");
+
+    const nextStaging = await createStaging(root);
+    await repinStagedGraphs(nextStaging, "c".repeat(40));
+    await cache.promoteContext(nextStaging, input({
+      builtFromSha: "c".repeat(40),
+      generation: parent.generation + 1,
+      parentManifestHash: parent.manifestHash,
+    }), { expectedExistingManifestHash: parent.manifestHash });
+
+    const leftovers = (await readdir(contextsDir)).filter((name) => name.includes("retiring"));
+    expect(leftovers).toEqual([]);
+  });
+
+  it("keeps at most K entries per repository and never evicts the newest (#60 eviction)", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+
+    // Three generations in one repository's entry slot: each publication
+    // REPLACES, so there is exactly one entry for the identity key. Eviction
+    // has nothing per-repository to do until versions drift — so prove the
+    // two behaviours that matter: the newest survives, and foreign repos are
+    // isolated.
+    await publishFull(root);
+    const cacheKey = { ...key, schemaVersion: 2 } as ContextCacheKey;
+    const secondStaging = await createStaging(root);
+    // A later createdAt, so the eviction's newest-first sort is deterministic.
+    await cache.promoteContext(secondStaging, {
+      ...input(),
+      key: cacheKey,
+      createdAt: "2026-07-19T08:00:00.000Z",
+    });
+
+    const evicted = await cache.evictOlderEntries(1);
+    expect(evicted).toBe(1);
+    // The newest of the group (schemaVersion 2) survived.
+    await expect(cache.lookupContext(cacheKey)).resolves.toBeDefined();
+    await expect(cache.lookupContext(key)).resolves.toBeUndefined();
+  });
+
+  it("keeps a concurrent review's manifest: the entry a reader just read is the newest", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const parent = await publishFull(root);
+
+    // A reader mid-review holds THIS manifest; eviction must not remove it.
+    const evicted = await cache.evictOlderEntries(3);
+    expect(evicted).toBe(0);
+    await expect(cache.lookupContext(key)).resolves.toEqual(parent);
   });
 });

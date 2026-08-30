@@ -145,17 +145,9 @@ describe("TgdPiMapper", () => {
     });
 
     expect(result.status).toBe("ready");
-    expect(digest).toHaveBeenCalledWith(outputRoot, {
-      provider: "gitlab",
-      host: "gitlab.example.com",
-      port: 8443,
-      namespace: ["group", "sub"],
-      repo: "project",
-      baseSha,
-      schemaVersion: 1,
-      tgdVersion: "mapping-validation",
-      policyVersion: "mapping-validation",
-    }, expect.any(Array));
+    // Issue #60: validation keys off the analyzed base SHA directly — there is
+    // no synthetic identity object between the mapper and the digests.
+    expect(digest).toHaveBeenCalledWith(outputRoot, baseSha, expect.any(Array));
   });
 
   it.each([

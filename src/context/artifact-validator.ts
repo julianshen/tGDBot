@@ -9,7 +9,6 @@ import type {
   ArtifactInput,
   ArtifactKind,
   ArtifactRecord,
-  ContextCacheKey,
   DocumentInput,
   DocumentRecord,
 } from "./types.js";
@@ -373,18 +372,18 @@ function validateJsonArtifactContents(
   kind: ArtifactKind,
   artifactPath: string,
   contents: Buffer,
-  key: ContextCacheKey,
+  expectedBaseSha: string,
 ): void {
   const parsed = parseJsonObject(contents, artifactPath);
   if (kind === "knowledge-graph" || kind === "domain-graph") {
-    validateGraph(parsed, artifactPath, kind === "domain-graph", key.baseSha);
+    validateGraph(parsed, artifactPath, kind === "domain-graph", expectedBaseSha);
   }
   if (kind === "mapping-metadata") {
     if (
       !hasExactKeys(parsed, ["baseSha", "status", "version"]) ||
       parsed.version !== 1 ||
       parsed.status !== "complete" ||
-      parsed.baseSha !== key.baseSha
+      parsed.baseSha !== expectedBaseSha
     ) {
       throw new ContextValidationError("Mapping metadata must be complete and match the analyzed base SHA");
     }
@@ -466,7 +465,7 @@ function digest(contents: Buffer): string {
 
 async function digestArtifacts(
   basePath: string,
-  key: ContextCacheKey,
+  expectedBaseSha: string,
   artifacts: readonly ArtifactInput[],
 ): Promise<ArtifactRecord[]> {
   const records: ArtifactRecord[] = [];
@@ -479,7 +478,7 @@ async function digestArtifacts(
       continue;
     }
     const contents = await readJsonArtifactWithin(basePath, artifact.path);
-    validateJsonArtifactContents(artifact.kind, artifact.path, contents, key);
+    validateJsonArtifactContents(artifact.kind, artifact.path, contents, expectedBaseSha);
     records.push({ ...artifact, sha256: digest(contents) });
   }
   return records.sort((left, right) => left.path.localeCompare(right.path));
@@ -487,17 +486,17 @@ async function digestArtifacts(
 
 export async function digestDegradedArtifactInputs(
   basePath: string,
-  key: ContextCacheKey,
+  expectedBaseSha: string,
   artifacts: readonly ArtifactInput[],
 ): Promise<ArtifactRecord[]> {
   if (!Array.isArray(artifacts)) throw new ContextValidationError("Artifacts must be an array");
   validateRecordSets(artifacts, [], "degraded");
-  return digestArtifacts(basePath, key, artifacts);
+  return digestArtifacts(basePath, expectedBaseSha, artifacts);
 }
 
 export async function digestArtifactInputs(
   basePath: string,
-  key: ContextCacheKey,
+  expectedBaseSha: string,
   artifacts: readonly ArtifactInput[],
   documents: readonly DocumentInput[] = [],
 ): Promise<{ artifacts: ArtifactRecord[]; documents: DocumentRecord[] }> {
@@ -505,7 +504,7 @@ export async function digestArtifactInputs(
   if (!Array.isArray(documents)) throw new ContextValidationError("Documents must be an array");
   validateRecordSets(artifacts, documents);
   await rejectUndeclaredDomainAlternative(basePath, artifacts);
-  const artifactRecords = await digestArtifacts(basePath, key, artifacts);
+  const artifactRecords = await digestArtifacts(basePath, expectedBaseSha, artifacts);
   const documentRecords: DocumentRecord[] = [];
   for (const document of documents) {
     const streamed = await streamDigestWithin(basePath, document.path, false);
@@ -520,7 +519,7 @@ export async function digestArtifactInputs(
 
 export async function validateArtifactRecords(
   basePath: string,
-  key: ContextCacheKey,
+  expectedBaseSha: string,
   artifacts: readonly ArtifactRecord[],
   documents: readonly DocumentRecord[],
 ): Promise<void> {
@@ -530,7 +529,7 @@ export async function validateArtifactRecords(
       throw new ContextValidationError(`Invalid SHA-256 digest for ${String(record.path)}`);
     }
   }
-  const recomputed = await digestArtifactInputs(basePath, key, artifacts, documents);
+  const recomputed = await digestArtifactInputs(basePath, expectedBaseSha, artifacts, documents);
   const expectedByPath = new Map(
     [...artifacts, ...documents].map((record) => [record.path, record.sha256] as const),
   );

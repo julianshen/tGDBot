@@ -35,6 +35,13 @@ export interface SelectContextInput {
   contextRoot: string;
   manifest: ContextManifest;
   changedFiles: string[];
+  /**
+   * The base commit under review (#60). The manifest's own `builtFromSha` is
+   * the commit the graphs currently describe; when the two differ the header
+   * says so, because a reviewer weighing a graph node must know which tree it
+   * describes. Optional so existing callers keep their exact rendering.
+   */
+  reviewBaseSha?: string;
 }
 
 export interface BuildContextPackInput extends SelectContextInput {
@@ -100,6 +107,7 @@ export interface ContextSelection {
   readonly knowledgeTexts: readonly string[];
   readonly domainTexts: readonly string[];
   readonly business: readonly SelectedBusinessDocument[];
+  readonly reviewBaseSha?: string;
 }
 
 interface GraphNode {
@@ -108,6 +116,8 @@ interface GraphNode {
   name: string;
   summary: string;
   filePath?: string;
+  /** Set by an incremental patch (#60): a neighbour's file changed since this node's summary was written. */
+  stale?: boolean;
 }
 
 interface GraphEdge {
@@ -194,7 +204,7 @@ function normalizeRuleName(ruleName: unknown): string {
   return normalized;
 }
 
-function normalizeChangedFile(changedFile: unknown): string {
+export function normalizeChangedFile(changedFile: unknown): string {
   if (typeof changedFile !== "string" || /[\u0000-\u001f\u007f]/u.test(changedFile)) {
     return invalid("Changed file must be a string containing no control characters");
   }
@@ -271,8 +281,22 @@ function validateManifestIdentity(manifest: unknown): asserts manifest is Contex
       return invalid(`Context manifest key ${name} is invalid`);
     }
   };
-  for (const name of ["host", "repo", "baseSha", "tgdVersion", "policyVersion"] as const) {
+  for (const name of ["host", "repo", "tgdVersion", "policyVersion"] as const) {
     validateKeyComponent(name, manifestKey[name]);
+  }
+  // Provenance (#60): the commit the graphs describe rides on the manifest,
+  // not the key. A pack cannot render without it.
+  const SHA40_PATTERN = /^[0-9a-f]{40}$/u;
+  if (
+    typeof candidate.builtFromSha !== "string" ||
+    !SHA40_PATTERN.test(candidate.builtFromSha) ||
+    !Number.isSafeInteger(candidate.generation) ||
+    (candidate.generation as number) < 0 ||
+    (candidate.parentManifestHash !== null &&
+      (typeof candidate.parentManifestHash !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(candidate.parentManifestHash)))
+  ) {
+    return invalid("Context manifest provenance is invalid");
   }
   if (manifestKey.provider === "github") {
     validateKeyComponent("owner", manifestKey.owner);
@@ -535,6 +559,7 @@ function parseGraph(contents: Buffer, artifactPath: string): ParsedGraph {
       name: singleLine(node.name),
       summary: singleLine(node.summary),
       ...(node.filePath === undefined ? {} : { filePath: normalizeChangedFile(node.filePath) }),
+      ...(node.stale === undefined ? {} : { stale: node.stale === true }),
     };
   });
   const edges = parsed.edges.map((edge): GraphEdge => {
@@ -629,6 +654,11 @@ function renderKnowledge(nodes: readonly RankedKnowledgeNode[]): string[] {
     `  Changed file: \`${node.matchedChangedFile}\``,
     ...(node.filePath === undefined ? [] : [`  Node file: \`${node.filePath}\``]),
     `  Summary: ${node.summary}`,
+    // Host-authored constant text, never diff-derived (#63): the marker's job
+    // is to make the node's provenance visible, not to name the delta.
+    ...(node.stale === true
+      ? ["  STALE: an incremental patch changed a neighbouring file after this summary was written; re-derive before relying on it"]
+      : []),
   ].join("\n"));
 }
 
@@ -649,9 +679,17 @@ function renderPack(
   content: SectionContent,
   eligible: Readonly<Record<EvidenceSection, number>>,
   zeroDomains: boolean,
+  reviewBaseSha?: string,
   omitted?: OmittedCounts,
 ): string {
   const degradedReasons = [...manifest.degradedReasons].sort(compareText);
+  const baseSha = reviewBaseSha ?? manifest.builtFromSha;
+  const graphProvenance = [
+    ...(manifest.builtFromSha === baseSha ? [] : [`Graph built at: ${manifest.builtFromSha}`]),
+    ...(manifest.generation > 0
+      ? [`Index: incremental patch, generation ${manifest.generation}`]
+      : []),
+  ];
   const knowledge = eligible.knowledge === 0
     ? ["No graph nodes matched the changed files."]
     : content.knowledge;
@@ -678,7 +716,8 @@ function renderPack(
     "",
     `Rule: ${ruleName}`,
     `Repository: ${repositoryLabel(manifest.key)}`,
-    `Base SHA: ${manifest.key.baseSha}`,
+    `Base SHA: ${baseSha}`,
+    ...graphProvenance,
     `Manifest hash: ${manifest.manifestHash}`,
     `Degraded reasons: ${degradedReasons.length === 0 ? "none" : degradedReasons.join(", ")}`,
     "",
@@ -730,11 +769,12 @@ function allocateEvidence(
   entries: readonly EvidenceEntry[],
   maxChars: number,
   zeroDomains: boolean,
+  reviewBaseSha?: string,
 ): { text: string; truncated: boolean } {
   const eligible = countEntries(entries);
   const all = emptySections();
   for (const entry of entries) all[entry.section].push(entry.text);
-  const untruncated = renderPack(ruleName, manifest, all, eligible, zeroDomains);
+  const untruncated = renderPack(ruleName, manifest, all, eligible, zeroDomains, reviewBaseSha);
   if (untruncated.length <= maxChars) {
     for (const entry of entries) accountEntry(entry, "includedItems");
     return { text: untruncated, truncated: false };
@@ -742,7 +782,7 @@ function allocateEvidence(
 
   const selected = emptySections();
   const footerReservation = { ...eligible };
-  const mandatory = renderPack(ruleName, manifest, selected, eligible, zeroDomains, footerReservation);
+  const mandatory = renderPack(ruleName, manifest, selected, eligible, zeroDomains, reviewBaseSha, footerReservation);
   if (mandatory.length > maxChars) return invalid("Mandatory context pack content exceeds maxChars");
 
   let selectedLength = mandatory.length;
@@ -761,7 +801,7 @@ function allocateEvidence(
     domain: eligible.domain - selected.domain.length,
     business: eligible.business - selected.business.length,
   };
-  const text = renderPack(ruleName, manifest, selected, eligible, zeroDomains, omitted);
+  const text = renderPack(ruleName, manifest, selected, eligible, zeroDomains, reviewBaseSha, omitted);
   if (text.length > maxChars) return invalid("Context pack allocation exceeded maxChars");
   return { text, truncated: true };
 }
@@ -780,7 +820,8 @@ export async function selectContext(input: SelectContextInput): Promise<ContextS
   validateRenderedPaths(input.manifest);
   await validateArtifactRecords(
     contextRoot,
-    input.manifest.key,
+    // Expected base SHA from the manifest's provenance, not the key (#60).
+    input.manifest.builtFromSha,
     input.manifest.artifacts,
     input.manifest.documents,
   );
@@ -804,6 +845,7 @@ export async function selectContext(input: SelectContextInput): Promise<ContextS
     knowledgeTexts: renderKnowledge(knowledge),
     domainTexts: renderDomainFlows(domainFlows, zeroDomains),
     business: await selectBusinessDocuments(contextRoot, input.manifest),
+    ...(input.reviewBaseSha === undefined ? {} : { reviewBaseSha: input.reviewBaseSha }),
   };
 }
 
@@ -845,6 +887,7 @@ export function renderContextPack(
     entries,
     resolvedMaxChars,
     selection.zeroDomains,
+    selection.reviewBaseSha,
   );
   return {
     text: allocated.text,

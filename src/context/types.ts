@@ -1,11 +1,22 @@
 import type { RepositoryRef } from "../target/types.js";
 
+/**
+ * The cache key is an IDENTITY, deliberately without the base commit.
+ *
+ * Issue #60: keying an entry by `baseSha` made it valid for one commit and no
+ * other — one merge to `main` invalidated the index for every open PR, and
+ * every next review paid a full re-map to re-derive a graph that differed from
+ * the discarded one by a handful of files. The key now names the repository
+ * and the producing versions; WHICH commit the graphs were built from is
+ * provenance, recorded on the manifest (`builtFromSha`), and a review at a
+ * newer base decides between an exact hit, an incremental patch, and a full
+ * re-map by measuring the delta.
+ */
 export interface GitHubContextCacheKey {
   provider: "github";
   host: string;
   owner: string;
   repo: string;
-  baseSha: string;
   schemaVersion: number;
   tgdVersion: string;
   policyVersion: string;
@@ -17,7 +28,6 @@ export interface GitLabContextCacheKey {
   port?: number;
   namespace: readonly string[];
   repo: string;
-  baseSha: string;
   schemaVersion: number;
   tgdVersion: string;
   policyVersion: string;
@@ -27,7 +37,7 @@ export type ContextCacheKey = GitHubContextCacheKey | GitLabContextCacheKey;
 
 export type ContextCacheVersionIdentity = Pick<
   ContextCacheKey,
-  "baseSha" | "schemaVersion" | "tgdVersion" | "policyVersion"
+  "schemaVersion" | "tgdVersion" | "policyVersion"
 >;
 
 type RepositoryLabelIdentity =
@@ -100,6 +110,12 @@ export interface ContextManifestInput {
   artifacts: ArtifactInput[];
   documents?: DocumentInput[];
   degradedReasons?: string[];
+  /** The base commit the graphs were built from. Provenance, not identity. */
+  builtFromSha: string;
+  /** How many incremental publications produced this entry. 0 after a full map. */
+  generation?: number;
+  /** The manifest hash this entry was patched from, when published incrementally. */
+  parentManifestHash?: string | null;
 }
 
 export interface ContextManifest {
@@ -111,6 +127,12 @@ export interface ContextManifest {
   artifacts: ArtifactRecord[];
   documents: DocumentRecord[];
   degradedReasons: string[];
+  /** The base commit the graphs were built from. Provenance, not identity. */
+  builtFromSha: string;
+  /** How many incremental publications produced this entry. 0 after a full map. */
+  generation: number;
+  /** The manifest hash this entry was patched from, when published incrementally. */
+  parentManifestHash: string | null;
 }
 
 export interface ContextLookupOptions {
@@ -119,8 +141,10 @@ export interface ContextLookupOptions {
 }
 
 /**
- * Mapping completion marker produced alongside the graphs.
- * The analyzed base SHA is the provenance link to ContextCacheKey.baseSha.
+ * Mapping completion marker produced alongside the graphs. The analyzed base
+ * SHA is mirrored onto the ready manifest as `builtFromSha`; this artifact is
+ * what the mapper itself writes, and the manifest field is what a lookup can
+ * read without opening artifacts.
  */
 export interface MappingMetadata {
   version: 1;

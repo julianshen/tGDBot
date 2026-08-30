@@ -18,15 +18,17 @@
 //     unavailable context into an error, for callers who would rather not
 //     review at all than review blind.
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { buildContextPacks, type ContextPackResult } from "./context-pack.js";
-import { declareMappedArtifacts } from "./artifact-paths.js";
+import { declareMappedArtifacts, KNOWLEDGE_PATH } from "./artifact-paths.js";
 import {
   ContextCache,
   ContextCacheConflictError,
   ContextCachePublicationInProgressError,
 } from "./cache.js";
+import { computeBaseDelta, mirrorGitRunner, type ClassifiedBaseDelta } from "./delta.js";
+import { loadDomainStepPaths, patchEntryArtifacts } from "./incremental.js";
 import { contextCacheKeyForRepository, type ContextCacheKey, type ContextManifest } from "./types.js";
 import { withPreparedWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
 import { assertNoSymlinkedAncestors, protectManagedRoot } from "../workspace/protect.js";
@@ -36,9 +38,11 @@ import type { RepositoryRef } from "../target/types.js";
 /**
  * Bumped when the shape of a published context entry changes. It is part of
  * the cache key, so a bump invalidates every cached entry rather than reading
- * an old one under new assumptions.
+ * an old one under new assumptions. v2: the key no longer carries the base
+ * commit (#60) — the manifest carries provenance instead, and a review at a
+ * newer base patches the cached graph or re-maps, measured by delta.
  */
-export const CONTEXT_SCHEMA_VERSION = 1;
+export const CONTEXT_SCHEMA_VERSION = 2;
 
 /**
  * Identifies the mapper that produced an entry. Changing mapper — or upgrading
@@ -49,6 +53,14 @@ export const CONTEXT_MAPPER_VERSION = "tgd-pi-mapper@1";
 
 /** Bumped when selection/rendering policy changes what a pack says. */
 export const CONTEXT_POLICY_VERSION = "1";
+
+/**
+ * After this many incremental publications the next one is a full map, whatever
+ * the delta says. Cheap insurance against accumulated merge error: an index
+ * that is never fully rebuilt drifts, and 20 (issue #60's starting number)
+ * bounds the drift while keeping the incremental path the common case.
+ */
+export const CONTEXT_GENERATION_CEILING = 20;
 
 export type ContextMode = "off" | "auto" | "require";
 
@@ -88,6 +100,8 @@ export type ContextPreparation =
     /** Empty on a healthy entry; a reused degraded entry states what is missing. */
     readonly degradedReasons: readonly string[];
     readonly cacheHit: boolean;
+    /** True when this run patched a cached graph instead of full-mapping (#60). */
+    readonly incremental: boolean;
   }
   | { readonly status: "unavailable"; readonly reasons: readonly string[] };
 
@@ -102,6 +116,17 @@ export interface PrepareContextDependencies {
   readonly createMapper?: () => Promise<ContextMapper> | ContextMapper;
   readonly createCache?: (root: string) => ContextCache;
   readonly now?: () => string;
+  /**
+   * Measures the delta between the cached graph's base and the review base,
+   * in the managed mirror, under the repository lock. Injectable so the
+   * incremental tests never run git.
+   */
+  readonly computeDelta?: (input: {
+    readonly mirrorPath: string;
+    readonly fromSha: string;
+    readonly toSha: string;
+    readonly domainStepPaths: ReadonlySet<string>;
+  }) => Promise<ClassifiedBaseDelta>;
   readonly onProgress?: (event: { stage: "lookup" | "workspace" | "map" | "publish" | "pack"; status: "started" | "completed" | "failed" }) => void;
 }
 
@@ -120,6 +145,9 @@ export interface PrepareContextDependencies {
 const PUBLICATION_WAIT_ATTEMPTS = 60;
 const PUBLICATION_WAIT_INTERVAL_MS = 500;
 
+/** How many context entries one repository keeps before the oldest is evicted (#60). */
+const EVICTION_KEEP_PER_REPOSITORY = 3;
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
@@ -131,18 +159,19 @@ function errorMessage(error: unknown): string {
 }
 
 /**
- * The cache identity for one repository at one base commit. Stamped with the
- * schema, mapper and policy versions so that changing any of them makes every
- * existing entry a miss rather than a stale hit — there is no in-place
- * migration, and reading an old entry under new rules is the failure this
- * prevents.
+ * The cache identity for one repository. Deliberately WITHOUT the base commit
+ * (#60): the entry is the repository's living index, and which commit the
+ * graphs currently describe is provenance on the manifest — a review at a
+ * newer base measures the delta and decides between an exact hit, an
+ * incremental patch, and a full re-map. Stamped with the schema, mapper and
+ * policy versions so that changing any of them makes every existing entry a
+ * miss rather than a stale hit — there is no in-place migration, and reading
+ * an old entry under new rules is the failure this prevents.
  */
 export function contextCacheKey(request: {
   readonly repository: RepositoryRef;
-  readonly baseSha: string;
 }): ContextCacheKey {
   return contextCacheKeyForRepository(request.repository, {
-    baseSha: request.baseSha,
     schemaVersion: CONTEXT_SCHEMA_VERSION,
     tgdVersion: CONTEXT_MAPPER_VERSION,
     policyVersion: CONTEXT_POLICY_VERSION,
@@ -232,25 +261,39 @@ async function publishMapping(
   artifactPaths: readonly string[],
   degradedReasons: readonly string[],
   createdAt: string,
+  /** Provenance for the published manifest: the graph state and its parentage (#60). */
+  provenance: {
+    readonly builtFromSha: string;
+    readonly generation?: number;
+    readonly parentManifestHash?: string | null;
+  },
   /**
    * Whether an abandoned claim may still be reclaimed. Cleared on the single
    * retry below so a claim that keeps reappearing cannot loop.
    */
   mayReclaim = true,
 ): Promise<PublishedMapping | undefined> {
+  // CAS replacement (#60): the destination normally already holds the parent
+  // entry, and replacing it is safe only while it still holds exactly what
+  // this publication was derived from.
+  const replacement = { expectedExistingManifestHash: provenance.parentManifestHash ?? null };
   try {
     const manifest = await cache.promoteContext(stagingPath, {
       key,
       createdAt,
       artifacts: declareMappedArtifacts(artifactPaths),
       degradedReasons: [...degradedReasons],
-    });
+      builtFromSha: provenance.builtFromSha,
+      generation: provenance.generation,
+      parentManifestHash: provenance.parentManifestHash ?? null,
+    }, replacement);
     return { manifest, ours: true };
   } catch (error) {
     if (error instanceof ContextCacheConflictError) {
-      // A concurrent run already published a complete entry. It is as good as
-      // ours would have been — same base commit, same mapper — so read it
-      // rather than failing.
+      // A concurrent run already published a NEWER entry. It is as good as
+      // ours would have been — same identity, same mapper — so read it rather
+      // than failing. Under the identity key this is no longer the common
+      // path: a CAS replacement retires the previous entry routinely.
       const manifest = await cache.lookupContext(key);
       return manifest === undefined ? undefined : { manifest, ours: false };
     }
@@ -273,6 +316,7 @@ async function publishMapping(
           artifactPaths,
           degradedReasons,
           createdAt,
+          provenance,
           false,
         );
       }
@@ -387,6 +431,7 @@ export async function prepareReviewContext(
     manifest: ContextManifest,
     cacheHit: boolean,
     discardOnFailure = false,
+    incremental = false,
   ): Promise<ContextPreparation> => {
     onProgress({ stage: "pack", status: "started" });
     try {
@@ -394,6 +439,7 @@ export async function prepareReviewContext(
         contextRoot: cache.entryPath(key),
         manifest,
         changedFiles: [...request.changedFiles],
+        reviewBaseSha: request.baseSha,
         ...(request.maxChars === undefined ? {} : { maxChars: request.maxChars }),
       }, request.ruleNames);
       onProgress({ stage: "pack", status: "completed" });
@@ -403,6 +449,7 @@ export async function prepareReviewContext(
         manifestHash: manifest.manifestHash,
         degradedReasons: manifest.degradedReasons,
         cacheHit,
+        incremental,
       };
     } catch (error) {
       onProgress({ stage: "pack", status: "failed" });
@@ -445,8 +492,12 @@ export async function prepareReviewContext(
     onProgress({ stage: "lookup", status: "failed" });
     return unavailable([`context cache lookup failed: ${errorMessage(error)}`]);
   }
-  if (cached !== undefined) return await pack(cached, true);
-
+  // A hit whose provenance names THIS base commit is an exact hit. A hit at an
+  // older commit is NOT consumed here: the delta decision needs the mirror and
+  // the repository lock, which the locked block below holds (#60).
+  if (cached !== undefined && cached.builtFromSha === request.baseSha) {
+    return await pack(cached, true);
+  }
   if (request.ruleNames.length === 0) {
     // Nothing would read the result. Mapping is the most expensive step in a
     // review; never pay for it to build packs no rule will be given.
@@ -490,7 +541,48 @@ export async function prepareReviewContext(
     // A failure is NOT fatal: the pre-lock lookup already succeeded, so this is
     // an optimisation and mapping remains the correct fallback.
     const alreadyPublished = await cache.lookupContext(key).catch(() => undefined);
-    if (alreadyPublished !== undefined) return await pack(alreadyPublished, true);
+    if (alreadyPublished !== undefined && alreadyPublished.builtFromSha === request.baseSha) {
+      return await pack(alreadyPublished, true);
+    }
+
+    // Issue #60: the entry is the repository's LIVING index, so a lookup whose
+    // provenance names an older commit is an incremental candidate, not a
+    // miss. The delta is measured in the managed mirror — both SHAs are
+    // objects it holds — and every uncertainty resolves to a full map, which
+    // is the behaviour the cache had before this path existed. Runs under the
+    // repository lock like everything else that reads the shared workspace.
+    let incremental: {
+      readonly manifest: ContextManifest;
+      readonly delta: ClassifiedBaseDelta;
+    } | undefined;
+    if (alreadyPublished !== undefined) {
+      const entryRoot = cache.entryPath(key);
+      const hasGraphs = alreadyPublished.artifacts.some((record) => record.kind === "knowledge-graph")
+        && alreadyPublished.artifacts.some((record) => record.kind === "domain-graph");
+      const domainStepPaths = hasGraphs ? await loadDomainStepPaths(entryRoot) : undefined;
+      const viable = hasGraphs
+        && domainStepPaths !== undefined
+        && alreadyPublished.generation < CONTEXT_GENERATION_CEILING;
+      if (viable && domainStepPaths !== undefined) {
+        try {
+          const delta = await (dependencies.computeDelta ?? defaultComputeDelta)({
+            mirrorPath: prepared.mirrorPath,
+            fromSha: alreadyPublished.builtFromSha,
+            toSha: request.baseSha,
+            domainStepPaths,
+          });
+          if (delta.kind === "incremental") {
+            incremental = { manifest: alreadyPublished, delta };
+          }
+        } catch {
+          // An unreadable mirror, a pruned old commit, a git failure — none of
+          // these say anything about the delta, and guessing one would publish
+          // a graph with an unmeasured hole. Full map, as before this path
+          // existed.
+          incremental = undefined;
+        }
+      }
+    }
 
   // Staging must live beneath the cache root — `promoteContext` refuses to
   // publish from anywhere else — and outside the source worktree, which
@@ -503,8 +595,13 @@ export async function prepareReviewContext(
   } catch (error) {
     return unavailable([`context staging directory could not be created: ${errorMessage(error)}`]);
   }
+  // The scoped session writes its own full artifact layout, which the patch
+  // reads from; it is NOT the published staging. Same root, own lifetime, same
+  // cleanup discipline.
+  let scopedStagingPath: string | undefined;
 
   let published: PublishedMapping | undefined;
+  let publishedIncrementally = false;
   // Collected rather than returned from inside the `try`. Under `require`,
   // `unavailable()` THROWS — so calling it in there would have the catch below
   // swallow its own ContextRequiredError and wrap it in a second one, handing
@@ -519,26 +616,37 @@ export async function prepareReviewContext(
   try {
     const mapper = await (dependencies.createMapper ?? defaultMapperFactory)();
     onProgress({ stage: "map", status: "started" });
-    const mapped = await mapper.map({
-      sourceRoot,
-      outputRoot: stagingPath,
-      baseSha: request.baseSha,
-      repository: request.repository,
-      ...(request.allowDegraded ? { allowDegradedContext: true } : {}),
-    });
-    if (mapped.status === "failed") {
-      onProgress({ stage: "map", status: "failed" });
-      failureReasons = [mapped.failure?.message ?? "mapping failed"];
-    } else if (mapped.status === "degraded") {
-      onProgress({ stage: "map", status: "completed" });
-      // A degraded map has a CONTEXT.md but no usable graph, and a pack
-      // without a knowledge graph is not something a rule can reason over.
-      // Report precisely what was missing instead of publishing an entry that
-      // could never produce a pack.
-      failureReasons = mapped.degradedReasons.length === 0
-        ? ["mapping degraded"]
-        : [...mapped.degradedReasons];
-    } else {
+    if (incremental !== undefined) {
+      // The patch path. The scoped session re-maps ONLY the delta at the new
+      // base; what enters the published graph is further restricted by the
+      // merge, so the merged graph differs from the parent by dropped nodes,
+      // stale marks, and delta-path nodes — nothing else.
+      const deltaPaths = [...incremental.delta.delta.added, ...incremental.delta.delta.changed];
+      let scopedGraph: Parameters<typeof patchEntryArtifacts>[0]["scopedGraph"];
+      if (deltaPaths.length > 0) {
+        const stagingRoot = path.join(cache.root, "staging");
+        scopedStagingPath = await mkdtemp(path.join(stagingRoot, `${randomUUID()}-scoped-`));
+        const scoped = await mapper.map({
+          sourceRoot,
+          outputRoot: scopedStagingPath,
+          baseSha: request.baseSha,
+          repository: request.repository,
+          ...(request.allowDegraded ? { allowDegradedContext: true } : {}),
+          scopePaths: deltaPaths,
+        });
+        if (scoped.status === "ready") {
+          scopedGraph = JSON.parse(
+            (await readFile(path.join(scopedStagingPath, KNOWLEDGE_PATH), "utf8")),
+          ) as Parameters<typeof patchEntryArtifacts>[0]["scopedGraph"];
+        }
+      }
+      const patched = await patchEntryArtifacts({
+        entryRoot: cache.entryPath(key),
+        stagingPath,
+        manifest: { builtFromSha: incremental.manifest.builtFromSha },
+        delta: incremental.delta.delta,
+        ...(scopedGraph === undefined ? {} : { scopedGraph }),
+      });
       onProgress({ stage: "map", status: "completed" });
       stage = "publish";
       onProgress({ stage: "publish", status: "started" });
@@ -546,11 +654,54 @@ export async function prepareReviewContext(
         cache,
         stagingPath,
         key,
-        mapped.artifactPaths,
-        mapped.degradedReasons,
+        patched.artifactPaths,
+        [...incremental.manifest.degradedReasons, ...patched.degradedReasons],
         now(),
+        {
+          builtFromSha: request.baseSha,
+          generation: incremental.manifest.generation + 1,
+          parentManifestHash: incremental.manifest.manifestHash,
+        },
       );
+      publishedIncrementally = published !== undefined;
       onProgress({ stage: "publish", status: published === undefined ? "failed" : "completed" });
+    } else {
+      const mapped = await mapper.map({
+        sourceRoot,
+        outputRoot: stagingPath,
+        baseSha: request.baseSha,
+        repository: request.repository,
+        ...(request.allowDegraded ? { allowDegradedContext: true } : {}),
+      });
+      if (mapped.status === "failed") {
+        onProgress({ stage: "map", status: "failed" });
+        failureReasons = [mapped.failure?.message ?? "mapping failed"];
+      } else if (mapped.status === "degraded") {
+        onProgress({ stage: "map", status: "completed" });
+        // A degraded map has a CONTEXT.md but no usable graph, and a pack
+        // without a knowledge graph is not something a rule can reason over.
+        // Report precisely what was missing instead of publishing an entry that
+        // could never produce a pack.
+        failureReasons = mapped.degradedReasons.length === 0
+          ? ["mapping degraded"]
+          : [...mapped.degradedReasons];
+      } else {
+        onProgress({ stage: "map", status: "completed" });
+        stage = "publish";
+        onProgress({ stage: "publish", status: "started" });
+        published = await publishMapping(
+          cache,
+          stagingPath,
+          key,
+          mapped.artifactPaths,
+          mapped.degradedReasons,
+          now(),
+          // A full map supersedes whatever entry the repository had: the CAS
+          // states "no expected parent", and the replacement retires it.
+          { builtFromSha: request.baseSha },
+        );
+        onProgress({ stage: "publish", status: published === undefined ? "failed" : "completed" });
+      }
     }
   } catch (error) {
     onProgress({ stage, status: "failed" });
@@ -559,13 +710,26 @@ export async function prepareReviewContext(
     // A successful promotion renames the staging directory away, so this only
     // ever removes what promotion left behind.
     await rm(stagingPath, { recursive: true, force: true }).catch(() => undefined);
+    if (scopedStagingPath !== undefined) {
+      await rm(scopedStagingPath, { recursive: true, force: true }).catch(() => undefined);
+    }
   }
 
   if (failureReasons !== undefined) return unavailable(failureReasons);
   if (published === undefined) {
     return unavailable(["context could not be published and no concurrent entry was found"]);
   }
-  return await pack(published.manifest, false, published.ours);
+  // Eviction runs here, inside the repository lock, after a successful
+  // publication: the entry just published is the newest of this repository's
+  // group, so it survives the keep-count, and a review already reading the
+  // previous entry holds its own reference to the manifest. Best-effort — an
+  // eviction failure costs disk, never the review.
+  try {
+    await cache.evictOlderEntries(EVICTION_KEEP_PER_REPOSITORY);
+  } catch {
+    // Deliberately absorbed: see the comment above.
+  }
+  return await pack(published.manifest, false, published.ours, publishedIncrementally);
     });
   } catch (error) {
     // `unavailable` THROWS under `require`, and everything inside the callback
@@ -584,4 +748,18 @@ export async function prepareReviewContext(
 async function defaultMapperFactory(): Promise<ContextMapper> {
   const { TgdPiMapper } = await import("./tgd-mapper.js");
   return new TgdPiMapper();
+}
+
+function defaultComputeDelta(input: {
+  readonly mirrorPath: string;
+  readonly fromSha: string;
+  readonly toSha: string;
+  readonly domainStepPaths: ReadonlySet<string>;
+}): Promise<ClassifiedBaseDelta> {
+  return computeBaseDelta(
+    mirrorGitRunner(input.mirrorPath),
+    input.fromSha,
+    input.toSha,
+    input.domainStepPaths,
+  );
 }

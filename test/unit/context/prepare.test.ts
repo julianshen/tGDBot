@@ -2,8 +2,9 @@ import { chmod, chown, mkdir, mkdtemp, readdir, realpath, rm, stat, symlink, uti
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ContextCache, ContextCacheConflictError, ContextCachePublicationInProgressError } from "../../../src/context/cache.js";
+import { computeManifestHash, ContextCache, ContextCacheConflictError, ContextCachePublicationInProgressError } from "../../../src/context/cache.js";
 import {
+  CONTEXT_GENERATION_CEILING,
   CONTEXT_MAPPER_VERSION,
   CONTEXT_POLICY_VERSION,
   CONTEXT_SCHEMA_VERSION,
@@ -12,6 +13,7 @@ import {
   contextFingerprint,
   prepareReviewContext,
 } from "../../../src/context/prepare.js";
+import type { ContextManifest } from "../../../src/context/types.js";
 import type { ContextMapRequest, ContextMapper, MappingResult } from "../../../src/context/mapper.js";
 import type { PrepareContextDependencies } from "../../../src/context/prepare.js";
 import type { PreparedWorkspace } from "../../../src/workspace/types.js";
@@ -46,7 +48,7 @@ async function tempRoot(): Promise<string> {
   return root;
 }
 
-function knowledgeGraph(): Record<string, unknown> {
+function knowledgeGraph(gitCommitHash: string = BASE_SHA): Record<string, unknown> {
   return {
     version: "1.0.0",
     kind: "codebase",
@@ -56,7 +58,7 @@ function knowledgeGraph(): Record<string, unknown> {
       frameworks: [],
       description: "Trusted test repository",
       analyzedAt: "2026-07-21T00:00:00.000Z",
-      gitCommitHash: BASE_SHA,
+      gitCommitHash,
     },
     nodes: [{
       id: "file:src/index.ts",
@@ -100,7 +102,7 @@ function stubMapper(overrides: {
       await writeFile(path.join(request.outputRoot, "CONTEXT.md"), "# Trusted context\n", "utf8");
       await writeFile(
         path.join(request.outputRoot, ".understand-anything/knowledge-graph.json"),
-        JSON.stringify(knowledgeGraph()),
+        JSON.stringify(knowledgeGraph(request.baseSha)),
         "utf8",
       );
       await writeFile(
@@ -195,12 +197,13 @@ describe("contextFingerprint", () => {
 
 describe("contextCacheKey", () => {
   it("pins the schema, mapper and policy identity into the key", () => {
-    expect(contextCacheKey({ repository, baseSha: BASE_SHA })).toEqual({
+    // Issue #60: the key is an identity — the base commit is deliberately
+    // absent, because the entry is the repository's living index.
+    expect(contextCacheKey({ repository })).toEqual({
       provider: "github",
       host: "github.com",
       owner: "octo-org",
       repo: "octo-repo",
-      baseSha: BASE_SHA,
       schemaVersion: CONTEXT_SCHEMA_VERSION,
       tgdVersion: CONTEXT_MAPPER_VERSION,
       policyVersion: CONTEXT_POLICY_VERSION,
@@ -513,7 +516,7 @@ describe("prepareReviewContext", () => {
       reasons: ["knowledge-graph-unavailable"],
     });
     const cache = new ContextCache(request.cacheRoot as string);
-    await expect(cache.lookupContext(contextCacheKey({ repository, baseSha: BASE_SHA })))
+    await expect(cache.lookupContext(contextCacheKey({ repository })))
       .resolves.toBeUndefined();
   });
 
@@ -806,7 +809,7 @@ describe("prepareReviewContext", () => {
   it("discards its own freshly published entry when the entry cannot render", async () => {
     const { worktree, request } = await baseRequest();
     const cache = new ContextCache(request.cacheRoot as string);
-    const key = contextCacheKey({ repository, baseSha: BASE_SHA });
+    const key = contextCacheKey({ repository });
 
     // Publication validates the artifacts against the same schema the renderer
     // parses, so a malformed graph never gets this far. What CAN get here is an
@@ -852,7 +855,7 @@ describe("prepareReviewContext", () => {
   // would destroy work this run did not do and cannot redo any better.
   it("leaves a concurrently published entry alone when the pack build fails", async () => {
     const { worktree, request } = await baseRequest();
-    const key = contextCacheKey({ repository, baseSha: BASE_SHA });
+    const key = contextCacheKey({ repository });
     // A real, complete entry, published by "another run".
     await prepareReviewContext(request, {
       prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
@@ -899,7 +902,7 @@ describe("prepareReviewContext", () => {
       createMapper: () => stubMapper(),
     });
     const cache = new ContextCache(request.cacheRoot as string);
-    const manifest = await cache.lookupContext(contextCacheKey({ repository, baseSha: BASE_SHA }));
+    const manifest = await cache.lookupContext(contextCacheKey({ repository }));
     expect(manifest).toBeDefined();
 
     // A hit whose artifacts are not where the renderer will look for them.
@@ -931,7 +934,7 @@ describe("prepareReviewContext", () => {
   it("publishes past a claim abandoned by a crashed publisher", async () => {
     const { worktree, request } = await baseRequest();
     const cache = new ContextCache(request.cacheRoot as string);
-    const key = contextCacheKey({ repository, baseSha: BASE_SHA });
+    const key = contextCacheKey({ repository });
     // Exactly what a crash mid-`promoteContext` leaves behind: the claim, with
     // the staged entry still inside it, and no process coming back for either.
     const claim = `${cache.entryPath(key)}.publishing`;
@@ -966,7 +969,7 @@ describe("prepareReviewContext", () => {
       createMapper: () => stubMapper(),
     });
     const published = await new ContextCache(request.cacheRoot as string)
-      .lookupContext(contextCacheKey({ repository, baseSha: BASE_SHA }));
+      .lookupContext(contextCacheKey({ repository }));
     expect(published).toBeDefined();
 
     // Now simulate the loser of a race: promotion reports the winner still
@@ -995,5 +998,238 @@ describe("prepareReviewContext", () => {
     });
 
     expect(prepared.status).toBe("ready");
+  });
+});
+
+// Issue #60: the entry is the repository's living index. A review at a newer
+// base with a warm entry from an older base measures the delta and decides
+// between an exact hit, an incremental patch, and a full re-map.
+describe("prepareReviewContext — the warm index (#60)", () => {
+  const NEW_SHA = "c".repeat(40);
+
+  /** A mapper stub that writes a domain-bearing graph pinned to the mapped commit. */
+  function stubDomainMapper(): ContextMapper & { calls: ContextMapRequest[] } {
+    const calls: ContextMapRequest[] = [];
+    return {
+      calls,
+      async map(request: ContextMapRequest): Promise<MappingResult> {
+        calls.push(request);
+        const artifactPaths = [
+          "CONTEXT.md",
+          ".understand-anything/knowledge-graph.json",
+          ".understand-anything/domain-graph.json",
+          ".understand-anything/mapping-metadata.json",
+        ];
+        await mkdir(path.join(request.outputRoot, ".understand-anything"), { recursive: true });
+        await writeFile(path.join(request.outputRoot, "CONTEXT.md"), "# Trusted context\n", "utf8");
+        const graph = knowledgeGraph(request.baseSha);
+        await writeFile(
+          path.join(request.outputRoot, ".understand-anything/knowledge-graph.json"),
+          JSON.stringify(graph),
+          "utf8",
+        );
+        await writeFile(
+          path.join(request.outputRoot, ".understand-anything/domain-graph.json"),
+          JSON.stringify({
+            version: "1.0.0",
+            project: { name: "octo-repo", languages: ["typescript"], frameworks: [], description: "domains", analyzedAt: "2026-07-21T00:00:00.000Z", gitCommitHash: request.baseSha },
+            nodes: [{ id: "domain:core", type: "domain", name: "core", summary: "Core domain", tags: [], complexity: "simple" }],
+            edges: [],
+            layers: [],
+            tour: [],
+          }),
+          "utf8",
+        );
+        await writeFile(
+          path.join(request.outputRoot, ".understand-anything/mapping-metadata.json"),
+          JSON.stringify({ version: 1, status: "complete", baseSha: request.baseSha }),
+          "utf8",
+        );
+        return {
+          status: "ready",
+          manifestPath: path.join(request.outputRoot, ".understand-anything/mapping-metadata.json"),
+          artifactPaths,
+          analyzedFiles: 1,
+          degradedReasons: [],
+        };
+      },
+    };
+  }
+
+  function incrementalDelta(overrides: Record<string, unknown> = {}) {
+    return {
+      delta: {
+        fromSha: BASE_SHA,
+        toSha: NEW_SHA,
+        commitCount: 1,
+        added: [],
+        changed: ["src/index.ts"],
+        deleted: [],
+        ...overrides,
+      },
+      kind: "incremental" as const,
+    };
+  }
+
+  async function warmCacheAtBase(request: Record<string, unknown>, baseSha: string = BASE_SHA): Promise<void> {
+    await prepareReviewContext({ ...request, baseSha } as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace((request as { workspaceRoot: string }).workspaceRoot) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => stubDomainMapper(),
+    });
+  }
+
+  it("reuses the cached graph on a small delta and re-maps ONLY the changed files", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await warmCacheAtBase(request, BASE_SHA);
+
+    const mapper = stubDomainMapper();
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.resolve(incrementalDelta()),
+    });
+
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(prepared.incremental).toBe(true);
+    expect(prepared.cacheHit).toBe(false);
+    // Exactly one scoped session, at the NEW base, scoped to the delta — and
+    // no full mapping session.
+    expect(mapper.calls).toHaveLength(1);
+    expect(mapper.calls[0]!.scopePaths).toEqual(["src/index.ts"]);
+    expect(mapper.calls[0]!.baseSha).toBe(NEW_SHA);
+    expect(mapper.calls[0]!.outputRoot).not.toBe(path.join((request.cacheRoot as string), "staging"));
+  });
+
+  it("does not start a scoped session at all when the delta only deletes", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await warmCacheAtBase(request, BASE_SHA);
+
+    const mapper = stubDomainMapper();
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.resolve(incrementalDelta({ changed: [], deleted: ["src/old.ts"] })),
+    });
+
+    expect(prepared.status).toBe("ready");
+    expect(mapper.calls).toHaveLength(0);
+    if (prepared.status !== "ready") return;
+    expect(prepared.incremental).toBe(true);
+  });
+
+  it("performs a full remap when the delta is large", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await warmCacheAtBase(request, BASE_SHA);
+
+    const mapper = stubDomainMapper();
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.resolve({
+        delta: { fromSha: BASE_SHA, toSha: NEW_SHA, commitCount: 40, added: [], changed: [], deleted: [] },
+        kind: "full",
+        reason: "too many commits",
+      }),
+    });
+
+    expect(prepared.status).toBe("ready");
+    expect(mapper.calls).toHaveLength(1);
+    expect(mapper.calls[0]!.scopePaths).toBeUndefined();
+    if (prepared.status !== "ready") return;
+    expect(prepared.incremental).toBe(false);
+    expect(prepared.cacheHit).toBe(false);
+  });
+
+  it("performs a full remap when the delta crosses a domain-graph flow file", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await warmCacheAtBase(request, BASE_SHA);
+
+    const mapper = stubDomainMapper();
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.resolve({
+        delta: { fromSha: BASE_SHA, toSha: NEW_SHA, commitCount: 1, added: [], changed: ["src/flow.ts"], deleted: [] },
+        kind: "full",
+        reason: "a file named by a domain-graph flow step changed",
+      }),
+    });
+
+    expect(prepared.status).toBe("ready");
+    expect(mapper.calls).toHaveLength(1);
+    expect(mapper.calls[0]!.scopePaths).toBeUndefined();
+  });
+
+  it("performs a full remap once the generation ceiling is reached", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await warmCacheAtBase(request, BASE_SHA);
+
+    const real = new ContextCache(request.cacheRoot as string);
+    const key = contextCacheKey({ repository });
+    const entry = await real.lookupContext(key);
+    expect(entry).toBeDefined();
+    // Artificially age the entry past the ceiling, re-signing the manifest the
+    // way buildManifest does so the only variable is the generation count.
+    const aged = { ...entry!, generation: CONTEXT_GENERATION_CEILING };
+    const agedManifest = aged as ContextManifest;
+    agedManifest.manifestHash = computeManifestHash(agedManifest);
+    await writeFile(
+      path.join(real.entryPath(key), "manifest.json"),
+      JSON.stringify(agedManifest),
+      "utf8",
+    );
+
+    const mapper = stubDomainMapper();
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.resolve(incrementalDelta()),
+    });
+
+    expect(prepared.status).toBe("ready");
+    expect(mapper.calls).toHaveLength(1);
+    expect(mapper.calls[0]!.scopePaths).toBeUndefined();
+  });
+
+  it("degrades to a full remap when the delta cannot be computed at all", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await warmCacheAtBase(request, BASE_SHA);
+
+    const mapper = stubDomainMapper();
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.reject(new Error("git mirror unreadable")),
+    });
+
+    expect(prepared.status).toBe("ready");
+    expect(mapper.calls).toHaveLength(1);
+    expect(mapper.calls[0]!.scopePaths).toBeUndefined();
+  });
+
+  it("publishes the patch atomically with parent provenance and a new manifest hash", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    await warmCacheAtBase(request, BASE_SHA);
+
+    const real = new ContextCache(request.cacheRoot as string);
+    const key = contextCacheKey({ repository });
+    const parent = await real.lookupContext(key);
+    expect(parent).toBeDefined();
+
+    const prepared = await prepareReviewContext(request as unknown as Parameters<typeof prepareReviewContext>[0], {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => stubDomainMapper(),
+      computeDelta: () => Promise.resolve(incrementalDelta()),
+    });
+    expect(prepared.status).toBe("ready");
+
+    const patched = await real.lookupContext(key);
+    expect(patched).toBeDefined();
+    if (patched === undefined || parent === undefined) return;
+    expect(patched.builtFromSha).toBe(NEW_SHA);
+    expect(patched.parentManifestHash).toBe(parent.manifestHash);
+    expect(patched.generation).toBe(parent.generation + 1);
+    expect(patched.manifestHash).not.toBe(parent.manifestHash);
   });
 });
