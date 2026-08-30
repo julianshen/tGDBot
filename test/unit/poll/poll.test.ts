@@ -1739,13 +1739,14 @@ describe("clarification answer lifecycle", () => {
     const inline = vcs.postedInlines.map((entry) => entry.body).join("\n");
     expect(inline).toMatch(/LEXICAL matches/);
     expect(inline).toContain("src/queue.ts:12");
-    // And the durable snapshot strips both fields — FindingSnapshot omits
-    // them so a stale check can never be replayed (pre-fix, this write
-    // THREW and the answer was never durably recorded).
+    // And the durable snapshot preserves the claim as UNCHECKED data for the
+    // retry path (issue #79; Codex review of PR #100), while the hostCheck is
+    // stripped — a stale verification must never be replayed. Pre-fix, this
+    // write THREW outright and the answer was never durably recorded.
     const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
     const frozen = snapshot.pending.clarifications[0]?.frozenOutcome;
     expect(frozen?.outcome).toBe("confirmed");
-    expect(JSON.stringify(frozen)).not.toContain("claim");
+    expect(frozen?.claim).toMatchObject({ symbol: "token" });
     expect(JSON.stringify(frozen)).not.toContain("hostCheck");
   });
 
@@ -1792,6 +1793,91 @@ describe("clarification answer lifecycle", () => {
     expect(inline).not.toContain("/home/runner");
     expect(warn.mock.calls.flat().join(" ")).toContain("/home/runner");
     vi.restoreAllMocks();
+  });
+
+  // Codex review of PR #100 (P1): a transient publication failure must not
+  // bypass answer-time verification. The claim survives in the frozen outcome
+  // as unchecked data, so the retry re-runs the fresh check against the base
+  // as it is THEN — it never republishes a stripped snapshot unverified.
+  it("re-checks a clarified claim when publication fails transiently", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    const prepare = vi.fn().mockResolvedValue({
+      root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
+      worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
+      ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
+    });
+    const check = vi.fn().mockImplementation(async (input: { findings: readonly unknown[] }) =>
+      input.findings.map((entry) => ({
+        ...entry,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })));
+    const vcs = silentReviewVcs();
+    // The FIRST publication attempt dies before its manifest is durable.
+    let findBotCommentCalls = 0;
+    // The FIRST publication attempt dies before its manifest is durable.
+    let findBotCommentCalled = false;
+    vcs.adapter.findBotComment = vi.fn(async () => {
+      if (!findBotCommentCalled) {
+        findBotCommentCalled = true;
+        throw new Error("transient provider outage");
+      }
+      // No bot comment exists in this fixture; null matches the original mock.
+      return null;
+    });
+
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The current hunk still logs the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+            claim: { kind: "no-other-references", symbol: "token" },
+          },
+        })),
+      }),
+      prepareStructuralWorkspace: prepare,
+      runStructuralChecks: check,
+    })).resolves.toBe(1);
+    expect(check).toHaveBeenCalledTimes(1);
+
+    // The retry: no new model call, but a FRESH check against the base as it
+    // is now, and a fully evidenced publication.
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), {
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({ outcome: "withdrawn", rationale: "must not be consulted" })),
+      }),
+      prepareStructuralWorkspace: prepare,
+      runStructuralChecks: check,
+    })).resolves.toBe(0);
+    expect(check).toHaveBeenCalledTimes(2);
+    const inline = vcs.postedInlines.map((entry) => entry.body).join("\n");
+    expect(inline).toMatch(/LEXICAL matches/);
+    expect(inline).toContain("src/queue.ts:12");
   });
 
   it("prepares no worktree for a clarified claim when the feature is off", async () => {

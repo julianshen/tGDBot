@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type { ConversationItemIdentity, ConversationPlacement, RepositoryBinding } from "./types.js";
 import { computeContentDigest, parseChildMarker } from "./markers.js";
+import { parseStructuralClaim, type StructuralClaim } from "../review/structural-check.js";
 
 const DIGEST_RE = /^[0-9a-f]{64}$/u;
 const SHA_RE = /^[0-9a-f]{7,64}$/iu;
@@ -61,6 +62,14 @@ export interface FrozenClarificationOutcome {
   readonly outcome: Exclude<ClarificationTerminalOutcome, "stale">;
   readonly rationale: string;
   readonly finding?: FindingSnapshot;
+  /**
+   * The reassessed finding's structural claim, preserved UNCHECKED (issue
+   * #79). The claim is model output a publication retry needs to re-run the
+   * fresh check against the base as it is THEN — while `hostCheck` stays
+   * deliberately unpersisted, because a stale verification replayed against
+   * a newer base is the failure this design exists to prevent.
+   */
+  readonly claim?: StructuralClaim;
 }
 
 export interface PendingClarification {
@@ -764,7 +773,7 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
       const answerIdentity = item.answerIdentity === undefined ? undefined :
         conversationItemIdentity(item.answerIdentity, "pending clarification answer identity");
       const frozenOutcome = item.frozenOutcome === undefined ? undefined : (() => {
-        const frozen = exact(item.frozenOutcome, "pending clarification frozenOutcome", ["outcome", "rationale"], ["finding"]);
+        const frozen = exact(item.frozenOutcome, "pending clarification frozenOutcome", ["outcome", "rationale"], ["finding", "claim"]);
         if (frozen.outcome !== "confirmed" && frozen.outcome !== "revised" && frozen.outcome !== "withdrawn") {
           throw new Error("pending clarification frozenOutcome.outcome is invalid");
         }
@@ -776,10 +785,22 @@ export function validatePendingSnapshot(value: unknown, expected: RepositoryBind
         if (frozen.outcome === "withdrawn" && finding !== undefined) {
           throw new Error("withdrawn clarification frozenOutcome cannot contain a finding");
         }
+        // Issue #79: the claim is preserved UNCHECKED so a publication retry
+        // can re-run the fresh check; only the check result itself is
+        // unpersistable. Validated with the same strict parser the reviewer
+        // output gets — a corrupt claim is a corrupt ledger.
+        const claim = frozen.claim === undefined ? undefined : parseStructuralClaim(frozen.claim);
+        if (frozen.claim !== undefined && claim === undefined) {
+          throw new Error("pending clarification frozenOutcome.claim is invalid");
+        }
+        if (frozen.outcome === "withdrawn" && claim !== undefined) {
+          throw new Error("withdrawn clarification frozenOutcome cannot contain a claim");
+        }
         return {
           outcome: frozen.outcome,
           rationale: text(frozen.rationale, "pending clarification frozenOutcome.rationale"),
           ...(finding === undefined ? {} : { finding }),
+          ...(claim === undefined ? {} : { claim }),
         } satisfies FrozenClarificationOutcome;
       })();
       if (validatedIdentity !== undefined && validatedIdentity.provider !== expected.provider) {
