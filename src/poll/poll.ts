@@ -919,6 +919,7 @@ function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): Review
     // different one (PR #54 review).
     dependencyFacts: config.dependencyFacts,
     structuralChecks: config.structuralChecks,
+    prIntent: config.prIntent,
     suggestions: config.suggestions,
     dryRun: config.dryRun,
     trustLocalRules: config.trustLocalRules,

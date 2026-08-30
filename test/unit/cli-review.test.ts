@@ -19,6 +19,7 @@ import { poll } from "../../src/poll/poll.js";
 import type { CliArgs, ReviewDependencies } from "../../src/cli.js";
 import type { PreparedWorkspace, WorkspaceRequest } from "../../src/workspace/types.js";
 import { computeReviewConfigHash, conversationDedupFingerprint, formatMarker, stateRootDomainIdentifier } from "../../src/review/dedup.js";
+import { prIntentFingerprint, sanitizePrIntent } from "../../src/review/pr-intent.js";
 import { BOT_SIGNATURE, BOT_SIGNATURE_BLOCK } from "../../src/review/comment-format.js";
 import { extractRelatedWork, relatedWorkFingerprint } from "../../src/review/related-work.js";
 import { ContextRequiredError, contextFingerprint } from "../../src/context/prepare.js";
@@ -222,6 +223,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     rulesDir: ".review/rules",
     disableBuiltinRule: false,
     advisor: "on",
+    prIntent: "on",
     suggestions: "on",
     dependencyFacts: "off",
     dryRun: false,
@@ -245,6 +247,32 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
 
 const DEFAULT_PR_URL = "https://github.com/acme/app/pull/42";
 const DEFAULT_REVIEW_ID = "PR_kwDOTest42";
+
+/**
+ * The config hash the review() flow actually computes for the harness's
+ * default PR (title "Some PR", description "Some description"): the pure
+ * dedup hash plus, when --pr-intent is on (the default), the intent digest
+ * issue #59 folds in so a description edit re-triggers. Related-work
+ * fingerprint tests pass their own value with --pr-intent off to exercise
+ * the pre-#59 semantics in isolation.
+ */
+function expectedConfigHash(
+  config: Parameters<typeof computeReviewConfigHash>[0],
+  relatedWork?: string,
+  conversation?: string,
+  context?: string,
+): string {
+  const intent = config.prIntent === "off"
+    ? undefined
+    : prIntentFingerprint(sanitizePrIntent({ title: "Some PR", description: "Some description" }));
+  const parts = [relatedWork, intent].filter((value): value is string => value !== undefined);
+  return computeReviewConfigHash(
+    config,
+    parts.length === 0 ? undefined : parts.join("\n"),
+    conversation,
+    context,
+  );
+}
 
 function makePr(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
   return {
@@ -471,7 +499,7 @@ describe("review", () => {
     const pr = makePr({ headSha: "cafef00d" });
     // A skip now requires BOTH the head SHA and the review-config hash to match —
     // the marker records the config the last review ran with (see #4 / dedup).
-    const cfg = computeReviewConfigHash(makeArgs());
+    const cfg = expectedConfigHash(makeArgs());
     const botComment: BotComment = {
       id: "999",
       body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
@@ -508,7 +536,7 @@ describe("review", () => {
     // root: without one it resolves the real user-level root and every parallel
     // worker contends on that single lock.
     const args = makeArgs({ stateDir: isolatedStateDir() });
-    const cfg = computeReviewConfigHash(args);
+    const cfg = expectedConfigHash(args);
     const botComment: BotComment = {
       id: "999",
       body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
@@ -550,7 +578,7 @@ describe("review", () => {
 
   it("runs a focused command even when the normal summary already covers the head", async () => {
     const args = makeArgs({ stateDir: isolatedStateDir() });
-    const cfg = computeReviewConfigHash(args);
+    const cfg = expectedConfigHash(args);
     const h = makeHarness({
       args,
       botComment: {
@@ -793,7 +821,7 @@ describe("review", () => {
       pr: "https://gitlab.example.com/group/project/-/merge_requests/42",
       vcs: "gitlab",
     });
-    const cfg = computeReviewConfigHash(args);
+    const cfg = expectedConfigHash(args);
     const botComment: BotComment = {
       id: "303",
       body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
@@ -816,16 +844,17 @@ describe("review", () => {
   it("re-reviews the same SHA only when normalized related references change", async () => {
     const url = "https://github.com/acme/app/pull/42";
     const priorInput = { provider: "github" as const, reviewUrl: url, title: "Fixes #7", description: "notes" };
-    const cfg = computeReviewConfigHash(makeArgs(), relatedWorkFingerprint(extractRelatedWork(priorInput)));
+    const args = makeArgs({ prIntent: "off" });
+    const cfg = expectedConfigHash(args, relatedWorkFingerprint(extractRelatedWork(priorInput)));
     const botComment: BotComment = { id: "999", body: formatMarker("cafef00d", cfg), lastReviewedSha: "cafef00d", reviewedConfig: cfg };
 
-    const unchanged = makeHarness({ botComment, pr: makePr({ url, title: "Fixes #7", description: "unrelated wording changed" }) });
+    const unchanged = makeHarness({ args, botComment, pr: makePr({ url, title: "Fixes #7", description: "unrelated wording changed" }) });
     await review(unchanged.args, depsFrom(unchanged));
     expect(unchanged.dispatchRules).not.toHaveBeenCalled();
     expect(unchanged.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
 
     for (const title of ["Fixes #8", "No related work"]) {
-      const changed = makeHarness({ botComment, pr: makePr({ url, title, description: "unrelated wording changed" }) });
+      const changed = makeHarness({ args, botComment, pr: makePr({ url, title, description: "unrelated wording changed" }) });
       await review(changed.args, depsFrom(changed));
       expect(changed.dispatchRules).toHaveBeenCalledOnce();
       if (title.includes("#")) expect(changed.vcsAdapter.resolveRelatedWork).toHaveBeenCalledOnce();
@@ -836,17 +865,18 @@ describe("review", () => {
   it("ignores changes beyond the first ten references but re-reviews shorthand changed to an explicit pull", async () => {
     const url = "https://github.com/acme/app/pull/42";
     const ten = Array.from({ length: 10 }, (_, i) => `#${i + 1}`).join(" ");
-    const configFor = (title: string) => computeReviewConfigHash(makeArgs(), relatedWorkFingerprint(extractRelatedWork({ provider: "github", reviewUrl: url, title, description: "" })));
+    const configFor = (title: string) => expectedConfigHash(makeArgs({ prIntent: "off" }), relatedWorkFingerprint(extractRelatedWork({ provider: "github", reviewUrl: url, title, description: "" })));
     const cappedCfg = configFor(`${ten} #11`);
     const cappedComment: BotComment = { id: "999", body: formatMarker("cafef00d", cappedCfg), lastReviewedSha: "cafef00d", reviewedConfig: cappedCfg };
-    const eleventhChanged = makeHarness({ botComment: cappedComment, pr: makePr({ url, title: `${ten} #12`, description: "" }) });
+    const offArgs = makeArgs({ prIntent: "off" });
+    const eleventhChanged = makeHarness({ args: offArgs, botComment: cappedComment, pr: makePr({ url, title: `${ten} #12`, description: "" }) });
     await review(eleventhChanged.args, depsFrom(eleventhChanged));
     expect(eleventhChanged.dispatchRules).not.toHaveBeenCalled();
     expect(eleventhChanged.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
 
     const shorthandCfg = configFor("#3");
     const shorthandComment: BotComment = { id: "999", body: formatMarker("cafef00d", shorthandCfg), lastReviewedSha: "cafef00d", reviewedConfig: shorthandCfg };
-    const explicitPull = makeHarness({ botComment: shorthandComment, pr: makePr({ url, title: "https://github.com/acme/app/pull/3", description: "" }) });
+    const explicitPull = makeHarness({ args: offArgs, botComment: shorthandComment, pr: makePr({ url, title: "https://github.com/acme/app/pull/3", description: "" }) });
     explicitPull.vcsAdapter.resolveRelatedWork.mockRejectedValue(new Error("lookup failed"));
     explicitPull.orchestrate.mockImplementation(buildPresentation);
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -879,7 +909,7 @@ describe("review", () => {
 
   it("fails closed for a current ready recovery note with the wrong exact note binding", async () => {
     const h = makeHarness({ botComment: null });
-    const configHash = computeReviewConfigHash(h.config);
+    const configHash = expectedConfigHash(h.config);
     const body = formatPendingMarker({
       phase: "ready",
       headSha: "cafef00d",
@@ -912,7 +942,7 @@ describe("review", () => {
       args: makeArgs({ dryRun: true }),
       botComment: null,
     });
-    const configHash = computeReviewConfigHash(h.config);
+    const configHash = expectedConfigHash(h.config);
     const body = formatPendingMarker({
       phase: "ready",
       headSha: "cafef00d",
@@ -945,7 +975,7 @@ describe("review", () => {
       args: makeArgs({ dryRun: true }),
       botComment: null,
     });
-    const configHash = computeReviewConfigHash(h.config);
+    const configHash = expectedConfigHash(h.config);
     const body = formatPendingMarker({
       phase: "ready",
       headSha: "cafef00d",
@@ -991,7 +1021,7 @@ describe("review", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
     // With a URL: the URL is logged, even though this run is skipped by dedup.
-    const cfg = computeReviewConfigHash(makeArgs());
+    const cfg = expectedConfigHash(makeArgs());
     const withUrl = makeHarness({
       pr: makePr({ headSha: "cafef00d", url: "https://github.com/octo-org/octo-repo/pull/42" }),
       botComment: {
@@ -1158,6 +1188,8 @@ describe("review", () => {
       diff: "diff --git a/x b/x",
       useAdvisor: true,
       orchestratorModel: undefined,
+      // Issue #59: the PR's stated intent rides along as untrusted evidence.
+      prIntent: { title: "Some PR", description: "Some description" },
     });
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
 
@@ -1197,7 +1229,7 @@ describe("review", () => {
     });
 
     it("a dedup-skipped run never resolves threads", async () => {
-      const cfg = computeReviewConfigHash(makeArgs());
+      const cfg = expectedConfigHash(makeArgs());
       const h = makeHarness({
         pr: makePr({ headSha: "cafef00d" }),
         botComment: {
@@ -2172,9 +2204,9 @@ describe("inline review comments", () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
         id: "909",
-        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${computeReviewConfigHash(h.config)} -->`,
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${expectedConfigHash(h.config)} -->`,
         lastReviewedSha: "cafef00d",
-        reviewedConfig: computeReviewConfigHash(h.config),
+        reviewedConfig: expectedConfigHash(h.config),
       });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -2211,9 +2243,9 @@ describe("inline review comments", () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
         id: "909",
-        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${computeReviewConfigHash(h.config)} -->`,
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${expectedConfigHash(h.config)} -->`,
         lastReviewedSha: "cafef00d",
-        reviewedConfig: computeReviewConfigHash(h.config),
+        reviewedConfig: expectedConfigHash(h.config),
       });
 
     await review(h.args, depsFrom(h));
@@ -2250,7 +2282,7 @@ describe("inline review comments", () => {
         id: "competing-999",
         body: "competing",
         lastReviewedSha: "cafef00d",
-        reviewedConfig: computeReviewConfigHash(h.config),
+        reviewedConfig: expectedConfigHash(h.config),
       });
     h.vcsAdapter.upsertComment.mockImplementation(
       (_locator, body: string) => Promise.resolve({
@@ -2313,7 +2345,7 @@ describe("inline review comments", () => {
     expect(stored).toMatchObject({
       id: "written-777",
       lastReviewedSha: "cafef00d",
-      reviewedConfig: computeReviewConfigHash(h.config),
+      reviewedConfig: expectedConfigHash(h.config),
     });
   });
 
@@ -2357,7 +2389,7 @@ describe("inline review comments", () => {
     expect(stored).toMatchObject({
       id: "written-777",
       lastReviewedSha: "cafef00d",
-      reviewedConfig: computeReviewConfigHash(h.config),
+      reviewedConfig: expectedConfigHash(h.config),
     });
     expect(stored?.body).not.toContain("finding 0");
     expect(stored?.body).toContain("finding 1");
@@ -2497,9 +2529,9 @@ describe("inline review comments", () => {
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce({
         id: "909",
-        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${computeReviewConfigHash(h.config)} -->`,
+        body: `<!-- tgd-review-agent:sha=cafef00d cfg=${expectedConfigHash(h.config)} -->`,
         lastReviewedSha: "cafef00d",
-        reviewedConfig: computeReviewConfigHash(h.config),
+        reviewedConfig: expectedConfigHash(h.config),
       });
     vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -2600,14 +2632,17 @@ describe("inline review comments", () => {
     vi.restoreAllMocks();
   });
 
-  it("does not resolve without references or when dispatch rejects", async () => {
+  it("does not resolve without references", async () => {
     const none = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42" }) });
     await review(none.args, depsFrom(none));
     expect(none.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
+    // Issue #59 moved resolution BEFORE dispatch (the resolved titles/states
+    // feed the intent section), so a dispatch rejection can no longer promise
+    // that the resolver was never called — it runs first, best-effort, and
+    // its failure is non-fatal either way.
     const failed = makeHarness({ pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" }) });
     failed.dispatchRules.mockRejectedValue(new Error("dispatch failed"));
     await expect(review(failed.args, depsFrom(failed))).rejects.toThrow("dispatch failed");
-    expect(failed.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
   });
 
   it("wires GitLab references through resolution and renders the related-work section", async () => {
@@ -2630,16 +2665,91 @@ describe("inline review comments", () => {
   });
 
   it.each([false, true])("does not resolve current ready recovery references (dryRun=%s)", async (dryRun) => {
-    const args = makeArgs({ dryRun });
+    const args = makeArgs({ dryRun, prIntent: "off" });
     const pr = makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7" });
     const h = makeHarness({ args, botComment: null, pr });
     const fingerprint = relatedWorkFingerprint(extractRelatedWork({ provider: "github", reviewUrl: pr.url!, title: pr.title, description: pr.description }));
-    const body = formatPendingMarker({ phase: "ready", headSha: "cafef00d", configHash: computeReviewConfigHash(h.config, fingerprint), noteId: "written-777", terminalResult: { status: "posted", findingsCount: 0, rulesRun: ["rule-a"], rulesFailed: [], exitCode: 0 } });
+    const body = formatPendingMarker({ phase: "ready", headSha: "cafef00d", configHash: expectedConfigHash(h.config, fingerprint), noteId: "written-777", terminalResult: { status: "posted", findingsCount: 0, rulesRun: ["rule-a"], rulesFailed: [], exitCode: 0 } });
     h.vcsAdapter.findBotComment.mockResolvedValue({ id: "written-777", body, ...parseBotMarker(body)! });
     vi.spyOn(console, "log").mockImplementation(() => {});
     await review(h.args, depsFrom(h));
     expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     vi.restoreAllMocks();
+  });
+
+  // Issue #59: the PR's stated intent reaches dispatch as sanitized
+  // untrusted evidence, and editing the prose re-triggers a review.
+  describe("issue #59: PR intent as untrusted evidence", () => {
+    it("dispatches the sanitized intent and --pr-intent off dispatches none", async () => {
+      const on = makeHarness({
+        pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Intent check", description: "Makes the budget per-host." }),
+      });
+      on.vcsAdapter.resolveRelatedWork.mockResolvedValue([]);
+      on.orchestrate.mockImplementation(buildPresentation);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      await review(on.args, depsFrom(on));
+
+      const dispatched = on.dispatchRules.mock.calls[0]?.[0] as { prIntent?: unknown };
+      expect(dispatched.prIntent).toEqual({ title: "Intent check", description: "Makes the budget per-host." });
+
+      const off = makeHarness({
+        args: makeArgs({ prIntent: "off" }),
+        pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Intent check", description: "Makes the budget per-host." }),
+      });
+      off.vcsAdapter.resolveRelatedWork.mockResolvedValue([]);
+      off.orchestrate.mockImplementation(buildPresentation);
+      await review(off.args, depsFrom(off));
+      const offDispatched = off.dispatchRules.mock.calls[0]?.[0] as { prIntent?: unknown };
+      expect("prIntent" in offDispatched).toBe(false);
+      vi.restoreAllMocks();
+    });
+
+    it("carries resolved linked-reference titles and states into the intent", async () => {
+      const h = makeHarness({
+        pr: makePr({ url: "https://github.com/acme/app/pull/42", title: "Fixes #7", description: "as discussed" }),
+      });
+      h.vcsAdapter.resolveRelatedWork.mockImplementation((refs) => Promise.resolve((refs as readonly Record<string, unknown>[]).map((ref) => ({
+        ...ref,
+        kind: "issue",
+        title: `Linked work ${ref.number}`,
+        state: "closed",
+        url: `https://github.com/acme/app/issues/${String(ref.number)}`,
+      }))));
+      h.orchestrate.mockImplementation(buildPresentation);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      await review(h.args, depsFrom(h));
+
+      const dispatched = h.dispatchRules.mock.calls[0]?.[0] as {
+        prIntent?: { linked?: readonly { identifier: string; title?: string; state?: string }[] };
+      };
+      expect(dispatched.prIntent?.linked).toEqual([
+        { identifier: "#7", title: "Linked work 7", state: "closed" },
+      ]);
+      vi.restoreAllMocks();
+    });
+
+    it("re-reviews an unchanged head when the PR description is edited", async () => {
+      const url = "https://github.com/acme/app/pull/42";
+      const priorDescription = "Makes the budget per-host.";
+      const cfg = computeReviewConfigHash(
+        makeArgs(),
+        [
+          relatedWorkFingerprint(extractRelatedWork({ provider: "github", reviewUrl: url, title: "Some PR", description: priorDescription })),
+          prIntentFingerprint(sanitizePrIntent({ title: "Some PR", description: priorDescription })),
+        ].filter((value) => value !== undefined).join("\n"),
+      );
+      const botComment: BotComment = { id: "999", body: formatMarker("cafef00d", cfg), lastReviewedSha: "cafef00d", reviewedConfig: cfg };
+
+      const unchanged = makeHarness({ botComment, pr: makePr({ url, description: priorDescription }) });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+      await review(unchanged.args, depsFrom(unchanged));
+      expect(unchanged.dispatchRules).not.toHaveBeenCalled();
+
+      const edited = makeHarness({ botComment, pr: makePr({ url, description: "EDITED after the review ran" }) });
+      await review(edited.args, depsFrom(edited));
+      expect(edited.dispatchRules).toHaveBeenCalledOnce();
+      logSpy.mockRestore();
+    });
   });
 
   it("caps resolver input at ten unique references after dedup and warns without title/body data", async () => {
@@ -2987,7 +3097,7 @@ describe("review publication crash-matrix", () => {
     expect(second.vcsAdapter.createInlineReview).not.toHaveBeenCalled();
     expect(stored?.pendingState).toBeUndefined();
     expect(stored?.lastReviewedSha).toBe("cafef00d");
-    expect(stored?.reviewedConfig).toBe(computeReviewConfigHash(second.config));
+    expect(stored?.reviewedConfig).toBe(expectedConfigHash(second.config));
     expect(stored?.body).not.toContain("finding 0");
     expect(stored?.body).toContain("finding 1");
     expect(stored?.body).not.toContain("finding 2");
@@ -3301,7 +3411,7 @@ describe("conversation-aware review", () => {
       memories: [{ id: `memory_${"a".repeat(32)}`, revision: "2026-08-14T00:00:00.000Z" }],
       stateRootDomain: stateRootDomainIdentifier(first.args.stateDir!),
     });
-    expect(parsed.reviewedConfig).toBe(computeReviewConfigHash(first.config, undefined, fingerprint));
+    expect(parsed.reviewedConfig).toBe(expectedConfigHash(first.config, undefined, fingerprint));
 
     const unchanged = conversationHarness({
       botComment: { id: "999", body: posted, lastReviewedSha: CONVERSATION_HEAD, reviewedConfig: parsed.reviewedConfig },
@@ -4327,7 +4437,7 @@ describe("repository context", () => {
   it("prepares context only after the dedup skip, so a skipped run never maps", async () => {
     const args = makeArgs({ context: "auto" });
     const pr = makePr({ headSha: "cafef00d" });
-    const cfg = computeReviewConfigHash(
+    const cfg = expectedConfigHash(
       args,
       undefined,
       undefined,
@@ -4486,7 +4596,7 @@ describe("repository context", () => {
   it("re-reviews when the context mode changes, because the config hash moves", async () => {
     const pr = makePr({ headSha: "cafef00d" });
     const offArgs = makeArgs({ context: "off" });
-    const offHash = computeReviewConfigHash(offArgs);
+    const offHash = expectedConfigHash(offArgs);
     const h = makeHarness({
       args: makeArgs({ context: "auto" }),
       pr,

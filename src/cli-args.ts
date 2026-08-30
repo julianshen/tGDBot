@@ -23,6 +23,12 @@ export interface SharedReviewOptions {
   dependencyFacts: "on" | "off";
   /** Issue #75: check a finding's structural claim against the base tree. */
   structuralChecks: "on" | "off";
+  /**
+   * Issue #59: give the dispatched reviewer the PR's stated intent (title,
+   * description, linked-reference titles/states) as untrusted evidence. Off
+   * for anyone who would rather their reviewer never read author prose.
+   */
+  prIntent: "on" | "off";
   /** Controls whether findings may render committable suggestion blocks. */
   suggestions: "on" | "off";
   dryRun: boolean;
@@ -69,6 +75,10 @@ const DEFAULTS = {
   // Off for v1: it needs a base worktree, which on a cold managed workspace
   // means a clone. Opt in until that cost is measured rather than assumed.
   structuralChecks: "off" as const,
+  // On by default: intent is bounded, boundary-tokened untrusted evidence,
+  // and a reviewer that cannot read what the PR says it is doing reports
+  // deliberate behaviour changes as regressions (issue #59).
+  prIntent: "on" as const,
   suggestions: "on" as const,
   dryRun: false,
   trustLocalRules: false,
@@ -96,6 +106,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       advisor: { type: "string" },
       "dependency-facts": { type: "string" },
       "structural-checks": { type: "string" },
+      "pr-intent": { type: "string" },
       suggestions: { type: "string" },
       model: { type: "string" },
       "dry-run": { type: "boolean" },
@@ -162,6 +173,11 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     throw new Error(
       `Invalid --structural-checks value: "${structuralChecks}" (expected "on" or "off")`,
     );
+  }
+
+  const prIntent = (values["pr-intent"] as string | undefined) ?? DEFAULTS.prIntent;
+  if (prIntent !== "on" && prIntent !== "off") {
+    throw new Error(`Invalid --pr-intent value: "${prIntent}" (expected "on" or "off")`);
   }
 
   const suggestions = (values.suggestions as string | undefined) ?? DEFAULTS.suggestions;
@@ -245,6 +261,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     advisor,
     dependencyFacts,
     structuralChecks,
+    prIntent,
     suggestions,
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
     trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,

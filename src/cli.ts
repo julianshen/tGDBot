@@ -83,6 +83,8 @@ import type { DispatchResult, Finding, ReviewDispatchInput } from "./review/type
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
+import { prIntentFingerprint, sanitizePrIntent } from "./review/pr-intent.js";
+import type { ExtractRelatedWorkResult } from "./review/related-work.js";
 import {
   ContextRequiredError,
   contextFingerprint,
@@ -867,6 +869,30 @@ async function fetchJsonReal(url: string, request?: FetchJsonRequest): Promise<u
 }
 
 /**
+ * Issue #59: the dedup fingerprint that a PR-prose edit must change. Combines
+ * the existing reference-identity fingerprint with a digest of the normalized
+ * title + description — but ONLY when intent is enabled: with `--pr-intent
+ * off` the prose never reaches a reviewer, so it must not reach the hash
+ * either, and flipping the flag on still changes the hash (it changes the
+ * review). Undefined inputs collapse away so a review with no intent at all
+ * hashes exactly as before.
+ */
+function relatedWorkFingerprintWithIntent(
+  config: { prIntent: "on" | "off" },
+  extracted: ExtractRelatedWorkResult,
+  title: string,
+  description: string,
+): string | undefined {
+  const parts = [
+    relatedWorkFingerprint(extracted),
+    ...(config.prIntent === "off"
+      ? []
+      : [prIntentFingerprint(sanitizePrIntent({ title, description }))]),
+  ].filter((value): value is string => value !== undefined);
+  return parts.length === 0 ? undefined : parts.join("\n");
+}
+
+/**
  * The actual `review` command flow: resolve config, fetch the PR + existing
  * bot comment, decide dedup, load + dispatch rules, orchestrate the merged
  * findings, and upsert (or dry-run print) the final comment.
@@ -895,6 +921,7 @@ export async function review(
             input.orchestratorModel,
             input.conversationContext,
             input.contextPacks,
+            input.prIntent,
           )
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
@@ -1047,7 +1074,12 @@ export async function review(
   });
   const configHash = computeReviewConfigHash(
     config,
-    relatedWorkFingerprint(extracted),
+    // Issue #59: when intent is enabled, the normalized title + description
+    // digest rides along with the reference identities, so EDITING the PR
+    // description re-triggers a review on an unchanged head instead of
+    // matching a stale marker. When off, nothing about the prose takes part
+    // and the hash is what it always was.
+    relatedWorkFingerprintWithIntent(config, extracted, pr.title, pr.description),
     loadedContext.fingerprint,
     ...(contextIdentity === undefined ? [] : [contextIdentity]),
   );
@@ -1482,6 +1514,34 @@ export async function review(
   const contextPacks = combinedPacks.size === rules.length && combinedPacks.size > 0
     ? Object.fromEntries(combinedPacks)
     : undefined;
+  // Issue #59: the linked references' resolved titles and states are part of
+  // the intent section, so the resolver runs BEFORE dispatch — but only after
+  // the dedup decision above, so a skipped review still fetches nothing.
+  if (extracted.omittedCount > 0) {
+    console.warn(`tgd-review-agent: ${extracted.omittedCount} additional related-work reference(s) omitted`);
+  }
+  let relatedWork: readonly RelatedWorkItem[] = extracted.references;
+  if (extracted.references.length > 0) {
+    try {
+      const output: unknown = await config.vcsAdapter.resolveRelatedWork(extracted.references);
+      relatedWork = reconcileRelatedWork(extracted.references, output);
+    } catch {
+      for (const reference of extracted.references) {
+        console.warn(`tgd-review-agent: related-work lookup failed for ${provider} ${safeRelatedWorkIdentifier(reference)}; using unresolved reference`);
+      }
+    }
+  }
+  const prIntent = config.prIntent === "off"
+    ? undefined
+    : sanitizePrIntent({
+      title: pr.title,
+      description: pr.description,
+      linked: relatedWork.map((item) => ({
+        identifier: item.identifier,
+        ...(item.title === undefined ? {} : { title: item.title }),
+        ...(item.state === undefined ? {} : { state: item.state }),
+      })),
+    });
   const dispatchResult = await dispatchRulesFn({
     rules,
     diff,
@@ -1491,6 +1551,7 @@ export async function review(
     ...(loadedContext.conversationContext === undefined
       ? {}
       : { conversationContext: loadedContext.conversationContext }),
+    ...(prIntent === undefined ? {} : { prIntent }),
   });
 
   // Issue #75: check the structural claims the reviewer chose to make, against
@@ -1586,20 +1647,8 @@ export async function review(
     }
   }
 
-  if (extracted.omittedCount > 0) {
-    console.warn(`tgd-review-agent: ${extracted.omittedCount} additional related-work reference(s) omitted`);
-  }
-  let relatedWork: readonly RelatedWorkItem[] = extracted.references;
-  if (extracted.references.length > 0) {
-    try {
-      const output: unknown = await config.vcsAdapter.resolveRelatedWork(extracted.references);
-      relatedWork = reconcileRelatedWork(extracted.references, output);
-    } catch {
-      for (const reference of extracted.references) {
-        console.warn(`tgd-review-agent: related-work lookup failed for ${provider} ${safeRelatedWorkIdentifier(reference)}; using unresolved reference`);
-      }
-    }
-  }
+  // (the related-work block above was moved before dispatch for issue #59:
+  // the resolved titles/states feed the intent section)
 
   // Findings are anchored to the diff and posted as INLINE review comments; only
   // what can't be anchored (no line number, or a line outside this PR's hunks)
