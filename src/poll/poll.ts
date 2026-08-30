@@ -2507,7 +2507,6 @@ async function queueVerifications(input: {
   if (input.budget <= 0) return holdAll;
 
   const outcomes = await input.options.store.readFindingOutcomes();
-  let metadata: Awaited<ReturnType<typeof loadReviewMetadata>>;
   const currentHead = await loadReviewHead(input.reviewNumber, input.options);
   if (currentHead === undefined) return holdAll;
 
@@ -2590,7 +2589,7 @@ async function queueVerifications(input: {
     };
   }
 
-  metadata = await loadReviewMetadata(input.reviewNumber, input.options);
+  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
   if (metadata === undefined) return holdAll;
 
   const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
