@@ -2012,6 +2012,95 @@ describe("clarification answer lifecycle", () => {
     expect(inline).not.toContain("src/queue.ts:12");
   });
 
+  // Codex review of PR #100, round four: a COMPLETED finding action must stay
+  // findable across a base advance. The identity is base-independent for
+  // exactly this reason: if the answer's own publication fails transiently
+  // after the finding published, the retry must reuse the completed action —
+  // superseding or re-minting it would post the same finding twice.
+  it("reuses a completed finding action when the base advances before the answer lands", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const reply = installQuestionThread(
+      adapter,
+      threadComment("human-1", "Audit does not require raw tokens."),
+    );
+    adapter.replaceEvents([reply]);
+    const preparedShape = {
+      root: "/ws", repositoryRoot: "/ws/repo", mirrorPath: "/ws/repo/mirror",
+      worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
+      ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
+    };
+    const prepare = vi.fn().mockImplementation((request: { baseSha: string }, use: (value: typeof preparedShape) => Promise<unknown>) =>
+      use({ ...preparedShape, baseSha: request.baseSha }));
+    const check = vi.fn().mockImplementation(async (input: { findings: readonly Record<string, unknown>[] }) =>
+      input.findings.map((entry) => ({
+        ...entry,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [{ file: "src/queue.ts", line: 12 }],
+          filesSearched: 9,
+        },
+      })));
+    const vcs = silentReviewVcs();
+    let base = "b".repeat(40);
+    // The finding publication completes, then the ANSWER's freeze fails
+    // transiently (its beforeFreeze hook re-loads review metadata), leaving
+    // the finding completed and the answer still owed.
+    let metadataCalls = 0;
+    let failMetadata = true;
+
+    const deps = () => ({
+      ...executionDeps(adapter, {
+        vcs,
+        diff: commentableAuthDiff,
+        createSession: sessionFor(JSON.stringify({
+          outcome: "confirmed",
+          rationale: "The current hunk still logs the token.",
+          finding: {
+            file: "src/auth.ts", line: 14, severity: "blocking", category: "security",
+            message: "Tokens must not be logged.", ruleName: "no-token-logs",
+            title: "Do not log tokens", decision: "still-valid",
+            claim: { kind: "no-other-references", symbol: "token" },
+          },
+        })),
+      }),
+      prepareStructuralWorkspace: prepare,
+      runStructuralChecks: check,
+      getReviewMetadata: async () => {
+        metadataCalls += 1;
+        // Call 4 in the first poll is the answer's beforeFreeze metadata load
+        // (1 = verification queue, 2 = clarification plan, 3 = reply-plan
+        // pre-build, 4 = beforeFreeze, 5 = verification queue again).
+        if (failMetadata && metadataCalls === 4) throw new Error("metadata unavailable");
+        return {
+          headSha: adapter.headSha,
+          baseSha: base,
+          diff: commentableAuthDiff,
+        };
+      },
+    });
+
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), deps())).resolves.toBe(1);
+    expect(vcs.postedInlines).toHaveLength(1);
+
+    // The base advances while the head stays put; the retry must NOT post the
+    // finding again — the completed action is reused as-is.
+    base = "c".repeat(40);
+    failMetadata = false;
+    adapter.replaceEvents([reply]);
+    await expect(poll(pollArgs(stateDir, {
+      model: "anthropic/claude-opus-4-5",
+      structuralChecks: "on",
+    }), deps())).resolves.toBe(0);
+    expect(vcs.postedInlines).toHaveLength(1);
+    const inline = vcs.postedInlines.map((entry) => entry.body).join("\n");
+    expect(inline).toMatch(/LEXICAL matches/);
+  });
+
   // Codex review of PR #100, round two: the publication normalizes an
   // `addressed`/`needs-clarification` decision to `still-valid`, so gating on
   // the RAW decision skipped the check and annotated a claim that published

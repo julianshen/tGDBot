@@ -8,14 +8,18 @@ import {
 } from "../conversation/state-schema.js";
 import {
   buildReviewPublicationGraph,
+  eventFromAction,
   executePublication,
   loadPublicationAction,
+  observePublication,
+  supersedeWithSuccessor,
   type PublicationAction,
   type PublicationChild,
   type PublicationExecutorHooks,
   type PublicationWriteResult,
   type PublicationWriter,
 } from "../conversation/publication-manifest.js";
+import { conversationSuccessorIdentity } from "../conversation/actions.js";
 import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "../conversation/markers.js";
 import { publicationBody, renderFocusReply } from "../conversation/render.js";
 import type { ConversationStateStore } from "../conversation/state-store.js";
@@ -869,19 +873,47 @@ export async function publishConfirmedClarificationFinding(options: {
   readonly now: () => string;
   readonly hooks?: PublicationExecutorHooks;
 }): Promise<number> {
-  const existing = loadPublicationAction(
-    (await options.store.readContextSnapshot()).events,
-    options.publicationIdentity,
-  );
-  if (existing !== undefined && (existing.state === "manifest-ready" || existing.state === "published" ||
-    existing.state === "completed" || existing.state === "superseded")) {
+  const snapshot = await options.store.readContextSnapshot();
+  const existing = loadPublicationAction(snapshot.events, options.publicationIdentity);
+  let identity = options.publicationIdentity;
+  if (
+    existing !== undefined && (existing.state === "manifest-ready" || existing.state === "published") &&
+    // Nothing was written yet, so superseding cannot orphan a posted comment…
+    existing.children.every((child) => child.status === "pending" && child.identity === undefined)
+  ) {
+    // …but the frozen manifest may describe a base that no longer exists
+    // (Codex review of PR #100, round three): the poll re-checks the claim
+    // fresh on every attempt, and replaying the unwritten frozen children
+    // would publish the OLD base's evidence. Recover the checked base from
+    // the finding ledger (the inline child's ledger entry) and supersede the
+    // manifest with a successor identity when it moved; the rebuild below
+    // then freezes the fresh check's result. A completed or written action is
+    // deliberately NEVER touched here: its content is already published, and
+    // re-finding it is what prevents a duplicate posting (round four).
+    const childIds = new Set(existing.children.map((child) => child.id));
+    const checkedBase = snapshot.findings.find((entry) => childIds.has(entry.id))?.baseSha;
+    if (checkedBase !== undefined && checkedBase.toLowerCase() !== options.pr.baseSha.toLowerCase()) {
+      const successor = conversationSuccessorIdentity(existing, options.pr.baseSha);
+      const pair = supersedeWithSuccessor(existing, successor);
+      await options.store.transact((tx) => {
+        tx.appendEvent(eventFromAction(pair.superseded, options.now()));
+        tx.appendEvent(eventFromAction(observePublication(pair.successor), options.now()));
+        tx.appendEvent(eventFromAction(pair.successor, options.now()));
+      });
+      identity = { actionId: pair.successor.actionId, identityDigest: pair.successor.identityDigest };
+    }
+  }
+  const current = identity.actionId === options.publicationIdentity.actionId ? existing :
+    loadPublicationAction((await options.store.readContextSnapshot()).events, identity);
+  if (current !== undefined && (current.state === "manifest-ready" || current.state === "published" ||
+    current.state === "completed" || current.state === "superseded")) {
     const botComment = await options.context.vcsAdapter.findBotComment(options.context.locator);
-    const configHash = existing.children.find((child) => child.kind === "summary" && child.placement.kind === "summary")
+    const configHash = current.children.find((child) => child.kind === "summary" && child.placement.kind === "summary")
       ?.placement.kind === "summary"
-      ? (existing.children.find((child) => child.kind === "summary")!.placement as { configHash: string }).configHash
-      : botComment?.reviewedConfig || options.publicationIdentity.identityDigest.slice(0, 12);
+      ? (current.children.find((child) => child.kind === "summary")!.placement as { configHash: string }).configHash
+      : botComment?.reviewedConfig || identity.identityDigest.slice(0, 12);
     return publishReviewFromManifest({
-      action: existing,
+      action: current,
       store: options.store,
       context: options.context,
       pr: options.pr,
@@ -949,10 +981,10 @@ export async function publishConfirmedClarificationFinding(options: {
   await persistPreparedFindings(options.store, prepared.preparedFindings);
   return publishReviewFromManifest({
     action: {
-      ...options.publicationIdentity,
+      ...identity,
       reviewNumber: Number(options.pr.id),
       repository: options.store.repositoryBinding,
-      state: existing?.state === "prepared" ? "prepared" : "manifest-ready",
+      state: current?.state === "prepared" ? "prepared" : "manifest-ready",
       successorActionId: null,
       children: prepared.children,
     },

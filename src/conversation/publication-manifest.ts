@@ -316,20 +316,19 @@ export function clarificationFindingPublicationIdentity(input: {
   readonly clarificationId: string;
   readonly answerEventId: string;
   readonly headSha: string;
-  readonly baseSha: string;
 }): { readonly actionId: string; readonly identityDigest: string } {
-  // The CHECKED base is part of the identity (Codex review of PR #100, round
-  // three): a base advance with an unchanged head must not replay a stored
-  // manifest whose host check describes a base that no longer exists — folding
-  // the base into the digest makes any base change build a fresh action from
-  // the freshly computed check. Same base → same identity → safe replay.
+  // Deliberately BASE-INDEPENDENT (Codex review of PR #100, round four): one
+  // clarification answer owns ONE finding publication for its whole life. A
+  // base advance must not mint a second identity — the completed action would
+  // stop being found and the finding would post twice — so staleness of an
+  // UNWRITTEN frozen manifest is handled by the replay branch superseding and
+  // rebuilding through a successor identity instead.
   const material = [
     input.repository.provider, input.repository.repositoryDigest, String(input.reviewNumber),
     input.clarificationId, input.answerEventId, input.headSha.toLowerCase(),
-    input.baseSha.toLowerCase(),
   ].join("\0");
   const identityDigest = createHash("sha256")
-    .update(`tgd:clarification-finding-publication:v2\0${material}`, "utf8")
+    .update(`tgd:clarification-finding-publication:v1\0${material}`, "utf8")
     .digest("hex");
   return { actionId: `action_${identityDigest.slice(0, 32)}`, identityDigest };
 }

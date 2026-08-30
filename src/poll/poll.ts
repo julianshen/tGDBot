@@ -2156,10 +2156,6 @@ async function executeClarificationAnswer(input: {
       // Gating on the raw decision would skip the check and annotate a claim
       // that publishes anyway.
       findingForPublication = actionableClarificationFinding(findingForPublication);
-      // One base value for BOTH the check and the publication identity (Codex
-      // review of PR #100, round three): the manifest is only replayed when its
-      // checked base is still current, because the identity folds this value
-      // into its digest.
       const baseSha = input.metadata.baseSha ?? "0".repeat(40);
       const answerDiff = input.metadata.diff;
       if (input.options.config.structuralChecks === "on" && findingForPublication.claim !== undefined) {
@@ -2243,11 +2239,6 @@ async function executeClarificationAnswer(input: {
               clarificationId: observed.id,
               answerEventId: input.item.event.eventId,
               headSha: input.metadata.headSha,
-              // A base advance with an unchanged head must NOT replay the
-              // stored manifest: its host check describes a base that no
-              // longer exists. Folding the checked base into the digest makes
-              // any base change build a fresh action from the fresh check.
-              baseSha,
             }),
             reviewIdentity: input.reviewIdentity,
             context: {
