@@ -231,6 +231,112 @@ describe("symbol resolution (issue #77)", () => {
     expect(result).toMatchObject({ status: "lexical-matches", occurrences: 4 });
   });
 
+  it("excludes references the diff removes from the resolved census", async () => {
+    // The PR deletes the last real caller. The lexical walk suppresses the
+    // deleted line during collection; the resolver walks the base tree
+    // independently and MUST apply the same reconciliation, or the deleted
+    // caller is published as a resolved contradiction against a finding
+    // about the head revision (Codex review of PR #104).
+    const base = await tree({
+      "tsconfig.json": TSCONFIG,
+      "src/wallet.ts": "export function budget(amount: number): number {\n  return amount;\n}\n",
+      "src/caller.ts": 'import { budget } from "./wallet.js";\nexport const total = budget(21);\n',
+      "src/keeper.ts": "import { budget } from \"./wallet.js\";\nexport const other = budget(1);\n",
+    });
+    // The removed lines map: caller.ts line 2 (the call) is deleted. The
+    // import specifier on line 1 survives; keeper.ts is untouched.
+    const removed = new Map([["src/caller.ts", {
+      positioned: true,
+      byLine: new Map([[2, "export const total = budget(21);"]]),
+      text: "",
+    }]]);
+    const resolver = await createSymbolResolver(base);
+    const result = await checkStructuralClaim(claim, {
+      baseRoot: base,
+      findingFile: "src/wallet.ts",
+    }, { resolver, removedLinesByFile: removed });
+
+    expect(result.status).toBe("resolved");
+    if (result.status !== "resolved") return;
+    // The deleted call is gone from the census; the import specifiers and
+    // the keeper's call survive.
+    expect(result.occurrences).toBe(3);
+    expect(result.references).toEqual([
+      { file: "src/caller.ts", line: 1 },
+      { file: "src/keeper.ts", line: 1 },
+      { file: "src/keeper.ts", line: 2 },
+    ]);
+  });
+
+  it("refuses an ambiguous anchor whose same-named declarations are equidistant", async () => {
+    // Two declarations at lines 2 and 6, an anchor at line 4: both are two
+    // lines away. A tie cannot attribute, and a guessed pick would publish
+    // the other symbol's uses as resolved references.
+    const base = await tree({
+      "tsconfig.json": TSCONFIG,
+      "src/wallet.ts": [
+        "export function budget(amount: number): number {",
+        "  return amount;",
+        "}",
+        "",
+        "",
+        "export namespace inner {",
+        "  export function budget(amount: number): number {",
+        "    return amount;",
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+      "src/caller.ts": 'import { budget } from "./wallet.js";\nexport const total = budget(21);\n',
+    });
+    const resolver = await createSymbolResolver(base);
+    const result = await checkStructuralClaim(claim, {
+      baseRoot: base,
+      findingFile: "src/wallet.ts",
+      // One-based lines 1 and 7 declare the name; the anchor at 4 is
+      // EQUIDISTANT (three lines from each), so attribution is a coin toss
+      // and the resolver refuses instead of guessing.
+      findingLine: 4,
+    }, { resolver });
+
+    expect(result).toMatchObject({ status: "lexical-matches", occurrences: 2 });
+  });
+
+  it("compares the anchor and declaration lines in one coordinate system", async () => {
+    // Declarations on one-based lines 1 and 2; an anchor on line 1. The
+    // compiler reports zero-based lines, and without normalizing the bases
+    // the anchor 'line 1' is NEAREST to the zero-based line 0... wait, to
+    // the line-2 declaration (distance 0 vs 1) — the wrong symbol wins, and
+    // the caller's use of the outer function goes unpublished. The fix
+    // compares one-based against one-based: the outer declaration is
+    // distance 0 and the caller resolves.
+    const base = await tree({
+      "tsconfig.json": TSCONFIG,
+      "src/wallet.ts": [
+        "export function budget(amount: number): number {",
+        "  return amount;",
+        "}",
+        "export namespace inner {",
+        "  export function budget(amount: number): number {",
+        "    return amount;",
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+      "src/caller.ts": 'import { budget } from "./wallet.js";\nexport const total = budget(21);\n',
+    });
+    const resolver = await createSymbolResolver(base);
+    const result = await checkStructuralClaim(claim, {
+      baseRoot: base,
+      findingFile: "src/wallet.ts",
+      findingLine: 1,
+    }, { resolver });
+
+    expect(result.status).toBe("resolved");
+    if (result.status !== "resolved") return;
+    expect(result.occurrences).toBe(2);
+  });
+
   it("never publishes a clean verdict, even when every checked occurrence resolves elsewhere", async () => {
     // The checker proved the two lexical matches are another symbol's method.
     // That SUPPORTS "no other references" but cannot prove it: dynamic

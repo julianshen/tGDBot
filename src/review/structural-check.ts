@@ -579,6 +579,15 @@ export async function checkStructuralClaim(
       findingFile: input.findingFile,
       ...(input.findingFileAtBase === undefined ? {} : { findingFileAtBase: input.findingFileAtBase }),
       ...(input.findingLine === undefined ? {} : { findingLine: input.findingLine }),
+      // The resolver walks the base tree independently of the lexical walk
+      // above, and without this its resolved census would resurrect callers
+      // the diff may already be deleting — the exact reconciliation the walk
+      // applies during collection (Codex review of PR #104). One predicate,
+      // the shared one below, so both passes answer identically.
+      ...(removedLinesByFile === undefined ? {} : {
+        isRemoved: (file: string, line: number): boolean =>
+          suppressedByDiff(claim.symbol, { file, line }, removedLinesByFile),
+      }),
     }, {
       // The walk runs inside the SAME wall-clock bound the lexical walk just
       // respected: what remains of this check's budget. Stopping early costs

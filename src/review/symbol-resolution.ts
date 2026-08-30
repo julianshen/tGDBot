@@ -122,9 +122,22 @@ export interface ResolveInput {
    * that stands), it only picks among declarations IN the same file. Without
    * a hint, several candidates refuse as ambiguous; a guessed resolved
    * contradiction is the exact credibility failure this feature exists to
-   * avoid.
+   * avoid. Equidistant candidates refuse too — a tie means the anchor
+   * genuinely cannot attribute, and one-based/zero-based mixups in that
+   * comparison would silently flip the choice (Codex review of PR #104).
    */
   readonly findingLine?: number;
+  /**
+   * Whether the pull request removes the line this occurrence sits on
+   * (repository-relative POSIX file, one-based line) — the same
+   * reconciliation the lexical walk applies during collection, passed in so
+   * the resolver's independent walk cannot resurrect a deleted caller as a
+   * resolved contradiction against a finding about the head revision (Codex
+   * review of PR #104). Removed occurrences are skipped entirely: counted
+   * neither as resolved nor as unresolved, exactly like the lexical walk's
+   * suppressed matches.
+   */
+  readonly isRemoved?: (file: string, line: number) => boolean;
 }
 
 export interface ResolveTiming {
@@ -240,9 +253,16 @@ export async function createSymbolResolver(
   if (expired()) return unavailable("budget-exhausted");
   const checker = program.getTypeChecker();
   const filesResolved = program.getSourceFiles().filter((sourceFile) => underRoot(sourceFile.fileName)).length;
+  // POSIX-normalized, matching the lexical walk's `canonicalRelative` keys:
+  // `path.relative` is platform-native, and on Windows it emits separators
+  // the lexical census never used, which made every covered file look
+  // uncovered — genuine callers reported once as resolved and again in the
+  // lexical fallback (Codex review of PR #104).
+  const relativePosix = (sourceFile: ts.SourceFile): string =>
+    path.relative(baseRoot, sourceFile.fileName).split(path.sep).join("/");
   const covered = new Set(program.getSourceFiles()
     .filter((sourceFile) => underRoot(sourceFile.fileName))
-    .map((sourceFile) => path.relative(baseRoot, sourceFile.fileName)));
+    .map(relativePosix));
 
   /**
    * The symbol the finding's own file declares with the claim's name.
@@ -306,15 +326,24 @@ export async function createSymbolResolver(
     if (groups.length > 1 && hintLine === undefined) {
       return { ok: false, reason: "ambiguous-declaration" };
     }
-    // Nearest declaration group to the anchor wins; ties resolve to the
-    // earlier line so the same input always yields the same answer.
+    // Nearest declaration group to the anchor wins. `firstLine` is the
+    // compiler's zero-based line; `findingLine` is one-based (an editor
+    // counts) — compare them in ONE coordinate system or the nearest pick is
+    // off by one and can select the WRONG symbol outright (Codex review of
+    // PR #104). Ties refuse: two same-named declarations equidistant from
+    // the anchor cannot be attributed, and a guessed resolved contradiction
+    // is the exact credibility failure this feature exists to avoid.
+    if (groups.length > 1 && hintLine !== undefined) {
+      const distances = groups.map((group) => Math.abs(group.firstLine + 1 - hintLine));
+      if (new Set(distances).size < distances.length) {
+        return { ok: false, reason: "ambiguous-declaration" };
+      }
+    }
     let best = groups[0]!;
     for (const group of groups) {
-      const bestDistance = Math.abs(best.firstLine - (hintLine ?? best.firstLine));
-      const distance = Math.abs(group.firstLine - (hintLine ?? group.firstLine));
-      if (distance < bestDistance || (distance === bestDistance && group.firstLine < best.firstLine)) {
-        best = group;
-      }
+      const bestDistance = Math.abs(best.firstLine + 1 - (hintLine ?? best.firstLine));
+      const distance = Math.abs(group.firstLine + 1 - (hintLine ?? group.firstLine));
+      if (distance < bestDistance) best = group;
     }
     return { ok: true, declarations: best.declarations };
   };
@@ -350,8 +379,8 @@ export async function createSymbolResolver(
 
       for (const sourceFile of program.getSourceFiles()) {
         if (walkExpired()) break;
-        const relative = path.relative(baseRoot, sourceFile.fileName);
         if (!underRoot(sourceFile.fileName)) continue;
+        const relative = relativePosix(sourceFile);
         if (sourceFile === program.getSourceFile(ownAbsolute)) continue;
         // A direct walk, one per claim per file: the identifiers of interest
         // are exactly the ones spelled like the symbol, and the compiler has
@@ -365,18 +394,19 @@ export async function createSymbolResolver(
             const target = symbol === undefined ? undefined : aliased(symbol);
             const targetDeclarations = target?.getDeclarations() ?? [];
             const sameIdentity = targetDeclarations.some((declaration) => own.declarations.has(declaration));
+            const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
+            const reference: SymbolReference = { file: relative, line: line + 1 };
+            // The same reconciliation the lexical walk applied during
+            // collection: a line the pull request removes is skipped in BOTH
+            // buckets, so the resolved census never accuses the finding of a
+            // caller the diff may already be deleting.
+            if (input.isRemoved?.(relative, reference.line) === true) return;
             if (sameIdentity) {
               resolvedOccurrences += 1;
-              if (resolved.length < MAX_RETAINED) {
-                const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-                resolved.push({ file: relative, line: line + 1 });
-              }
+              if (resolved.length < MAX_RETAINED) resolved.push(reference);
             } else {
               unresolvedOccurrences += 1;
-              if (unresolved.length < MAX_RETAINED) {
-                const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
-                unresolved.push({ file: relative, line: line + 1 });
-              }
+              if (unresolved.length < MAX_RETAINED) unresolved.push(reference);
             }
           }
           node.forEachChild(visit);
