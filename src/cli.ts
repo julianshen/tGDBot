@@ -876,6 +876,16 @@ async function fetchJsonReal(url: string, request?: FetchJsonRequest): Promise<u
  * either, and flipping the flag on still changes the hash (it changes the
  * review). Undefined inputs collapse away so a review with no intent at all
  * hashes exactly as before.
+ *
+ * Deliberately NOT hashed: the linked references' RESOLVED titles and states.
+ * Hashing them would require resolving before the dedup decision, putting N
+ * provider lookups on every skipped run (the common poll path) and breaking
+ * the documented "a skipped review must fetch nothing" guarantee (dedup.ts,
+ * pinned by the AC-8.1 test). That cost buys nothing for the intent section
+ * itself — it is transient dispatch input, rebuilt from a fresh resolution on
+ * every run a reviewer actually sees — and the published "Related work" list
+ * has carried identity-only fingerprinting (and the same eventual freshness,
+ * on the next real review) since before this feature existed.
  */
 function relatedWorkFingerprintWithIntent(
   config: { prIntent: "on" | "off" },
