@@ -51,6 +51,7 @@ import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 import type { Finding } from "../../../src/review/types.js";
+import type { PreparedWorkspace, WorkspaceRequest } from "../../../src/workspace/types.js";
 import { parseBotMarker } from "../../../src/review/comment-marker.js";
 import { validateConversationItemIdentity } from "../../../src/vcs/adapter.js";
 import type { BotComment } from "../../../src/vcs/adapter.js";
@@ -2098,6 +2099,43 @@ describe("clarification answer lifecycle", () => {
     });
   }
 
+  /**
+   * A workspace preparer that records its requests.
+   *
+   * Written out rather than wrapped in `vi.fn`, because the real
+   * `withPreparedWorkspace` is generic in its callback's return and a `Mock`
+   * collapses that to `unknown` — which the dependency slot then rejects.
+   */
+  function recordingWorkspace(): {
+    readonly requests: WorkspaceRequest[];
+    readonly prepare: <T>(
+      request: WorkspaceRequest,
+      use: (prepared: PreparedWorkspace) => Promise<T>,
+    ) => Promise<T>;
+  } {
+    const requests: WorkspaceRequest[] = [];
+    return {
+      requests,
+      prepare: async (request, use) => {
+        requests.push(request);
+        return use(preparedWorkspaceAt(request.baseSha));
+      },
+    };
+  }
+
+  /** A prepared workspace standing at `baseSha`, with the paths never read. */
+  function preparedWorkspaceAt(baseSha: string): PreparedWorkspace {
+    return {
+      baseSha,
+      root: "/workspace",
+      repositoryRoot: "/workspace/owner-repo",
+      mirrorPath: "/workspace/owner-repo/mirror.git",
+      worktreesRoot: "/workspace/owner-repo/worktrees",
+      baseWorktreePath: "/base",
+      ownerMarkerPath: "/workspace/owner-repo/owner.json",
+    };
+  }
+
   /** The body of the inline finding comment this publication posted. */
   function inlineFindingBody(vcs: ReturnType<typeof silentReviewVcs>): string {
     const comments = vcs.adapter.createInlineReview.mock.calls[0]?.[2] as
@@ -2121,10 +2159,15 @@ describe("clarification answer lifecycle", () => {
     expect(adapter.postedBodies.at(-1)).toMatch(/Confirmed/);
     const snapshot = await createConversationStateStore({ root: stateDir, repository: repo }).readContextSnapshot();
     expect(snapshot.pending.clarifications[0]?.state).toBe("terminal");
-    // The claim is deliberately NOT persisted: a check computed against one
-    // base must never be reattached to a finding regenerated against another.
+    // The claim survives BESIDE the snapshot, never inside it: the snapshot's
+    // exclusion is about a stale CHECK, and the claim is re-checked against the
+    // current base on every attempt.
     expect(snapshot.pending.clarifications[0]?.frozenOutcome?.finding)
       .not.toHaveProperty("claim");
+    expect(snapshot.pending.clarifications[0]?.frozenOutcome?.claim)
+      .toEqual(claimingFinding.claim);
+    expect(snapshot.pending.clarifications[0]?.frozenOutcome?.finding)
+      .not.toHaveProperty("hostCheck");
   });
 
   it("checks the claim against a base worktree prepared at publication time", async () => {
@@ -2132,10 +2175,7 @@ describe("clarification answer lifecycle", () => {
     const { stateDir } = await bootstrapAndSeed(adapter);
     await seedPublishedQuestion(stateDir);
     const vcs = silentReviewVcs();
-    const prepareStructuralWorkspace = vi.fn(async (
-      request: { readonly baseSha: string },
-      use: (prepared: { baseSha: string; baseWorktreePath: string }) => Promise<unknown>,
-    ) => use({ baseSha: request.baseSha, baseWorktreePath: "/base" }));
+    const workspace = recordingWorkspace();
     const runStructuralChecks = vi.fn(async (checkInput: { readonly findings: readonly Finding[] }) =>
       checkInput.findings.map((finding) => ({
         ...finding,
@@ -2150,13 +2190,13 @@ describe("clarification answer lifecycle", () => {
     await expect(answerWithAClaim(stateDir, adapter, {
       args: { structuralChecks: "on" },
       vcs,
-      deps: { prepareStructuralWorkspace, runStructuralChecks },
+      deps: { prepareStructuralWorkspace: workspace.prepare, runStructuralChecks },
     })).resolves.toBe(0);
 
     // The claim reached the checker, against the base the publication names —
     // not one carried over from the review that first raised the question.
-    expect(prepareStructuralWorkspace).toHaveBeenCalledOnce();
-    expect(prepareStructuralWorkspace.mock.calls[0]?.[0]).toMatchObject({
+    expect(workspace.requests).toHaveLength(1);
+    expect(workspace.requests[0]).toMatchObject({
       baseSha: "b".repeat(40),
       rejectPreviouslySharedRoot: true,
     });
@@ -2247,6 +2287,61 @@ describe("clarification answer lifecycle", () => {
 
     expect(prepareStructuralWorkspace).not.toHaveBeenCalled();
     expect(inlineFindingBody(vcs)).toMatch(/Host check: not performed — the review base commit was not available/);
+  });
+
+  // Codex review of PR #101. The freeze commits before the publication runs, so
+  // a failure BELOW it — `findBotComment` throwing, or the process exiting —
+  // leaves a frozen outcome and no manifest. The next poll must still be able to
+  // check the claim the reassessment made; it may not silently publish a finding
+  // that asserts nothing, having promised a check.
+  it("re-checks the frozen claim after a publication that stored no manifest", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir } = await bootstrapAndSeed(adapter);
+    await seedPublishedQuestion(stateDir);
+    const vcs = silentReviewVcs();
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const workspace = recordingWorkspace();
+    const runStructuralChecks = vi.fn(async (checkInput: { readonly findings: readonly Finding[] }) =>
+      checkInput.findings.map((finding) => ({
+        ...finding,
+        hostCheck: {
+          status: "lexical-matches" as const,
+          references: [{ file: "src/other.ts", line: 3 }],
+          filesSearched: 2,
+          occurrences: 1,
+        },
+      })));
+
+    // Fails AFTER the check has run and BEFORE any manifest is stored.
+    vcs.adapter.findBotComment.mockRejectedValueOnce(new Error("summary lookup failed"));
+    const first = claimingSession();
+    adapter.replaceEvents([commentEvent("crash-answer", `answer ${CLAR_ID}: keep the current logger`)]);
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5", structuralChecks: "on" }), {
+      ...executionDeps(adapter, { vcs, diff: commentableAuthDiff, createSession: first }),
+      prepareStructuralWorkspace: workspace.prepare,
+      runStructuralChecks,
+    })).resolves.toBe(1);
+
+    // The retry must not re-run the model: the frozen outcome exists precisely
+    // so a nondeterministic second opinion cannot replace the first.
+    const second = vi.fn(sessionFor(JSON.stringify({
+      outcome: "withdrawn",
+      rationale: "A nondeterministic retry changed its mind.",
+    })));
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5", structuralChecks: "on" }), {
+      ...executionDeps(adapter, { vcs, diff: commentableAuthDiff, createSession: second }),
+      prepareStructuralWorkspace: workspace.prepare,
+      runStructuralChecks,
+    })).resolves.toBe(0);
+
+    expect(first).toHaveBeenCalledOnce();
+    expect(second).not.toHaveBeenCalled();
+    // The point of the test: the SECOND attempt still had a claim to check.
+    expect(runStructuralChecks).toHaveBeenCalledTimes(2);
+    expect(runStructuralChecks.mock.calls[1]?.[0]).toMatchObject({
+      findings: [expect.objectContaining({ claim: claimingFinding.claim })],
+    });
+    expect(inlineFindingBody(vcs)).toMatch(/Host check: the name `dump` occurs 1 time\(s\) outside this file/);
   });
 
   it("prepares no worktree when structural checks are off", async () => {

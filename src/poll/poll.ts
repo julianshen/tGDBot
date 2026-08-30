@@ -2209,6 +2209,15 @@ async function executeClarificationAnswer(input: {
           // parsed unconditionally from reviewer output, so this needed no
           // flag to be set to happen.
           finding: toFindingSnapshot(result.result.finding),
+          // Beside the snapshot, not inside it. The claim must outlive a
+          // publication that fails before its manifest is stored — otherwise
+          // the next poll resumes from a claim-less snapshot and the assertion
+          // is dropped without a word (Codex review of PR #101). The CHECK is
+          // still never persisted: it is recomputed against the current base on
+          // every attempt.
+          ...(result.result.finding.claim === undefined
+            ? {}
+            : { claim: result.result.finding.claim }),
         };
       } else {
         frozenOutcome = { outcome: "withdrawn", rationale: result.result.rationale };
@@ -2231,7 +2240,13 @@ async function executeClarificationAnswer(input: {
         try {
           const publishedFinding = await publishConfirmedClarificationFinding({
             store: input.options.store,
-            finding: reassessedFinding ?? frozenOutcome.finding,
+            // A resumed pass rebuilds the finding from the snapshot plus the
+            // claim frozen beside it, so it is checked on exactly the terms the
+            // first attempt would have been.
+            finding: reassessedFinding ?? {
+              ...frozenOutcome.finding,
+              ...(frozenOutcome.claim === undefined ? {} : { claim: frozenOutcome.claim }),
+            },
             ...(input.options.config.structuralChecks === "on"
               ? {
                   checkClaim: clarificationClaimChecker({
