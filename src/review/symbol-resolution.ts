@@ -90,8 +90,21 @@ export type SymbolResolution =
      */
     readonly unresolved: readonly SymbolReference[];
     readonly unresolvedOccurrences: number;
-    /** Type-checked files under the base root, for the published wording. */
+    /**
+     * Type-checked files under the base root — or, when `partial` is set,
+     * the files the walk actually reached before its deadline. The caller's
+     * wording renders this count, so it must never claim more than was read
+     * (Codex review of PR #104).
+     */
     readonly filesResolved: number;
+    /**
+     * True when the per-claim deadline stopped the walk partway through the
+     * program. The counts are exact for what was read; resolved references
+     * found before the deadline are still sound (positive evidence cannot be
+     * made untrue by a file left unvisited), but the census is not whole, and
+     * the caller must say so instead of rendering a complete-scan number.
+     */
+    readonly partial: boolean;
   }
   | { readonly available: false; readonly reason: ResolutionUnavailable };
 
@@ -376,19 +389,24 @@ export async function createSymbolResolver(
       const unresolved: SymbolReference[] = [];
       let resolvedOccurrences = 0;
       let unresolvedOccurrences = 0;
+      // Files the walk actually reached — the honest denominator when the
+      // deadline stops it partway.
+      let traversedFiles = 0;
+      let timedOut = false;
 
       for (const sourceFile of program.getSourceFiles()) {
-        if (walkExpired()) break;
+        if (walkExpired()) { timedOut = true; break; }
         if (!underRoot(sourceFile.fileName)) continue;
         const relative = relativePosix(sourceFile);
         if (sourceFile === program.getSourceFile(ownAbsolute)) continue;
+        traversedFiles += 1;
         // A direct walk, one per claim per file: the identifiers of interest
         // are exactly the ones spelled like the symbol, and the compiler has
         // already parsed the file, so this is tree traversal only. The line
         // is computed AFTER the symbol test — most identifiers in a file are
         // not this symbol, and position mapping is not free.
         const visit = (node: ts.Node): void => {
-          if (walkExpired()) return;
+          if (walkExpired()) { timedOut = true; return; }
           if (ts.isIdentifier(node) && node.text === input.claim.symbol) {
             const symbol = checker.getSymbolAtLocation(node);
             const target = symbol === undefined ? undefined : aliased(symbol);
@@ -422,7 +440,11 @@ export async function createSymbolResolver(
         resolvedOccurrences,
         unresolved: unresolved.sort(byLocation),
         unresolvedOccurrences,
-        filesResolved,
+        // A partial walk reports only the inspected scope — the full program
+        // count would make the rendered "across M type-checked file(s)"
+        // claim more than the walk read.
+        filesResolved: timedOut ? traversedFiles : filesResolved,
+        partial: timedOut,
       };
     },
     covers: (file: string): boolean => covered.has(file),

@@ -156,6 +156,14 @@ export type StructuralCheck =
     };
     readonly filesSearched: number;
     readonly filesResolved: number;
+    /**
+     * The per-claim deadline stopped the walk partway through the program
+     * (issue #77; Codex review of PR #104). The counts are exact for the
+     * files the checker reached — `filesResolved` IS that reached count, not
+     * the program's — and the renderer must say the walk was cut short
+     * rather than render a complete-scan number.
+     */
+    readonly partial?: true;
   }
   /** Nothing was established. Always carries why, and never means "no callers exist". */
   | { readonly status: "not-checked"; readonly reason: string };
@@ -648,6 +656,7 @@ export async function checkStructuralClaim(
     ...(lexicalFallback === undefined ? {} : { lexicalFallback }),
     filesSearched,
     filesResolved: resolution.filesResolved,
+    ...(resolution.partial ? { partial: true as const } : {}),
   };
 }
 
@@ -706,6 +715,11 @@ export function describeCheck(
         : "";
       parts.push(
         `${check.unresolvedOccurrences} other occurrence(s) of the name in those files do NOT resolve to this \`${escape(claim.symbol)}\` (${unresolvedRendered}${unresolvedMore}) — different symbols that share the spelling.`,
+      );
+    }
+    if (check.partial === true) {
+      parts.push(
+        `The deadline stopped the walk after ${check.filesResolved} file(s) — the counts cover what the checker reached, and a later poll may find more.`,
       );
     }
     if (check.lexicalFallback !== undefined) {

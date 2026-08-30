@@ -337,6 +337,40 @@ describe("symbol resolution (issue #77)", () => {
     expect(result.occurrences).toBe(2);
   });
 
+  it("reports the inspected scope when the per-claim deadline stops the walk", async () => {
+    // The resolved references found before the deadline are sound, but the
+    // census is not whole — the result must flag the partial walk and report
+    // the files actually reached, not the program's full count (Codex review
+    // of PR #104).
+    const files: Record<string, string> = {
+      "tsconfig.json": TSCONFIG,
+      "src/wallet.ts": "export function budget(amount: number): number {\n  return amount;\n}\n",
+      "src/caller.ts": 'import { budget } from "./wallet.js";\nexport const total = budget(21);\n',
+    };
+    for (const index of [1, 2, 3, 4, 5, 6]) {
+      files[`src/module${index}.ts`] = `export const value${index} = ${index};\n`;
+    }
+    const base = await tree(files);
+    const resolver = await createSymbolResolver(base);
+    let calls = 0;
+    const resolution = await resolver.resolve({
+      claim,
+      findingFile: "src/wallet.ts",
+    }, {
+      // Each clock read advances 1ms past a 2ms budget: the walk stops after
+      // the first couple of deadline checks, mid-program.
+      timeBudgetMs: 2,
+      now: () => {
+        calls += 1;
+        return calls;
+      },
+    });
+    expect(resolution.available).toBe(true);
+    if (!resolution.available) return;
+    expect(resolution.partial).toBe(true);
+    expect(resolution.filesResolved).toBeLessThan(8);
+  });
+
   it("never publishes a clean verdict, even when every checked occurrence resolves elsewhere", async () => {
     // The checker proved the two lexical matches are another symbol's method.
     // That SUPPORTS "no other references" but cannot prove it: dynamic
@@ -517,6 +551,12 @@ describe("symbol resolution (issue #77)", () => {
       expect(text).toContain("resolves to 2 reference(s)");
       expect(text).toContain("resolved references");
       expect(text).toContain("3 same-named but unresolved");
+    });
+
+    it("says the walk was cut short when the result is partial", () => {
+      const text = describeCheck(claim, { ...resolved, partial: true });
+      expect(text).toContain("The deadline stopped the walk after 4 file(s)");
+      expect(text).toContain("the counts cover what the checker reached");
     });
 
     it("omits the unresolved and fallback clauses when there is nothing to account for", () => {
