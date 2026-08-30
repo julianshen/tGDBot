@@ -9,6 +9,7 @@ import {
   AmbiguousInlinePublishError,
   type BotComment,
   type ReviewLocator,
+  CompareNotDirectError,
 } from "../../../src/vcs/adapter.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
 import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "../../../src/conversation/markers.js";
@@ -933,6 +934,39 @@ describe("GitHubAdapter", () => {
       const adapter = new GitHubAdapter(execGh);
 
       expect(await adapter.getMergeBaseSha(locator42, "basetip", "headsha")).toBeUndefined();
+    });
+  });
+
+  describe("getCompareDiff", () => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const patch = "diff --git a/src/auth.ts b/src/auth.ts\n+touched\n";
+
+    it("asks the compare API for the raw incremental diff", async () => {
+      const execGh = vi.fn(async () => patch);
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getCompareDiff(locator42, fromSha, toSha)).resolves.toBe(patch);
+      expect(execGh).toHaveBeenCalledWith(expect.arrayContaining([
+        "api",
+        `repos/{owner}/{repo}/compare/${fromSha}...${toSha}`,
+        "-H",
+        "Accept: application/vnd.github.diff",
+      ]));
+    });
+
+    it("rejects a merge-base compare that is not a direct tree diff from the origin", async () => {
+      const execGh = vi.fn(async (args: string[]) => {
+        if (args.includes("Accept: application/vnd.github.diff")) return patch;
+        return JSON.stringify({ merge_base_commit: { sha: "e".repeat(40) } });
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getCompareDiff(locator42, fromSha, toSha))
+        .rejects.toBeInstanceOf(CompareNotDirectError);
+      expect(execGh).not.toHaveBeenCalledWith(expect.arrayContaining([
+        "Accept: application/vnd.github.diff",
+      ]));
     });
   });
 

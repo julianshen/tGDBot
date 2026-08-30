@@ -42,6 +42,14 @@ export interface ReviewCursorRecord {
    * threads of one review rather than of a repository.
    */
   readonly threadsResolved?: readonly string[];
+  /**
+   * Head whose origin-head compares already finished for this review.
+   *
+   * Idle polls with bound findings must not re-download diffs at a head that
+   * was already scanned. Absent until the first completed scan, and cleared
+   * in effect when the live head moves on.
+   */
+  readonly headChangeScanSha?: string;
 }
 
 export interface ConversationCursorSnapshot {
@@ -717,7 +725,7 @@ export function validateCursorSnapshot(value: unknown, expected: RepositoryBindi
   }
   const reviews = array(object.reviews, "cursor.reviews", 5_000).map((entry, index) => {
     const review = exact(entry, `cursor.reviews[${index}]`, ["reviewNumber", "cursor", "retired"],
-      ["retiredAt", "eventPageToken", "threadsResolved"]);
+      ["retiredAt", "eventPageToken", "threadsResolved", "headChangeScanSha"]);
     if (typeof review.retired !== "boolean") throw new Error("review retired flag must be boolean");
     if (review.retired && review.retiredAt === undefined) throw new Error("retired review must record retiredAt");
     if (!review.retired && review.retiredAt !== undefined) throw new Error("active review cannot record retiredAt");
@@ -727,6 +735,15 @@ export function validateCursorSnapshot(value: unknown, expected: RepositoryBindi
       ...(review.threadsResolved === undefined ? {} : {
         threadsResolved: array(review.threadsResolved, `cursor.reviews[${index}].threadsResolved`, MAX_RESOLVED_THREADS)
           .map((threadId, at) => text(threadId, `cursor.reviews[${index}].threadsResolved[${at}]`, 512)),
+      }),
+      ...(review.headChangeScanSha === undefined ? {} : {
+        headChangeScanSha: (() => {
+          const value = review.headChangeScanSha;
+          if (typeof value !== "string" || !SHA_RE.test(value)) {
+            throw new Error(`cursor.reviews[${index}].headChangeScanSha is invalid`);
+          }
+          return value.toLowerCase();
+        })(),
       }) };
   });
   if (new Set(reviews.map((review) => review.reviewNumber)).size !== reviews.length) throw new Error("cursor contains duplicate reviews");

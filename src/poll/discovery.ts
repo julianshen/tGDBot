@@ -314,6 +314,7 @@ function applyDiscoveredReviews(
       // Carried across the sweep, like the page token. Rebuilding without it
       // discarded the observed resolution state on every discovery pass (#90).
       ...(existing?.threadsResolved === undefined ? {} : { threadsResolved: existing.threadsResolved }),
+      ...(existing?.headChangeScanSha === undefined ? {} : { headChangeScanSha: existing.headChangeScanSha }),
     });
   }
   return [...byNumber.values()].sort((left, right) => left.reviewNumber - right.reviewNumber);
@@ -347,6 +348,7 @@ function retireUnseen(
           // never survived a poll and a still-resolved thread verified again
           // at each new head (#90).
           ...(review.threadsResolved === undefined ? {} : { threadsResolved: review.threadsResolved }),
+          ...(review.headChangeScanSha === undefined ? {} : { headChangeScanSha: review.headChangeScanSha }),
         };
     return { reviewNumber: review.reviewNumber, cursor: review.cursor, retired: true, retiredAt };
   });

@@ -63,6 +63,19 @@ export interface VerificationQueueInput {
   /** Lines the new head touched, by path. Empty when the head did not move. */
   readonly changedLines: ReadonlyMap<string, ReadonlySet<number>>;
   /**
+   * Origin-side lines removed between a finding's origin head and the current
+   * head, keyed by that origin SHA (lowercased). When present, a finding is
+   * matched only against its own increment — unioning every origin would treat
+   * a later finding as touched by commits that landed before it was raised.
+   */
+  readonly touchedLinesByOriginHead?: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>>;
+  /**
+   * Origin-side lines after which the increment inserted, keyed the same way.
+   * Used only for multiline ranges: an insert between first and last is a
+   * touch, an insert after a single-line anchor is not.
+   */
+  readonly insertAfterByOriginHead?: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>>;
+  /**
    * Threads the caller last observed RESOLVED, from durable state.
    *
    * A resolution is a state both adapters re-emit, not an event, so acting on
@@ -209,9 +222,15 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
     // what the review was reading. Verifying it against the commit that
     // produced it spends the ceiling and posts a reply nobody prompted
     // (PR #73 review).
+    const originKey = candidate.headSha.toLowerCase();
+    const originLines = input.touchedLinesByOriginHead === undefined
+      ? input.changedLines
+      : input.touchedLinesByOriginHead.get(originKey);
+    const insertAfter = input.insertAfterByOriginHead?.get(originKey);
     const touched = candidate.placement !== null
-      && candidate.headSha.toLowerCase() !== input.headSha.toLowerCase()
-      && anchorTouched(candidate.placement, input.changedLines);
+      && originKey !== input.headSha.toLowerCase()
+      && originLines !== undefined
+      && anchorTouched(candidate.placement, originLines, insertAfter);
 
     const trigger = humanTrigger ?? (touched ? "head-change" : undefined);
     if (trigger === undefined) continue;
@@ -234,13 +253,22 @@ export function pendingVerifications(input: VerificationQueueInput): PendingVeri
 function anchorTouched(
   placement: NonNullable<VerificationCandidate["placement"]>,
   changedLines: ReadonlyMap<string, ReadonlySet<number>>,
+  insertAfter?: ReadonlyMap<string, ReadonlySet<number>>,
 ): boolean {
-  const changed = changedLines.get(placement.path);
-  if (changed === undefined) return false;
   const last = placement.line;
   const first = placement.startLine ?? last;
-  for (let line = Math.min(first, last); line <= Math.max(first, last); line += 1) {
-    if (changed.has(line)) return true;
+  const lo = Math.min(first, last);
+  const hi = Math.max(first, last);
+  const changed = changedLines.get(placement.path);
+  if (changed !== undefined) {
+    for (let line = lo; line <= hi; line += 1) {
+      if (changed.has(line)) return true;
+    }
+  }
+  const inserted = insertAfter?.get(placement.path);
+  if (inserted === undefined) return false;
+  for (const after of inserted) {
+    if (after >= lo && after < hi) return true;
   }
   return false;
 }

@@ -250,6 +250,26 @@ export function projectEndpoint(repo: GitLabRepositoryRef, suffix: string): stri
   return `projects/${encodeURIComponent(projectPath)}/${suffix}`;
 }
 
+function gitlabComparePatch(entry: unknown): string {
+  if (entry === null || typeof entry !== "object") return "";
+  const row: object = entry;
+  const newPath = "new_path" in row && typeof row.new_path === "string" ? row.new_path : undefined;
+  const oldPath = "old_path" in row && typeof row.old_path === "string" ? row.old_path : newPath;
+  const hunk = "diff" in row && typeof row.diff === "string" ? row.diff : "";
+  if (newPath === undefined || hunk.length === 0) return "";
+  const deleted = "deleted_file" in row && row.deleted_file === true;
+  const created = "new_file" in row && row.new_file === true;
+  const renamed = ("renamed_file" in row && row.renamed_file === true)
+    || (oldPath !== undefined && oldPath !== newPath && !created && !deleted);
+  return [
+    `diff --git a/${oldPath ?? newPath} b/${newPath}`,
+    ...(renamed && oldPath !== undefined ? [`rename from ${oldPath}`, `rename to ${newPath}`] : []),
+    `--- ${created ? "/dev/null" : `a/${oldPath ?? newPath}`}`,
+    `+++ ${deleted ? "/dev/null" : `b/${newPath}`}`,
+    hunk.endsWith("\n") ? hunk.slice(0, -1) : hunk,
+  ].join("\n") + (hunk.endsWith("\n") ? "\n" : "");
+}
+
 export function decodeNdjsonRecords<T>(stdout: string): T[] {
   const records: T[] = [];
   for (const [index, line] of stdout.split(/\r?\n/u).entries()) {
@@ -1011,6 +1031,47 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
   async getDiff(locator: ReviewLocator): Promise<string> {
     const { repo, iid } = resolveMergeRequestLocator(locator);
     return this.execGlab(["mr", "diff", iid, "--repo", repo.canonicalUrl]);
+  }
+
+  async getCompareDiff(
+    locator: ReviewLocator,
+    fromSha: string,
+    toSha: string,
+  ): Promise<string> {
+    if (!isCommitSha(fromSha) || !isCommitSha(toSha)) {
+      throw new Error("compare requires commit SHAs");
+    }
+    const { repo } = resolveMergeRequestLocator(locator);
+    const stdout = await this.execGlab([
+      "api",
+      "--method",
+      "GET",
+      "--hostname",
+      repo.host,
+      `${projectEndpoint(repo, "repository/compare")}?from=${encodeURIComponent(fromSha)}&to=${encodeURIComponent(toSha)}&straight=true`,
+    ]);
+    const parsed: unknown = JSON.parse(stdout);
+    if (parsed === null || typeof parsed !== "object") {
+      return "";
+    }
+    const body: object = parsed;
+    if ("compare_timeout" in body && body.compare_timeout === true) {
+      throw new Error("GitLab compare timed out; the returned diffs are incomplete");
+    }
+    if (!("diffs" in body) || !Array.isArray(body.diffs)) {
+      return "";
+    }
+    for (const entry of body.diffs) {
+      if (entry === null || typeof entry !== "object") continue;
+      const row: object = entry;
+      if ("collapsed" in row && row.collapsed === true) {
+        throw new Error("GitLab compare omitted a collapsed file diff");
+      }
+      if ("too_large" in row && row.too_large === true) {
+        throw new Error("GitLab compare omitted a too large file diff");
+      }
+    }
+    return body.diffs.map(gitlabComparePatch).filter((patch) => patch.length > 0).join("\n");
   }
 
   async findBotComment(locator: ReviewLocator): Promise<BotComment | null> {

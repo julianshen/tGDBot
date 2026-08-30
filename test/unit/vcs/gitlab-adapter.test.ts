@@ -17,6 +17,7 @@ import {
 import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 import type { InlineReviewComment } from "../../../src/vcs/adapter.js";
+import { originTouchedLines } from "../../../src/review/diff-anchors.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
 import {
   computeContentDigest,
@@ -160,6 +161,68 @@ describe("GitLabAdapter merge request snapshot", () => {
       "--repo",
       customPortRepo.canonicalUrl,
     ]);
+  });
+
+  it("rebuilds a unified incremental diff from the repository compare API", async () => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const hunk = "@@ -1,1 +1,2 @@\n keep\n+added\n";
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(JSON.stringify({
+      diffs: [{
+        old_path: "src/other.ts",
+        new_path: "src/other.ts",
+        new_file: false,
+        deleted_file: false,
+        diff: hunk,
+      }],
+    }));
+
+    const diff = await new GitLabAdapter(execGlab).getCompareDiff(locator(customPortRepo), fromSha, toSha);
+    expect(diff).toContain("diff --git a/src/other.ts b/src/other.ts");
+    expect(diff).toContain(hunk);
+    expect(execGlab).toHaveBeenCalledWith(expect.arrayContaining([
+      "api",
+      "--hostname",
+      customPortRepo.host,
+      expect.stringContaining("repository/compare"),
+    ]));
+    const compareArg = execGlab.mock.calls[0]?.[0].find((arg) => arg.includes("repository/compare"));
+    expect(compareArg).toContain(`from=${fromSha}`);
+    expect(compareArg).toContain(`to=${toSha}`);
+    expect(compareArg).toContain("straight=true");
+  });
+
+  it("emits rename from/to so origin-side removals stay keyed on the old path", async () => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const hunk = "@@ -14,1 +14,1 @@\n-  console.log(user.token);\n+  console.log(\"[redacted]\");\n";
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(JSON.stringify({
+      diffs: [{
+        old_path: "src/auth.ts",
+        new_path: "src/login.ts",
+        new_file: false,
+        deleted_file: false,
+        renamed_file: true,
+        diff: hunk,
+      }],
+    }));
+
+    const diff = await new GitLabAdapter(execGlab).getCompareDiff(locator(customPortRepo), fromSha, toSha);
+    expect(diff).toContain("rename from src/auth.ts");
+    expect(diff).toContain("rename to src/login.ts");
+    expect([...(originTouchedLines(diff).get("src/auth.ts") ?? [])]).toEqual([14]);
+  });
+
+  it.each([
+    ["compare_timeout", { compare_timeout: true, diffs: [] }],
+    ["collapsed", { diffs: [{ old_path: "a.ts", new_path: "a.ts", collapsed: true, diff: "" }] }],
+    ["too_large", { diffs: [{ old_path: "a.ts", new_path: "a.ts", too_large: true, diff: "" }] }],
+  ])("rejects an incomplete compare when GitLab reports %s", async (_label, body) => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(JSON.stringify(body));
+    await expect(new GitLabAdapter(execGlab).getCompareDiff(locator(customPortRepo), fromSha, toSha))
+      .rejects.toThrow(/incomplete|timeout|collapsed|too large/i);
   });
 
   it("rejects ambient and GitHub repository locators before invoking glab", async () => {
