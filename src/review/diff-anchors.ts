@@ -92,6 +92,78 @@ export function originTouchedLines(diff: string): CommentableLines {
 }
 
 /**
+ * Origin-side line numbers after which the increment inserted a new line.
+ *
+ * A multiline finding is a range. An insert between its first and last origin
+ * lines changes the anchored block without producing a `-` row, so removals
+ * alone would miss it. The recorded number is the last origin line *before*
+ * the insert (`@@ -13,0` means after line 13). Inserting after the last line
+ * of a single-line anchor is not inside that range.
+ */
+export function originInsertAfterLines(diff: string): CommentableLines {
+  const result: CommentableLines = new Map();
+  const renameSources = renameSourcesByHeadPath(diff);
+  let newPath: string | undefined;
+  let oldLine: number | undefined;
+  let oldCount = 0;
+  let consumedOld = 0;
+  let hunkOldStart = 0;
+  let inHunk = false;
+
+  const record = (after: number): void => {
+    if (newPath === undefined || after < 0) return;
+    const base = renameSources.get(newPath);
+    const keys = base === undefined || base === newPath ? [newPath] : [base, newPath];
+    for (const key of keys) {
+      let set = result.get(key);
+      if (set === undefined) {
+        set = new Set();
+        result.set(key, set);
+      }
+      set.add(after);
+    }
+  };
+
+  for (const raw of diff.split("\n")) {
+    if (raw.startsWith("diff --git ")) {
+      inHunk = false;
+      newPath = undefined;
+      continue;
+    }
+    if (!inHunk && raw.startsWith("+++ ")) {
+      const path = raw.slice(4).trim().split("\t")[0] ?? "";
+      newPath = path === "/dev/null" ? undefined : stripDiffPathPrefix(path);
+      continue;
+    }
+    const hunk = HUNK_RE.exec(raw);
+    if (hunk) {
+      inHunk = true;
+      hunkOldStart = Number(hunk[1]);
+      oldCount = hunk[2] === undefined ? 1 : Number(hunk[2]);
+      oldLine = hunkOldStart;
+      consumedOld = 0;
+      continue;
+    }
+    if (!inHunk) continue;
+    const marker = raw[0];
+    if (marker === "+") {
+      record(consumedOld === 0 && oldCount === 0 ? hunkOldStart : (oldLine ?? 1) - 1);
+    } else if (marker === "-") {
+      if (oldLine !== undefined) oldLine += 1;
+      consumedOld += 1;
+    } else if (marker === " ") {
+      if (oldLine !== undefined) oldLine += 1;
+      consumedOld += 1;
+    } else if (marker === "\\") {
+      continue;
+    } else {
+      inHunk = false;
+    }
+  }
+  return result;
+}
+
+/**
  * True iff `file`:`line` is a valid new-side inline anchor.
  *
  * A finding with no line (`line: null`, per the JSON contract) can never be

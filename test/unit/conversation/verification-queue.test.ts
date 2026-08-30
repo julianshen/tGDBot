@@ -311,6 +311,29 @@ describe("pendingVerifications — a multi-line anchor is a range", () => {
     expect(queue[0]?.trigger).toBe("head-change");
   });
 
+  it("queues when a line is inserted inside the range", () => {
+    const queue = pendingVerifications(input({
+      findings: [ranged],
+      events: [],
+      changedLines: new Map(),
+      touchedLinesByOriginHead: new Map([[OLD, new Map()]]),
+      insertAfterByOriginHead: new Map([[OLD, new Map([["src/a.ts", new Set([10])]])]]),
+    }));
+
+    expect(queue[0]?.trigger).toBe("head-change");
+  });
+
+  it("does not treat an insert after a single-line anchor as a touch", () => {
+    const queue = pendingVerifications(input({
+      events: [],
+      changedLines: new Map(),
+      touchedLinesByOriginHead: new Map([[OLD, new Map()]]),
+      insertAfterByOriginHead: new Map([[OLD, new Map([["src/a.ts", new Set([10])]])]]),
+    }));
+
+    expect(queue).toEqual([]);
+  });
+
   it("queues when the middle of the range changed", () => {
     const queue = pendingVerifications(input({
       findings: [ranged],

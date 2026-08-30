@@ -15,6 +15,7 @@ import {
   commentableLines,
   addedLines,
   originTouchedLines,
+  originInsertAfterLines,
   diffPositionRange,
   parseDiffPositions,
   isCommentable,
@@ -88,6 +89,30 @@ describe("originTouchedLines", () => {
     expect([...(originTouchedLines(diff).get("src/auth.ts") ?? [])]).toEqual([14]);
     expect(addedLines(diff).get("src/auth.ts")?.has(15)).toBe(true);
     expect(addedLines(diff).get("src/auth.ts")?.has(14)).toBe(false);
+  });
+});
+
+describe("originInsertAfterLines", () => {
+  it("records the origin line after which a silent insert landed", () => {
+    const diff = `diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -10,2 +10,3 @@
+ line10
++guard
+ line11
+`;
+    expect([...(originInsertAfterLines(diff).get("src/a.ts") ?? [])]).toEqual([10]);
+  });
+
+  it("uses the hunk old-start when the insert deletes no origin lines", () => {
+    const diff = `diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -13,0 +14,1 @@
++inserted
+`;
+    expect([...(originInsertAfterLines(diff).get("src/a.ts") ?? [])]).toEqual([13]);
   });
 });
 

@@ -92,7 +92,7 @@ import type {
   RepositoryBinding,
 } from "../conversation/types.js";
 import { observeResolvedThreads, pendingVerifications } from "../conversation/verification-queue.js";
-import { originTouchedLines } from "../review/diff-anchors.js";
+import { originInsertAfterLines, originTouchedLines } from "../review/diff-anchors.js";
 import { CompareNotDirectError } from "../vcs/adapter.js";
 import type { PendingVerification } from "../conversation/verification-queue.js";
 import { verifyFinding } from "../conversation/verification.js";
@@ -2291,9 +2291,11 @@ async function loadTouchedLinesByOriginHead(input: {
   };
 }): Promise<{
   readonly lines: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>>;
+  readonly insertAfter: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>>;
   readonly complete: boolean;
 }> {
   const touched = new Map<string, ReadonlyMap<string, ReadonlySet<number>>>();
+  const insertAfter = new Map<string, ReadonlyMap<string, ReadonlySet<number>>>();
   const locator = {
     kind: "repository" as const,
     repo: input.options.config.repository,
@@ -2304,17 +2306,21 @@ async function loadTouchedLinesByOriginHead(input: {
     if (origin.toLowerCase() === input.currentHead.toLowerCase()) continue;
     try {
       const diff = await input.options.config.vcsAdapter.getCompareDiff(locator, origin, input.currentHead);
-      touched.set(origin.toLowerCase(), originTouchedLines(diff));
+      const key = origin.toLowerCase();
+      touched.set(key, originTouchedLines(diff));
+      insertAfter.set(key, originInsertAfterLines(diff));
     } catch (error) {
       if (error instanceof CompareNotDirectError) {
-        touched.set(origin.toLowerCase(), originAnchorLines(origin, input.findings));
+        const key = origin.toLowerCase();
+        touched.set(key, originAnchorLines(origin, input.findings));
+        insertAfter.set(key, new Map());
         continue;
       }
       complete = false;
       console.warn(`tgd-review-agent: could not compare ${origin.slice(0, 8)}…${input.currentHead.slice(0, 8)} (${redactedMessage(error)})`);
     }
   }
-  return { lines: touched, complete };
+  return { lines: touched, insertAfter, complete };
 }
 
 function originAnchorLines(
@@ -2521,6 +2527,7 @@ async function queueVerifications(input: {
   const needsCompare = staleOrigins.length > 0 && !alreadyScanned;
   let scannedHeadSha: string | undefined = alreadyScanned ? currentHead : undefined;
   let touchedLinesByOriginHead: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>> = new Map();
+  let insertAfterByOriginHead: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>> = new Map();
 
   if (waiting.length === 0 && recoveryDeferred.length === 0 && !needsCompare) {
     return { items: [], deferred: false, deferredEvents: [], boundThreads: bound, scannedHeadSha: currentHead };
@@ -2538,6 +2545,7 @@ async function queueVerifications(input: {
       options: input.options,
     });
     touchedLinesByOriginHead = loaded.lines;
+    insertAfterByOriginHead = loaded.insertAfter;
     if (loaded.complete && origins.length === staleOrigins.length) scannedHeadSha = currentHead;
   }
 
@@ -2566,6 +2574,7 @@ async function queueVerifications(input: {
     resolvedThreads: input.resolvedThreads,
     changedLines: new Map(),
     touchedLinesByOriginHead,
+    insertAfterByOriginHead,
     ceiling: MAX_VERIFICATION_CANDIDATES,
   });
   if (queue.length === 0) {
