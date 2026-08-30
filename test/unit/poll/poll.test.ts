@@ -1840,7 +1840,7 @@ describe("clarification answer lifecycle", () => {
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
       ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
     });
-    const check = vi.fn().mockImplementation(async (input: { findings: readonly unknown[] }) =>
+    const check = vi.fn().mockImplementation(async (input: { findings: readonly Record<string, unknown>[] }) =>
       input.findings.map((entry) => ({
         ...entry,
         hostCheck: {
@@ -1925,7 +1925,7 @@ describe("clarification answer lifecycle", () => {
       worktreesRoot: "/ws/repo/worktrees", baseWorktreePath: "/ws/repo/base",
       ownerMarkerPath: "/ws/repo/owner.json", baseSha: "b".repeat(40),
     });
-    const check = vi.fn().mockImplementation(async (input: { findings: readonly unknown[] }) =>
+    const check = vi.fn().mockImplementation(async (input: { findings: readonly Record<string, unknown>[] }) =>
       input.findings.map((entry) => ({
         ...entry,
         hostCheck: {
