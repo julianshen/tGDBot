@@ -744,12 +744,20 @@ export class ContextCache {
         }
         try {
           await this.#rename(claimedStagingPath, destination);
-          published = true;
-        } finally {
-          // Housekeeping after the commit point, like every claim cleanup:
-          // a failure here must not unsay a replacement that happened.
-          await rm(retiringPath, { recursive: true, force: true }).catch(() => undefined);
+        } catch (installError) {
+          // PR #107 review: the retired entry is still the only valid index
+          // this repository has. Restore it BEFORE propagating - a failed
+          // promotion must not have destroyed the previous manifest (#60's
+          // own acceptance criterion). The retired directory is deliberately
+          // left in place if the restore itself fails, so the recovery path
+          // never deletes the last good copy.
+          await this.#rename(retiringPath, destination).catch(() => undefined);
+          throw installError;
         }
+        published = true;
+        // Housekeeping after the commit point, like every claim cleanup:
+        // a failure here must not unsay a replacement that happened.
+        await rm(retiringPath, { recursive: true, force: true }).catch(() => undefined);
       }
       return manifest;
     })().then(

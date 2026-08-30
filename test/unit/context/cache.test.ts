@@ -1919,3 +1919,51 @@ describe("ContextCache — eviction stays inside the locked repository (PR #107 
     await expect(cache.lookupContext(key)).resolves.toBeUndefined();
   });
 });
+
+describe("ContextCache — replacement restores the retired entry on failure (PR #107 review round two)", () => {
+  it("leaves the previous manifest intact and readable when the install rename fails", async () => {
+    const root = await tempRoot();
+    const cache = new ContextCache(root);
+    const firstStaging = await createStaging(root);
+    const parent = await cache.promoteContext(firstStaging, input());
+    const realRename = rename;
+    let call = 0;
+    const failingCache = new ContextCache(root, {
+      // Call order on the CAS path: (1) staging -> destination fails with
+      // EEXIST (destination occupied), (2) destination -> retiring succeeds,
+      // (3) staging -> destination fails transiently, (4) restore succeeds.
+      rename: async (source, destination) => {
+        call += 1;
+        if (call === 3) throw Object.assign(new Error("transient EIO"), { code: "EIO" });
+        return realRename(source, destination);
+      },
+    });
+
+    const nextStaging = await createStaging(root);
+    // The staged artifacts must pin the commit the replacement manifest claims.
+    await writeFile(
+      path.join(nextStaging, ".understand-anything/mapping-metadata.json"),
+      JSON.stringify({ version: 1, status: "complete", baseSha: "c".repeat(40) }),
+      "utf8",
+    );
+    for (const graphPath of [
+      path.join(nextStaging, ".understand-anything/knowledge-graph.json"),
+      path.join(nextStaging, ".understand-anything/domain-graph.json"),
+    ]) {
+      const graph = JSON.parse(await readFile(graphPath, "utf8")) as { project: { gitCommitHash: string } };
+      graph.project.gitCommitHash = "c".repeat(40);
+      await writeFile(graphPath, JSON.stringify(graph), "utf8");
+    }
+    await expect(failingCache.promoteContext(nextStaging, input({
+      builtFromSha: "c".repeat(40),
+      generation: parent.generation + 1,
+      parentManifestHash: parent.manifestHash,
+    }), { expectedExistingManifestHash: parent.manifestHash })).rejects.toMatchObject({ code: "EIO" });
+
+    // THE point: the previous entry is intact and readable at its own path.
+    await expect(cache.lookupContext(key)).resolves.toEqual(parent);
+    // And nothing was lost or left retired behind.
+    const leftovers = (await readdir(path.join(root, "contexts"))).filter((name) => name.includes("retiring"));
+    expect(leftovers).toEqual([]);
+  });
+});
