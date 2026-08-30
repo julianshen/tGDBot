@@ -102,13 +102,19 @@ describe("dependencyChangesFromDiff", () => {
     expect(changesFrom(diff)[0]?.manifest).toBe("packages/api/package.json");
   });
 
-  it("deduplicates a package that appears in several manifests at one version", () => {
+  // One change PER manifest, not one per diff: the same addition in two
+  // workspaces is checked against each manifest's own declared names, and the
+  // pack describes each manifest's tree (PR #102 review, round three).
+  it("keeps the same addition in several manifests as one change per manifest", () => {
     const diff = [
       diffOf("package.json", '@@ -1 +1,2 @@\n   "dependencies": {\n+    "lodash": "4.17.21",'),
       diffOf("web/package.json", '@@ -1 +1,2 @@\n   "dependencies": {\n+    "lodash": "4.17.21",'),
     ].join("\n");
 
-    expect(changesFrom(diff)).toHaveLength(1);
+    expect(changesFrom(diff).map((change) => change.manifest).sort()).toEqual([
+      "package.json",
+      "web/package.json",
+    ]);
   });
 
   // Ranges are what a manifest usually carries; the caret is not part of the
@@ -1465,5 +1471,39 @@ describe("dependencyChanges — non-semver dependencies", () => {
     );
 
     expect(result.changes).toHaveLength(200);
+  });
+
+  // PR #102 review, round three: the same name and spec added to two
+  // manifests is two candidates, because the corpus is per manifest. Only the
+  // manifest that ALSO declares the neighbour has the typosquat.
+  it("extracts the same addition in every manifest so each gets its own name check", () => {
+    const manifestsWithoutCorpus = JSON.stringify({
+      dependencies: { lodahs: "1.0.0" },
+    });
+    const manifestWithCorpus = JSON.stringify({
+      dependencies: { lodahs: "1.0.0", lodash: "4.17.21" },
+    });
+    const head = new Map([
+      ["packages/api/package.json", manifestsWithoutCorpus],
+      ["packages/web/package.json", manifestWithCorpus],
+    ]);
+    const result = dependencyChanges(
+      [
+        { path: "packages/api/package.json", basePath: undefined },
+        { path: "packages/web/package.json", basePath: undefined },
+      ],
+      head,
+      new Map(),
+    );
+
+    expect(result.changes.map((change) => change.manifest).sort()).toEqual([
+      "packages/api/package.json",
+      "packages/web/package.json",
+      "packages/web/package.json",
+    ]);
+    expect(result.changes.filter((change) => change.name === "lodahs").map((change) => change.manifest)).toEqual([
+      "packages/api/package.json",
+      "packages/web/package.json",
+    ]);
   });
 });

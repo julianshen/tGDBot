@@ -128,6 +128,27 @@ describe("typosquatFacts", () => {
     expect(facts[0]?.skipped).toBe("no-other-names");
   });
 
+  // PR #102 review, round three: the same name added to two manifests is two
+  // candidates, each against its own corpus — only the manifest that also
+  // declares the neighbour flags.
+  it("checks each manifest's copy of the same addition against that manifest's corpus", () => {
+    const facts = typosquatFacts(
+      [
+        { name: "lodahs", manifest: "packages/api/package.json" },
+        { name: "lodahs", manifest: "packages/web/package.json" },
+      ],
+      new Map([
+        ["packages/api/package.json", ["lodahs"]],
+        ["packages/web/package.json", ["lodahs", "lodash"]],
+      ]),
+    );
+
+    expect(facts[0]?.matches).toEqual([]);
+    expect(facts[1]?.matches).toEqual([
+      { existing: "lodash", distance: 1, kind: "transposition" },
+    ]);
+  });
+
   it("says so when the manifest has no other name to compare against", () => {
     const facts = typosquatFacts(
       [{ name: "lodahs", manifest: "package.json" }],

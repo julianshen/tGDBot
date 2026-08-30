@@ -442,7 +442,13 @@ export function dependencyChanges(
         if (nameCheckCount >= MAX_NAME_CHECKS_PER_DIFF) continue;
         nameCheckCount += 1;
       }
-      const identity = `${section}\u0000${name}@${spec}`;
+      const identity = `${path}\u0000${section}\u0000${name}@${spec}`;
+      // Keyed by MANIFEST: the same addition in two workspaces is two changes,
+      // because the name check's corpus is per manifest — `lodahs@1.0.0` added
+      // beside `lodash` in one package.json is a typosquat there and not in the
+      // other, and dropping the second copy silently skipped the check that
+      // mattered (PR #102 review, round three). Registry requests are unaffected:
+      // the fact lookups deduplicate by name and by spec on their own.
       if (seen.has(identity)) continue;
       seen.add(identity);
       changes.push({
