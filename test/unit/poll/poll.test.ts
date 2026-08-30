@@ -13,7 +13,7 @@ import {
 } from "../../../src/conversation/markers.js";
 import { encodeMemoryPublicId } from "../../../src/conversation/memories.js";
 import { resolvePollConfig } from "../../../src/poll/config.js";
-import type { VcsAdapter } from "../../../src/vcs/adapter.js";
+import { CompareNotDirectError, type VcsAdapter } from "../../../src/vcs/adapter.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
 import { createConversationStateStore } from "../../../src/conversation/state-store.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
@@ -2222,6 +2222,26 @@ describe("automatic verification", () => {
       ...executionDeps(adapter, { createSession: session, compareDiff: shiftedReplacementDiff }),
     })).resolves.toBe(0);
 
+    expect(sessions).toBe(1);
+  });
+
+  it("verifies a silent push when the origin is no longer an ancestor of the head", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    const deps = executionDeps(adapter, { createSession: session });
+    deps.vcs.adapter.getCompareDiff = vi.fn(async () => {
+      throw new CompareNotDirectError("origin is not an ancestor of the current head");
+    });
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
     expect(sessions).toBe(1);
   });
 

@@ -259,8 +259,11 @@ function gitlabComparePatch(entry: unknown): string {
   if (newPath === undefined || hunk.length === 0) return "";
   const deleted = "deleted_file" in row && row.deleted_file === true;
   const created = "new_file" in row && row.new_file === true;
+  const renamed = ("renamed_file" in row && row.renamed_file === true)
+    || (oldPath !== undefined && oldPath !== newPath && !created && !deleted);
   return [
     `diff --git a/${oldPath ?? newPath} b/${newPath}`,
+    ...(renamed && oldPath !== undefined ? [`rename from ${oldPath}`, `rename to ${newPath}`] : []),
     `--- ${created ? "/dev/null" : `a/${oldPath ?? newPath}`}`,
     `+++ ${deleted ? "/dev/null" : `b/${newPath}`}`,
     hunk.endsWith("\n") ? hunk.slice(0, -1) : hunk,
@@ -1045,7 +1048,7 @@ export class GitLabAdapter implements VcsAdapter, ConversationAdapter {
       "GET",
       "--hostname",
       repo.host,
-      `${projectEndpoint(repo, "repository/compare")}?from=${encodeURIComponent(fromSha)}&to=${encodeURIComponent(toSha)}`,
+      `${projectEndpoint(repo, "repository/compare")}?from=${encodeURIComponent(fromSha)}&to=${encodeURIComponent(toSha)}&straight=true`,
     ]);
     const parsed: unknown = JSON.parse(stdout);
     if (parsed === null || typeof parsed !== "object") {

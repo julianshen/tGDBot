@@ -67,12 +67,18 @@ export interface VcsAdapter {
     options?: { expectedHeadSha?: string; expectedBaseSha?: string },
   ): Promise<string>;
   /**
-   * Unified diff of what `toSha` changed since `fromSha` (three-dot compare).
+   * Unified diff of the `fromSha` tree against the `toSha` tree (two-dot /
+   * straight compare).
    *
    * `getDiff` is the pull request's full base..head, which still contains
    * every finding line as context or as the original addition. Head-change
    * verification needs the increment between the finding's own head and the
    * current one, otherwise any later push re-verifies every open finding.
+   *
+   * Three-dot / merge-base compare is wrong after a force-push: the origin
+   * commit is no longer an ancestor, so origin-side removals never appear.
+   * Implementations that cannot produce a direct tree diff throw
+   * `CompareNotDirectError`.
    */
   getCompareDiff(
     locator: ReviewLocator,
@@ -442,6 +448,18 @@ export function validateInlinePublishOutcomes(
  * a branch name resolves to that branch's tip — precisely the comparison the
  * merge base exists to avoid (PR #67 review).
  */
+/**
+ * The provider can only compare `fromSha` through a merge base, not against
+ * the origin tree itself. Poll treats every anchor at that origin as touched
+ * rather than checkpointing an empty increment.
+ */
+export class CompareNotDirectError extends Error {
+  constructor(message = "compare is not a direct tree diff") {
+    super(message);
+    this.name = "CompareNotDirectError";
+  }
+}
+
 export function isCommitSha(value: unknown): value is string {
   return typeof value === "string" && /^[0-9a-f]{7,40}$/u.test(value);
 }

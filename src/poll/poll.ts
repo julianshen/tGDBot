@@ -93,6 +93,7 @@ import type {
 } from "../conversation/types.js";
 import { observeResolvedThreads, pendingVerifications } from "../conversation/verification-queue.js";
 import { originTouchedLines } from "../review/diff-anchors.js";
+import { CompareNotDirectError } from "../vcs/adapter.js";
 import type { PendingVerification } from "../conversation/verification-queue.js";
 import { verifyFinding } from "../conversation/verification.js";
 import { MAX_RESOLVED_THREADS } from "../conversation/state-schema.js";
@@ -2284,6 +2285,7 @@ async function loadTouchedLinesByOriginHead(input: {
   readonly reviewNumber: number;
   readonly currentHead: string;
   readonly origins: readonly string[];
+  readonly findings: readonly FindingLedgerEntry[];
   readonly options: {
     readonly config: ResolvedPollConfig;
   };
@@ -2304,11 +2306,39 @@ async function loadTouchedLinesByOriginHead(input: {
       const diff = await input.options.config.vcsAdapter.getCompareDiff(locator, origin, input.currentHead);
       touched.set(origin.toLowerCase(), originTouchedLines(diff));
     } catch (error) {
+      if (error instanceof CompareNotDirectError) {
+        touched.set(origin.toLowerCase(), originAnchorLines(origin, input.findings));
+        continue;
+      }
       complete = false;
       console.warn(`tgd-review-agent: could not compare ${origin.slice(0, 8)}…${input.currentHead.slice(0, 8)} (${redactedMessage(error)})`);
     }
   }
   return { lines: touched, complete };
+}
+
+function originAnchorLines(
+  origin: string,
+  findings: readonly FindingLedgerEntry[],
+): ReadonlyMap<string, ReadonlySet<number>> {
+  const lines = new Map<string, Set<number>>();
+  const key = origin.toLowerCase();
+  for (const entry of findings) {
+    if (entry.headSha.toLowerCase() !== key) continue;
+    if (entry.placement === null || entry.placement.line === undefined) continue;
+    const path = entry.placement.file;
+    const last = entry.placement.line;
+    const first = entry.placement.startLine ?? last;
+    let set = lines.get(path);
+    if (set === undefined) {
+      set = new Set();
+      lines.set(path, set);
+    }
+    for (let line = Math.min(first, last); line <= Math.max(first, last); line += 1) {
+      set.add(line);
+    }
+  }
+  return lines;
 }
 
 function headChangeActivity(input: {
@@ -2504,6 +2534,7 @@ async function queueVerifications(input: {
       reviewNumber: input.reviewNumber,
       currentHead,
       origins,
+      findings,
       options: input.options,
     });
     touchedLinesByOriginHead = loaded.lines;

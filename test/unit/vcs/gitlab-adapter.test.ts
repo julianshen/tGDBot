@@ -17,6 +17,7 @@ import {
 import { GitHubAdapter } from "../../../src/vcs/github-adapter.js";
 import type { GitLabRepositoryRef } from "../../../src/target/types.js";
 import type { InlineReviewComment } from "../../../src/vcs/adapter.js";
+import { originTouchedLines } from "../../../src/review/diff-anchors.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
 import {
   computeContentDigest,
@@ -188,6 +189,28 @@ describe("GitLabAdapter merge request snapshot", () => {
     const compareArg = execGlab.mock.calls[0]?.[0].find((arg) => arg.includes("repository/compare"));
     expect(compareArg).toContain(`from=${fromSha}`);
     expect(compareArg).toContain(`to=${toSha}`);
+    expect(compareArg).toContain("straight=true");
+  });
+
+  it("emits rename from/to so origin-side removals stay keyed on the old path", async () => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const hunk = "@@ -14,1 +14,1 @@\n-  console.log(user.token);\n+  console.log(\"[redacted]\");\n";
+    const execGlab = vi.fn<ExecGlab>().mockResolvedValue(JSON.stringify({
+      diffs: [{
+        old_path: "src/auth.ts",
+        new_path: "src/login.ts",
+        new_file: false,
+        deleted_file: false,
+        renamed_file: true,
+        diff: hunk,
+      }],
+    }));
+
+    const diff = await new GitLabAdapter(execGlab).getCompareDiff(locator(customPortRepo), fromSha, toSha);
+    expect(diff).toContain("rename from src/auth.ts");
+    expect(diff).toContain("rename to src/login.ts");
+    expect([...(originTouchedLines(diff).get("src/auth.ts") ?? [])]).toEqual([14]);
   });
 
   it.each([

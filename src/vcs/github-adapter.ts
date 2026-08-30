@@ -9,7 +9,7 @@ import {
   type InlineRecoveryChild,
   type InlineRecoveryState,
 } from "../review/comment-marker.js";
-import { compareOrderKeys, isCommitSha, AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
+import { compareOrderKeys, isCommitSha, AmbiguousInlinePublishError, CompareNotDirectError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -1315,6 +1315,12 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
   ): Promise<string> {
     if (!isCommitSha(fromSha) || !isCommitSha(toSha)) {
       throw new Error("compare requires commit SHAs");
+    }
+    const mergeBase = await this.getMergeBaseSha(locator, fromSha, toSha);
+    if (mergeBase !== undefined && mergeBase.toLowerCase() !== fromSha.toLowerCase()) {
+      throw new CompareNotDirectError(
+        "GitHub compare uses a merge base other than the origin commit",
+      );
     }
     const { repo } = resolvePullLocator(locator);
     return this.execGh([
