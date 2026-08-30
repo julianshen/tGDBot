@@ -250,9 +250,13 @@ function taskBoundaryToken(
     untrustedContextText,
     FINDING_JSON_CONTRACT,
     diff,
-    intentText,
     conversationText,
   ];
+  // Only when the section actually renders. Feeding an unconditional empty
+  // string into the hash would change EVERY boundary token in the wild —
+  // including every --pr-intent-off task, which must stay byte-identical to
+  // the pre-#59 output (CodeRabbit review of PR #106).
+  if (prIntent !== undefined) enclosed.push(intentText);
 
   for (let counter = 0; ; counter += 1) {
     const hash = createHash("sha256");
@@ -264,7 +268,7 @@ function taskBoundaryToken(
       contextText,
       untrustedContextText,
       diff,
-      intentText,
+      ...(prIntent === undefined ? [] : [intentText]),
       conversationText,
       String(counter),
     ]) {
