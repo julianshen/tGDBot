@@ -76,6 +76,7 @@ import {
   createConversationStateStore,
   replacePendingClarification,
   type ConversationStateStore,
+  type ConversationStateTransaction,
 } from "../conversation/state-store.js";
 import {
   prepareFindingLedgerEntry,
@@ -94,9 +95,12 @@ import type {
 import { observeResolvedThreads, pendingVerifications } from "../conversation/verification-queue.js";
 import { contextRoots, selectContextRoot } from "../context/root.js";
 import {
+  originInsertAfterLines,
+  originTouchedLines,
   removedLinesByFile as removedLinesFromDiff,
   renameSourcesByHeadPath,
 } from "../review/diff-anchors.js";
+import { CompareNotDirectError } from "../vcs/adapter.js";
 import { hasCheckableClaim, runStructuralChecks as runStructuralChecksReal } from "../review/structural-check.js";
 import { prepareWorkspace as prepareWorkspaceReal } from "../workspace/manager.js";
 import type { Finding } from "../review/types.js";
@@ -332,13 +336,14 @@ async function classifyOpenReviewEvents(options: {
         item.event.kind !== "general-comment" && item.event.authorIsBot !== true &&
         item.event.threadId !== undefined && !boundThreads.has(item.event.threadId))
       .map((item) => item.event);
-    const queued = candidateEvents.length === 0 && recoveryEvents.length === 0
+    const queued = candidateEvents.length === 0 && recoveryEvents.length === 0 && boundThreads.size === 0
       ? { items: [], deferred: false, deferredEvents: [], boundThreads } as VerificationQueue
       : await queueVerifications({
       events: classified.filter((item) => item.parsed.kind === "irrelevant"),
       reviewNumber: review.reviewNumber,
       reviewIdentity: identity,
       resolvedThreads: new Set(review.threadsResolved ?? []),
+      headChangeScanSha: review.headChangeScanSha,
       budget: verificationBudget,
       options,
     }).catch((error: unknown) => {
@@ -490,6 +495,54 @@ async function classifyOpenReviewEvents(options: {
     // be repeated.
     if (!options.dryRun && !haltTransient && !haltCursor) {
       for (const item of queued.items) {
+        const latest = await resolveLatestAction(options.store, item.identity);
+        if (latest !== undefined && (latest.state === "manifest-ready" || latest.state === "published" ||
+          latest.state === "prepared")) {
+          const recoveredAction = actionFromEvent(latest);
+          const recoveredVerdict = recoveredAction.children.find((child) =>
+            child.placement.kind === "group-reply")?.placement;
+          const verificationVerdict = recoveredVerdict?.kind === "group-reply"
+            ? recoveredVerdict.verificationVerdict
+            : undefined;
+          const recoveredMetadata = queued.context?.metadata;
+          const recovered = await publishPreparedReply({
+            event: item.event,
+            identity: item.identity,
+            latest,
+            reviewIdentity: identity,
+            options,
+            ...(verificationVerdict !== undefined && recoveredMetadata !== undefined
+              ? {
+                  onComplete: (tx) => {
+                    tx.appendOutcome(prepareFindingOutcome({
+                      repository: options.store.repositoryBinding,
+                      id: `outcome_${createHash("sha256")
+                        .update(`${item.ledger.id}\0${recoveredMetadata.headSha}`, "utf8")
+                        .digest("hex").slice(0, 32)}`,
+                      findingId: item.ledger.id,
+                      reviewNumber: item.ledger.reviewNumber,
+                      headSha: recoveredMetadata.headSha,
+                      ruleName: item.ledger.finding.ruleName,
+                      category: item.ledger.finding.category,
+                      severity: item.pending.severity,
+                      ...(item.ledger.finding.effort === undefined
+                        ? {}
+                        : { effort: item.ledger.finding.effort }),
+                      verdict: verificationVerdict,
+                      trigger: item.pending.trigger,
+                      anchorChanged: item.pending.trigger === "head-change",
+                      at: options.now(),
+                    }));
+                  },
+                }
+              : {}),
+          });
+          if (recovered === "transient") { haltTransient = true; haltCursor = true; break; }
+          if (recovered === "stale") { haltCursor = true; break; }
+          knownActionIds.add(item.identity.actionId);
+          outstanding.delete(item.event.eventId);
+          continue;
+        }
         const verification = queued.context === undefined
           ? ({ kind: "transient" } as const)
           : await verifyQueued({ item, context: queued.context, reviewNumber: review.reviewNumber, options });
@@ -572,6 +625,9 @@ async function classifyOpenReviewEvents(options: {
                       retired: false,
                       ...(page.nextPageToken === undefined ? {} : { eventPageToken: page.nextPageToken.opaque }),
                       ...(threadsResolved.length === 0 ? {} : { threadsResolved }),
+                      ...((queued.scannedHeadSha ?? entry.headChangeScanSha) === undefined
+                        ? {}
+                        : { headChangeScanSha: queued.scannedHeadSha ?? entry.headChangeScanSha }),
                     }
                   : entry)
             : tx.snapshot.cursor.reviews,
@@ -779,6 +835,7 @@ type ReplyPlan =
       readonly rationale: string;
       readonly outcome: FindingOutcomeEntry;
       readonly headSha: string;
+      readonly resolveOwnThread: boolean;
     }
   | {
       readonly kind: "clarification";
@@ -1350,6 +1407,13 @@ async function publishReplyPlan(input: {
         writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event,
           input.parentCommentId),
         now: input.options.now,
+        finalize: async (publishedAction) => {
+          await resolveOwnThreadAfterReply({
+            adapter: input.options.adapter,
+            reviewIdentity: input.reviewIdentity,
+            action: publishedAction,
+          });
+        },
         ...(plan.kind === "verification"
           ? { onComplete: (tx) => { tx.appendOutcome(plan.outcome); } }
           : {}),
@@ -1424,6 +1488,7 @@ async function publishPreparedReply(input: {
     readonly config: ResolvedPollConfig;
     readonly deps: PollDependencies;
   };
+  readonly onComplete?: (tx: ConversationStateTransaction) => void;
 }): Promise<"completed" | "transient" | "stale"> {
   try {
     const action = actionFromEvent(input.latest);
@@ -1449,12 +1514,33 @@ async function publishPreparedReply(input: {
       action,
       writer: conversationWriter(input.options.adapter, input.reviewIdentity, input.event),
       now: input.options.now,
+      finalize: async (publishedAction) => {
+        await resolveOwnThreadAfterReply({
+          adapter: input.options.adapter,
+          reviewIdentity: input.reviewIdentity,
+          action: publishedAction,
+        });
+      },
+      ...(input.onComplete === undefined ? {} : { onComplete: input.onComplete }),
     });
     return published.state === "completed" ? "completed" : "transient";
   } catch (error) {
     console.warn(`tgd-review-agent: conversation reply recovery failed (${redactedMessage(error)})`);
     return "transient";
   }
+}
+
+async function resolveOwnThreadAfterReply(input: {
+  readonly adapter: ConversationAdapter;
+  readonly reviewIdentity: ReturnType<typeof reviewIdentityFrom>;
+  readonly action: PublicationAction;
+}): Promise<void> {
+  const owed = input.action.children.find((child) =>
+    child.placement.kind === "group-reply" && child.placement.resolveOwnThread === true);
+  if (owed === undefined || owed.placement.kind !== "group-reply") return;
+  const threadId = owed.placement.threadId;
+  if (threadId === undefined) return;
+  await input.adapter.resolveReviewThread(input.reviewIdentity, threadId);
 }
 
 function conversationWriter(
@@ -1599,6 +1685,12 @@ function buildReplyChild(input: {
           ? { headSha: input.plan.headSha }
           : {}
       ),
+      ...(input.plan.kind === "verification"
+        ? {
+            verificationVerdict: input.plan.verdict,
+            ...(input.plan.resolveOwnThread ? { resolveOwnThread: true as const } : {}),
+          }
+        : {}),
     },
     body: render(marker),
     marker: `<!-- tgd-conversation:${input.actionId}:${childId} -->`,
@@ -1617,6 +1709,24 @@ async function loadReviewMetadata(
     return { headSha: pr.headSha, baseSha: pr.baseSha, diff };
   } catch (error) {
     console.warn(`tgd-review-agent: could not load review metadata (${redactedMessage(error)})`);
+    return undefined;
+  }
+}
+
+/** Head SHA only — idle head-change scans must not download the full PR diff. */
+async function loadReviewHead(
+  reviewNumber: number,
+  options: { readonly config: ResolvedPollConfig; readonly deps: PollDependencies },
+): Promise<string | undefined> {
+  if (options.deps.getReviewMetadata !== undefined) {
+    const metadata = await loadReviewMetadata(reviewNumber, options);
+    return metadata?.headSha;
+  }
+  try {
+    const locator = { kind: "repository" as const, repo: options.config.repository, number: reviewNumber };
+    return (await options.config.vcsAdapter.getPullRequest(locator)).headSha;
+  } catch (error) {
+    console.warn(`tgd-review-agent: could not load review head (${redactedMessage(error)})`);
     return undefined;
   }
 }
@@ -2220,10 +2330,9 @@ const MAX_IDENTITY_RECOVERY_READS = 4;
  * this page's events, the finding ledger, the recorded outcomes — and only what
  * survives it costs a thread fetch and a model call.
  *
- * Event-driven triggers only for now. `head-change` needs the review's diff to
- * know which lines moved, and the identity of a verification with no triggering
- * event needs deciding; both belong with that trigger rather than smuggled in
- * here.
+ * Human thread events AND a silent push that removed origin-side lines inside
+ * a finding's anchor. Head-change has no page event; the reply is keyed on the
+ * finding and the new head, and posted under the bot's own thread root.
  */
 /** One verification the queue selected, with everything the verdict needs. */
 interface QueuedVerification {
@@ -2265,6 +2374,13 @@ interface VerificationQueue {
    * it asked for is never given (PR #74 review).
    */
   readonly deferredEvents: readonly ReviewActivityEvent[];
+  /**
+   * Head SHA whose origin compares finished this page. Written to the review
+   * cursor so a later idle poll of the same head does not re-download diffs.
+   * Absent when a compare failed or the origin list was truncated, so the
+   * next poll retries instead of treating an unscanned origin as untouched.
+   */
+  readonly scannedHeadSha?: string;
   readonly context?: {
     readonly metadata: Awaited<ReturnType<typeof loadReviewMetadata>>;
     readonly rules: Awaited<ReturnType<typeof loadActiveRules>>;
@@ -2278,6 +2394,99 @@ interface VerificationQueue {
  * ledger, recorded outcomes, the thread — so a dry run can report exactly what
  * would happen without spending a model call on a preview (PR #74 review).
  */
+async function loadTouchedLinesByOriginHead(input: {
+  readonly reviewNumber: number;
+  readonly currentHead: string;
+  readonly origins: readonly string[];
+  readonly findings: readonly FindingLedgerEntry[];
+  readonly options: {
+    readonly config: ResolvedPollConfig;
+  };
+}): Promise<{
+  readonly lines: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>>;
+  readonly insertAfter: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>>;
+  readonly complete: boolean;
+}> {
+  const touched = new Map<string, ReadonlyMap<string, ReadonlySet<number>>>();
+  const insertAfter = new Map<string, ReadonlyMap<string, ReadonlySet<number>>>();
+  const locator = {
+    kind: "repository" as const,
+    repo: input.options.config.repository,
+    number: input.reviewNumber,
+  };
+  let complete = true;
+  for (const origin of input.origins) {
+    if (origin.toLowerCase() === input.currentHead.toLowerCase()) continue;
+    try {
+      const diff = await input.options.config.vcsAdapter.getCompareDiff(locator, origin, input.currentHead);
+      const key = origin.toLowerCase();
+      touched.set(key, originTouchedLines(diff));
+      insertAfter.set(key, originInsertAfterLines(diff));
+    } catch (error) {
+      if (error instanceof CompareNotDirectError) {
+        const key = origin.toLowerCase();
+        touched.set(key, originAnchorLines(origin, input.findings));
+        insertAfter.set(key, new Map());
+        continue;
+      }
+      complete = false;
+      console.warn(`tgd-review-agent: could not compare ${origin.slice(0, 8)}…${input.currentHead.slice(0, 8)} (${redactedMessage(error)})`);
+    }
+  }
+  return { lines: touched, insertAfter, complete };
+}
+
+function originAnchorLines(
+  origin: string,
+  findings: readonly FindingLedgerEntry[],
+): ReadonlyMap<string, ReadonlySet<number>> {
+  const lines = new Map<string, Set<number>>();
+  const key = origin.toLowerCase();
+  for (const entry of findings) {
+    if (entry.headSha.toLowerCase() !== key) continue;
+    if (entry.placement === null || entry.placement.line === undefined) continue;
+    const path = entry.placement.file;
+    const last = entry.placement.line;
+    const first = entry.placement.startLine ?? last;
+    let set = lines.get(path);
+    if (set === undefined) {
+      set = new Set();
+      lines.set(path, set);
+    }
+    for (let line = Math.min(first, last); line <= Math.max(first, last); line += 1) {
+      set.add(line);
+    }
+  }
+  return lines;
+}
+
+function headChangeActivity(input: {
+  readonly ledger: FindingLedgerEntry;
+  readonly threadId: string;
+  readonly headSha: string;
+  readonly reviewNumber: number;
+  readonly binding: RepositoryBinding;
+  readonly at: string;
+}): ReviewActivityEvent {
+  const eventId = `head-change:${input.ledger.id}`;
+  return {
+    kind: "thread-resolution",
+    provider: input.binding.provider,
+    repositoryDigest: input.binding.repositoryDigest,
+    reviewNumber: input.reviewNumber,
+    eventId,
+    revisionId: `${eventId}:${input.headSha}`,
+    orderKey: `${input.headSha}|${eventId}`,
+    createdAt: input.at,
+    updatedAt: input.at,
+    body: "",
+    url: input.ledger.identity?.url ?? "",
+    threadId: input.threadId,
+    resolved: false,
+    outdated: false,
+  };
+}
+
 async function queueVerifications(input: {
   readonly events: readonly { readonly event: ReviewActivityEvent }[];
   readonly reviewNumber: number;
@@ -2286,6 +2495,8 @@ async function queueVerifications(input: {
   readonly budget: number;
   /** Threads this review last observed resolved, from the durable cursor. */
   readonly resolvedThreads: ReadonlySet<string>;
+  /** Last head whose origin compares finished, from the durable cursor. */
+  readonly headChangeScanSha?: string;
   readonly options: {
     readonly adapter: ConversationAdapter;
     readonly store: ConversationStateStore;
@@ -2326,7 +2537,7 @@ async function queueVerifications(input: {
   const unmatched = input.events
     .filter((item) => replyShape(item) && !bound.has(item.event.threadId!))
     .map((item) => item.event);
-  if (waiting.length === 0 && unmatched.length === 0) {
+  if (waiting.length === 0 && unmatched.length === 0 && bound.size === 0) {
     return { items: [], deferred: false, deferredEvents: [], boundThreads: bound };
   }
 
@@ -2408,11 +2619,51 @@ async function queueVerifications(input: {
   const holdAll = { items: [], deferred: true, deferredEvents: [...waiting, ...recoveryDeferred], boundThreads: bound };
   if (input.budget <= 0) return holdAll;
 
-  const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
-  if (metadata === undefined) return holdAll;
+  const outcomes = await input.options.store.readFindingOutcomes();
+  let metadata: Awaited<ReturnType<typeof loadReviewMetadata>>;
+  const currentHead = await loadReviewHead(input.reviewNumber, input.options);
+  if (currentHead === undefined) return holdAll;
+
+  const alreadyScanned = input.headChangeScanSha !== undefined
+    && input.headChangeScanSha.toLowerCase() === currentHead.toLowerCase();
+  const verifiedAtHead = new Set(
+    outcomes.filter((outcome) => outcome.headSha.toLowerCase() === currentHead.toLowerCase()).map((outcome) => outcome.findingId),
+  );
+  const staleOrigins = [...new Set(findings
+    .filter((entry) =>
+      entry.headSha.toLowerCase() !== currentHead.toLowerCase()
+      && entry.placement !== null
+      && entry.placement.line !== undefined
+      && entry.identity?.threadId !== undefined
+      && !verifiedAtHead.has(entry.id))
+    .map((entry) => entry.headSha))];
+  const needsCompare = staleOrigins.length > 0 && !alreadyScanned;
+  let scannedHeadSha: string | undefined = alreadyScanned ? currentHead : undefined;
+  let touchedLinesByOriginHead: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>> = new Map();
+  let insertAfterByOriginHead: ReadonlyMap<string, ReadonlyMap<string, ReadonlySet<number>>> = new Map();
+
+  if (waiting.length === 0 && recoveryDeferred.length === 0 && !needsCompare) {
+    return { items: [], deferred: false, deferredEvents: [], boundThreads: bound, scannedHeadSha: currentHead };
+  }
+
+  if (needsCompare) {
+    const origins = [...staleOrigins]
+      .sort((left, right) => (left < right ? -1 : left > right ? 1 : 0))
+      .slice(0, MAX_VERIFICATION_CANDIDATES);
+    const loaded = await loadTouchedLinesByOriginHead({
+      reviewNumber: input.reviewNumber,
+      currentHead,
+      origins,
+      findings,
+      options: input.options,
+    });
+    touchedLinesByOriginHead = loaded.lines;
+    insertAfterByOriginHead = loaded.insertAfter;
+    if (loaded.complete && origins.length === staleOrigins.length) scannedHeadSha = currentHead;
+  }
 
   const queue = pendingVerifications({
-    headSha: metadata.headSha,
+    headSha: currentHead,
     findings: findings.map((entry) => ({
       id: entry.id,
       headSha: entry.headSha,
@@ -2432,19 +2683,28 @@ async function queueVerifications(input: {
       authorIsBot: item.event.authorIsBot,
       resolved: item.event.kind === "thread-resolution" ? item.event.resolved : undefined,
     })),
-    outcomes: await input.options.store.readFindingOutcomes(),
+    outcomes,
     resolvedThreads: input.resolvedThreads,
-    // Event-driven only until head-change lands: an empty map means the anchor
-    // trigger can never fire, rather than firing on stale information.
     changedLines: new Map(),
+    touchedLinesByOriginHead,
+    insertAfterByOriginHead,
     ceiling: MAX_VERIFICATION_CANDIDATES,
   });
   if (queue.length === 0) {
     // A recovery read outage defers its event even when no candidate emerged:
     // the event is off the page either way, and the reply it carries must not
     // be spent on a transport failure.
-    return { items: [], deferred: recoveryDeferred.length > 0, deferredEvents: recoveryDeferred, boundThreads: bound };
+    return {
+      items: [],
+      deferred: recoveryDeferred.length > 0,
+      deferredEvents: recoveryDeferred,
+      boundThreads: bound,
+      ...(scannedHeadSha === undefined ? {} : { scannedHeadSha }),
+    };
   }
+
+  metadata = await loadReviewMetadata(input.reviewNumber, input.options);
+  if (metadata === undefined) return holdAll;
 
   const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
   if (rules.error !== undefined) {
@@ -2464,8 +2724,16 @@ async function queueVerifications(input: {
     // the action carries a real provenance.
     const trigger = input.events.find((item) =>
       item.event.kind !== "general-comment" && item.event.threadId === threadId);
-    if (trigger === undefined) return [];
-    return [{ pending, ledger, threadId, event: trigger.event }];
+    if (trigger !== undefined) return [{ pending, ledger, threadId, event: trigger.event }];
+    if (pending.trigger !== "head-change") return [];
+    return [{ pending, ledger, threadId, event: headChangeActivity({
+      ledger,
+      threadId,
+      headSha: metadata.headSha,
+      reviewNumber: input.reviewNumber,
+      binding: input.options.store.repositoryBinding,
+      at: input.options.now(),
+    }) }];
   });
 
   // The DURABLE idempotency check, on the action ledger rather than the outcome
@@ -2644,6 +2912,7 @@ async function verifyQueued(input: {
       rationale: result.plan.reply.rationale,
       outcome: result.plan.outcome,
       headSha: metadata.headSha,
+      resolveOwnThread: result.plan.resolveOwnThread,
     },
   };
 }

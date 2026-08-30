@@ -43,6 +43,14 @@ export interface ReviewCursorRecord {
    * threads of one review rather than of a repository.
    */
   readonly threadsResolved?: readonly string[];
+  /**
+   * Head whose origin-head compares already finished for this review.
+   *
+   * Idle polls with bound findings must not re-download diffs at a head that
+   * was already scanned. Absent until the first completed scan, and cleared
+   * in effect when the live head moves on.
+   */
+  readonly headChangeScanSha?: string;
 }
 
 export interface ConversationCursorSnapshot {
@@ -122,7 +130,13 @@ export type PublicationStatus = PublicationChildStatus;
 
 export type PublicationPlacement =
   | { readonly kind: "summary"; readonly headSha?: string; readonly configHash?: string; readonly terminalResult?: PublicationTerminalResult }
-  | { readonly kind: "group-reply"; readonly threadId?: string; readonly headSha?: string }
+  | {
+      readonly kind: "group-reply";
+      readonly threadId?: string;
+      readonly headSha?: string;
+      readonly resolveOwnThread?: true;
+      readonly verificationVerdict?: FindingVerdict;
+    }
   | { readonly kind: "inline"; readonly file: string; readonly line: number; readonly startLine?: number; readonly side?: "old" | "new"; readonly clientId?: string; readonly position?: PublicationInlinePosition }
   | { readonly kind: "general-question"; readonly file?: string; readonly line?: number }
   | { readonly kind: "fallback" };
@@ -720,7 +734,7 @@ export function validateCursorSnapshot(value: unknown, expected: RepositoryBindi
   }
   const reviews = array(object.reviews, "cursor.reviews", 5_000).map((entry, index) => {
     const review = exact(entry, `cursor.reviews[${index}]`, ["reviewNumber", "cursor", "retired"],
-      ["retiredAt", "eventPageToken", "threadsResolved"]);
+      ["retiredAt", "eventPageToken", "threadsResolved", "headChangeScanSha"]);
     if (typeof review.retired !== "boolean") throw new Error("review retired flag must be boolean");
     if (review.retired && review.retiredAt === undefined) throw new Error("retired review must record retiredAt");
     if (!review.retired && review.retiredAt !== undefined) throw new Error("active review cannot record retiredAt");
@@ -730,6 +744,15 @@ export function validateCursorSnapshot(value: unknown, expected: RepositoryBindi
       ...(review.threadsResolved === undefined ? {} : {
         threadsResolved: array(review.threadsResolved, `cursor.reviews[${index}].threadsResolved`, MAX_RESOLVED_THREADS)
           .map((threadId, at) => text(threadId, `cursor.reviews[${index}].threadsResolved[${at}]`, 512)),
+      }),
+      ...(review.headChangeScanSha === undefined ? {} : {
+        headChangeScanSha: (() => {
+          const value = review.headChangeScanSha;
+          if (typeof value !== "string" || !SHA_RE.test(value)) {
+            throw new Error(`cursor.reviews[${index}].headChangeScanSha is invalid`);
+          }
+          return value.toLowerCase();
+        })(),
       }) };
   });
   if (new Set(reviews.map((review) => review.reviewNumber)).size !== reviews.length) throw new Error("cursor contains duplicate reviews");
@@ -940,7 +963,8 @@ function publicationTerminalResult(value: unknown, name: string): PublicationTer
 }
 
 function publicationPlacement(value: unknown, name: string): PublicationPlacement {
-  const object = exact(value, name, ["kind"], ["headSha", "configHash", "terminalResult", "threadId", "file", "line",
+  const object = exact(value, name, ["kind"], ["headSha", "configHash", "terminalResult", "threadId", "resolveOwnThread",
+    "verificationVerdict", "file", "line",
     "startLine", "side", "clientId", "position"]);
   if (object.kind === "summary") {
     return {
@@ -953,10 +977,19 @@ function publicationPlacement(value: unknown, name: string): PublicationPlacemen
     };
   }
   if (object.kind === "group-reply") {
+    if (object.resolveOwnThread !== undefined && object.resolveOwnThread !== true) {
+      throw new Error(`${name}.resolveOwnThread is invalid`);
+    }
+    const verdict = object.verificationVerdict;
+    if (verdict !== undefined && verdict !== "confirmed" && verdict !== "revised" && verdict !== "withdrawn") {
+      throw new Error(`${name}.verificationVerdict is invalid`);
+    }
     return {
       kind: "group-reply",
       ...(object.threadId === undefined ? {} : { threadId: text(object.threadId, `${name}.threadId`, 256) }),
       ...(object.headSha === undefined ? {} : { headSha: text(object.headSha, `${name}.headSha`, 64) }),
+      ...(object.resolveOwnThread === true ? { resolveOwnThread: true as const } : {}),
+      ...(verdict === undefined ? {} : { verificationVerdict: verdict }),
     };
   }
   if (object.kind === "inline") {

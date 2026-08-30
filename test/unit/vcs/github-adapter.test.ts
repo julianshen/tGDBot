@@ -9,6 +9,7 @@ import {
   AmbiguousInlinePublishError,
   type BotComment,
   type ReviewLocator,
+  CompareNotDirectError,
 } from "../../../src/vcs/adapter.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
 import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "../../../src/conversation/markers.js";
@@ -936,6 +937,39 @@ describe("GitHubAdapter", () => {
     });
   });
 
+  describe("getCompareDiff", () => {
+    const fromSha = "c".repeat(40);
+    const toSha = "d".repeat(40);
+    const patch = "diff --git a/src/auth.ts b/src/auth.ts\n+touched\n";
+
+    it("asks the compare API for the raw incremental diff", async () => {
+      const execGh = vi.fn(async () => patch);
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getCompareDiff(locator42, fromSha, toSha)).resolves.toBe(patch);
+      expect(execGh).toHaveBeenCalledWith(expect.arrayContaining([
+        "api",
+        `repos/{owner}/{repo}/compare/${fromSha}...${toSha}`,
+        "-H",
+        "Accept: application/vnd.github.diff",
+      ]));
+    });
+
+    it("rejects a merge-base compare that is not a direct tree diff from the origin", async () => {
+      const execGh = vi.fn(async (args: string[]) => {
+        if (args.includes("Accept: application/vnd.github.diff")) return patch;
+        return JSON.stringify({ merge_base_commit: { sha: "e".repeat(40) } });
+      });
+      const adapter = new GitHubAdapter(execGh);
+
+      await expect(adapter.getCompareDiff(locator42, fromSha, toSha))
+        .rejects.toBeInstanceOf(CompareNotDirectError);
+      expect(execGh).not.toHaveBeenCalledWith(expect.arrayContaining([
+        "Accept: application/vnd.github.diff",
+      ]));
+    });
+  });
+
   // --- getFileAtRef (issue #56) ---
   //
   // The general form of the machinery getRuleFilesFromBase already used, so
@@ -1550,6 +1584,28 @@ describe("GitHub conversation activity", () => {
     });
     expect(computeRepositoryDigest("github", mixed.canonicalUrl))
       .not.toBe(computeRepositoryDigest("github", canonical.canonicalUrl));
+  });
+
+  it("resolves one review thread through the GraphQL mutation", async () => {
+    const execGh = vi.fn<ExecGh>(async (args) => {
+      if (args[0] === "api" && args[1] === "graphql" && args.some((arg) => arg.startsWith("query=mutation("))) {
+        return JSON.stringify({ data: { resolveReviewThread: { thread: { id: "PRRT_kwDOThread1" } } } });
+      }
+      throw new Error(`unexpected gh invocation: ${args.join(" ")}`);
+    });
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.resolveReviewThread(review, "PRRT_kwDOThread1")).resolves.toBeUndefined();
+    expect(execGh).toHaveBeenCalledWith(expect.arrayContaining([
+      "api", "graphql",
+      "query=mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{id}}}",
+      "threadId=PRRT_kwDOThread1",
+    ]));
+  });
+
+  it("rejects a GraphQL resolve that returns no thread", async () => {
+    const execGh = vi.fn<ExecGh>(async () => JSON.stringify({ errors: [{ message: "not found" }] }));
+    const adapter = new GitHubAdapter(execGh, repo);
+    await expect(adapter.resolveReviewThread(review, "PRRT_kwDOThread1")).rejects.toThrow(/missing expected data/);
   });
 
   it("loads threads and child markers when GraphQL/REST keep mixed-case GitHub URLs", async () => {

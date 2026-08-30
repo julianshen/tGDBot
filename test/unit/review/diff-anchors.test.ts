@@ -13,6 +13,9 @@ import {
   renameSourcesByHeadPath,
   quoteGitPathOperand,
   commentableLines,
+  addedLines,
+  originTouchedLines,
+  originInsertAfterLines,
   diffPositionRange,
   parseDiffPositions,
   isCommentable,
@@ -30,6 +33,88 @@ index 111..222 100644
 +added2
  ctx2
 `;
+
+describe("addedLines", () => {
+  // Head-change verification must not treat hunk context as a touch: a later
+  // push that leaves the finding's line as surrounding context would otherwise
+  // re-verify every finding still in the pull request's full diff.
+  it("maps only added (+) lines, never context or removals", () => {
+    const map = addedLines(SIMPLE);
+
+    expect([...(map.get("src/a.go") ?? [])].sort((a, b) => a - b)).toEqual([11, 12]);
+  });
+
+  it("returns an empty map for a diff with no additions", () => {
+    const diff = `diff --git a/t.ts b/t.ts
+--- a/t.ts
++++ b/t.ts
+@@ -1,2 +1,1 @@
+ keep
+-gone
+`;
+    expect(addedLines(diff).size).toBe(0);
+  });
+});
+
+describe("originTouchedLines", () => {
+  // Head-change verification matches the finding's origin-side placement, not
+  // the current-head line numbers. A later insert above the anchor shifts every
+  // new-side `+` line, so those numbers must not be the match key.
+  it("maps removed origin-side line numbers, never new-side additions or context", () => {
+    const map = originTouchedLines(SIMPLE);
+
+    expect([...(map.get("src/a.go") ?? [])]).toEqual([11]);
+  });
+
+  it("treats deleting the anchored line as a touch", () => {
+    const diff = `diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -14,1 +13,0 @@
+-  console.log(user.token);
+`;
+    expect([...(originTouchedLines(diff).get("src/auth.ts") ?? [])]).toEqual([14]);
+  });
+
+  it("keeps the origin line when an insert above shifts the replacement", () => {
+    const diff = `diff --git a/src/auth.ts b/src/auth.ts
+--- a/src/auth.ts
++++ b/src/auth.ts
+@@ -9,0 +10,1 @@
++inserted
+@@ -14,1 +15,1 @@
+-  console.log(user.token);
++  console.log("[redacted]");
+`;
+    expect([...(originTouchedLines(diff).get("src/auth.ts") ?? [])]).toEqual([14]);
+    expect(addedLines(diff).get("src/auth.ts")?.has(15)).toBe(true);
+    expect(addedLines(diff).get("src/auth.ts")?.has(14)).toBe(false);
+  });
+});
+
+describe("originInsertAfterLines", () => {
+  it("records the origin line after which a silent insert landed", () => {
+    const diff = `diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -10,2 +10,3 @@
+ line10
++guard
+ line11
+`;
+    expect([...(originInsertAfterLines(diff).get("src/a.ts") ?? [])]).toEqual([10]);
+  });
+
+  it("uses the hunk old-start when the insert deletes no origin lines", () => {
+    const diff = `diff --git a/src/a.ts b/src/a.ts
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -13,0 +14,1 @@
++inserted
+`;
+    expect([...(originInsertAfterLines(diff).get("src/a.ts") ?? [])]).toEqual([13]);
+  });
+});
 
 describe("commentableLines", () => {
   it("maps added and context lines to their NEW-file line numbers", () => {

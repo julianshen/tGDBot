@@ -20,6 +20,31 @@ import type { RepositoryRef } from "../target/types.js";
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
+
+/**
+ * How long a consumer waits for the lock when the work runs UNDER it.
+ *
+ * Preparation is seconds, so 30s is right for `prepareWorkspace`. Mapping is
+ * budgeted at 30 minutes, so the same 30s would turn serialisation into a
+ * timeout: the second review would fail rather than queue, which is worse than
+ * the race it replaced — `--context require` would fail outright (PR #99
+ * review). Slightly over the mapper's own budget, so the holder's timeout
+ * fires first and the waiter reports a genuine deadlock rather than
+ * pre-empting work that was still progressing.
+ */
+export const SCOPED_LOCK_TIMEOUT_MS = 31 * 60 * 1000;
+
+/**
+ * The absolute ceiling on waiting for a scoped consumer.
+ *
+ * The per-attempt timeout above renews while the holder is demonstrably alive,
+ * so a legitimately slow holder — cold clone at two minutes a command, then a
+ * mapping budgeted at thirty — no longer fails its waiters (PR #99 review).
+ * This is the backstop for a holder that is alive and going nowhere: far past
+ * any real run, so reaching it means something is genuinely wrong, and the
+ * operator learns rather than waiting forever.
+ */
+export const SCOPED_LOCK_MAX_WAIT_MS = 4 * 60 * 60 * 1000;
 const GIT_PATH_OVERRIDE_VARIABLES = [
   "GIT_DIR",
   "GIT_WORK_TREE",
@@ -359,10 +384,46 @@ async function prepareWorkspaceUnlocked(
   return { ...paths, baseSha: expectedMarker.baseSha };
 }
 
+/**
+ * Prepares the workspace and holds the repository lock for `use`.
+ *
+ * `prepareWorkspace` releases the lock before it returns, so every caller read
+ * the shared worktree unlocked: the `reset --hard` and `clean -ffdx` that run
+ * inside the lock cannot protect a later reader, and two jobs on the same
+ * repository and base could have one rewriting the tree while the other read
+ * it (#78). That was tolerable while the readers produced CONTEXT, which is
+ * framed as untrusted and which a reader weighs. A structural check derives a
+ * host-authored fact — the one line a reader is invited to trust without
+ * re-deriving — so the same race can now publish "the name occurs at
+ * src/x.ts:88" for a line that only ever existed in another job's scratch edit.
+ *
+ * The cost is real and deliberate: a long consumer now serialises other jobs
+ * against the same repository and base. That is what the lock was always for.
+ */
+export async function withPreparedWorkspace<T>(
+  request: WorkspaceRequest,
+  use: (prepared: PreparedWorkspace) => Promise<T>,
+  dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
+): Promise<T> {
+  return prepareWorkspaceLocked(
+    request,
+    { lockTimeoutMs: SCOPED_LOCK_TIMEOUT_MS, lockMaxWaitMs: SCOPED_LOCK_MAX_WAIT_MS, ...dependencies },
+    use,
+  );
+}
+
 export async function prepareWorkspace(
   request: WorkspaceRequest,
   dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
 ): Promise<PreparedWorkspace> {
+  return prepareWorkspaceLocked(request, dependencies, async (prepared) => prepared);
+}
+
+async function prepareWorkspaceLocked<T>(
+  request: WorkspaceRequest,
+  dependencies: WorkspaceDependencies,
+  use: (prepared: PreparedWorkspace) => Promise<T>,
+): Promise<T> {
   const paths = deriveWorkspacePaths({ ...request, root: await physicalWorkspaceRoot(request.root) });
   const normalizedRequest = { ...request, root: paths.root };
   await mkdir(paths.root, { recursive: true });
@@ -385,12 +446,15 @@ export async function prepareWorkspace(
   return withRepositoryLock({
     lockPath,
     timeoutMs: dependencies.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
+    ...(dependencies.lockMaxWaitMs === undefined ? {} : { maxWaitMs: dependencies.lockMaxWaitMs }),
     owner: { runId: randomUUID() },
   }, async () => {
     await assertNoSymlinkedAncestors(
       paths.root,
       [paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
     );
-    return prepareWorkspaceUnlocked(normalizedRequest, dependencies);
+    // The consumer runs INSIDE the lock, so what it reads is what preparation
+    // just guaranteed.
+    return use(await prepareWorkspaceUnlocked(normalizedRequest, dependencies));
   });
 }

@@ -9,7 +9,7 @@ import {
   type InlineRecoveryChild,
   type InlineRecoveryState,
 } from "../review/comment-marker.js";
-import { compareOrderKeys, isCommitSha, AmbiguousInlinePublishError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
+import { compareOrderKeys, isCommitSha, AmbiguousInlinePublishError, CompareNotDirectError, validateConversationItemIdentity, validateInlinePublishInputs } from "./adapter.js";
 import type {
   BotComment,
   InlineReviewComment,
@@ -1123,6 +1123,24 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
     }
   }
 
+  async resolveReviewThread(review: ReviewIdentity, threadId: string): Promise<void> {
+    const repo = this.repositoryForReview(review);
+    const id = providerId(threadId, "review thread id");
+    const out = await this.execGh([
+      "api",
+      "graphql",
+      "-f",
+      `query=${RESOLVE_THREAD_MUTATION}`,
+      "-f",
+      `threadId=${id}`,
+      ...apiHost(repo),
+    ]);
+    const parsed = JSON.parse(out) as { data?: { resolveReviewThread?: { thread?: { id?: unknown } } }; errors?: unknown };
+    if (parsed.data?.resolveReviewThread?.thread?.id === undefined) {
+      throw new Error(`GitHub resolveReviewThread response missing expected data: ${out.slice(0, 200)}`);
+    }
+  }
+
   async findBotChildMarker(review: ReviewIdentity, marker: ChildMarkerLookup): Promise<ConversationItemIdentity | null> {
     if (marker.provider !== review.provider || marker.repositoryDigest !== review.repositoryDigest || marker.reviewNumber !== review.reviewNumber) {
       throw new Error("GitHub child marker lookup binding mismatch");
@@ -1288,6 +1306,30 @@ export class GitHubAdapter implements VcsAdapter, ConversationAdapter {
       if (!isDiffTooLargeError(error)) throw error;
       return await this.getDiffFromFiles(repo, id, options);
     }
+  }
+
+  async getCompareDiff(
+    locator: ReviewLocator,
+    fromSha: string,
+    toSha: string,
+  ): Promise<string> {
+    if (!isCommitSha(fromSha) || !isCommitSha(toSha)) {
+      throw new Error("compare requires commit SHAs");
+    }
+    const mergeBase = await this.getMergeBaseSha(locator, fromSha, toSha);
+    if (mergeBase !== undefined && mergeBase.toLowerCase() !== fromSha.toLowerCase()) {
+      throw new CompareNotDirectError(
+        "GitHub compare uses a merge base other than the origin commit",
+      );
+    }
+    const { repo } = resolvePullLocator(locator);
+    return this.execGh([
+      "api",
+      `${apiRepo(repo)}/compare/${encodeURIComponent(fromSha)}...${encodeURIComponent(toSha)}`,
+      ...apiHost(repo),
+      "-H",
+      "Accept: application/vnd.github.diff",
+    ]);
   }
 
   /**

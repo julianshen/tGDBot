@@ -13,7 +13,7 @@ import {
 } from "../../../src/conversation/markers.js";
 import { encodeMemoryPublicId } from "../../../src/conversation/memories.js";
 import { resolvePollConfig } from "../../../src/poll/config.js";
-import type { VcsAdapter } from "../../../src/vcs/adapter.js";
+import { CompareNotDirectError, type VcsAdapter } from "../../../src/vcs/adapter.js";
 import { deriveConversationStatePaths } from "../../../src/conversation/state-paths.js";
 import { createConversationStateStore } from "../../../src/conversation/state-store.js";
 import { parseRepositoryRef } from "../../../src/target/review-target.js";
@@ -270,6 +270,14 @@ class ClassificationAdapter implements ConversationAdapter {
   async resolveReviewIdentity(_repository: RepositoryRef, reviewNumber: number): Promise<ReviewIdentity> {
     return identity(reviewNumber);
   }
+
+  async resolveReviewThread(
+    ..._args: Parameters<ConversationAdapter["resolveReviewThread"]>
+  ): Promise<void> {
+    void _args;
+    this.writes.push("resolve");
+    throw new Error("provider writes are not implemented");
+  }
 }
 
 async function journalEvents(store: ConversationStateStore): Promise<ConversationEventEntry[]> {
@@ -494,6 +502,8 @@ function postedInlineIdentity(commentId: string) {
 
 function silentReviewVcs(options: {
   readonly failNextInline?: "throw" | "accept-then-fail" | null;
+  readonly compareDiff?: string;
+  readonly headSha?: () => string;
 } = {}) {
   let stored: BotComment | null = null;
   const postedInlines: Array<{ clientId: string; path: string; line: number; body: string }> = [];
@@ -541,13 +551,14 @@ function silentReviewVcs(options: {
     getPullRequest: vi.fn(async () => ({
       id: "1",
       reviewId: "PR_1",
-      headSha: "c".repeat(40),
+      headSha: options.headSha?.() ?? "c".repeat(40),
       baseSha: "b".repeat(40),
       title: "Review",
       description: "",
       url: "https://github.com/owner/repo/pull/1",
     })),
     getDiff: vi.fn(async () => commentableAuthDiff),
+    getCompareDiff: vi.fn(async () => options.compareDiff ?? ""),
     getRuleFilesFromBase: vi.fn(async () => []),
     resolveRelatedWork: vi.fn(async (references: unknown) => references),
   };
@@ -631,6 +642,18 @@ class ExecutionAdapter extends ClassificationAdapter {
 
   failNextThreadRead = false;
   threadReads = 0;
+  readonly resolvedThreadIds: string[] = [];
+  failNextResolve = false;
+
+  override async resolveReviewThread(_review: ReviewIdentity, threadId: string): Promise<void> {
+    if (this.failNextResolve) {
+      this.failNextResolve = false;
+      throw new Error("resolve is temporarily unavailable");
+    }
+    this.resolvedThreadIds.push(threadId);
+    const thread = this.threads.get(threadId);
+    if (thread !== undefined) this.threads.set(threadId, { ...thread, resolved: true });
+  }
 
   override async getReviewThread(_review: ReviewIdentity, threadId: string): Promise<ReviewThreadSnapshot> {
     this.threadReads += 1;
@@ -798,11 +821,15 @@ function executionDeps(adapter: ExecutionAdapter, extras: {
   readonly rules?: readonly RuleDefinition[];
   readonly ruleLoadError?: Error;
   readonly diff?: string;
+  readonly compareDiff?: string;
   readonly vcs?: ReturnType<typeof silentReviewVcs>;
   readonly publicationHooks?: PublicationExecutorHooks;
 } = {}) {
   const heads = extras.heads === undefined ? undefined : [...extras.heads];
-  const vcs = extras.vcs ?? silentReviewVcs();
+  const vcs = extras.vcs ?? silentReviewVcs({
+    compareDiff: extras.compareDiff,
+    headSha: () => adapter.headSha,
+  });
   return {
     conversationAdapter: adapter,
     createSession: extras.createSession ?? sessionFor(JSON.stringify({ explanation: "The logger prints user.token." })),
@@ -2356,6 +2383,207 @@ describe("automatic verification", () => {
         },
   );
 
+  const unrelatedCompareDiff = [
+    "diff --git a/src/other.ts b/src/other.ts",
+    "--- a/src/other.ts",
+    "+++ b/src/other.ts",
+    "@@ -1,1 +1,2 @@",
+    " keep",
+    "+added",
+  ].join("\n");
+  // The finding is anchored at src/auth.ts:14. In the full PR diff that line
+  // is hunk CONTEXT (the original addition is line 13). A later push that
+  // actually touches the finding must change origin-side line 14 in the
+  // INCREMENTAL compare, which is how we prove we did not reuse the pull
+  // request's full diff.
+  const touchingCompareDiff = [
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -14,1 +14,1 @@",
+    "-  console.log(user.token);",
+    "+  console.log(\"[redacted]\");",
+  ].join("\n");
+  const deletingCompareDiff = [
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -14,1 +13,0 @@",
+    "-  console.log(user.token);",
+  ].join("\n");
+  const shiftedReplacementDiff = [
+    "diff --git a/src/auth.ts b/src/auth.ts",
+    "--- a/src/auth.ts",
+    "+++ b/src/auth.ts",
+    "@@ -9,0 +10,1 @@",
+    "+inserted",
+    "@@ -14,1 +15,1 @@",
+    "-  console.log(user.token);",
+    "+  console.log(\"[redacted]\");",
+  ].join("\n");
+
+  it("verifies a silent push that touches the anchored line and leaves a human thread unresolved", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    installFindingThread(
+      adapter, findingMarker!, threadComment("human-root", "looking at this", { threadId: "T-human" }),
+      { rootAuthorIsBot: false },
+    );
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    const deps = executionDeps(adapter, {
+      createSession: session,
+      diff: commentableAuthDiff,
+      compareDiff: touchingCompareDiff,
+    });
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("withdrawn");
+    expect(outcomes[0]!.trigger).toBe("head-change");
+    expect(outcomes[0]!.headSha).toBe("d".repeat(40));
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+  });
+
+  it("does not verify a silent push that only changes an unrelated file", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: session,
+        diff: commentableAuthDiff,
+        compareDiff: unrelatedCompareDiff,
+      }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(0);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+    await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
+      .resolves.toEqual([]);
+  });
+
+  it("verifies a silent push that deletes the anchored line", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session, compareDiff: deletingCompareDiff }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+  });
+
+  it("verifies a silent push that inserts above the anchor and then replaces it", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, { createSession: session, compareDiff: shiftedReplacementDiff }),
+    })).resolves.toBe(0);
+
+    expect(sessions).toBe(1);
+  });
+
+  it("verifies a silent push when the origin is no longer an ancestor of the head", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    const deps = executionDeps(adapter, { createSession: session });
+    deps.vcs.adapter.getCompareDiff = vi.fn(async () => {
+      throw new CompareNotDirectError("origin is not an ancestor of the current head");
+    });
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+  });
+
+  it("does not re-compare a head that already produced no touch", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    const deps = executionDeps(adapter, { compareDiff: unrelatedCompareDiff });
+    const compare = deps.vcs.adapter.getCompareDiff;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(compare).toHaveBeenCalled();
+    const first = compare.mock.calls.length;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(compare.mock.calls.length).toBe(first);
+  });
+
+  it("does not fetch the pull-request diff on an idle poll of a scanned head", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    installFindingThread(adapter, findingMarker!, threadComment("seed", "noted"));
+    adapter.replaceEvents([]);
+    adapter.headSha = "d".repeat(40);
+    const deps = executionDeps(adapter, { compareDiff: unrelatedCompareDiff });
+    const { getReviewMetadata, ...withoutMetadata } = deps;
+    void getReviewMetadata;
+    const vcs = deps.vcs.adapter;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), withoutMetadata)).resolves.toBe(0);
+    expect(vcs.getCompareDiff).toHaveBeenCalled();
+    expect(vcs.getDiff).not.toHaveBeenCalled();
+    const pulls = vcs.getPullRequest.mock.calls.length;
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), withoutMetadata)).resolves.toBe(0);
+    expect(vcs.getDiff).not.toHaveBeenCalled();
+    expect(vcs.getCompareDiff.mock.calls.length).toBe(1);
+    expect(vcs.getPullRequest.mock.calls.length).toBeGreaterThan(pulls);
+  });
+
   it("verifies once when a human replies, without being asked", async () => {
     const adapter = new ExecutionAdapter([]);
     const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
@@ -2386,6 +2614,75 @@ describe("automatic verification", () => {
     expect(outcomes[0]!.headSha).toBe("c".repeat(40));
     // Labels are never stored — only digests of them (#57 design).
     expect(JSON.stringify(outcomes[0])).not.toContain("no-token-logs");
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+  });
+
+  it("does not resolve the thread when the finding still stands", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "this is still wrong"),
+    );
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: async () => createPiSessionStub(verdict("confirmed")).session,
+      }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+  });
+
+  it("does not resolve a thread the bot did not root", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this"),
+      { rootAuthorIsBot: false },
+    );
+    adapter.replaceEvents([reply]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), {
+      ...executionDeps(adapter, {
+        createSession: async () => createPiSessionStub(verdict("withdrawn")).session,
+      }),
+    })).resolves.toBe(0);
+
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(0);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+  });
+
+  it("does not consume the verification when resolving the thread fails", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "fixed this in the latest push"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("withdrawn")).session;
+    };
+    adapter.replaceEvents([reply]);
+    adapter.failNextResolve = true;
+    const deps = { ...executionDeps(adapter, { createSession: session }) };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect(adapter.resolvedThreadIds).toEqual([]);
+    await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
+      .resolves.toEqual([]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    expect(adapter.resolvedThreadIds).toEqual(["T1"]);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("withdrawn");
   });
 
   // THE idempotency criterion: the same page seen twice must not verify twice.
@@ -2442,6 +2739,62 @@ describe("automatic verification", () => {
     // A verdict the reader cannot argue with is worse than no verdict. The
     // invitation names the AUTHENTICATED account, so the mention resolves.
     expect(body).toContain("`@tgdbot reconsider <why>`");
+  });
+
+  it("records a confirmed outcome when recovery completes a posted reply", async () => {
+    const adapter = new ExecutionAdapter([]);
+    const { stateDir, findingMarker } = await bootstrapAndSeed(adapter, { seedFinding: true, bindThreadId: "T1" });
+    const reply = installFindingThread(
+      adapter, findingMarker!, threadComment("human", "I think this one is wrong"),
+    );
+    let sessions = 0;
+    const session: ConversationSessionFactory = async () => {
+      sessions += 1;
+      return createPiSessionStub(verdict("confirmed")).session;
+    };
+    adapter.replaceEvents([reply]);
+    let crashOnce = true;
+    const crashComplete = <T>(fn: (tx: ConversationStateTransaction) => T) =>
+      (tx: ConversationStateTransaction) => {
+        const appendEvent = tx.appendEvent.bind(tx);
+        tx.appendEvent = (entry) => {
+          if (crashOnce && entry.state === "completed") {
+            crashOnce = false;
+            throw new Error("crash before complete persist");
+          }
+          appendEvent(entry);
+        };
+        return fn(tx);
+      };
+    const deps = {
+      ...executionDeps(adapter, { createSession: session }),
+      createStateStore: (opts: Parameters<typeof createConversationStateStore>[0]) => {
+        const store = createConversationStateStore(opts);
+        const transact = store.transact.bind(store);
+        store.transact = ((fn: Parameters<ConversationStateStore["transact"]>[0]) =>
+          transact(crashComplete(fn) as typeof fn)) as typeof store.transact;
+        const lock = store.withExclusiveLock.bind(store);
+        store.withExclusiveLock = (fn) => lock(async (session) => {
+          const commit = session.commit.bind(session);
+          session.commit = ((txFn: Parameters<typeof commit>[0]) =>
+            commit(crashComplete(txFn) as typeof txFn)) as typeof commit;
+          return fn(session);
+        });
+        return store;
+      },
+    };
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(1);
+    expect(adapter.postedBodies.filter((body) => /## Verification/.test(body))).toHaveLength(1);
+    await expect(createConversationStateStore({ root: stateDir, repository: repo }).readFindingOutcomes())
+      .resolves.toEqual([]);
+
+    await expect(poll(pollArgs(stateDir, { model: "anthropic/claude-opus-4-5" }), deps)).resolves.toBe(0);
+    expect(sessions).toBe(1);
+    const outcomes = await createConversationStateStore({ root: stateDir, repository: repo })
+      .readFindingOutcomes();
+    expect(outcomes).toHaveLength(1);
+    expect(outcomes[0]!.verdict).toBe("confirmed");
   });
 
   // A transient provider failure must not consume the reply. The poll marks an

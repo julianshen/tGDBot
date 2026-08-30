@@ -17,6 +17,16 @@ export interface LockOwner {
 export interface RepositoryLockOptions {
   lockPath: string;
   timeoutMs: number;
+  /**
+   * An absolute ceiling on waiting, however healthy the holder looks.
+   *
+   * Renewing while the holder is alive is right for a holder that is SLOW, and
+   * wrong for one that is hung: a live process that never finishes would block
+   * a waiter forever and the operator would see nothing at all. Defaults to
+   * `timeoutMs`, so a caller that does not opt in keeps exactly the old
+   * behaviour.
+   */
+  maxWaitMs?: number;
   pollMs?: number;
   owner: LockOwner;
 }
@@ -68,6 +78,45 @@ function validateOptions(options: RepositoryLockOptions): number {
     throw new Error("Repository lock owner hostname must be non-empty");
   }
   return pollMs;
+}
+
+/** Who holds the lock now, or undefined when the file cannot be read. */
+async function currentLockHolder(
+  lockPath: string,
+): Promise<{ runId: string; pid?: number; hostname?: string } | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as
+      { runId?: unknown; pid?: unknown; hostname?: unknown };
+    if (typeof parsed.runId !== "string") return undefined;
+    return {
+      runId: parsed.runId,
+      ...(typeof parsed.pid === "number" ? { pid: parsed.pid } : {}),
+      ...(typeof parsed.hostname === "string" ? { hostname: parsed.hostname } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether the holder's process is still running, when that is knowable.
+ *
+ * `undefined` means UNKNOWN, not alive: another machine's PID says nothing
+ * here, and treating unknown as alive would make the timeout unreachable for
+ * any cross-host holder.
+ *
+ * Signal 0 performs the permission and existence checks without delivering
+ * anything. `EPERM` means the process exists but belongs to another user, which
+ * is still alive for our purposes.
+ */
+function holderIsAlive(holder: { pid?: number; hostname?: string }): boolean | undefined {
+  if (holder.pid === undefined || holder.hostname !== hostname()) return undefined;
+  try {
+    process.kill(holder.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 function buildMetadata(owner: LockOwner): LockMetadata {
@@ -246,7 +295,16 @@ export async function withRepositoryLock<T>(
 
   const metadata = buildMetadata(options.owner);
   const contents = `${JSON.stringify(metadata)}\n`;
-  const deadline = performance.now() + options.timeoutMs;
+  const startedAt = performance.now();
+  const ceiling = startedAt + Math.max(options.maxWaitMs ?? options.timeoutMs, options.timeoutMs);
+  let deadline = startedAt + options.timeoutMs;
+  // The run ID currently holding the lock, so a CHANGE of owner can be told
+  // apart from a stuck one. The timeout has to mean "nothing is progressing",
+  // not "it is not my turn yet": the lock is repository-wide, so several
+  // legitimate consumers can queue, and a fixed deadline measured from the
+  // first attempt fails the third waiter even though every holder before it
+  // stayed inside its own budget (PR #99 review).
+  let observedOwner: string | undefined;
 
   await mkdir(path.dirname(options.lockPath), { recursive: true });
   let isInitialAttempt = true;
@@ -277,6 +335,25 @@ export async function withRepositoryLock<T>(
       return workResult.value;
     }
     isInitialAttempt = false;
+    // Whoever holds it now. Unreadable is treated as no information rather than
+    // as a change, or a transiently missing file would renew the deadline
+    // forever and the timeout would never fire.
+    const holder = await currentLockHolder(options.lockPath);
+    if (holder !== undefined) {
+      // Two kinds of evidence that waiting is still worthwhile. Either the
+      // queue moved, or the current holder is demonstrably still running — and
+      // a holder that is alive is doing work this waiter has no business
+      // pre-empting, however long its own budget legitimately is. Sizing a
+      // constant to cover preparation plus mapping plus cleanup was guesswork
+      // that a slower repository would defeat (PR #99 review).
+      const ownerChanged = observedOwner !== undefined && holder.runId !== observedOwner;
+      if (ownerChanged || holderIsAlive(holder) === true) {
+        // Never past the ceiling: a live holder that never finishes is still a
+        // failure, and one the operator has to be told about.
+        deadline = Math.min(performance.now() + options.timeoutMs, ceiling);
+      }
+      observedOwner = holder.runId;
+    }
     const remainingMs = deadline - performance.now();
     if (remainingMs <= 0) throw await timeoutError(options.lockPath, options.timeoutMs);
     await delay(Math.min(pollMs, remainingMs));

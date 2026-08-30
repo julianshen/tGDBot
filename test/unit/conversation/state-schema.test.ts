@@ -45,6 +45,19 @@ describe("strict state schemas", () => {
     }, binding)).toThrow(/eventPageToken/i);
   });
 
+  test("accepts an optional headChangeScanSha on a review cursor record", () => {
+    const review = { reviewNumber: 1, cursor: "{\"id\":\"PR_1\"}", retired: false };
+    const sha = "c".repeat(40);
+    expect(validateCursorSnapshot({
+      ...cursor,
+      reviews: [{ ...review, headChangeScanSha: sha }],
+    }, binding).reviews[0]).toMatchObject({ headChangeScanSha: sha });
+    expect(() => validateCursorSnapshot({
+      ...cursor,
+      reviews: [{ ...review, headChangeScanSha: "not-a-sha" }],
+    }, binding)).toThrow(/headChangeScanSha/i);
+  });
+
   test("rejects accessors, symbols, and non-plain prototypes before reading properties", () => {
     const accessor = { ...cursor } as Record<string, unknown>;
     Object.defineProperty(accessor, "initialized", { enumerable: true, get: () => true });

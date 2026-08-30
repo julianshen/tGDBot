@@ -92,7 +92,7 @@ import {
   hasCheckableClaim,
   runStructuralChecks as runStructuralChecksReal,
 } from "./review/structural-check.js";
-import { prepareWorkspace as prepareWorkspaceReal } from "./workspace/manager.js";
+import { withPreparedWorkspace as withPreparedWorkspaceReal } from "./workspace/manager.js";
 import {
   combineContextPacks,
   DEFAULT_CONTEXT_MAX_CHARS,
@@ -224,7 +224,13 @@ export interface ReviewDependencies {
    */
   runStructuralChecks?: typeof runStructuralChecksReal;
   /** Resolves the trusted base worktree the checks read. Injected alongside them. */
-  prepareStructuralWorkspace?: typeof prepareWorkspaceReal;
+  /**
+   * Runs the structural check INSIDE the repository lock. It was
+   * `prepareWorkspace`, which releases the lock before returning, so the
+   * checker read a tree another job could be resetting underneath it — and a
+   * host-authored fact is the one output a reader does not re-derive (#78).
+   */
+  prepareStructuralWorkspace?: typeof withPreparedWorkspaceReal;
   now?: () => string;
 }
 
@@ -892,7 +898,7 @@ export async function review(
       : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
   const runStructuralChecksFn = deps.runStructuralChecks ?? runStructuralChecksReal;
-  const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? prepareWorkspaceReal;
+  const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? withPreparedWorkspaceReal;
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
   const fetchJsonFn = deps.fetchJson ?? fetchJsonReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
@@ -1517,7 +1523,10 @@ export async function review(
       && (finding.decision ?? "new") !== "addressed";
     if (dispatchResult.findings.some((finding) => hasCheckableClaim(finding, isSuppressed))) {
       try {
-        const prepared = await prepareStructuralWorkspaceFn({
+        // Issue #78: the check runs INSIDE the repository lock. Reading the
+        // shared worktree after the lock is released lets another job reset it
+        // mid-read, and this derives a host-authored fact from what it reads.
+        dispatchResult.findings = await prepareStructuralWorkspaceFn({
           // The SAME managed workspace context mapping uses, so a repository
           // is mirrored once whichever feature asked for it first.
           root: contextRoots(selectContextRoot({
@@ -1526,27 +1535,28 @@ export async function review(
           repo: repository,
           baseSha: pr.baseSha,
           rejectPreviouslySharedRoot: true,
-        });
-        if (prepared.baseSha !== pr.baseSha) {
-          throw new Error("prepared worktree does not sit at the requested base commit");
-        }
-        dispatchResult.findings = await runStructuralChecksFn({
-          findings: dispatchResult.findings,
-          baseRoot: prepared.baseWorktreePath,
-          // A finding names its HEAD path; the base tree holds a renamed file
-          // under the old one, and without this the symbol's own declaration
-          // reads as a reference from elsewhere.
-          renamedFrom: renameSourcesByHeadPath(diff),
-          // Lets the checker drop occurrences whose base-side lines may be
-          // precisely the ones this PR deletes — per file, so an untouched
-          // caller elsewhere survives.
-          removedLinesByFile: removedLinesByFile(diff),
-          // `orchestrate` drops an actionable finding whose dedup key matches an
-          // `addressed` one, so checking those spends budget on results no reader
-          // sees. Wired HERE, at the composition root, using orchestrate's own
-          // `dedupeKey` — the checker stays independent of the orchestrator and
-          // there is only one definition of the rule.
-          isSuppressed,
+        }, async (prepared) => {
+          if (prepared.baseSha !== pr.baseSha) {
+            throw new Error("prepared worktree does not sit at the requested base commit");
+          }
+          return runStructuralChecksFn({
+            findings: dispatchResult.findings,
+            baseRoot: prepared.baseWorktreePath,
+            // A finding names its HEAD path; the base tree holds a renamed file
+            // under the old one, and without this the symbol's own declaration
+            // reads as a reference from elsewhere.
+            renamedFrom: renameSourcesByHeadPath(diff),
+            // Lets the checker drop occurrences whose base-side lines may be
+            // precisely the ones this PR deletes — per file, so an untouched
+            // caller elsewhere survives.
+            removedLinesByFile: removedLinesByFile(diff),
+            // `orchestrate` drops an actionable finding whose dedup key matches
+            // an `addressed` one, so checking those spends budget on results no
+            // reader sees. Wired HERE, at the composition root, using
+            // orchestrate's own `dedupeKey` — the checker stays independent of
+            // the orchestrator and there is only one definition of the rule.
+            isSuppressed,
+          });
         });
       } catch (error) {
       // Stated on the findings that asked for a check, so the reader learns the
