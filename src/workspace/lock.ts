@@ -70,6 +70,16 @@ function validateOptions(options: RepositoryLockOptions): number {
   return pollMs;
 }
 
+/** The run ID in the lock file, or undefined when it cannot be read. */
+async function currentLockOwner(lockPath: string): Promise<string | undefined> {
+  try {
+    const parsed = JSON.parse(await readFile(lockPath, "utf8")) as { runId?: unknown };
+    return typeof parsed.runId === "string" ? parsed.runId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function buildMetadata(owner: LockOwner): LockMetadata {
   return {
     version: LOCK_SCHEMA_VERSION,
@@ -246,7 +256,14 @@ export async function withRepositoryLock<T>(
 
   const metadata = buildMetadata(options.owner);
   const contents = `${JSON.stringify(metadata)}\n`;
-  const deadline = performance.now() + options.timeoutMs;
+  let deadline = performance.now() + options.timeoutMs;
+  // The run ID currently holding the lock, so a CHANGE of owner can be told
+  // apart from a stuck one. The timeout has to mean "nothing is progressing",
+  // not "it is not my turn yet": the lock is repository-wide, so several
+  // legitimate consumers can queue, and a fixed deadline measured from the
+  // first attempt fails the third waiter even though every holder before it
+  // stayed inside its own budget (PR #99 review).
+  let observedOwner: string | undefined;
 
   await mkdir(path.dirname(options.lockPath), { recursive: true });
   let isInitialAttempt = true;
@@ -277,6 +294,18 @@ export async function withRepositoryLock<T>(
       return workResult.value;
     }
     isInitialAttempt = false;
+    // Whoever holds it now. Unreadable is treated as no information rather than
+    // as a change, or a transiently missing file would renew the deadline
+    // forever and the timeout would never fire.
+    const holder = await currentLockOwner(options.lockPath);
+    if (holder !== undefined) {
+      if (observedOwner !== undefined && holder !== observedOwner) {
+        // The queue moved. Someone else's turn finishing is progress, so this
+        // waiter gets its full allowance against the NEW holder.
+        deadline = performance.now() + options.timeoutMs;
+      }
+      observedOwner = holder;
+    }
     const remainingMs = deadline - performance.now();
     if (remainingMs <= 0) throw await timeoutError(options.lockPath, options.timeoutMs);
     await delay(Math.min(pollMs, remainingMs));

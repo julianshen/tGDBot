@@ -56,6 +56,61 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
+describe("withRepositoryLock — the timeout means no progress, not no turn", () => {
+  // PR #99 review: the lock is repository-wide, so several legitimate consumers
+  // queue behind each other. A deadline measured from the first attempt fails
+  // the third waiter even when every holder before it stayed inside its own
+  // budget — the lock working correctly, reported as a deadlock.
+  it("survives more queued holders than its timeout would cover alone", async () => {
+    const lockPath = await tempLockPath();
+    const hold = 80;
+    // Shorter than the two holders together, longer than either alone: without
+    // renewal the waiter dies during the second holder's legitimate turn.
+    const timeoutMs = 120;
+
+    const holder = (runId: string) => withRepositoryLock(
+      { lockPath, timeoutMs: 5_000, pollMs: 5, owner: { runId } },
+      async () => { await new Promise((resolve) => setTimeout(resolve, hold)); },
+    );
+
+    // Both holders are queued BEFORE the waiter starts, so the waiter never
+    // wins the lock early and the ordering under test is the one described.
+    const first = holder("first");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const second = holder("second");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const waiter = withRepositoryLock(
+      { lockPath, timeoutMs, pollMs: 5, owner: { runId: "waiter" } },
+      async () => "got it",
+    );
+
+    await Promise.all([first, second]);
+    // The waiter outlasted 2 x 80ms of legitimate holding on a 120ms timeout,
+    // because each change of owner is evidence the queue is moving.
+    await expect(waiter).resolves.toBe("got it");
+  });
+
+  // The other half: a lock nobody hands on still times out.
+  it("still fails when one holder never lets go", async () => {
+    const lockPath = await tempLockPath();
+    let release: (() => void) | undefined;
+    const held = withRepositoryLock(
+      { lockPath, timeoutMs: 5_000, pollMs: 5, owner: { runId: "stuck" } },
+      async () => { await new Promise<void>((resolve) => { release = resolve; }); },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    await expect(withRepositoryLock(
+      { lockPath, timeoutMs: 60, pollMs: 5, owner: { runId: "waiter" } },
+      async () => "unreachable",
+    )).rejects.toThrow(/timed out|timeout/i);
+
+    release?.();
+    await held;
+  });
+});
+
 describe("withRepositoryLock", () => {
   it("rejects unsafe lock options before creating a file", async () => {
     const lockPath = await tempLockPath();
