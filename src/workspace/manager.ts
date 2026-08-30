@@ -33,6 +33,18 @@ const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
  * pre-empting work that was still progressing.
  */
 export const SCOPED_LOCK_TIMEOUT_MS = 31 * 60 * 1000;
+
+/**
+ * The absolute ceiling on waiting for a scoped consumer.
+ *
+ * The per-attempt timeout above renews while the holder is demonstrably alive,
+ * so a legitimately slow holder — cold clone at two minutes a command, then a
+ * mapping budgeted at thirty — no longer fails its waiters (PR #99 review).
+ * This is the backstop for a holder that is alive and going nowhere: far past
+ * any real run, so reaching it means something is genuinely wrong, and the
+ * operator learns rather than waiting forever.
+ */
+export const SCOPED_LOCK_MAX_WAIT_MS = 4 * 60 * 60 * 1000;
 const GIT_PATH_OVERRIDE_VARIABLES = [
   "GIT_DIR",
   "GIT_WORK_TREE",
@@ -395,7 +407,7 @@ export async function withPreparedWorkspace<T>(
 ): Promise<T> {
   return prepareWorkspaceLocked(
     request,
-    { lockTimeoutMs: SCOPED_LOCK_TIMEOUT_MS, ...dependencies },
+    { lockTimeoutMs: SCOPED_LOCK_TIMEOUT_MS, lockMaxWaitMs: SCOPED_LOCK_MAX_WAIT_MS, ...dependencies },
     use,
   );
 }
@@ -434,6 +446,7 @@ async function prepareWorkspaceLocked<T>(
   return withRepositoryLock({
     lockPath,
     timeoutMs: dependencies.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
+    ...(dependencies.lockMaxWaitMs === undefined ? {} : { maxWaitMs: dependencies.lockMaxWaitMs }),
     owner: { runId: randomUUID() },
   }, async () => {
     await assertNoSymlinkedAncestors(

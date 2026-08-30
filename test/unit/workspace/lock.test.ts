@@ -81,7 +81,10 @@ describe("withRepositoryLock — the timeout means no progress, not no turn", ()
     await new Promise((resolve) => setTimeout(resolve, 10));
 
     const waiter = withRepositoryLock(
-      { lockPath, timeoutMs, pollMs: 5, owner: { runId: "waiter" } },
+      // `maxWaitMs` is what a scoped consumer opts into; without it the ceiling
+      // defaults to `timeoutMs` and renewal cannot exceed it, which is the
+      // unchanged behaviour every other caller keeps.
+      { lockPath, timeoutMs, maxWaitMs: 5_000, pollMs: 5, owner: { runId: "waiter" } },
       async () => "got it",
     );
 
@@ -89,6 +92,51 @@ describe("withRepositoryLock — the timeout means no progress, not no turn", ()
     // The waiter outlasted 2 x 80ms of legitimate holding on a 120ms timeout,
     // because each change of owner is evidence the queue is moving.
     await expect(waiter).resolves.toBe("got it");
+  });
+
+  // Codex's case, and the one owner-change renewal cannot reach: a SINGLE
+  // holder legitimately outlasting the waiter's per-attempt timeout. On a cold
+  // repository the holder does clone, fetch and worktree work at two minutes a
+  // command before its mapping even starts, so no constant sized to "one
+  // mapping" is safe. Liveness is the evidence that waiting is still right.
+  it("waits out one holder that outlasts the per-attempt timeout", async () => {
+    const lockPath = await tempLockPath();
+    const held = withRepositoryLock(
+      { lockPath, timeoutMs: 5_000, pollMs: 5, owner: { runId: "slow" } },
+      async () => { await new Promise((resolve) => setTimeout(resolve, 120)); },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // 30ms per attempt against a 120ms holder: without liveness renewal this
+    // waiter dies while the holder is working perfectly normally.
+    await expect(withRepositoryLock(
+      { lockPath, timeoutMs: 30, maxWaitMs: 5_000, pollMs: 5, owner: { runId: "waiter" } },
+      async () => "got it",
+    )).resolves.toBe("got it");
+    await held;
+  });
+
+  // A holder that is ALIVE and going nowhere is still a failure. Renewal on
+  // liveness is right for a slow holder and wrong for a hung one, so the
+  // ceiling is what makes sure the operator eventually learns.
+  it("gives up on a live holder that never finishes, at the ceiling", async () => {
+    const lockPath = await tempLockPath();
+    let release: (() => void) | undefined;
+    const held = withRepositoryLock(
+      { lockPath, timeoutMs: 5_000, pollMs: 5, owner: { runId: "hung" } },
+      async () => { await new Promise<void>((resolve) => { release = resolve; }); },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    // The holder is this very process, so liveness renewal applies and only the
+    // ceiling can end the wait.
+    await expect(withRepositoryLock(
+      { lockPath, timeoutMs: 30, maxWaitMs: 120, pollMs: 5, owner: { runId: "waiter" } },
+      async () => "unreachable",
+    )).rejects.toThrow(/timed out|timeout/i);
+
+    release?.();
+    await held;
   });
 
   // The other half: a lock nobody hands on still times out.

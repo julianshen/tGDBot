@@ -37,4 +37,6 @@ export interface WorkspaceDependencies {
   exec: ExecWorkspaceCommand;
   commandTimeoutMs?: number;
   lockTimeoutMs?: number;
+  /** Absolute ceiling on lock waiting; see `maxWaitMs` on the lock itself. */
+  lockMaxWaitMs?: number;
 }
