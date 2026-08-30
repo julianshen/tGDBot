@@ -4543,10 +4543,10 @@ describe("review — dependency facts", () => {
     return input?.contextPacks?.["rule-a"]?.untrustedText;
   };
 
-  // Final round: with the feature off there is no pack at all, because its
-  // identifiers are diff-controlled — see "the dependency pack is part of the
-  // opt-in" below.
-  it("makes no request, and supplies no context, unless asked", async () => {
+  // `--dependency-facts` is the registry/OSV opt-in. The pack still ships when
+  // a manifest changed, because #69's local name check lives there; it says
+  // plainly that nothing was looked up.
+  it("makes no registry request unless asked", async () => {
     const h = makeHarness();
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
     const fetchJson = vi.fn();
@@ -4554,7 +4554,9 @@ describe("review — dependency facts", () => {
     await review(h.args, { ...depsFrom(h), fetchJson });
 
     expect(fetchJson).not.toHaveBeenCalled();
-    expect(packFor(h)).toBeUndefined();
+    expect(packFor(h)).toMatch(/not been checked/i);
+    expect(packFor(h)).not.toContain("lodash");
+    expect(untrustedPackFor(h)).toContain("lodash");
   });
 
   it("puts the registry's answer in front of the rule when enabled", async () => {
@@ -4676,7 +4678,7 @@ describe("review — dependency facts under legacy dispatch", () => {
 // forming a sentence with spaces, `ignore-all-previous-instructions` needs no
 // spaces. Those strings are already in UNTRUSTED_DIFF; copying them into
 // TRUSTED_CONTEXT is what elevates them, and it was happening by default.
-describe("review — the dependency pack is part of the opt-in", () => {
+describe("review — the dependency pack is not the registry opt-in", () => {
   const MANIFEST_DIFF = [
     "diff --git a/package.json b/package.json",
     "--- a/package.json",
@@ -4700,13 +4702,18 @@ describe("review — the dependency pack is part of the opt-in", () => {
     return input?.contextPacks?.["rule-a"]?.untrustedText;
   };
 
-  it("supplies no pack at all when the feature is off", async () => {
+  // Issue #69: the pack is how local name-similarity notes reach the rules.
+  // Registry lookup stays off; author-chosen names stay untrusted.
+  it("still supplies the pack when registry facts are off, without querying a registry", async () => {
     const h = makeHarness();
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn();
 
-    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+    await review(h.args, { ...depsFrom(h), fetchJson });
 
-    expect(packFor(h)).toBeUndefined();
+    expect(untrustedPackFor(h)).toContain("lodash");
+    expect(packFor(h)).not.toContain("lodash");
+    expect(fetchJson).not.toHaveBeenCalled();
   });
 
   it("supplies one when the feature is on", async () => {
@@ -4806,13 +4813,18 @@ describe("review — manifests are read at the head ref", () => {
     expect(wholePackFor(h)).not.toContain("react");
   });
 
-  it("makes no manifest request when the feature is off", async () => {
+  // Issue #69: the local name check needs the manifests and needs no registry.
+  // `--dependency-facts` is the outbound-request flag; inheriting it would hide
+  // a check that makes no request.
+  it("still reads manifests when registry facts are off, and does not query a registry", async () => {
     const h = makeHarness();
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
+    const fetchJson = vi.fn();
 
-    await review(h.args, { ...depsFrom(h), fetchJson: vi.fn() });
+    await review(h.args, { ...depsFrom(h), fetchJson });
 
-    expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalled();
+    expect(h.vcsAdapter.getFileAtRef).toHaveBeenCalled();
+    expect(fetchJson).not.toHaveBeenCalled();
   });
 
   // "We could not look" must not render as "we looked and it was fine".
@@ -4838,6 +4850,58 @@ describe("review — manifests are read at the head ref", () => {
     expect(exitCode).toBe(0);
     expect(wholePackFor(h)).toMatch(/could NOT be read/i);
     warn.mockRestore();
+  });
+});
+
+// Issue #69: a silent typosquat check over names the host already has. No
+// registry, no `--dependency-facts`.
+describe("review — typosquat comparison is local", () => {
+  const DIFF = [
+    "diff --git a/package.json b/package.json",
+    "--- a/package.json",
+    "+++ b/package.json",
+    "@@ -3,2 +3,3 @@",
+    '   "dependencies": {',
+    '+    "lodahs": "1.0.0",',
+  ].join("\n");
+
+  const wholePackFor = (h: Harness): string | undefined => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
+      | undefined;
+    const pack = input?.contextPacks?.["rule-a"];
+    return pack === undefined ? undefined : `${pack.text}\n${pack.untrustedText ?? ""}`;
+  };
+
+  const packFor = (h: Harness) => {
+    const input = h.dispatchRules.mock.calls[0]?.[0] as
+      | { contextPacks?: Record<string, { text: string; untrustedText?: string }> }
+      | undefined;
+    return input?.contextPacks?.["rule-a"];
+  };
+
+  it("flags a one-keystroke neighbour without --dependency-facts", async () => {
+    const h = makeHarness();
+    h.vcsAdapter.getDiff.mockResolvedValue(DIFF);
+    h.vcsAdapter.getFileAtRef.mockImplementation(async (_locator: unknown, ref: string) =>
+      JSON.stringify({
+        dependencies: ref === "deadbeef"
+          ? { lodash: "4.17.20" }
+          : { lodash: "4.17.20", lodahs: "1.0.0" },
+      }),
+    );
+    const fetchJson = vi.fn();
+
+    await review(h.args, { ...depsFrom(h), fetchJson });
+
+    const pack = packFor(h);
+    expect(pack?.text).toMatch(/1 transposition from neighbour 1/i);
+    expect(pack?.text).not.toContain("lodahs");
+    expect(pack?.text).not.toContain("lodash");
+    expect(pack?.untrustedText).toContain("lodahs");
+    expect(pack?.untrustedText).toContain("Entry 1 neighbour 1 = lodash");
+    expect(fetchJson).not.toHaveBeenCalled();
+    expect(wholePackFor(h)).toMatch(/same manifest/i);
   });
 });
 

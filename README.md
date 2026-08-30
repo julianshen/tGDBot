@@ -401,19 +401,18 @@ tgd-review-agent review \
                                   # notice, which is text the package owner writes and is not
                                   # trusted input; rules are told to send the reader to the registry
                                   # for it rather than paraphrase what they were not given.
-                                  # The context section is part of this opt-in: with the flag off
-                                  # no dependency context is supplied at all, because the package
-                                  # names and manifest paths in it come from the diff. With it on,
-                                  # the host also reads each changed manifest at the PR's head ref
-                                  # and parses it, so which entries are dependencies comes from the
-                                  # file rather than from guessing at diff context; a manifest that
-                                  # cannot be read is named in the context as unexamined.
                                   # Off by default because it reveals a private
-                                  # repository's dependencies to a third party. With it off the
-                                  # context still lists the changed versions and says plainly that
-                                  # none of them were checked. Carried by BOTH dispatch
-                                  # engines: the registry lookup and the context section it
-                                  # produces do not depend on which engine runs the rules.
+                                  # repository's dependencies to a third party.
+                                  # Independently of this flag, a changed package.json is still
+                                  # parsed: the host compares each new name against other names
+                                  # already declared in the same manifest and, when the two are
+                                  # one keystroke apart, states the distance and the kind of edit
+                                  # against host-assigned labels. The names themselves stay in the
+                                  # untrusted half of the context. That check makes no outbound
+                                  # request. A bundled popular-package list and registry download
+                                  # counts are not consulted.
+                                  # A manifest that cannot be read is named as unexamined.
+                                  # Carried by BOTH dispatch engines.
                                   # See examples/rules/dependency-currency.md
   --model <provider>/<model>     # optional: the DEFAULT model. Runs the review's orchestrating
                                   # session AND any rule that doesn't pin its own provider/model
@@ -570,8 +569,8 @@ context. Until that is resolved, on Windows either keep the cache root
 somewhere exclusively yours or run with `--context off`.
 
 `--context-max-chars` is a ceiling on the whole trusted-context section a rule
-receives, not on the repository map alone. When `--dependency-facts` also
-produces a section, both of its halves are reserved first and the repository map is
+receives, not on the repository map alone. When a changed manifest produces a
+dependency section, both of its halves are reserved first and the repository map is
 rendered against what is left — reserving rather than truncating, because the
 map can drop whole evidence entries and report the omission counts while a list
 of dependency facts cannot be cut mid-claim. The repository map keeps a floor of

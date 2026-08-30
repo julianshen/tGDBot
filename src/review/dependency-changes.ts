@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import type { ContextPackResult } from "../context/context-pack.js";
 import type { DependencyFact } from "./dependency-facts.js";
 import type { DependencyAdvisoryFact } from "./dependency-advisories.js";
+import type { TyposquatFact } from "./dependency-typosquat.js";
 
 // Issue #50: reviewing a dependency bump needs facts the checkout does not
 // contain — whether a version is current, withdrawn, deprecated, or carries a
@@ -54,6 +55,8 @@ export interface DependencyChange {
    * with the answer the file gives directly.
    */
   readonly section: string;
+  /** Whether the spec can be queried against a registry. */
+  readonly registryEligible?: boolean;
 }
 
 /** The one host queried. Not configurable: an allowlist of exactly one. */
@@ -122,6 +125,19 @@ const MANIFEST_PATH_RE = /^[A-Za-z0-9._@\/-]{1,512}$/u;
  * matters more than perfect coverage of an enormous bump.
  */
 const MAX_PACKAGES_PER_DIFF = 200;
+
+/**
+ * How many NON-registry declarations one diff may keep for the same-manifest
+ * name check (issue #69).
+ *
+ * The registry ceiling above counts only specs a registry could answer: a
+ * workspace, file, git or alias spec used to be skipped without consuming it,
+ * and keeping it in `changes` must not let two hundred such entries starve the
+ * semver entry behind them of its registry lookups. This is the separate bound
+ * those entries spend — it also keeps the pack itself bounded, at the sum of
+ * the two ceilings.
+ */
+const MAX_NAME_CHECKS_PER_DIFF = 200;
 
 /** How many manifest paths the pack will name before summarising the rest. */
 const MAX_LISTED_MANIFESTS = 20;
@@ -321,6 +337,13 @@ export interface DependencyExtraction {
    * written against (PR #67 review).
    */
   readonly unreadable: string[];
+  /**
+   * Every declared package name in each readable manifest, at HEAD ∪ base.
+   *
+   * Issue #69's corpus: a newly added `lodahs` is compared against names this
+   * file already declared, including one that was removed in the same change.
+   */
+  readonly namesByManifest: ReadonlyMap<string, readonly string[]>;
 }
 
 /**
@@ -346,6 +369,23 @@ export function dependencyChanges(
   const changes: DependencyChange[] = [];
   const unreadable: string[] = [];
   const seen = new Set<string>();
+  const namesByManifest = new Map<string, string[]>();
+  let registryCount = 0;
+  let nameCheckCount = 0;
+
+  const recordNames = (
+    path: string,
+    deps: Map<string, { section: string; name: string; spec: string }>,
+  ): void => {
+    const names = namesByManifest.get(path) ?? [];
+    const already = new Set(names);
+    for (const { name } of deps.values()) {
+      if (already.has(name)) continue;
+      already.add(name);
+      names.push(name);
+    }
+    namesByManifest.set(path, names);
+  };
 
   for (const { path, basePath } of manifests) {
     const headText = head.get(path);
@@ -378,8 +418,10 @@ export function dependencyChanges(
       baseDeps = parsedBase;
     }
 
+    recordNames(path, headDeps);
+    recordNames(path, baseDeps);
+
     for (const [key, { section, name, spec }] of headDeps) {
-      if (changes.length >= MAX_PACKAGES_PER_DIFF) break;
       // Unchanged is not a change. This is the whole comparison — and SECTION
       // counts as much as spec: a package moving from devDependencies to
       // dependencies at the same version enters the production tree, which is
@@ -387,15 +429,40 @@ export function dependencyChanges(
       // review, round two).
       const before = baseDeps.get(key);
       if (before !== undefined && before.spec === spec && before.section === section) continue;
+      if (!isValidPackageName(name)) continue;
       const version = stripRange(spec);
-      if (!isValidPackageName(name) || !VERSION_RE.test(version)) continue;
-      const identity = `${section}\u0000${name}@${spec}`;
+      const registryEligible = VERSION_RE.test(version);
+      // Each kind spends its own budget: a wall of workspace entries must not
+      // consume the registry ceiling any more than a wall of version bumps
+      // should consume the name-check one.
+      if (registryEligible) {
+        if (registryCount >= MAX_PACKAGES_PER_DIFF) continue;
+        registryCount += 1;
+      } else {
+        if (nameCheckCount >= MAX_NAME_CHECKS_PER_DIFF) continue;
+        nameCheckCount += 1;
+      }
+      const identity = `${path}\u0000${section}\u0000${name}@${spec}`;
+      // Keyed by MANIFEST: the same addition in two workspaces is two changes,
+      // because the name check's corpus is per manifest — `lodahs@1.0.0` added
+      // beside `lodash` in one package.json is a typosquat there and not in the
+      // other, and dropping the second copy silently skipped the check that
+      // mattered (PR #102 review, round three). Registry requests are unaffected:
+      // the fact lookups deduplicate by name and by spec on their own.
       if (seen.has(identity)) continue;
       seen.add(identity);
-      changes.push({ name, version, spec, manifest: path, pinned: isPinnedSpec(spec), section });
+      changes.push({
+        name,
+        version,
+        spec,
+        manifest: path,
+        pinned: isPinnedSpec(spec),
+        section,
+        registryEligible,
+      });
     }
   }
-  return { changes, unreadable };
+  return { changes, unreadable, namesByManifest };
 }
 
 /**
@@ -450,12 +517,17 @@ export function dependencyContextPack(
   facts: readonly DependencyFact[] = [],
   unreadableManifests: readonly string[] = [],
   advisoryFacts: readonly DependencyAdvisoryFact[] = [],
+  typosquats: readonly TyposquatFact[] = [],
 ): ContextPackResult | undefined {
   if (changes.length === 0 && unreadableManifests.length === 0) return undefined;
   // Keyed by SPEC: a pin and a range share a stripped version, so name@version
   // handed both changes whichever fact was written last (round six).
   const factFor = new Map(facts.map((fact) => [`${fact.name}@${fact.spec}`, fact]));
   const advisoryFor = new Map(advisoryFacts.map((fact) => [`${fact.name}@${fact.spec}`, fact]));
+  const squatFor = new Map(
+    typosquats.map((fact) => [`${fact.manifest}\0${fact.candidateName}`, fact]),
+  );
+  const neighbourLines: string[] = [];
   const lines = changes.map((change, index) => {
     // The entry LABEL, not the package. `name`, `spec` and `manifest` are all
     // strings the pull-request author chose, and this half of the pack means
@@ -472,18 +544,13 @@ export function dependencyContextPack(
     const head = `- ${label} (${change.section})`;
     const fact = factFor.get(`${change.name}@${change.spec}`);
     const advisory = advisoryFor.get(`${change.name}@${change.spec}`);
-    const advisoryNotes = renderAdvisoryNotes(advisory);
-    if (fact === undefined) {
-      return advisoryNotes.length === 0
-        ? head
-        : `${head}\n${advisoryNotes.map((note) => `  - ${note}`).join("\n")}`;
-    }
-    const notes: string[] = [...advisoryNotes];
-    // An unchecked package must read as unchecked, never as clean.
-    // `unknown` is host-authored by construction — see fetchDependencyFacts,
-    // which logs the remote detail rather than putting it here.
-    if (fact.unknown !== undefined) notes.push(`lookup failed — ${fact.unknown}`);
-    if (fact.published === false) notes.push("this version is NOT published by the registry");
+    const notes: string[] = [...renderAdvisoryNotes(advisory)];
+    if (fact !== undefined) {
+      // An unchecked package must read as unchecked, never as clean.
+      // `unknown` is host-authored by construction — see fetchDependencyFacts,
+      // which logs the remote detail rather than putting it here.
+      if (fact.unknown !== undefined) notes.push(`lookup failed — ${fact.unknown}`);
+      if (fact.published === false) notes.push("this version is NOT published by the registry");
     // The FLAG only, never the publisher's words.
     //
     // Round three flattened and capped the notice and left it in place. That
@@ -497,26 +564,39 @@ export function dependencyContextPack(
     // The deprecation FLAG is host-established and is what a rule acts on. The
     // guidance in the notice is a real loss, and a small one against an
     // injection channel that cannot be closed while the text is here.
-    if (fact.deprecated !== undefined) {
-      notes.push("the registry marks this version deprecated (see the registry for the publisher's guidance)");
-    }
-    // `dist-tags.latest` is a value from a document the publisher controls, so
-    // it is rendered only when it IS a version. Anything else is not a latest
-    // tag worth repeating, and validating beats escaping (round four).
-    const latest = fact.latest !== undefined && isExactVersion(fact.latest) ? fact.latest : undefined;
-    if (latest !== undefined) {
-      if (!change.pinned) {
-        // A range may ALREADY resolve to the latest release, so stating a gap
-        // would invent one. The tag is still worth having; the comparison is
-        // not ours to make without resolving the range (round six).
-        notes.push(
-          `the registry's newest release is ${latest}, but this is a range — the resolver may already be installing it, so nothing here says the dependency is behind`,
-        );
-      } else if (latest !== change.version) {
-        notes.push(`latest is ${latest}`);
-      } else {
-        notes.push("this is the latest");
+      if (fact.deprecated !== undefined) {
+        notes.push("the registry marks this version deprecated (see the registry for the publisher's guidance)");
       }
+      // `dist-tags.latest` is a value from a document the publisher controls, so
+      // it is rendered only when it IS a version. Anything else is not a latest
+      // tag worth repeating, and validating beats escaping (round four).
+      const latest = fact.latest !== undefined && isExactVersion(fact.latest) ? fact.latest : undefined;
+      if (latest !== undefined) {
+        if (!change.pinned) {
+          // A range may ALREADY resolve to the latest release, so stating a gap
+          // would invent one. The tag is still worth having; the comparison is
+          // not ours to make without resolving the range (round six).
+          notes.push(
+            `the registry's newest release is ${latest}, but this is a range — the resolver may already be installing it, so nothing here says the dependency is behind`,
+          );
+        } else if (latest !== change.version) {
+          notes.push(`latest is ${latest}`);
+        } else {
+          notes.push("this is the latest");
+        }
+      }
+    }
+    const squat = squatFor.get(`${change.manifest}\0${change.name}`);
+    if (squat?.skipped === "no-other-names") {
+      notes.push("typosquat NOT checked — no other declared name in this manifest to compare against");
+    } else if (squat !== undefined) {
+      squat.matches.forEach((match, neighbourIndex) => {
+        const neighbour = neighbourIndex + 1;
+        notes.push(
+          `${match.distance} ${match.kind} from neighbour ${neighbour}, which this manifest also declares`,
+        );
+        neighbourLines.push(`- ${label} neighbour ${neighbour} = ${match.existing}`);
+      });
     }
     return notes.length === 0 ? head : `${head}\n${notes.map((note) => `  - ${note}`).join("\n")}`;
   });
@@ -543,6 +623,11 @@ export function dependencyContextPack(
           + ": whether each is current, deprecated, withdrawn"
           + (advisoriesRan ? "" : ", or affected by a known advisory")
           + " is unknown here. Do not assert otherwise.",
+      ];
+  const typosquatClosing = typosquats.length === 0
+    ? []
+    : [
+        "Typosquat comparison used only names declared in the same manifest. A name that is a typosquat of a package this repository does not already depend on was not checked.",
       ];
   // A manifest the host could not read is stated, never omitted. Its
   // dependencies were not examined, and an absent section would read as an
@@ -576,6 +661,7 @@ export function dependencyContextPack(
     ...unreadable,
     "",
     ...closing,
+    ...typosquatClosing,
   ].join("\n");
   // The author's strings. Deliberately NOT interpolated into `text` above: a
   // package name is a value a pull-request author picks, and npm's naming rules
@@ -592,6 +678,7 @@ export function dependencyContextPack(
     ...changes.map(
       (change, index) => `- Entry ${index + 1} = ${change.name}@${change.spec} (${change.manifest})`,
     ),
+    ...neighbourLines,
   ].join("\n");
   return {
     text,
