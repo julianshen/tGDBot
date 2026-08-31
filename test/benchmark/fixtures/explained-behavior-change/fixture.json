@@ -1,0 +1,12 @@
+{
+  "description": "A deliberate change the description explains. Asserts no findings: silence is correct.",
+  "pr": {
+    "id": "2",
+    "title": "Cut the upload timeout to 5s",
+    "description": "Deliberate. The 30s timeout held a worker for the whole window on a dead connection; p99 upload latency is 1.8s, so 5s is generous. Retries already cover the tail. This is a behaviour change and it is intended.",
+    "baseSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "headSha": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+    "url": "https://github.com/benchmark/fixture/pull/2"
+  },
+  "expected": []
+}

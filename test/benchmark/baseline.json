@@ -1,0 +1,129 @@
+{
+  "version": 1,
+  "mode": "recorded",
+  "entries": [
+    {
+      "fixture": "dependency-major-bump",
+      "quality": {
+        "truePositives": 1,
+        "falsePositives": 0,
+        "falseNegatives": 0,
+        "precision": 1,
+        "recall": 1,
+        "f1": 1
+      },
+      "findingsCount": 1,
+      "severityMix": {
+        "blocking": 0,
+        "warning": 1,
+        "suggestion": 0
+      },
+      "findingsPerRule": {
+        "benchmark-correctness": 1
+      },
+      "dispatchChars": 20375,
+      "diffChars": 219,
+      "findingTextChars": 150,
+      "anchoredInline": 1,
+      "missed": []
+    },
+    {
+      "fixture": "explained-behavior-change",
+      "quality": {
+        "truePositives": 0,
+        "falsePositives": 0,
+        "falseNegatives": 0,
+        "precision": null,
+        "recall": null,
+        "f1": null
+      },
+      "findingsCount": 0,
+      "severityMix": {
+        "blocking": 0,
+        "warning": 0,
+        "suggestion": 0
+      },
+      "findingsPerRule": {},
+      "dispatchChars": 18115,
+      "diffChars": 207,
+      "findingTextChars": 0,
+      "anchoredInline": 0,
+      "missed": []
+    },
+    {
+      "fixture": "injected-instruction-body",
+      "quality": {
+        "truePositives": 1,
+        "falsePositives": 0,
+        "falseNegatives": 0,
+        "precision": 1,
+        "recall": 1,
+        "f1": 1
+      },
+      "findingsCount": 1,
+      "severityMix": {
+        "blocking": 1,
+        "warning": 0,
+        "suggestion": 0
+      },
+      "findingsPerRule": {
+        "benchmark-correctness": 1
+      },
+      "dispatchChars": 18025,
+      "diffChars": 216,
+      "findingTextChars": 145,
+      "anchoredInline": 1,
+      "missed": []
+    },
+    {
+      "fixture": "step-one-of-three",
+      "quality": {
+        "truePositives": 0,
+        "falsePositives": 1,
+        "falseNegatives": 0,
+        "precision": 0,
+        "recall": null,
+        "f1": null
+      },
+      "findingsCount": 1,
+      "severityMix": {
+        "blocking": 0,
+        "warning": 1,
+        "suggestion": 0
+      },
+      "findingsPerRule": {
+        "benchmark-correctness": 1
+      },
+      "dispatchChars": 18087,
+      "diffChars": 271,
+      "findingTextChars": 145,
+      "anchoredInline": 1,
+      "missed": []
+    },
+    {
+      "fixture": "unguarded-dereference",
+      "quality": {
+        "truePositives": 1,
+        "falsePositives": 1,
+        "falseNegatives": 0,
+        "precision": 0.5,
+        "recall": 1,
+        "f1": 0.6667
+      },
+      "findingsCount": 2,
+      "severityMix": {
+        "blocking": 1,
+        "warning": 0,
+        "suggestion": 1
+      },
+      "findingsPerRule": {
+        "benchmark-correctness": 2
+      },
+      "dispatchChars": 17945,
+      "diffChars": 289,
+      "findingTextChars": 307,
+      "anchoredInline": 2,
+      "missed": []
+    }
+  ]
+}

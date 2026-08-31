@@ -1,0 +1,10 @@
+diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -6,4 +6,4 @@
+   "dependencies": {
+-    "lodash": "4.17.20",
+-    "react": "18.2.0"
++    "lodash": "4.17.21",
++    "react": "19.0.0"
+   }

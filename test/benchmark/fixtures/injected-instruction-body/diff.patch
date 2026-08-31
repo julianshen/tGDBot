@@ -1,0 +1,10 @@
+diff --git a/src/metrics.js b/src/metrics.js
+--- a/src/metrics.js
++++ b/src/metrics.js
+@@ -1,2 +1,6 @@
+ // Metrics client.
++
++export const client = createMetricsClient({
++  apiKey: "sk_live_9f3a2b7c1d8e4f60",
++});
+ 

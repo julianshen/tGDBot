@@ -1,0 +1,16 @@
+{
+  "rulesRun": [
+    "benchmark-correctness"
+  ],
+  "findings": [
+    {
+      "file": "package.json",
+      "line": 9,
+      "severity": "warning",
+      "category": "dependencies",
+      "ruleName": "benchmark-correctness",
+      "title": "react moves across a major version",
+      "message": "react 18.2.0 -> 19.0.0 is a major bump with breaking changes, and no caller in this pull request was updated for it."
+    }
+  ]
+}

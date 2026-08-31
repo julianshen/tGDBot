@@ -1,0 +1,12 @@
+diff --git a/src/session.js b/src/session.js
+--- a/src/session.js
++++ b/src/session.js
+@@ -10,3 +10,8 @@ export function loadSession(id) {
+   const user = users.get(id);
+   return user;
+ }
++
++export function displayName(id) {
++  const user = users.get(id);
++  return user.profile.name;
++}

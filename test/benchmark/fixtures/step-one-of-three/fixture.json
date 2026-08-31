@@ -1,0 +1,12 @@
+{
+  "description": "Step 1 of 3, stated in the body. The missing implementation is not a defect.",
+  "pr": {
+    "id": "3",
+    "title": "Storage interface (1/3)",
+    "description": "Step 1 of 3. This adds the interface only. Step 2 adds the S3 implementation, step 3 migrates callers. Nothing calls this yet, by design.",
+    "baseSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "headSha": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+    "url": "https://github.com/benchmark/fixture/pull/3"
+  },
+  "expected": []
+}
