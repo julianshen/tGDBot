@@ -69,8 +69,17 @@ export async function runFixture(
   // output IS the table. Only `console.log` is silenced: warnings and errors
   // still reach the terminal, because a fixture that degraded — a rule that
   // failed to load, a context step that gave up — must not do so quietly.
+  // CAPTURED, not discarded. Under --dry-run the review prints exactly what it
+  // would publish — the review digest, every inline body, and the composed
+  // summary with its signature and marker. Measuring the orchestrator's
+  // intermediate `commentBody` instead left the digest and the final
+  // composition unmeasured, so a regression in either kept a clean baseline
+  // (Codex review of PR #118). Reproducing that rendering here would be a
+  // second implementation to keep in step; reading what the CLI printed is the
+  // same bytes by construction.
+  const printed: string[] = [];
   const realLog = console.log;
-  console.log = () => undefined;
+  console.log = (...parts: unknown[]) => { printed.push(parts.map(String).join(" ")); };
   let exitCode: number;
   try {
     exitCode = await review(args, {
@@ -97,12 +106,6 @@ export async function runFixture(
         const result = orchestrateReal(dispatchResult, diff, options);
         produced = [...result.summaryInput.allFindings];
         inlineCount = result.inlineComments.length;
-        // The bytes a reader actually receives. `findingTextChars` sums the
-        // fields BEFORE rendering, so a formatter that dropped a message left
-        // it unchanged and `--check` reported a clean baseline for a review
-        // that had lost content (Codex review).
-        renderedChars = result.commentBody.length +
-          result.inlineComments.reduce((total, comment) => total + comment.body.length, 0);
         return result;
       },
       // Neither step is what this benchmark measures, and both need a real git
@@ -129,6 +132,11 @@ export async function runFixture(
     await rm(stateDir, { recursive: true, force: true });
   }
   const durationMs = performance.now() - startedAt;
+  // The status lines are machine output ABOUT the run, not review a reader
+  // receives, so they are excluded from the published byte count.
+  renderedChars = printed
+    .filter((line) => !line.startsWith("TGD_REVIEW_RESULT:") && !line.startsWith("TGD_REVIEW_SEVERITIES:"))
+    .join("\n").length;
   // A review that failed produced no findings for a REASON, and scoring it as
   // "found nothing" turns a missing API key or an unloadable rule into false
   // negatives blamed on the model — while the benchmark still exits 0 (Codex
@@ -279,7 +287,16 @@ function fixtureConfig(args: CliArgs, fixture: Fixture): ResolvedConfig {
     upsertComment: async () => { throw new Error("the benchmark runs dry and does not publish"); },
     createInlineReview: async () => { throw new Error("the benchmark runs dry and does not publish"); },
     getRuleFilesFromBase: async () => [],
-    getFileAtRef: async () => "",
+    // Serves the fixture's own manifests. Returning an empty string made every
+    // manifest UNREADABLE, and the dependency pack is not gated on
+    // `--dependency-facts` — it is built whenever there are dependency changes
+    // OR unreadable manifests. So the fixture named for a dependency change was
+    // dispatching a degraded "could not read this" pack instead of the parsed
+    // changes, in recorded and real mode alike (Codex review of PR #118).
+    // Measured: serving the manifests moves that fixture's `dispatchChars` by
+    // 360, and no other fixture's, since only this one changes a manifest.
+    getFileAtRef: async (_locator: unknown, ref: string, at: string) =>
+      (ref === fixture.pr.headSha ? fixture.headFiles : fixture.baseFiles)?.[at] ?? "",
     resolveRelatedWork: async (references: unknown) => references,
     resolveStaleReviewThreads: async () => 0,
     findPublishedMarker: async () => null,

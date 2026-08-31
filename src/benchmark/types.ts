@@ -58,6 +58,15 @@ export interface Fixture {
     readonly url: string;
   };
   readonly diff: string;
+  /**
+   * File contents the review may read at the base and head revisions, keyed by
+   * path. Today that is manifests, which dependency extraction reads at both
+   * revisions to work out what actually changed.
+   *
+   * Absent for a fixture whose review reads no files, which is most of them.
+   */
+  readonly baseFiles?: Readonly<Record<string, string>>;
+  readonly headFiles?: Readonly<Record<string, string>>;
   readonly expected: readonly ExpectedFinding[];
   /**
    * The recorded model output this fixture replays under `--mode recorded`.

@@ -21,10 +21,10 @@
       "findingsPerRule": {
         "benchmark-correctness": 1
       },
-      "dispatchChars": 20375,
+      "dispatchChars": 20735,
       "diffChars": 219,
       "findingTextChars": 150,
-      "renderedChars": 850,
+      "renderedChars": 1879,
       "anchoredInline": 1,
       "missed": []
     },
@@ -48,7 +48,7 @@
       "dispatchChars": 18115,
       "diffChars": 207,
       "findingTextChars": 0,
-      "renderedChars": 197,
+      "renderedChars": 474,
       "anchoredInline": 0,
       "missed": []
     },
@@ -74,7 +74,7 @@
       "dispatchChars": 18025,
       "diffChars": 216,
       "findingTextChars": 145,
-      "renderedChars": 843,
+      "renderedChars": 1875,
       "anchoredInline": 1,
       "missed": []
     },
@@ -100,7 +100,7 @@
       "dispatchChars": 18087,
       "diffChars": 271,
       "findingTextChars": 145,
-      "renderedChars": 837,
+      "renderedChars": 1868,
       "anchoredInline": 1,
       "missed": []
     },
@@ -126,7 +126,7 @@
       "dispatchChars": 17635,
       "diffChars": 169,
       "findingTextChars": 140,
-      "renderedChars": 970,
+      "renderedChars": 2000,
       "anchoredInline": 1,
       "missed": []
     },
@@ -152,7 +152,7 @@
       "dispatchChars": 17945,
       "diffChars": 289,
       "findingTextChars": 307,
-      "renderedChars": 1505,
+      "renderedChars": 2605,
       "anchoredInline": 2,
       "missed": []
     }

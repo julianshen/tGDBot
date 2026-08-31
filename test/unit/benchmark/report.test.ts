@@ -137,6 +137,14 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--update", "--check"])).toThrow(/mutually exclusive/);
   });
 
+  it("refuses --update or --check in real mode during argument parsing", () => {
+    // Validated BEFORE the fixture loop. Checking after meant a mistyped
+    // command called the paid model for every fixture and only then reported
+    // the combination invalid.
+    expect(() => parseArgs(["--mode", "real", "--check"])).toThrow(/recorded mode only/);
+    expect(() => parseArgs(["--mode", "real", "--update"])).toThrow(/recorded mode only/);
+  });
+
   it("refuses --only with --update or --check", () => {
     // The baseline covers the whole suite. Written from a filtered run it
     // deletes every unselected row; compared against one it reports them all

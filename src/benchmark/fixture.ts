@@ -6,6 +6,7 @@
 // improvement, which is worse than reporting nothing.
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
+import { normalizeUnknownFinding } from "../review/dispatch-results.js";
 import type { Finding } from "../review/types.js";
 import type { ExpectedFinding, Fixture } from "./types.js";
 
@@ -50,6 +51,8 @@ export async function loadFixture(dir: string, name: string): Promise<Fixture> {
       url: requireString(pr.url, `${name}.pr.url`),
     },
     diff,
+    ...(object.baseFiles === undefined ? {} : { baseFiles: fileMap(object.baseFiles, `${name}.baseFiles`) }),
+    ...(object.headFiles === undefined ? {} : { headFiles: fileMap(object.headFiles, `${name}.headFiles`) }),
     expected,
     ...(recorded === undefined ? {} : recorded),
   };
@@ -75,7 +78,18 @@ async function readRecorded(
   const parsed: unknown = JSON.parse(raw);
   const object = requireObject(parsed, "recorded.json");
   return {
-    recordedFindings: requireArray(object.findings, "recorded.findings") as Finding[],
+    // Through the PRODUCTION parser, not a cast. A recording is dispatcher
+    // output that happens to be committed, and asserting `Finding[]` over
+    // untyped JSON let a typo like "blockng" become ground truth: it matches
+    // nothing, so it reads as a miss, and `severityMix` counts it into a key
+    // that does not exist and serializes as null (Codex review of PR #118).
+    // The same gate real output passes means a recording cannot express a
+    // finding the reviewer could never have produced.
+    recordedFindings: requireArray(object.findings, "recorded.findings").map((value, index) => {
+      const finding = normalizeUnknownFinding(value);
+      if (finding === undefined) throw new Error(`recorded.findings[${index}] is not a valid finding`);
+      return finding;
+    }),
     recordedRulesRun: requireArray(object.rulesRun, "recorded.rulesRun").map((value, index) =>
       requireString(value, `recorded.rulesRun[${index}]`)),
   };
@@ -111,6 +125,14 @@ function expectedFinding(value: unknown, where: string): ExpectedFinding {
       : { messagePattern: requireString(object.messagePattern, `${where}.messagePattern`) }),
     ...(object.severity === undefined ? {} : { severity: object.severity }),
   };
+}
+
+function fileMap(value: unknown, where: string): Record<string, string> {
+  const object = requireObject(value, where);
+  return Object.fromEntries(Object.entries(object).map(([key, content]) => {
+    if (typeof content !== "string") throw new Error(`${where}["${key}"] must be a string`);
+    return [key, content];
+  }));
 }
 
 function requireObject(value: unknown, where: string): Record<string, unknown> {

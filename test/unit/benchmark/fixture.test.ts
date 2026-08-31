@@ -71,6 +71,26 @@ describe("loadFixture", () => {
     await expect(loadFixture(path.join(root, "case"), "case")).rejects.toThrow(/severity is invalid/);
   });
 
+  it("rejects a recorded finding the production parser would not accept", async () => {
+    // A recording is dispatcher output that happens to be committed. Casting
+    // untyped JSON to Finding[] let "blockng" become ground truth: it matches
+    // nothing, so it reads as a miss, and the severity count lands in a key
+    // that does not exist and serializes as null.
+    const root = await fixtureDir(manifest([]), { recorded: { rulesRun: ["r"], findings: [
+      { file: "src/a.ts", severity: "blockng", category: "c", message: "m", ruleName: "r" },
+    ] } });
+    await expect(loadFixture(path.join(root, "case"), "case"))
+      .rejects.toThrow(/recorded.findings\[0\] is not a valid finding/);
+  });
+
+  it("accepts a well-formed recording through the production parser", async () => {
+    const root = await fixtureDir(manifest([]), { recorded: { rulesRun: ["r"], findings: [
+      { file: "src/a.ts", line: 3, severity: "blocking", category: "c", message: "m", ruleName: "r" },
+    ] } });
+    const fixture = await loadFixture(path.join(root, "case"), "case");
+    expect(fixture.recordedFindings?.[0]).toMatchObject({ file: "src/a.ts", severity: "blocking" });
+  });
+
   it("rejects a malformed recording rather than treating it as absent", async () => {
     // Silently reading corrupt ground truth as "no recording" would turn a
     // broken fixture into a quietly shrinking benchmark.

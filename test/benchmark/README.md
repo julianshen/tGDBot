@@ -55,7 +55,10 @@ them as fixture design rather than as measurement.
   reader sees, and invisible to precision and recall.
 - `renderedChars` moving while `findingTextChars` holds is a **rendering**
   change: the findings are the same, the published bytes are not. Only this
-  number catches a formatter that started dropping content.
+  number catches a formatter that started dropping content. It is measured
+  from the dry-run preview the CLI actually prints — the review digest, every
+  inline body, and the composed summary with its signature and marker — rather
+  than reproduced here, so it cannot drift from what would be published.
 - A fixture appearing as `present -> absent` means it stopped running. That is
   never an improvement, even though the failing rows disappear with it.
 
@@ -108,8 +111,16 @@ An empty `expected` is a legitimate fixture: a change the reviewer should stay
 quiet about. Its only meaningful number is the false-positive count.
 
 **`recorded.json`** (optional) — `{"rulesRun": [...], "findings": [...]}`. The
-`findings` are `Finding` objects as the dispatcher would return them. Without
-this file the fixture is real-mode only and recorded runs report it as skipped.
+`findings` are `Finding` objects as the dispatcher would return them, and they
+are loaded through the **production parser**, so a recording cannot express a
+finding the reviewer could never have produced. Without this file the fixture is
+real-mode only and recorded runs report it as skipped.
+
+**`baseFiles` / `headFiles`** (optional, in `fixture.json`) — path-to-content
+maps the review may read at each revision. Needed whenever the diff touches a
+manifest: dependency extraction reads it at both revisions, and without the
+content it reports the manifest unreadable and dispatches a degraded pack
+instead of the parsed changes. `dependency-major-bump` shows the shape.
 
 Then `npm run benchmark -- --update` and commit `baseline.json` with the
 fixture.

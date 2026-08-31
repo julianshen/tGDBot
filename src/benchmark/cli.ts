@@ -71,13 +71,11 @@ export async function main(argv: readonly string[]): Promise<number> {
   };
   console.log(formatReport(report));
 
+  // A real run is not reproducible, so it never becomes the baseline. It is for
+  // looking at, and for deciding whether a recording needs refreshing.
+  // `parseArgs` has already refused --update/--check for this mode, before any
+  // model was called.
   if (options.mode === "real") {
-    // A real run is not reproducible, so it never becomes the baseline. It is
-    // for looking at, and for deciding whether a recording needs refreshing.
-    if (options.update || options.check) {
-      console.error("benchmark: --update and --check apply to recorded mode only");
-      return EXIT_FAILED;
-    }
     return skipped.some((entry) => entry.kind === "failed") ? EXIT_FAILED : EXIT_OK;
   }
 
@@ -163,6 +161,13 @@ export function parseArgs(argv: readonly string[]): Options {
   // Both are silent data loss dressed as a result (Codex review of PR #118).
   if (only !== undefined && (update || check)) {
     throw new Error("--only cannot be combined with --update or --check: the baseline covers the whole suite");
+  }
+  // Checked HERE, not after the fixture loop. Validating late meant
+  // `--mode real --check` called the paid model for every fixture and only
+  // then reported the combination invalid — a typo billed in full (Codex
+  // review of PR #118).
+  if (mode === "real" && (update || check)) {
+    throw new Error("--update and --check apply to recorded mode only: a real run is not reproducible");
   }
   if (mode === "recorded" && model !== undefined) {
     // Silently ignoring it would let someone believe they had measured a model
