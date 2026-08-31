@@ -11,6 +11,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   GraphifyMapper,
   GRAPHIFY_MAPPER_VERSION,
+  GRAPHIFY_VERSION,
   adaptGraphifyGraph,
   type GraphifyRunner,
 } from "../../../src/context/graphify-mapper.js";
@@ -81,11 +82,18 @@ interface Fixture {
 
 function runnerWritingGraph(
   graph: unknown,
-  options: { failWith?: Error } = {},
+  options: { failWith?: Error; reportedVersion?: string } = {},
 ): { runner: GraphifyRunner; fixture: Promise<Fixture> } {
   let resolveFixture: (fixture: Fixture) => void;
   const fixture = new Promise<Fixture>((resolve) => { resolveFixture = resolve; });
   const runner: GraphifyRunner = async (args, env) => {
+    // The mapper probes --version before every extract; only the extract is
+    // recorded as a request under test.
+    if (args[0] === "--version") {
+      const reported = options.reportedVersion ?? GRAPHIFY_VERSION;
+      if (options.failWith !== undefined && options.reportedVersion === undefined) throw options.failWith;
+      return { stdout: `graphify ${reported}`, stderr: "" };
+    }
     const sourceRoot = args[1] as string;
     const outputRoot = args[args.indexOf("--out") + 1] as string;
     resolveFixture({ sourceRoot, outputRoot, requests: [{ args, env }] });
@@ -117,6 +125,7 @@ describe("GraphifyMapper — the subprocess boundary", () => {
       const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
       expect(result.status).toBe("ready");
       const { requests } = await fixture;
+      // Request 0 is the version probe; request 1 is the extract.
       expect(requests).toHaveLength(1);
       const [args, env] = [requests[0]!.args, requests[0]!.env];
       // The whole argument list is fixed; --code-only is what makes the
@@ -152,11 +161,47 @@ describe("GraphifyMapper — the subprocess boundary", () => {
     const outputRoot = await tempRoot("graphify-out-");
     const { runner } = runnerWritingGraph(graphifyGraph(), {
       failWith: Object.assign(new Error("exit 1"), { stderr: "boom" }),
+      reportedVersion: GRAPHIFY_VERSION,
     });
     const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
     expect(result.status).toBe("failed");
     expect(result.failure?.code).toBe("mapper-subprocess-failed");
     expect(result.failure?.message).toContain("boom");
+  });
+
+  it("refuses to map when the installed graphify does not match the pinned version", async () => {
+    const sourceRoot = await tempRoot("graphify-src-");
+    const outputRoot = await tempRoot("graphify-out-");
+    let extractInvocations = 0;
+    const runner: GraphifyRunner = async (args) => {
+      if (args[0] === "--version") return { stdout: "graphify 0.10.0", stderr: "" };
+      extractInvocations += 1;
+      return { stdout: "", stderr: "" };
+    };
+    const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
+    expect(result.status).toBe("failed");
+    expect(result.failure?.code).toBe("mapper-subprocess-failed");
+    // Both versions are named, and the cache-key identity is defended: a
+    // different release must never publish graphs attributed to the pin.
+    expect(result.failure?.message).toContain("0.10.0");
+    expect(result.failure?.message).toContain(GRAPHIFY_VERSION);
+    // The extract never runs against a mismatched binary.
+    expect(extractInvocations).toBe(0);
+  });
+
+  it("refuses to map when the version probe reports no recognizable version", async () => {
+    const sourceRoot = await tempRoot("graphify-src-");
+    const outputRoot = await tempRoot("graphify-out-");
+    let extractInvocations = 0;
+    const runner: GraphifyRunner = async (args) => {
+      if (args[0] === "--version") return { stdout: "graphify", stderr: "" };
+      extractInvocations += 1;
+      return { stdout: "", stderr: "" };
+    };
+    const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
+    expect(result.status).toBe("failed");
+    expect(result.failure?.message).toMatch(/no recognizable version/);
+    expect(extractInvocations).toBe(0);
   });
 });
 
@@ -194,7 +239,10 @@ describe("GraphifyMapper — degradation, never a throw", () => {
   it("degrades when the output graph is absent", async () => {
     const sourceRoot = await tempRoot("graphify-src-");
     const outputRoot = await tempRoot("graphify-out-");
-    const runner: GraphifyRunner = async () => ({ stdout: "", stderr: "" });
+    const runner: GraphifyRunner = async (args) => {
+      if (args[0] === "--version") return { stdout: `graphify ${GRAPHIFY_VERSION}`, stderr: "" };
+      return { stdout: "", stderr: "" };
+    };
     const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
     expect(result.status).toBe("degraded");
     expect(result.degradedReasons.join(" ")).toMatch(/no graph document/);
@@ -214,8 +262,9 @@ describe("GraphifyMapper — degradation, never a throw", () => {
     const outputRoot = await tempRoot("graphify-out-");
     const runner: GraphifyRunner = async (args, env) => {
       void env;
-      const outputRoot = args[args.indexOf("--out") + 1] as string;
-      await writeFile(path.join(outputRoot, "graph.json"), "{not json", "utf8");
+      if (args[0] === "--version") return { stdout: `graphify ${GRAPHIFY_VERSION}`, stderr: "" };
+      const outRoot = args[args.indexOf("--out") + 1] as string;
+      await writeFile(path.join(outRoot, "graph.json"), "{not json", "utf8");
       return { stdout: "", stderr: "" };
     };
     const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));

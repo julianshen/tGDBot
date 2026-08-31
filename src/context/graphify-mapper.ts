@@ -387,6 +387,37 @@ export class GraphifyMapper implements ContextMapper {
     const { sourceRoot, outputRoot } = roots;
 
     this.#onProgress({ stage: "extract", status: "started" });
+    // The cache key claims graphs come from the PINNED graphify release
+    // (GRAPHIFY_MAPPER_VERSION embeds it), so an installed binary that
+    // reports anything else must not map: a warm cache would not invalidate
+    // across an upgrade, and the incremental path could merge graphs from
+    // different releases under one identity (PR #116 review). Verify before
+    // every extract; the check costs one subprocess round trip.
+    let reportedVersion: string | undefined;
+    try {
+      const probe = await this.#run(["--version"], scrubbedChildEnvironment());
+      reportedVersion = /\d+\.\d+\.\d+/.exec(probe.stdout)?.[0];
+    } catch (error) {
+      this.#onProgress({ stage: "extract", status: "failed" });
+      const err = error as NodeJS.ErrnoException;
+      if (isMissing(error) || err.code === "ENOENT") {
+        return failed(
+          "mapper-subprocess-failed",
+          "the graphify executable was not found on PATH; install it (e.g. `pipx install graphifyy`) or run with --context-mapper tgd",
+        );
+      }
+      return failed(
+        "mapper-subprocess-failed",
+        `graphify --version failed: ${errorMessage(error).slice(0, MAX_STDERR_CHARS)}`,
+      );
+    }
+    if (reportedVersion !== GRAPHIFY_VERSION) {
+      this.#onProgress({ stage: "extract", status: "failed" });
+      return failed(
+        "mapper-subprocess-failed",
+        `graphify on PATH reports ${reportedVersion ?? "no recognizable version"}, but this build pins graphify@${GRAPHIFY_VERSION}; install exactly that release (e.g. pipx install graphifyy==${GRAPHIFY_VERSION}) or run with --context-mapper tgd`,
+      );
+    }
     try {
       await this.#run(
         ["extract", sourceRoot, "--code-only", "--no-label", "--out", outputRoot],

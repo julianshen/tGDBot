@@ -989,6 +989,9 @@ describe("event-to-action poll", () => {
       disableBuiltinRule: true,
       trustLocalRules: true,
       maxDiffChars: 4242,
+      // Issue #62: the mapper choice is one of those flags — poll-triggered
+      // reviews must not silently fall back to the tgd backend.
+      contextMapper: "graphify",
     }), { ...executionDeps(adapter), runReview })).resolves.toBe(0);
 
     expect(runReview).toHaveBeenCalledTimes(1);
@@ -1005,6 +1008,7 @@ describe("event-to-action poll", () => {
       disableBuiltinRule: true,
       trustLocalRules: true,
       maxDiffChars: 4242,
+      contextMapper: "graphify",
       stateDir,
     });
     expect(reviewDeps.invocation).toMatchObject({ kind: "forced-command" });
