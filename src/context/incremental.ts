@@ -56,6 +56,12 @@ export interface IncrementalPatchInput {
   };
   readonly delta: BaseDelta;
   /**
+   * True when the delta contained paths that needed a scoped re-map (added or
+   * changed). A deletion-only delta legitimately runs no scoped session, so
+   * it must not be labelled as one that failed (PR #107 review, round three).
+   */
+  readonly scopedMapRequired?: boolean;
+  /**
    * True when the cached entry carries the explicit zero-domains marker
    * instead of a domain graph (#60 — PR #107 review). The patch then carries
    * the marker forward untouched: there is no domain statement to gate or
@@ -305,7 +311,10 @@ export async function patchEntryArtifacts(
     "utf8",
   );
 
-  const degradedReasons = input.scopedGraph === undefined
+  // Only a delta that NEEDED a scoped re-map can have failed to produce one.
+  // A deletion-only delta runs no session at all, and labelling it degraded
+  // would poison every later patch, which inherits this manifest's reasons.
+  const degradedReasons = input.scopedGraph === undefined && input.scopedMapRequired === true
     ? ["incremental-patch: the scoped re-map did not produce a usable graph; changed files are represented only by stale marks"]
     : [];
   return {

@@ -224,6 +224,7 @@ describe("patchEntryArtifacts", () => {
       stagingPath,
       manifest: { builtFromSha: FROM },
       delta: delta({ changed: ["src/changed.ts"] }),
+      scopedMapRequired: true,
     });
 
     expect(result.merged).toBe(0);
@@ -282,5 +283,53 @@ describe("patchKnowledgeGraph — review round two (PR #107)", () => {
     expect(marker).toEqual({ version: 1, status: "zero-domains" });
     const metadata = JSON.parse(await readFile(path.join(stagingPath, METADATA_PATH), "utf8"));
     expect(metadata.baseSha).toBe(TO);
+  });
+});
+
+describe("patchEntryArtifacts — degradation only when a scoped map was required (PR #107 review, round three)", () => {
+  it("does not degrade a deletion-only delta that legitimately ran no scoped map", async () => {
+    const entryRoot = await tempRoot("incremental-del-");
+    const stagingPath = await tempRoot("incremental-del-stage-");
+    await mkdir(path.join(entryRoot, ".understand-anything"), { recursive: true });
+    await writeFile(path.join(entryRoot, KNOWLEDGE_PATH), JSON.stringify(
+      knowledgeGraph([node("fn:kept", "src/kept.ts")], []),
+    ));
+    await writeFile(path.join(entryRoot, DOMAIN_PATH), JSON.stringify({
+      version: "1.0.0", project: { name: "octo-repo", gitCommitHash: FROM }, nodes: [], edges: [], layers: [], tour: [],
+    }));
+    await writeFile(path.join(entryRoot, CONTEXT_PATH), "# Trusted context\n", "utf8");
+
+    const result = await patchEntryArtifacts({
+      entryRoot,
+      stagingPath,
+      manifest: { builtFromSha: FROM },
+      delta: delta({ deleted: ["src/gone.ts"] }),
+      scopedMapRequired: false,
+    });
+
+    expect(result.degradedReasons).toEqual([]);
+  });
+
+  it("still degrades when a required scoped map produced nothing", async () => {
+    const entryRoot = await tempRoot("incremental-req-");
+    const stagingPath = await tempRoot("incremental-req-stage-");
+    await mkdir(path.join(entryRoot, ".understand-anything"), { recursive: true });
+    await writeFile(path.join(entryRoot, KNOWLEDGE_PATH), JSON.stringify(
+      knowledgeGraph([node("fn:kept", "src/kept.ts")], []),
+    ));
+    await writeFile(path.join(entryRoot, DOMAIN_PATH), JSON.stringify({
+      version: "1.0.0", project: { name: "octo-repo", gitCommitHash: FROM }, nodes: [], edges: [], layers: [], tour: [],
+    }));
+    await writeFile(path.join(entryRoot, CONTEXT_PATH), "# Trusted context\n", "utf8");
+
+    const result = await patchEntryArtifacts({
+      entryRoot,
+      stagingPath,
+      manifest: { builtFromSha: FROM },
+      delta: delta({ changed: ["src/changed.ts"] }),
+      scopedMapRequired: true,
+    });
+
+    expect(result.degradedReasons.join(" ")).toMatch(/scoped re-map/i);
   });
 });

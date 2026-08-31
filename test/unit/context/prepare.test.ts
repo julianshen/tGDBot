@@ -1157,6 +1157,10 @@ describe("prepareReviewContext — the warm index (#60)", () => {
     expect(mapper.calls).toHaveLength(0);
     if (prepared.status !== "ready") return;
     expect(prepared.incremental).toBe(true);
+    // PR #107 review, round three: a deletion-only delta runs no scoped
+    // session, so it must not be labelled as one that failed — that reason
+    // would be inherited by every later patch.
+    expect(prepared.degradedReasons).toEqual([]);
   });
 
   it("performs a full remap when the delta is large", async () => {

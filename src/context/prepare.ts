@@ -655,6 +655,7 @@ export async function prepareReviewContext(
         manifest: { builtFromSha: incremental.manifest.builtFromSha },
         delta: incremental.delta.delta,
         zeroDomains: incremental.zeroDomains,
+        scopedMapRequired: deltaPaths.length > 0,
         ...(scopedGraph === undefined ? {} : { scopedGraph }),
       });
       onProgress({ stage: "map", status: "completed" });
