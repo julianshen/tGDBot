@@ -352,6 +352,15 @@ describe("GraphifyMapper — the artifact contract", () => {
     expect(pack.text).toContain("absence from this graph is not evidence of absence in the code");
   });
 
+  it("removes the raw graph document so promotion publishes no unmanifested duplicate", async () => {
+    const sourceRoot = await tempRoot("graphify-src-");
+    const outputRoot = await tempRoot("graphify-out-");
+    const { runner } = runnerWritingGraph(graphifyGraph());
+    const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
+    expect(result.status).toBe("ready");
+    await expect(readFile(path.join(outputRoot, "graph.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("writes mapping metadata pinned to the analyzed base commit", async () => {
     const sourceRoot = await tempRoot("graphify-src-");
     const outputRoot = await tempRoot("graphify-out-");

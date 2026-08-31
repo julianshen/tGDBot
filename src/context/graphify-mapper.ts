@@ -20,7 +20,7 @@
 // release adding a type must not break mapping outright.
 
 import { execFile } from "node:child_process";
-import { lstat, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import {
@@ -524,6 +524,12 @@ export class GraphifyMapper implements ContextMapper {
 
     const graphRoot = path.join(outputRoot, GRAPH_ROOT);
     await mkdir(graphRoot, { recursive: true });
+    // The raw graph document has been adapted; remove it so promotion does
+    // not publish an unmanifested duplicate into the cache entry - it would
+    // bypass artifact hashing and size validation, and duplicate the graph's
+    // disk cost for large repositories (PR #116 review).
+    await rm(graphPath, { force: true });
+
     const graphDocument = {
       version: "1.0.0",
       kind: "codebase",
