@@ -297,6 +297,11 @@ export async function dispatchRulesDirect(
     >;
     for (const name of unresolvedNames) ruleFailureReasons[name] = unresolved[name];
 
+    // Issue #109: the real per-run prompt cost, reported on the result. The
+    // diff is embedded once per rule by design (fresh child sessions), so the
+    // honest unit is the sum of the task texts the engine actually built.
+    let taskTextChars = 0;
+
     // Enough to see what the model actually did without dumping a full response.
 const UNPARSEABLE_EXCERPT_CHARS = 2_000;
 
@@ -315,10 +320,10 @@ interface RuleOutcome {
           ruleTimeoutMs,
           `rule "${rule.name}" session creation timed out after ${ruleTimeoutMs}ms`,
         );
+        const taskText = buildTaskText(rule, diff, validatedContext.packsByRule?.get(rule.name), conversationContext, prIntent);
+        taskTextChars += taskText.length;
         await withTimeout(
-          session.prompt(
-            buildTaskText(rule, diff, validatedContext.packsByRule?.get(rule.name), conversationContext, prIntent),
-          ),
+          session.prompt(taskText),
           ruleTimeoutMs,
           `rule "${rule.name}" timed out after ${ruleTimeoutMs}ms`,
         );
@@ -448,6 +453,9 @@ interface RuleOutcome {
       rulesFailed,
       ruleFailureReasons,
       ...(modelsUsed.length === 0 ? {} : { modelsUsed }),
+      // Issue #109: reported even when rules failed or were unresolved — the
+      // task texts that WERE built are the cost that was actually paid.
+      taskTextChars,
       ...(validatedContext.manifestHash === undefined
         ? {}
         : { contextManifestHash: validatedContext.manifestHash }),

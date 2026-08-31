@@ -24,6 +24,7 @@ import {
   persistPreparedFindings,
   prepareReviewFindingPublication,
   publishFocusedReview,
+  finalizeRunMetrics,
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
@@ -79,11 +80,12 @@ import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
-import type { DispatchResult, Finding, ReviewDispatchInput } from "./review/types.js";
+import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
 import { prIntentFingerprint, sanitizePrIntent } from "./review/pr-intent.js";
+import { prIntentText } from "./review/pr-intent.js";
 import type { ExtractRelatedWorkResult } from "./review/related-work.js";
 import {
   ContextRequiredError,
@@ -679,6 +681,13 @@ interface StatusLog {
   // (via JSON.stringify dropping `undefined` values) when there were no
   // load errors, so the "skipped"/all-succeeded log shape is unchanged.
   loadErrors?: readonly string[];
+  // Issue #109: per-run cost and size telemetry, present ONLY on runs that
+  // actually dispatched (posted/partial) — a skipped run keeps its exact
+  // pre-#109 shape. All sizes in characters (~4 chars/token), which is the
+  // honest unit this process can observe without SDK plumbing. The publication
+  // module emits it on real runs and --dry-run emits it here; both finalize the
+  // duration AT the emitter (Codex review of PR #117).
+  metrics?: RunMetrics;
 }
 
 // Task 8 review fix #2: the final structured status line is always the
@@ -914,6 +923,10 @@ export async function review(
   args: CliArgs,
   deps: Partial<ReviewDependencies> = {},
 ): Promise<number> {
+  // Issue #109: wall-clock baseline for the run's metrics. Date.now(), not
+  // deps.now — that seam returns ISO strings for publication timestamps, and
+  // a duration needs a monotonic-enough millisecond source of its own.
+  const startedAtMs = Date.now();
   const invocation: ReviewInvocation = deps.invocation ?? { kind: "normal" };
   const resolveConfigFn = deps.resolveConfig ?? resolveConfigReal;
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
@@ -1736,6 +1749,32 @@ export async function review(
     logSeverityMix(orchestration.summaryInput.allFindings);
   }
   const hasFailure = loadErrors.length > 0 || orchestration.rulesFailed.length > 0;
+  // Issue #109: computed BEFORE the terminal result so the metrics ride on it
+  // — the publication module serializes the terminal result as the terminal
+  // status line on real runs, and --dry-run's logStatus below serializes the
+  // same object.
+  const findingsPerRule: Record<string, number> = {};
+  let findingTextChars = 0;
+  const hostChecks = { resolved: 0, lexical: 0, notChecked: 0 };
+  for (const finding of dispatchResult.findings) {
+    findingsPerRule[finding.ruleName] = (findingsPerRule[finding.ruleName] ?? 0) + 1;
+    findingTextChars += (finding.title?.length ?? 0) + finding.message.length + (finding.suggestion?.length ?? 0);
+    if (finding.hostCheck?.status === "resolved") hostChecks.resolved += 1;
+    else if (finding.hostCheck?.status === "lexical-matches") hostChecks.lexical += 1;
+    else if (finding.hostCheck?.status === "not-checked") hostChecks.notChecked += 1;
+  }
+  const pendingMetrics: PendingRunMetrics = {
+    startedAtMs,
+    diffChars: diff.length,
+    ...(dispatchResult.taskTextChars === undefined ? {} : { dispatchChars: dispatchResult.taskTextChars }),
+    contextPackChars: [...combinedPacks.values()].reduce(
+      (total, pack) => total + pack.text.length + (pack.untrustedText?.length ?? 0), 0),
+    prIntentChars: prIntent === undefined ? 0 : prIntentText(prIntent).length,
+    conversationChars: loadedContext.conversationContext?.text.length ?? 0,
+    findingsPerRule,
+    findingTextChars,
+    hostChecks,
+  };
   const terminalResult = {
     status: hasFailure ? "partial" as const : "posted" as const,
     findingsCount: orchestration.findingsCount,
@@ -1838,6 +1877,11 @@ export async function review(
       ...(invocation.threadId === undefined ? {} : { threadId: invocation.threadId }),
       now,
       ...(publicationHooks === undefined ? {} : { hooks: publicationHooks }),
+      // Issue #109: focused commands dispatch every rule, so they owe the
+      // same terminal telemetry as any other dispatched run (Codex review of
+      // PR #117).
+      metrics: pendingMetrics,
+      logStatus,
     });
   } else {
     if (stateStore === undefined) throw new Error("Review publication requires a conversation state store");
@@ -1918,6 +1962,11 @@ export async function review(
       preparedFindings: prepared.preparedFindings,
       identity: reviewIdentity,
       logStatus,
+      // Issue #109: the terminal status line carries the run's cost/size
+      // telemetry; the publication module emits it (with the duration frozen
+      // AT publication completion), so it travels here rather than on
+      // terminalResult, which is SERIALIZED into pending markers.
+      metrics: pendingMetrics,
     });
   }
 
@@ -1927,6 +1976,8 @@ export async function review(
     rulesRun: orchestration.rulesRun,
     rulesFailed: orchestration.rulesFailed,
     loadErrors: loadErrors.length > 0 ? loadErrors.map((e) => `${e.sourcePath}: ${e.message}`) : undefined,
+    // Dry run: this IS the terminal emitter, so the duration freezes here.
+    metrics: finalizeRunMetrics(pendingMetrics),
   });
 
   // AC-8.6 / Task 8 review fix #1: EXIT_FATAL is reserved strictly for

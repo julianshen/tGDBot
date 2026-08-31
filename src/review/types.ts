@@ -134,6 +134,51 @@ export interface Finding {
   hostCheck?: StructuralCheck;
 }
 
+/**
+ * Issue #109: every field is a committed, greppable measurement so prompt-
+ * contract and dispatch changes (message budgets, conditional advisor, model
+ * tiers) can be A/B-compared across runs instead of argued from intuition.
+ * Char counts are the token proxy; real usage data needs SDK plumbing that
+ * this deliberately does not add.
+ *
+ * `durationMs` covers the WHOLE invocation including publication — provider
+ * writes and retries are part of what a prompt change can move (the number of
+ * findings changes the number of inline writes), so it is computed at the
+ * TERMINAL emitter from the `startedAtMs` a pending carry, not where the
+ * metrics object is first built (Codex review of PR #117).
+ */
+export interface RunMetrics {
+  /** Wall-clock for the whole review() invocation. */
+  readonly durationMs: number;
+  /** The diff as dispatched. */
+  readonly diffChars: number;
+  /** Sum of the task texts the engines actually built, one per dispatched rule. Omitted by stub engines that never build task texts. */
+  readonly dispatchChars?: number;
+  /** Trusted-base context packs, trusted + untrusted halves. */
+  readonly contextPackChars: number;
+  /** The #59 PR-intent section content. */
+  readonly prIntentChars: number;
+  /** The re-review suppression conversation context. */
+  readonly conversationChars: number;
+  /** Findings per rule — the #36 severity lesson, per rule. */
+  readonly findingsPerRule: Readonly<Record<string, number>>;
+  /** Total title+message+suggestion size across findings — the output size a message budget would move. */
+  readonly findingTextChars: number;
+  /** Structural-check coverage mix over the published findings. */
+  readonly hostChecks: Readonly<{ resolved: number; lexical: number; notChecked: number }>;
+}
+
+/**
+ * The metrics as built before publication completes: everything except the
+ * duration, plus the epoch millisecond the terminal emitters subtract from.
+ * Publication providers differ by minutes on slow networks; freezing a
+ * duration early would corrupt exactly the comparisons these numbers exist
+ * for.
+ */
+export type PendingRunMetrics = Omit<RunMetrics, "durationMs"> & {
+  readonly startedAtMs: number;
+};
+
 export interface DispatchResult {
   findings: Finding[];
   rulesRun: string[];
@@ -148,6 +193,14 @@ export interface DispatchResult {
    * provider's own default leave the host genuinely not knowing.
    */
   modelsUsed?: string[];
+  /**
+   * Issue #109: total characters across the task texts the engine actually
+   * built — one per dispatched rule. This is the honest per-run prompt cost
+   * (the diff is embedded once per rule by design), reported by the engine
+   * that built them rather than re-estimated by the caller. Omitted by stub
+   * engines that never build task texts.
+   */
+  taskTextChars?: number;
   /**
    * ruleName -> WHY it failed, as a short CLASSIFIED phrase safe to publish.
    *

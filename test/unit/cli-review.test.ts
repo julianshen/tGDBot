@@ -650,6 +650,16 @@ describe("review", () => {
     });
 
     expect(exitCode).toBe(0);
+    // Issue #109 / Codex review of PR #117: a focused command dispatched every
+    // rule, so its terminal line carries the same metrics as any other run.
+    const focusedStatus = logSpy.mock.calls.map(([line]) => String(line))
+      .filter((line) => line.startsWith("TGD_REVIEW_RESULT: "))
+      .at(-1);
+    const parsedFocused = JSON.parse(focusedStatus!.slice("TGD_REVIEW_RESULT: ".length));
+    expect(parsedFocused.status).toBe("posted");
+    expect(parsedFocused.metrics.findingsPerRule).toEqual({ "rule-a": 1 });
+    expect(parsedFocused.metrics.durationMs).toEqual(expect.any(Number));
+    expect(parsedFocused.metrics).not.toHaveProperty("startedAtMs");
     // The findings went to a reply of their own...
     expect(h.vcsAdapter.postGeneralReply).toHaveBeenCalledTimes(1);
     const [, replyInput] = h.vcsAdapter.postGeneralReply.mock.calls[0] as [unknown, { body: string }];
@@ -2675,6 +2685,89 @@ describe("inline review comments", () => {
     await review(h.args, depsFrom(h));
     expect(h.vcsAdapter.resolveRelatedWork).not.toHaveBeenCalled();
     vi.restoreAllMocks();
+  });
+
+  // Issue #109: per-run cost/size telemetry on the posted/partial status line.
+  describe("issue #109: run metrics", () => {
+    it("carries cost and size metrics on a posted run", async () => {
+      const h = makeHarness({
+        dispatchResult: {
+          findings: [{
+            file: "src/x.ts",
+            line: 3,
+            severity: "warning",
+            category: "correctness",
+            message: "Off by one.",
+            ruleName: "rule-a",
+            title: "Bad loop",
+            suggestion: "for (let i = 0; i < n; i++)",
+            hostCheck: { status: "resolved", references: [], occurrences: 1, unresolved: [], unresolvedOccurrences: 0, filesSearched: 2, filesResolved: 2 },
+          }],
+          rulesRun: ["rule-a"],
+          rulesFailed: [],
+          taskTextChars: 4321,
+        },
+      });
+      // Codex review of PR #117 (P1): the duration must include publication,
+      // not stop where the metrics object was first built. Slow the summary
+      // write so the terminal duration has to cover it.
+      const innerUpsert = h.vcsAdapter.upsertComment.getMockImplementation()!;
+      h.vcsAdapter.upsertComment.mockImplementation(async (locator, body, existing) => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return innerUpsert(locator, body, existing);
+      });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await review(h.args, depsFrom(h));
+
+      // The publication module logs its own intermediate "posted" line; the
+      // metrics live on the TERMINAL status line (the documented last-line-
+      // of-stdout contract), so take the last one.
+      const status = logSpy.mock.calls.map(([line]) => String(line))
+        .filter((line) => line.startsWith("TGD_REVIEW_RESULT: "))
+        .at(-1);
+      const parsed = JSON.parse(status!.slice("TGD_REVIEW_RESULT: ".length));
+
+      expect(parsed.status).toBe("posted");
+      expect(parsed.metrics).toEqual({
+        durationMs: expect.any(Number),
+        diffChars: "diff --git a/x b/x".length,
+        // From the stub engine's result: engines report what they built.
+        dispatchChars: 4321,
+        contextPackChars: 0,
+        prIntentChars: expect.any(Number),
+        conversationChars: 0,
+        findingsPerRule: { "rule-a": 1 },
+        findingTextChars: "Bad loop".length + "Off by one.".length + "for (let i = 0; i < n; i++)".length,
+        hostChecks: { resolved: 1, lexical: 0, notChecked: 0 },
+      });
+      expect(parsed.metrics.prIntentChars).toBeGreaterThan(0);
+      // The 40ms write above happened AFTER the metrics object was built, so
+      // a duration frozen at build time would be far below it.
+      expect(parsed.metrics.durationMs).toBeGreaterThanOrEqual(40);
+      expect(parsed.metrics).not.toHaveProperty("startedAtMs");
+      vi.restoreAllMocks();
+    });
+
+    it("omits metrics from a skipped run so its shape never changes", async () => {
+      const pr = makePr({ headSha: "cafef00d" });
+      const cfg = expectedConfigHash(makeArgs());
+      const botComment: BotComment = { id: "999", body: formatMarker("cafef00d", cfg), lastReviewedSha: "cafef00d", reviewedConfig: cfg };
+      const h = makeHarness({ botComment, pr });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await review(h.args, depsFrom(h));
+
+      const status = logSpy.mock.calls.map(([line]) => String(line))
+        .find((line) => line.startsWith("TGD_REVIEW_RESULT: "));
+      expect(JSON.parse(status!.slice("TGD_REVIEW_RESULT: ".length))).toEqual({
+        status: "skipped",
+        findingsCount: 0,
+        rulesRun: [],
+        rulesFailed: [],
+      });
+      vi.restoreAllMocks();
+    });
   });
 
   // Issue #59: the PR's stated intent reaches dispatch as sanitized

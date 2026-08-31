@@ -27,7 +27,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { RuleDefinition } from "../rules/types.js";
-import { buildDispatchPrompt } from "./dispatch-prompt.js";
+import { buildDispatchPrompt, buildTaskText } from "./dispatch-prompt.js";
 import type { PrIntent } from "./pr-intent.js";
 import { validateDispatchContext } from "./dispatch-context.js";
 import {
@@ -302,6 +302,9 @@ async function runDispatch(
     string,
     string
   >;
+  // Issue #109: assigned inside the try once the task texts exist; the catch
+  // below reports it when the failure came after they were built.
+  let taskTextChars: number | undefined;
 
   try {
     sessionCwd = await createIsolatedSessionCwd();
@@ -375,6 +378,21 @@ async function runDispatch(
 
     const session = await createSession(useAdvisor, sessionCwd, modelRequest);
     const prompt = buildDispatchPrompt(effective, diff, useAdvisor, conversationContext, packsByRule, prIntent);
+    // Issue #109: the honest per-run prompt cost is the sum of the per-rule
+    // task texts. buildDispatchPrompt embeds them inside the orchestration
+    // prompt, which is not the number a per-rule cost metric means, so each
+    // task text is rebuilt here purely for its length. Legacy is the
+    // non-default engine; the direct engine accumulates during dispatch
+    // instead of paying this second pass.
+    // Declared OUTSIDE the try so a session.prompt failure AFTER the task
+    // texts were built can still report the cost that was actually paid
+    // (Codex review of PR #117) — a prompt timeout or rate limit is exactly
+    // the failed run whose cost the metrics exist to measure.
+    taskTextChars = effective.reduce(
+      (total, rule) =>
+        total + buildTaskText(rule, diff, packsByRule?.get(rule.name), conversationContext, prIntent).length,
+      0,
+    );
 
     // Capture the subagent tool's structured per-task results (details.results)
     // so we can deterministically reconcile the orchestrator's self-reported
@@ -416,7 +434,9 @@ async function runDispatch(
           ? ` — ${missingAuthDiagnostic}`
           : "";
       console.warn(`dispatchRules: session.prompt() threw (${message})${authHint}`);
-      return withUnresolved(fallbackResult(effective));
+      // Issue #109: the task texts WERE built before the prompt threw — the
+      // failed run still reports the cost it paid.
+      return withUnresolved({ ...fallbackResult(effective), taskTextChars });
     } finally {
       unsubscribe?.();
     }
@@ -463,12 +483,11 @@ async function runDispatch(
     // ADR-007: a suggestion is committable code. It may only survive if a dispatched
     // reviewer actually proposed it for that exact file/line — never because the
     // orchestrator said so. Unverifiable => stripped.
-    return withUnresolved(
-      enforceSuggestionProvenance(
-        reconciled,
-        suggestionProvenanceKeys(capturedTaskResults, effective),
-      ),
+    const withProvenance = enforceSuggestionProvenance(
+      reconciled,
+      suggestionProvenanceKeys(capturedTaskResults, effective),
     );
+    return withUnresolved({ ...withProvenance, taskTextChars });
   } catch (err) {
     // Setup/session-creation failure (createIsolatedSessionCwd,
     // createIsolatedAgentDir, or createSession threw). Degrade to
@@ -485,6 +504,7 @@ async function runDispatch(
     return {
       ...fallback,
       ruleFailureReasons: { ...fallback.ruleFailureReasons, ...unresolvedForFallback },
+      ...(taskTextChars === undefined ? {} : { taskTextChars }),
     };
   } finally {
     // Restore PI_CODING_AGENT_DIR to exactly its prior state (unset vs. a
