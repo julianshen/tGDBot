@@ -24,6 +24,7 @@ import {
   persistPreparedFindings,
   prepareReviewFindingPublication,
   publishFocusedReview,
+  finalizeRunMetrics,
   publishReviewFromManifest,
   type ReviewPublicationContext,
 } from "./review/review-publication.js";
@@ -79,7 +80,7 @@ import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-
 import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
-import type { DispatchResult, Finding, ReviewDispatchInput, RunMetrics } from "./review/types.js";
+import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
@@ -683,9 +684,9 @@ interface StatusLog {
   // Issue #109: per-run cost and size telemetry, present ONLY on runs that
   // actually dispatched (posted/partial) — a skipped run keeps its exact
   // pre-#109 shape. All sizes in characters (~4 chars/token), which is the
-  // honest unit this process can observe without SDK plumbing. Lives on the
-  // terminal result, which is what BOTH terminal emitters (the publication
-  // module on real runs, this file on --dry-run) serialize.
+  // honest unit this process can observe without SDK plumbing. The publication
+  // module emits it on real runs and --dry-run emits it here; both finalize the
+  // duration AT the emitter (Codex review of PR #117).
   metrics?: RunMetrics;
 }
 
@@ -1757,8 +1758,8 @@ export async function review(
     else if (finding.hostCheck?.status === "lexical-matches") hostChecks.lexical += 1;
     else if (finding.hostCheck?.status === "not-checked") hostChecks.notChecked += 1;
   }
-  const metrics: RunMetrics = {
-    durationMs: Date.now() - startedAtMs,
+  const pendingMetrics: PendingRunMetrics = {
+    startedAtMs,
     diffChars: diff.length,
     ...(dispatchResult.taskTextChars === undefined ? {} : { dispatchChars: dispatchResult.taskTextChars }),
     contextPackChars: [...combinedPacks.values()].reduce(
@@ -1871,6 +1872,11 @@ export async function review(
       ...(invocation.threadId === undefined ? {} : { threadId: invocation.threadId }),
       now,
       ...(publicationHooks === undefined ? {} : { hooks: publicationHooks }),
+      // Issue #109: focused commands dispatch every rule, so they owe the
+      // same terminal telemetry as any other dispatched run (Codex review of
+      // PR #117).
+      metrics: pendingMetrics,
+      logStatus,
     });
   } else {
     if (stateStore === undefined) throw new Error("Review publication requires a conversation state store");
@@ -1952,9 +1958,10 @@ export async function review(
       identity: reviewIdentity,
       logStatus,
       // Issue #109: the terminal status line carries the run's cost/size
-      // telemetry; the publication module emits it, so it travels here rather
-      // than on terminalResult, which is SERIALIZED into pending markers.
-      metrics,
+      // telemetry; the publication module emits it (with the duration frozen
+      // AT publication completion), so it travels here rather than on
+      // terminalResult, which is SERIALIZED into pending markers.
+      metrics: pendingMetrics,
     });
   }
 
@@ -1964,7 +1971,8 @@ export async function review(
     rulesRun: orchestration.rulesRun,
     rulesFailed: orchestration.rulesFailed,
     loadErrors: loadErrors.length > 0 ? loadErrors.map((e) => `${e.sourcePath}: ${e.message}`) : undefined,
-    metrics,
+    // Dry run: this IS the terminal emitter, so the duration freezes here.
+    metrics: finalizeRunMetrics(pendingMetrics),
   });
 
   // AC-8.6 / Task 8 review fix #1: EXIT_FATAL is reserved strictly for

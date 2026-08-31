@@ -140,6 +140,12 @@ export interface Finding {
  * tiers) can be A/B-compared across runs instead of argued from intuition.
  * Char counts are the token proxy; real usage data needs SDK plumbing that
  * this deliberately does not add.
+ *
+ * `durationMs` covers the WHOLE invocation including publication — provider
+ * writes and retries are part of what a prompt change can move (the number of
+ * findings changes the number of inline writes), so it is computed at the
+ * TERMINAL emitter from the `startedAtMs` a pending carry, not where the
+ * metrics object is first built (Codex review of PR #117).
  */
 export interface RunMetrics {
   /** Wall-clock for the whole review() invocation. */
@@ -161,6 +167,17 @@ export interface RunMetrics {
   /** Structural-check coverage mix over the published findings. */
   readonly hostChecks: Readonly<{ resolved: number; lexical: number; notChecked: number }>;
 }
+
+/**
+ * The metrics as built before publication completes: everything except the
+ * duration, plus the epoch millisecond the terminal emitters subtract from.
+ * Publication providers differ by minutes on slow networks; freezing a
+ * duration early would corrupt exactly the comparisons these numbers exist
+ * for.
+ */
+export type PendingRunMetrics = Omit<RunMetrics, "durationMs"> & {
+  readonly startedAtMs: number;
+};
 
 export interface DispatchResult {
   findings: Finding[];

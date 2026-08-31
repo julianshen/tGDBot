@@ -650,6 +650,16 @@ describe("review", () => {
     });
 
     expect(exitCode).toBe(0);
+    // Issue #109 / Codex review of PR #117: a focused command dispatched every
+    // rule, so its terminal line carries the same metrics as any other run.
+    const focusedStatus = logSpy.mock.calls.map(([line]) => String(line))
+      .filter((line) => line.startsWith("TGD_REVIEW_RESULT: "))
+      .at(-1);
+    const parsedFocused = JSON.parse(focusedStatus!.slice("TGD_REVIEW_RESULT: ".length));
+    expect(parsedFocused.status).toBe("posted");
+    expect(parsedFocused.metrics.findingsPerRule).toEqual({ "rule-a": 1 });
+    expect(parsedFocused.metrics.durationMs).toEqual(expect.any(Number));
+    expect(parsedFocused.metrics).not.toHaveProperty("startedAtMs");
     // The findings went to a reply of their own...
     expect(h.vcsAdapter.postGeneralReply).toHaveBeenCalledTimes(1);
     const [, replyInput] = h.vcsAdapter.postGeneralReply.mock.calls[0] as [unknown, { body: string }];
@@ -2698,6 +2708,14 @@ describe("inline review comments", () => {
           taskTextChars: 4321,
         },
       });
+      // Codex review of PR #117 (P1): the duration must include publication,
+      // not stop where the metrics object was first built. Slow the summary
+      // write so the terminal duration has to cover it.
+      const innerUpsert = h.vcsAdapter.upsertComment.getMockImplementation()!;
+      h.vcsAdapter.upsertComment.mockImplementation(async (locator, body, existing) => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return innerUpsert(locator, body, existing);
+      });
       const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
 
       await review(h.args, depsFrom(h));
@@ -2724,6 +2742,10 @@ describe("inline review comments", () => {
         hostChecks: { resolved: 1, lexical: 0, notChecked: 0 },
       });
       expect(parsed.metrics.prIntentChars).toBeGreaterThan(0);
+      // The 40ms write above happened AFTER the metrics object was built, so
+      // a duration frozen at build time would be far below it.
+      expect(parsed.metrics.durationMs).toBeGreaterThanOrEqual(40);
+      expect(parsed.metrics).not.toHaveProperty("startedAtMs");
       vi.restoreAllMocks();
     });
 

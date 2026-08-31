@@ -652,6 +652,9 @@ describe("dispatchRules isolated session cwd (ADR-003)", () => {
 
     expect(result).toMatchObject({ findings: [], rulesRun: [], rulesFailed: ["rule-a"] });
     expect(result.ruleFailureReasons?.["rule-a"]).toMatch(/orchestrator did not complete/i);
+    // Issue #109 / Codex review of PR #117: the task text WAS built before the
+    // prompt rejected, so the failed run still reports the cost it paid.
+    expect(result.taskTextChars).toBeGreaterThan(0);
     expect(capturedCwd).toBeDefined();
     expect(existsSync(capturedCwd as string)).toBe(false);
     warnSpy.mockRestore();

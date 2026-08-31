@@ -1,4 +1,4 @@
-import type { RunMetrics } from "./types.js";
+import type { PendingRunMetrics, RunMetrics } from "./types.js";
 import { createHash } from "node:crypto";
 import {
   bindFindingLedgerIdentity,
@@ -61,6 +61,18 @@ export interface ReviewPublicationStatusLog {
   loadErrors?: string[];
   /** Issue #109: per-run cost/size telemetry; present on runs that dispatched. */
   metrics?: RunMetrics;
+}
+
+/**
+ * Issue #109 / Codex review of PR #117: freezes the run duration AT the
+ * terminal emitter, not where the metrics object was first built. Publication
+ * (provider writes, retries, summary updates) is part of what a prompt change
+ * can move — more findings mean more inline writes — so a duration frozen
+ * before it would corrupt exactly the comparisons the metrics exist for.
+ */
+export function finalizeRunMetrics(pending: PendingRunMetrics): RunMetrics {
+  const { startedAtMs, ...rest } = pending;
+  return { ...rest, durationMs: Date.now() - startedAtMs };
 }
 
 export interface ReviewPublicationContext {
@@ -357,7 +369,7 @@ export async function publishReviewFromManifest(options: {
   readonly now: () => string;
   readonly orchestration?: OrchestrationResult;
   /** Issue #109: per-run cost/size telemetry for the terminal status line. */
-  readonly metrics?: RunMetrics;
+  readonly metrics?: PendingRunMetrics;
   readonly loadErrors?: readonly { readonly sourcePath: string; readonly message: string }[];
   readonly buildBody?: (
     o: OrchestrationResult,
@@ -808,6 +820,9 @@ export async function publishReviewFromManifest(options: {
         rulesRun: [...terminalResult.rulesRun],
         rulesFailed: [...terminalResult.rulesFailed],
         reason: "inline-publication-ambiguous",
+        // The run dispatched and paid its full prompt cost, so the ambiguous
+        // partial still owes the terminal telemetry (Codex review of PR #117).
+        ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
       });
       return EXIT_PARTIAL;
     }
@@ -829,7 +844,7 @@ export async function publishReviewFromManifest(options: {
         rulesRun: [...terminalResult.rulesRun],
         rulesFailed: [...terminalResult.rulesFailed],
         loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
-        ...(options.metrics === undefined ? {} : { metrics: options.metrics }),
+        ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
         ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
       });
       return terminalResult.exitCode;
@@ -847,7 +862,7 @@ export async function publishReviewFromManifest(options: {
     rulesRun: [...terminalResult.rulesRun],
     rulesFailed: [...terminalResult.rulesFailed],
     loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
-    ...(options.metrics === undefined ? {} : { metrics: options.metrics }),
+    ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
     ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
   });
   return terminalResult.exitCode === 0 ? EXIT_OK : terminalResult.exitCode;
@@ -1055,6 +1070,9 @@ export async function publishFocusedReview(options: {
   readonly threadId?: string;
   readonly now: () => string;
   readonly hooks?: PublicationExecutorHooks;
+  /** Issue #109: focused commands dispatch every rule, so they emit the same terminal telemetry. */
+  readonly metrics?: PendingRunMetrics;
+  readonly logStatus?: (log: ReviewPublicationStatusLog) => void;
 }): Promise<number> {
   const adapter = options.context.vcsAdapter as unknown as ConversationAdapter;
   const { vcsAdapter, locator, provider } = options.context;
@@ -1185,6 +1203,16 @@ export async function publishFocusedReview(options: {
     writer,
     now: options.now,
     ...(options.hooks === undefined ? {} : { hooks: options.hooks }),
+  });
+  // Issue #109: a focused command dispatched every rule — its terminal line
+  // owes the same telemetry, including the publication time just spent.
+  const hasFailure = options.orchestration.rulesFailed.length > 0;
+  options.logStatus?.({
+    status: hasFailure ? "partial" : "posted",
+    findingsCount: options.orchestration.findingsCount,
+    rulesRun: [...options.orchestration.rulesRun],
+    rulesFailed: [...options.orchestration.rulesFailed],
+    ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
   });
   return published.state === "completed" ? 0 : 2;
 }

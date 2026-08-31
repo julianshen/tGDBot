@@ -302,6 +302,9 @@ async function runDispatch(
     string,
     string
   >;
+  // Issue #109: assigned inside the try once the task texts exist; the catch
+  // below reports it when the failure came after they were built.
+  let taskTextChars: number | undefined;
 
   try {
     sessionCwd = await createIsolatedSessionCwd();
@@ -381,7 +384,11 @@ async function runDispatch(
     // task text is rebuilt here purely for its length. Legacy is the
     // non-default engine; the direct engine accumulates during dispatch
     // instead of paying this second pass.
-    const taskTextChars = effective.reduce(
+    // Declared OUTSIDE the try so a session.prompt failure AFTER the task
+    // texts were built can still report the cost that was actually paid
+    // (Codex review of PR #117) — a prompt timeout or rate limit is exactly
+    // the failed run whose cost the metrics exist to measure.
+    taskTextChars = effective.reduce(
       (total, rule) =>
         total + buildTaskText(rule, diff, packsByRule?.get(rule.name), conversationContext, prIntent).length,
       0,
@@ -427,7 +434,9 @@ async function runDispatch(
           ? ` — ${missingAuthDiagnostic}`
           : "";
       console.warn(`dispatchRules: session.prompt() threw (${message})${authHint}`);
-      return withUnresolved(fallbackResult(effective));
+      // Issue #109: the task texts WERE built before the prompt threw — the
+      // failed run still reports the cost it paid.
+      return withUnresolved({ ...fallbackResult(effective), taskTextChars });
     } finally {
       unsubscribe?.();
     }
@@ -495,6 +504,7 @@ async function runDispatch(
     return {
       ...fallback,
       ruleFailureReasons: { ...fallback.ruleFailureReasons, ...unresolvedForFallback },
+      ...(taskTextChars === undefined ? {} : { taskTextChars }),
     };
   } finally {
     // Restore PI_CODING_AGENT_DIR to exactly its prior state (unset vs. a
