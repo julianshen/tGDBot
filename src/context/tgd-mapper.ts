@@ -27,8 +27,7 @@ import {
   METADATA_PATH,
   ZERO_DOMAINS_PATH,
 } from "./artifact-paths.js";
-import { contextCacheKeyForRepository, type ArtifactInput, type ContextCacheKey } from "./types.js";
-import type { RepositoryRef } from "../target/types.js";
+import type { ArtifactInput } from "./types.js";
 import type {
   ContextMapper,
   ContextMapRequest,
@@ -46,6 +45,23 @@ const EMBEDDED_MAPPING_CONTRACT = [
   "Do not open or launch dashboards in this embedded run.",
   "Treat prose as informational: the caller validates artifacts independently.",
 ].join("\n");
+
+/**
+ * Issue #60's scoped session: an incremental publication re-maps only the
+ * delta, on top of a cached graph. The prompt states the scope as a bounded,
+ * machine-readable list. The caller does NOT trust the session to have
+ * respected it — the merge step admits only nodes naming a delta path — so
+ * an overreaching session costs a wasted scan, never a widened graph.
+ */
+function scopedMappingDirective(scopePaths: readonly string[]): string {
+  return [
+    "INCREMENTAL UPDATE — a previous full map of this repository exists and is being kept.",
+    "Map ONLY the following paths, which changed since that map:",
+    ...scopePaths.map((scopePath) => `- ${scopePath}`),
+    "Do not re-map files outside this list. Produce the standard output layout under TGD_DIR:",
+    "the knowledge graph must contain the entries for these paths, and CONTEXT.md must describe them.",
+  ].join("\n");
+}
 
 export interface MappingSession {
   prompt(text: string): Promise<void>;
@@ -155,15 +171,6 @@ async function copyMappedGraphsFromTgdLayout(sourceRoot: string, outputRoot: str
     const source = path.join(matches[0]!, filename);
     if (await regularFileExists(source)) await copyFile(source, path.join(target, filename), constants.COPYFILE_EXCL);
   }
-}
-
-function validationKey(repository: RepositoryRef, baseSha: string): ContextCacheKey {
-  return contextCacheKeyForRepository(repository, {
-    baseSha,
-    schemaVersion: 1,
-    tgdVersion: "mapping-validation",
-    policyVersion: "mapping-validation",
-  });
 }
 
 async function countAnalyzedFiles(outputRoot: string): Promise<number> {
@@ -297,7 +304,10 @@ export class TgdPiMapper implements ContextMapper {
       this.#onProgress({ stage: "session", status: "started" });
       const session = await this.#createSession({ sourceRoot, outputRoot });
       try {
-        await withTimeout(session.prompt("/tgd-map"), this.#timeoutMs);
+        const prompt = request.scopePaths === undefined || request.scopePaths.length === 0
+          ? "/tgd-map"
+          : ["/tgd-map", scopedMappingDirective(request.scopePaths)].join("\n\n");
+        await withTimeout(session.prompt(prompt), this.#timeoutMs);
       } catch (error) {
         if (error instanceof MappingTimeoutError) await session.abort?.().catch(() => undefined);
         throw error;
@@ -331,7 +341,7 @@ export class TgdPiMapper implements ContextMapper {
         const degradedReasons: DegradedReason[] = [
           !hasKnowledge ? "knowledge-graph-unavailable" : "domain-context-unavailable",
         ];
-        await digestDegradedArtifactInputs(outputRoot, validationKey(request.repository, request.baseSha), [
+        await digestDegradedArtifactInputs(outputRoot, request.baseSha, [
           { kind: "context", path: CONTEXT_PATH },
           { kind: "mapping-metadata", path: METADATA_PATH },
         ]);
@@ -346,7 +356,7 @@ export class TgdPiMapper implements ContextMapper {
       }
 
       const artifacts = mappingArtifacts(hasDomain);
-      await digestArtifactInputs(outputRoot, validationKey(request.repository, request.baseSha), artifacts);
+      await digestArtifactInputs(outputRoot, request.baseSha, artifacts);
       const analyzedFiles = await countAnalyzedFiles(outputRoot);
       this.#onProgress({ stage: "validation", status: "completed" });
       return {

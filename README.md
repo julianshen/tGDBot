@@ -494,14 +494,26 @@ the two complaints people actually have — a changed function reported as
 unused because its only caller is outside the diff, and a real break in a
 caller the diff never shows.
 
-**How it works.** On the first review of a given base commit the CLI prepares a
-detached worktree at that commit, runs the tGD mapper over it, and publishes
-the result — `CONTEXT.md`, a knowledge graph, and either a domain graph or an
-explicit zero-domains marker — into a cache keyed by
-`{repository, base SHA, schema version, mapper version, policy version}`. Every
-later review of the same base commit reuses it and starts no mapping session.
-Selection happens once per review and is rendered once per rule, bounded by
-`--context-max-chars`.
+**How it works.** The CLI prepares a detached worktree at the review's base
+commit, runs the tGD mapper over it, and publishes the result — `CONTEXT.md`,
+a knowledge graph, and either a domain graph or an explicit zero-domains
+marker — into a cache keyed by
+`{repository, schema version, mapper version, policy version}`. The key is an
+identity, deliberately without the base commit (#60): the entry is the
+repository's living index, and the commit the graphs currently describe is
+recorded on the manifest as provenance. A review whose base matches that
+provenance is an exact hit and starts no mapping session. A review at a newer
+base measures the delta (`git diff --name-status`, commit count, ancestry) in
+the managed mirror: a small delta (≤ 25 files, ≤ 10 commits, no domain-graph
+flow file touched) re-maps ONLY the changed files through a scoped session and
+patches the cached graph — nodes whose file changed are dropped, their
+distance-1 neighbours are marked `STALE` inline in the pack, and the header
+names the provenance when it differs from the review base. Anything else — a
+large delta, a rewritten history, the 20-publication generation ceiling —
+falls back to a full re-map. Publication replaces the previous entry through a
+compare-and-swap on the parent manifest hash, so a concurrent publisher's
+entry is never clobbered. Selection happens once per review and is rendered
+once per rule, bounded by `--context-max-chars`.
 
 **It maps the BASE branch, never the PR.** This is not an implementation
 detail. The mapper runs a pi session with `bash`, `edit` and `write` — the

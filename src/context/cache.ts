@@ -1,12 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, realpath, rename as fsRename, rm, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, open, readdir, readFile, realpath, rename as fsRename, rm, rmdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import {
   ContextValidationError,
   digestArtifactInputs,
   validateArtifactRecords,
 } from "./artifact-validator.js";
+import { repositoryLabel, type RepositoryLabelIdentity } from "./types.js";
 import type {
   ArtifactRecord,
   ContextCacheKey,
@@ -46,6 +47,27 @@ export interface ContextCacheDependencies {
   claimRename?: Rename;
   lookupOpen?: Open;
   beforeManifestReplace?: BeforeManifestReplace;
+}
+
+/**
+ * Compare-and-swap replacement of the entry already at the destination.
+ *
+ * Under the identity key of issue #60, every publication of a repository
+ * targets the SAME directory, which normally already holds the previous
+ * entry — so what was an exotic conflict under per-base keys is now the
+ * common case. A replacement is safe only as a CAS: when the existing entry's
+ * hash matches the one this publication was derived from (`parentManifestHash`
+ * for a patch) — or the caller states there is nothing to expect (`null`, the
+ * full-map case) — the old entry is renamed aside and removed after the new
+ * one is in place. Any other existing hash means a concurrent publisher moved
+ * the index forward and its entry is not ours to replace: conflict, as before.
+ *
+ * Same-repo publishers are serialised by the repository lock (#78), so this
+ * CAS decides between legitimate racers, not against a storm.
+ */
+export interface ContextReplacement {
+  /** The manifest hash the destination is expected to hold, or null for "replace whatever is there". */
+  readonly expectedExistingManifestHash: string | null;
 }
 
 export class ContextCacheConflictError extends Error {
@@ -137,8 +159,9 @@ function validateComponent(name: string, value: unknown): asserts value is strin
 
 function validateKey(value: unknown): asserts value is ContextCacheKey {
   if (!isRecord(value)) throw new ContextValidationError("Invalid context cache key");
+  // No `baseSha`: the key is a repository-and-versions identity (#60). Which
+  // commit the graphs were built from lives on the manifest as provenance.
   const commonKeys = [
-      "baseSha",
       "host",
       "policyVersion",
       "provider",
@@ -155,7 +178,7 @@ function validateKey(value: unknown): asserts value is ContextCacheKey {
   if (!hasExactKeys(value, expectedKeys.sort())) {
     throw new ContextValidationError("Invalid context cache key fields");
   }
-  for (const name of ["host", "repo", "baseSha", "tgdVersion", "policyVersion"] as const) {
+  for (const name of ["host", "repo", "tgdVersion", "policyVersion"] as const) {
     validateComponent(name, value[name]);
   }
   if (value.provider === "github") {
@@ -196,6 +219,8 @@ function parseDocumentRecord(value: unknown): DocumentRecord {
   return value as unknown as DocumentRecord;
 }
 
+const SHA40_PATTERN = /^[0-9a-f]{40}$/u;
+
 function parseReadyManifest(value: unknown): ContextManifest {
   if (!isRecord(value) || value.version !== 1 || value.status !== "ready") {
     throw new ContextValidationError("Manifest is not ready version 1");
@@ -203,11 +228,14 @@ function parseReadyManifest(value: unknown): ContextManifest {
   if (
     !hasExactKeys(value, [
       "artifacts",
+      "builtFromSha",
       "createdAt",
       "degradedReasons",
       "documents",
+      "generation",
       "key",
       "manifestHash",
+      "parentManifestHash",
       "status",
       "version",
     ])
@@ -225,6 +253,21 @@ function parseReadyManifest(value: unknown): ContextManifest {
   if (typeof value.manifestHash !== "string" || !HASH_PATTERN.test(value.manifestHash)) {
     throw new ContextValidationError("Invalid manifest hash");
   }
+  // Provenance (#60). A graph is only strictly true of the tree it was built
+  // from, so the commit it names must be present and SHA-shaped; whether it is
+  // the SHA under review is the CALLER's delta decision, not a parse error.
+  if (typeof value.builtFromSha !== "string" || !SHA40_PATTERN.test(value.builtFromSha)) {
+    throw new ContextValidationError("Invalid manifest builtFromSha");
+  }
+  if (!Number.isSafeInteger(value.generation) || (value.generation as number) < 0) {
+    throw new ContextValidationError("Invalid manifest generation");
+  }
+  if (
+    value.parentManifestHash !== null &&
+    (typeof value.parentManifestHash !== "string" || !HASH_PATTERN.test(value.parentManifestHash))
+  ) {
+    throw new ContextValidationError("Invalid manifest parentManifestHash");
+  }
   if (!Array.isArray(value.artifacts) || !Array.isArray(value.documents) || !Array.isArray(value.degradedReasons)) {
     throw new ContextValidationError("Invalid manifest record lists");
   }
@@ -240,6 +283,9 @@ function parseReadyManifest(value: unknown): ContextManifest {
     artifacts: value.artifacts.map(parseArtifactRecord),
     documents: value.documents.map(parseDocumentRecord),
     degradedReasons: [...value.degradedReasons] as string[],
+    builtFromSha: value.builtFromSha as string,
+    generation: value.generation as number,
+    parentManifestHash: value.parentManifestHash as string | null,
   };
 }
 
@@ -256,6 +302,9 @@ function buildManifest(
     artifacts: [...records.artifacts].sort(compareRecords),
     documents: [...records.documents].sort(compareRecords),
     degradedReasons: [...(input.degradedReasons ?? [])].sort(),
+    builtFromSha: input.builtFromSha,
+    generation: input.generation ?? 0,
+    parentManifestHash: input.parentManifestHash ?? null,
   };
   const parsed = parseReadyManifest({ ...manifest, manifestHash: "0".repeat(64) });
   manifest.manifestHash = computeManifestHash(parsed);
@@ -351,6 +400,78 @@ export class ContextCache {
     return path.join(this.root, "contexts", identity);
   }
 
+  /**
+   * Keeps at most `keep` entries for ONE repository, evicting the older ones.
+   *
+   * The cache root is shared across repositories, and each publication of one
+   * repository replaces its own entry — so per-repository growth comes from
+   * version bumps and legacy schemas, which is exactly the drift #60 bounds.
+   * Grouping reads each entry's manifest for its repository identity; an
+   * entry whose manifest cannot be read is attributed through the key that is
+   * still legible inside it, and only entries attributable to the SAME
+   * repository are ever deleted.
+   *
+   * That restriction is the race-safety story, not a nicety (PR #107 review):
+   * the caller holds only ITS OWN repository's lock, so eviction must never
+   * touch another repository's entries — a rolling version change means a
+   * review of repository B can legitimately be reading one of B's older
+   * identity entries while an unrelated publication for repository A runs.
+   * Corrupt manifests that cannot be attributed to ANY repository are left
+   * alone entirely; they cost disk, not correctness, and guessing their
+   * owner would be exactly the cross-repository reach this method refuses.
+   */
+  async evictOlderEntries(keep: number, repository: RepositoryLabelIdentity): Promise<number> {
+    if (!Number.isSafeInteger(keep) || keep < 1) {
+      throw new ContextValidationError("Context cache eviction keep count must be a positive integer");
+    }
+    let contextsDir: string;
+    let names: string[];
+    try {
+      contextsDir = path.join(this.root, "contexts");
+      names = await readdir(contextsDir);
+    } catch (error) {
+      if (isMissing(error)) return 0;
+      throw error;
+    }
+
+    const byRepository = new Map<string, Array<{ name: string; createdAt: number }>>();
+    for (const name of names) {
+      // Entry directory names are hashes this cache computed; anything else
+      // was not written here by this cache and is not ours to judge.
+      if (!HASH_PATTERN.test(name)) continue;
+      const entryPath = path.join(contextsDir, name);
+      const info = await lstat(entryPath).catch(() => undefined);
+      if (info === undefined || !info.isDirectory() || info.isSymbolicLink()) continue;
+      const manifestContents = await readFile(path.join(entryPath, "manifest.json"), "utf8").catch(() => undefined);
+      if (manifestContents === undefined) continue;
+      try {
+        const manifest = parseReadyManifest(JSON.parse(manifestContents));
+        const group = repositoryLabel(manifest.key);
+        const entries = byRepository.get(group) ?? [];
+        entries.push({ name, createdAt: Date.parse(manifest.createdAt) });
+        byRepository.set(group, entries);
+      } catch {
+        // Unattributable — a legacy or corrupt manifest. Left alone: it costs
+        // disk, never correctness, and deleting an entry whose owner cannot
+        // be established is the cross-repository reach this method refuses.
+      }
+    }
+
+    let evicted = 0;
+    // Only the locked repository's group is touched. `repositoryLabel` is the
+    // same grouping the scan used, so the caller's identity matches by
+    // construction.
+    const group = byRepository.get(repositoryLabel(repository)) ?? [];
+    group.sort((left, right) => right.createdAt - left.createdAt);
+    for (const entry of group.slice(keep)) {
+      await rm(path.join(contextsDir, entry.name), { recursive: true, force: true }).then(
+        () => { evicted += 1; },
+        () => undefined,
+      );
+    }
+    return evicted;
+  }
+
   async lookupContext(
     key: ContextCacheKey,
     options: ContextLookupOptions = {},
@@ -409,7 +530,9 @@ export class ContextCache {
       const manifest = parseReadyManifest(parsedJson);
       if (!exactKey(manifest.key, key)) return undefined;
       if (computeManifestHash(manifest) !== manifest.manifestHash) return undefined;
-      await validateArtifactRecords(entry, key, manifest.artifacts, manifest.documents);
+      // The expected base SHA comes from the manifest's provenance, not the
+      // key (#60): the key no longer carries a commit.
+      await validateArtifactRecords(entry, manifest.builtFromSha, manifest.artifacts, manifest.documents);
       return manifest;
     } catch (error) {
       if (error instanceof ContextValidationError || isUnsafeLookupPath(error)) return undefined;
@@ -467,7 +590,11 @@ export class ContextCache {
     return true;
   }
 
-  async promoteContext(stagingPath: string, input: ContextManifestInput): Promise<ContextManifest> {
+  async promoteContext(
+    stagingPath: string,
+    input: ContextManifestInput,
+    replacement?: ContextReplacement,
+  ): Promise<ContextManifest> {
     validateKey(input.key);
     if (input.documents !== undefined && !Array.isArray(input.documents)) {
       throw new ContextValidationError("Documents must be an array when provided");
@@ -506,7 +633,7 @@ export class ContextCache {
       if (!isAlreadyExists(error)) throw error;
       const records = await digestArtifactInputs(
         stagingPath,
-        input.key,
+        input.builtFromSha,
         input.artifacts,
         input.documents ?? [],
       );
@@ -537,7 +664,7 @@ export class ContextCache {
       await assertDirectoryIdentity(claimedStagingPath, claimedStagingIdentity);
       const records = await digestArtifactInputs(
         claimedStagingPath,
-        input.key,
+        input.builtFromSha,
         input.artifacts,
         input.documents ?? [],
       );
@@ -546,13 +673,24 @@ export class ContextCache {
       const existing = await this.lookupContext(input.key);
       if (existing !== undefined) {
         if (existing.manifestHash === manifest.manifestHash) return existing;
-        throw new ContextCacheConflictError(destination);
+        if (replacement === undefined) throw new ContextCacheConflictError(destination);
+        if (
+          replacement.expectedExistingManifestHash !== null &&
+          existing.manifestHash !== replacement.expectedExistingManifestHash
+        ) {
+          // A concurrent publisher moved the index forward. Its entry is newer
+          // than the parent this publication was derived from, so replacing
+          // it would discard work this run never saw.
+          throw new ContextCacheConflictError(destination);
+        }
       }
-      try {
-        await lstat(destination);
-        throw new ContextCacheConflictError(destination);
-      } catch (error) {
-        if (!isMissing(error)) throw error;
+      if (replacement === undefined) {
+        try {
+          await lstat(destination);
+          throw new ContextCacheConflictError(destination);
+        } catch (error) {
+          if (!isMissing(error)) throw error;
+        }
       }
 
       const stagingManifestPath = path.join(claimedStagingPath, "manifest.json");
@@ -587,7 +725,39 @@ export class ContextCache {
         if (!isRenameCollision(error)) throw error;
         const raced = await this.lookupContext(input.key);
         if (raced?.manifestHash === manifest.manifestHash) return raced;
-        throw new ContextCacheConflictError(destination);
+        if (replacement === undefined) throw new ContextCacheConflictError(destination);
+        // CAS replacement: the occupied destination is the entry this
+        // publication was derived from (the CAS above verified its hash).
+        // Rename it aside, rename ours into place, then remove the retired
+        // copy. A reader that looks up mid-window gets a miss and re-maps —
+        // wasteful, never wrong.
+        const retiringPath = `${destination}.retiring-${randomUUID()}`;
+        try {
+          await this.#rename(destination, retiringPath);
+        } catch (retireError) {
+          if (isMissing(retireError)) {
+            await this.#rename(claimedStagingPath, destination);
+            published = true;
+            return manifest;
+          }
+          throw retireError;
+        }
+        try {
+          await this.#rename(claimedStagingPath, destination);
+        } catch (installError) {
+          // PR #107 review: the retired entry is still the only valid index
+          // this repository has. Restore it BEFORE propagating - a failed
+          // promotion must not have destroyed the previous manifest (#60's
+          // own acceptance criterion). The retired directory is deliberately
+          // left in place if the restore itself fails, so the recovery path
+          // never deletes the last good copy.
+          await this.#rename(retiringPath, destination).catch(() => undefined);
+          throw installError;
+        }
+        published = true;
+        // Housekeeping after the commit point, like every claim cleanup:
+        // a failure here must not unsay a replacement that happened.
+        await rm(retiringPath, { recursive: true, force: true }).catch(() => undefined);
       }
       return manifest;
     })().then(

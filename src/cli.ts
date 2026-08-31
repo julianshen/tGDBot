@@ -1500,9 +1500,14 @@ export async function review(
         `(${contextPreparation.reasons.join("; ")})`,
     );
   } else if (contextPreparation.status === "ready") {
+    const source = contextPreparation.incremental
+      ? "patched incrementally"
+      : contextPreparation.cacheHit
+        ? "cached"
+        : "mapped";
     console.log(
       `tgd-review-agent: repository context ready for ${rules.length} rule(s) ` +
-        `(${contextPreparation.cacheHit ? "cached" : "mapped"} at base ${pr.baseSha})`,
+        `(${source} at base ${pr.baseSha})`,
     );
   }
 
