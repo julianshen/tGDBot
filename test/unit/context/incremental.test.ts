@@ -256,6 +256,44 @@ describe("patchKnowledgeGraph — review round two (PR #107)", () => {
     expect(patched.graph.edges).toEqual([edge("fn:caller", "fn:dropped")]);
   });
 
+  it("rejects scoped edges between two unchanged cached nodes", () => {
+    const cached = {
+      nodes: [node("fn:a", "src/a.ts"), node("fn:b", "src/b.ts")],
+      edges: [],
+    };
+    // An overreaching scoped session fabricates a relationship between two
+    // files the delta never touched.
+    const scoped = {
+      nodes: [node("fn:new", "src/changed.ts")],
+      edges: [edge("fn:a", "fn:b")],
+    };
+    const patched = patchKnowledgeGraph(
+      cached as unknown as GraphLike,
+      delta({ changed: ["src/changed.ts"] }),
+      scoped as unknown as GraphLike,
+    );
+    expect(patched.graph.edges).toEqual([]);
+    // The delta-backed node itself is still merged.
+    expect(patched.graph.nodes.map((n) => n.id)).toEqual(["fn:a", "fn:b", "fn:new"]);
+  });
+
+  it("admits a scoped edge between a delta node and an unchanged cached node", () => {
+    const cached = {
+      nodes: [node("fn:caller", "src/kept.ts")],
+      edges: [],
+    };
+    const scoped = {
+      nodes: [node("fn:dropped-recreated", "src/changed.ts")],
+      edges: [edge("fn:caller", "fn:dropped-recreated")],
+    };
+    const patched = patchKnowledgeGraph(
+      cached as unknown as GraphLike,
+      delta({ changed: ["src/changed.ts"] }),
+      scoped as unknown as GraphLike,
+    );
+    expect(patched.graph.edges).toEqual([edge("fn:caller", "fn:dropped-recreated")]);
+  });
+
   it("carries a zero-domains marker forward instead of reading a domain graph", async () => {
     const entryRoot = await tempRoot("incremental-zero-");
     const stagingPath = await tempRoot("incremental-zero-stage-");

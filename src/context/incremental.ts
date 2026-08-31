@@ -201,18 +201,25 @@ export function patchKnowledgeGraph(
   let merged = 0;
   const knownIds = new Set(nodes.map((node) => node.id));
   const scopedNodes: GraphNodeLike[] = [];
+  // The ids actually admitted from the scoped map. Edge admission requires one
+  // of these as an endpoint: both-endpoints-cached edges would let an
+  // overreaching scoped session fabricate relationships between unchanged
+  // files — graph regions the delta never touched (PR #107 review, round four).
+  const scopedNodeIds = new Set<string>();
   for (const node of scopedGraph?.nodes ?? []) {
     if (node.filePath === undefined) continue;
     const normalized = normalizePath(node.filePath);
     if (normalized === undefined || !changedPaths.has(normalized)) continue;
     if (knownIds.has(node.id)) continue;
     knownIds.add(node.id);
+    scopedNodeIds.add(node.id);
     scopedNodes.push(node);
     merged += 1;
   }
   for (const edge of scopedGraph?.edges ?? []) {
     if (seenEdges.has(edgeKey(edge))) continue;
     if (!knownIds.has(edge.source) || !knownIds.has(edge.target)) continue;
+    if (!scopedNodeIds.has(edge.source) && !scopedNodeIds.has(edge.target)) continue;
     seenEdges.add(edgeKey(edge));
     edges.push(edge);
   }
