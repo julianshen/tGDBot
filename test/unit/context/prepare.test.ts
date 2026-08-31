@@ -1311,3 +1311,21 @@ describe("prepareReviewContext — the warm index (#60)", () => {
     expect(patched.manifestHash).not.toBe(parent.manifestHash);
   });
 });
+
+// PR #116 review: the policy version exists so a rendering change re-reviews
+// an already-reviewed PR. Pin the bump that went with the #62 pack changes.
+describe("CONTEXT_POLICY_VERSION", () => {
+  it("was bumped for the #62 rendering changes, so old markers do not suppress re-review", () => {
+    expect(Number(CONTEXT_POLICY_VERSION)).toBeGreaterThanOrEqual(2);
+    // And it is the value the cache key and the fingerprint agree on.
+    const key = contextCacheKey({ repository });
+    expect(key.policyVersion).toBe(CONTEXT_POLICY_VERSION);
+    const fingerprintWith = contextFingerprint({
+      mode: "auto",
+      baseSha: BASE_SHA,
+      allowDegraded: false,
+      mapperVersion: "x",
+    });
+    expect(fingerprintWith).toBeTypeOf("string");
+  });
+});

@@ -51,8 +51,14 @@ export const CONTEXT_SCHEMA_VERSION = 2;
  */
 export const CONTEXT_MAPPER_VERSION = "tgd-pi-mapper@1";
 
-/** Bumped when selection/rendering policy changes what a pack says. */
-export const CONTEXT_POLICY_VERSION = "1";
+/**
+ * Bumped when selection/rendering policy changes what a pack says. v2: the
+ * Trust Boundary gained the graph-coverage caveat and knowledge nodes render
+ * location anchors and relation-confidence counts (#62) — an existing review
+ * marker at the same head and base must not keep a review silent under the
+ * old pack text (PR #116 review).
+ */
+export const CONTEXT_POLICY_VERSION = "2";
 
 /**
  * After this many incremental publications the next one is a full map, whatever
