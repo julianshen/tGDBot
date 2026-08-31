@@ -48,6 +48,7 @@ describe("parseCommandArgs", () => {
       dispatch: "direct",
       maxDiffChars: undefined,
       context: "auto",
+      contextMapper: "tgd",
       contextMaxChars: undefined,
       allowDegradedContext: false,
       contextDir: undefined,
@@ -99,6 +100,7 @@ describe("parseArgs", () => {
       dispatch: "direct",
       maxDiffChars: undefined,
       context: "auto",
+      contextMapper: "tgd",
       contextMaxChars: undefined,
       allowDegradedContext: false,
       contextDir: undefined,
@@ -127,6 +129,8 @@ describe("parseArgs", () => {
       "legacy",
       "--context",
       "require",
+      "--context-mapper",
+      "graphify",
       "--context-max-chars",
       "12000",
       "--allow-degraded-context",
@@ -152,6 +156,7 @@ describe("parseArgs", () => {
       trustLocalRules: true,
       dispatch: "legacy",
       context: "require",
+      contextMapper: "graphify",
       contextMaxChars: 12_000,
       allowDegradedContext: true,
       contextDir: "/srv/ctx",
@@ -443,5 +448,21 @@ describe("--structural-checks", () => {
   it("rejects anything else, naming what it expected", () => {
     expect(() => parseArgs(["review", "--pr", "7", "--structural-checks", "yes"]))
       .toThrow(/Invalid --structural-checks value: "yes" \(expected "on" or "off"\)/);
+  });
+});
+
+// Issue #62: which ContextMapper implementation builds the repository index.
+describe("--context-mapper", () => {
+  it("defaults to the tgd mapper", () => {
+    expect(parseArgs(["review", "--pr", "7"]).contextMapper).toBe("tgd");
+  });
+
+  it.each(["tgd", "graphify"] as const)("accepts %s", (value) => {
+    expect(parseArgs(["review", "--pr", "7", "--context-mapper", value]).contextMapper).toBe(value);
+  });
+
+  it("rejects anything else, naming what it expected", () => {
+    expect(() => parseArgs(["review", "--pr", "7", "--context-mapper", "llm"]))
+      .toThrow(/Invalid --context-mapper value: "llm" \(expected "tgd" or "graphify"\)/);
   });
 });

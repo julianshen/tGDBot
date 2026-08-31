@@ -80,6 +80,13 @@ export class ContextRequiredError extends Error {
 export interface ContextPreparationRequest {
   readonly mode: ContextMode;
   readonly repository: RepositoryRef;
+  /**
+   * Which mapper implementation will run, as a cache-key identity (#62).
+   * Absent means the tgd mapper's version. Switching --context-mapper — or
+   * upgrading graphify behind its mapper — must invalidate cached context,
+   * and this is the field that does it.
+   */
+  readonly mapperVersion?: string;
   readonly baseSha: string;
   /** Only ever compared against, never mapped. See invariant 1 above. */
   readonly headSha: string;
@@ -170,10 +177,11 @@ function errorMessage(error: unknown): string {
  */
 export function contextCacheKey(request: {
   readonly repository: RepositoryRef;
+  readonly mapperVersion?: string;
 }): ContextCacheKey {
   return contextCacheKeyForRepository(request.repository, {
     schemaVersion: CONTEXT_SCHEMA_VERSION,
-    tgdVersion: CONTEXT_MAPPER_VERSION,
+    tgdVersion: request.mapperVersion ?? CONTEXT_MAPPER_VERSION,
     policyVersion: CONTEXT_POLICY_VERSION,
   });
 }
@@ -213,6 +221,7 @@ export function contextFingerprint(request: {
   readonly baseSha: string;
   readonly maxChars?: number;
   readonly allowDegraded: boolean;
+  readonly mapperVersion?: string;
 }): string | undefined {
   // `off` contributes nothing, and returns nothing. A review that asks for no
   // context has exactly the inputs it had before this feature existed, so its
@@ -228,7 +237,7 @@ export function contextFingerprint(request: {
     request.mode,
     request.baseSha,
     CONTEXT_SCHEMA_VERSION,
-    CONTEXT_MAPPER_VERSION,
+    request.mapperVersion ?? CONTEXT_MAPPER_VERSION,
     CONTEXT_POLICY_VERSION,
     request.maxChars ?? null,
     request.allowDegraded,

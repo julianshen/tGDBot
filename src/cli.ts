@@ -91,6 +91,17 @@ import {
   prepareReviewContext as prepareReviewContextReal,
 } from "./context/prepare.js";
 import { contextRoots, selectContextRoot } from "./context/root.js";
+import { GraphifyMapper, GRAPHIFY_MAPPER_VERSION } from "./context/graphify-mapper.js";
+import { CONTEXT_MAPPER_VERSION } from "./context/prepare.js";
+
+/**
+ * The mapper identity that goes into the context cache key and the review
+ * fingerprint (#62). Carried as a function of the flag so both sides agree by
+ * construction.
+ */
+function selectedMapperVersion(mapper: "tgd" | "graphify"): string {
+  return mapper === "graphify" ? GRAPHIFY_MAPPER_VERSION : CONTEXT_MAPPER_VERSION;
+}
 import {
   hasCheckableClaim,
   runStructuralChecks as runStructuralChecksReal,
@@ -1081,6 +1092,7 @@ export async function review(
     baseSha: pr.baseSha,
     ...(config.contextMaxChars === undefined ? {} : { maxChars: config.contextMaxChars }),
     allowDegraded: config.allowDegradedContext,
+    mapperVersion: selectedMapperVersion(config.contextMapper),
   });
   const configHash = computeReviewConfigHash(
     config,
@@ -1469,9 +1481,15 @@ export async function review(
         ruleNames: rules.map((rule) => rule.name),
         maxChars: repositoryContextBudget,
         allowDegraded: config.allowDegradedContext,
+        mapperVersion: selectedMapperVersion(config.contextMapper),
         ...roots,
       },
-      {},
+      // #62: the graphify backend is a subprocess with a JSON contract, so it
+      // is constructed here rather than imported at module load; `--context
+      // off` and warm-cache runs never pay for it.
+      config.contextMapper === "graphify"
+        ? { createMapper: async () => new GraphifyMapper() }
+        : {},
     );
   } catch (error) {
     // `--context require` is the mode whose whole point is that reviewing

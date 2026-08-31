@@ -45,6 +45,12 @@ export interface SharedReviewOptions {
    * means never paying for the first map of a large repository.
    */
   context: "off" | "auto" | "require";
+  /**
+   * Issue #62: which ContextMapper implementation builds the repository
+   * index. "tgd" runs the model-driven /tgd-map session; "graphify" runs the
+   * deterministic AST indexer as a subprocess and needs Python 3 + graphify.
+   */
+  contextMapper: "tgd" | "graphify";
   /** Per-rule context-pack size ceiling; absent uses the pack builder's default. */
   contextMaxChars?: number;
   /** Lets mapping publish a partial result instead of failing outright. */
@@ -114,6 +120,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "max-diff-chars": { type: "string" },
       dispatch: { type: "string" },
       context: { type: "string" },
+      "context-mapper": { type: "string" },
       "context-max-chars": { type: "string" },
       "allow-degraded-context": { type: "boolean" },
       "context-dir": { type: "string" },
@@ -216,6 +223,14 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     throw new Error(`Invalid --context value: "${context}" (expected "off", "auto" or "require")`);
   }
 
+  // Issue #62: which ContextMapper implementation builds the index. "tgd" is
+  // the model-driven default; "graphify" is the deterministic AST backend and
+  // needs Python 3 + graphify on PATH.
+  const contextMapper = (values["context-mapper"] as string | undefined) ?? "tgd";
+  if (contextMapper !== "tgd" && contextMapper !== "graphify") {
+    throw new Error(`Invalid --context-mapper value: "${contextMapper}" (expected "tgd" or "graphify")`);
+  }
+
   const contextMaxCharsRaw = values["context-max-chars"] as string | undefined;
   let contextMaxChars: number | undefined;
   if (contextMaxCharsRaw !== undefined) {
@@ -252,6 +267,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     maxDiffChars,
     dispatch,
     context,
+    contextMapper,
     contextMaxChars,
     allowDegradedContext:
       (values["allow-degraded-context"] as boolean | undefined) ?? DEFAULTS.allowDegradedContext,

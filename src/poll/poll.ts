@@ -910,6 +910,9 @@ function isReviewCommand(command: ConversationCommand): command is
 function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): ReviewCommandArgs {
   return {
     pr: String(reviewNumber),
+    // #62: poll has no mapper flag of its own yet — reviews it dispatches use
+    // the default tgd mapper.
+    contextMapper: "tgd",
     vcs: config.vcs,
     repo: config.repo,
     rulesDir: config.rulesDir,
