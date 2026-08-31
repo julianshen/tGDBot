@@ -27,7 +27,9 @@
 // header says so. A reviewer who knows a node is stale can weigh it; a
 // reviewer given a silently-outdated graph as trusted context cannot.
 
+import { Buffer } from "node:buffer";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { MAX_JSON_ARTIFACT_BYTES } from "./artifact-validator.js";
 import path from "node:path";
 import { CONTEXT_PATH, DOMAIN_PATH, KNOWLEDGE_PATH, METADATA_PATH, ZERO_DOMAINS_PATH } from "./artifact-paths.js";
 import type { BaseDelta } from "./delta.js";
@@ -161,8 +163,18 @@ async function readGraph(graphPath: string): Promise<GraphLike> {
 }
 
 async function writeGraph(graphPath: string, graph: GraphLike): Promise<void> {
+  // Serialized COMPACTLY and bounded before writing: pretty-printing added
+  // enough whitespace that a graph whose compact form sat just under the
+  // validator's ceiling crossed it on the next incremental rewrite, and
+  // every later patch then failed publication the same way (PR #116 review,
+  // round two). The error is deliberately a clear failure, not a silent
+  // skip: prepare reports it and the review proceeds without context.
+  const serialized = `${JSON.stringify(graph)}\n`;
+  if (Buffer.byteLength(serialized, "utf8") > MAX_JSON_ARTIFACT_BYTES) {
+    throw new Error(`patched graph exceeds the ${MAX_JSON_ARTIFACT_BYTES}-byte safe-size limit; a full re-map is required`);
+  }
   await mkdir(path.dirname(graphPath), { recursive: true });
-  await writeFile(graphPath, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+  await writeFile(graphPath, serialized, "utf8");
 }
 
 /**
@@ -173,7 +185,7 @@ export function patchKnowledgeGraph(
   cached: GraphLike,
   delta: BaseDelta,
   scopedGraph: GraphLike | undefined,
-): { graph: GraphLike; staleMarked: number; merged: number } {
+): { graph: GraphLike; droppedIds: ReadonlySet<string>; staleMarked: number; merged: number } {
   const changedPaths = new Set<string>(
     [...delta.added, ...delta.changed, ...delta.deleted]
       .map((filePath) => normalizePath(filePath))
@@ -237,6 +249,7 @@ export function patchKnowledgeGraph(
 
   return {
     graph: { nodes: [...nodes, ...scopedNodes], edges },
+    droppedIds,
     staleMarked,
     merged,
   };
@@ -287,16 +300,10 @@ export async function patchEntryArtifacts(
     input.delta,
     input.scopedGraph,
   );
-  const droppedIds = new Set(
-    (cachedKnowledgeDocument.nodes as Array<Record<string, unknown>>)
-      .map((node) => node.id)
-      .filter((id): id is string => typeof id === "string")
-      .filter((id) => !patched.graph.nodes.some((node) => node.id === id)),
-  );
   const knowledgeDocument = cachedKnowledgeDocument as Record<string, unknown>;
   knowledgeDocument.nodes = patched.graph.nodes;
   knowledgeDocument.edges = patched.graph.edges;
-  repinGraphDocument(knowledgeDocument, input.delta.toSha, droppedIds);
+  repinGraphDocument(knowledgeDocument, input.delta.toSha, patched.droppedIds);
   // Written from the FULL document — project, layers and tour travel with it
   // — not the trimmed nodes/edges pair.
   await writeGraph(path.join(input.stagingPath, KNOWLEDGE_PATH), knowledgeDocument as unknown as GraphLike);
