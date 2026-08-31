@@ -115,6 +115,16 @@ export interface BaselineEntry {
   /** Sum of title+message+suggestion lengths: the output-size variable (#110). */
   readonly findingTextChars: number;
   /**
+   * Bytes of review a reader actually receives: the summary body plus every
+   * inline comment body.
+   *
+   * Distinct from `findingTextChars`, which sums the finding FIELDS before
+   * rendering. A formatter that dropped a message would leave that number
+   * untouched while the published review lost content, so only this one can
+   * catch a rendering regression (Codex review of PR #118).
+   */
+  readonly renderedChars: number;
+  /**
    * How many findings a reader sees anchored to a line, rather than folded
    * into the summary because nothing could place them.
    *
@@ -146,6 +156,19 @@ export interface RunReport {
   readonly mode: "recorded" | "real";
   readonly generatedAt: string;
   readonly results: readonly FixtureRunResult[];
-  /** Fixtures that could not run, and why. Never silently omitted. */
-  readonly skipped: readonly { readonly fixture: string; readonly reason: string }[];
+  /**
+   * Fixtures that produced no measurement, and why. Never silently omitted.
+   *
+   * `kind` separates two very different situations. `no-recording` is expected
+   * and permanent: a real-mode-only fixture simply cannot be replayed, and the
+   * baseline correctly has no row for it. `failed` means a fixture that SHOULD
+   * have measured did not, which makes the whole run partial — and blessing a
+   * partial run as the baseline silently deletes that fixture's row (Codex
+   * review of PR #118).
+   */
+  readonly skipped: readonly {
+    readonly fixture: string;
+    readonly kind: "no-recording" | "failed";
+    readonly reason: string;
+  }[];
 }

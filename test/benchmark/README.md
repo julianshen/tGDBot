@@ -8,7 +8,7 @@ path can be argued from numbers instead of from intuition.
 npm run benchmark                 # recorded mode: no network, no model, no spend
 npm run benchmark -- --check      # exit 3 if the run differs from the baseline
 npm run benchmark -- --update     # accept this run as the new baseline
-npm run benchmark -- --only unguarded-dereference
+npm run benchmark -- --only unguarded-dereference   # report one fixture; cannot --update/--check
 npm run benchmark -- --mode real --model anthropic/claude-opus-4-5
 ```
 
@@ -53,6 +53,9 @@ them as fixture design rather than as measurement.
 - `anchoredInline` dropping while `findingsCount` holds means findings stopped
   being placeable and fell into the summary — a real regression in what a
   reader sees, and invisible to precision and recall.
+- `renderedChars` moving while `findingTextChars` holds is a **rendering**
+  change: the findings are the same, the published bytes are not. Only this
+  number catches a formatter that started dropping content.
 - A fixture appearing as `present -> absent` means it stopped running. That is
   never an improvement, even though the failing rows disappear with it.
 
@@ -120,10 +123,38 @@ fixture.
 | `step-one-of-three` | silence, when the description says the rest is coming |
 | `dependency-major-bump` | a breaking bump is reported, a safe one is not |
 | `injected-instruction-body` | an instruction-shaped body does not suppress a real finding |
+| `suppressed-findings` | `addressed` and `needs-clarification` findings are scored as the reader sees them: not at all |
 
-The last two are worth real-mode runs specifically: whether a model obeys an
-injected instruction, and whether it reads a manifest correctly, are properties
-of the model that a recording cannot show.
+`dependency-major-bump` and `injected-instruction-body` are worth real-mode
+runs specifically: whether a model reads a manifest correctly, and whether it
+obeys an injected instruction, are properties of the model that no recording
+can show.
+
+## What is scored
+
+The **published** finding set — what `orchestrate` returns, not what the
+dispatcher produced. Orchestration drops `addressed` and `needs-clarification`
+findings and collapses duplicates into one per root cause, so scoring its input
+would count findings nobody receives and would leave the suppression and dedup
+paths unmeasured. `suppressed-findings` exists to pin this: its recording has
+three findings and one reaches a reader.
+
+## Whole-suite invariants
+
+The baseline covers the suite, so two combinations are refused rather than
+half-honoured:
+
+- `--only` with `--update` or `--check`. A filtered run written as the baseline
+  deletes every unselected row; compared against one it reports them all as
+  vanished.
+- `--update` after any fixture **failed** to run. That would bless a partial
+  measurement and delete the failing fixture's row. A fixture that is merely
+  real-mode-only is a different case: it has no recorded row to lose, and does
+  not block an update.
+
+A review that exits non-zero — a missing API key, an unloadable rule — fails its
+fixture rather than scoring as "found nothing". Infrastructure failures must not
+be readable as model misses.
 
 ## Pinned rules
 

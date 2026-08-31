@@ -24,6 +24,7 @@
       "dispatchChars": 20375,
       "diffChars": 219,
       "findingTextChars": 150,
+      "renderedChars": 850,
       "anchoredInline": 1,
       "missed": []
     },
@@ -47,6 +48,7 @@
       "dispatchChars": 18115,
       "diffChars": 207,
       "findingTextChars": 0,
+      "renderedChars": 197,
       "anchoredInline": 0,
       "missed": []
     },
@@ -72,6 +74,7 @@
       "dispatchChars": 18025,
       "diffChars": 216,
       "findingTextChars": 145,
+      "renderedChars": 843,
       "anchoredInline": 1,
       "missed": []
     },
@@ -97,6 +100,33 @@
       "dispatchChars": 18087,
       "diffChars": 271,
       "findingTextChars": 145,
+      "renderedChars": 837,
+      "anchoredInline": 1,
+      "missed": []
+    },
+    {
+      "fixture": "suppressed-findings",
+      "quality": {
+        "truePositives": 1,
+        "falsePositives": 0,
+        "falseNegatives": 0,
+        "precision": 1,
+        "recall": 1,
+        "f1": 1
+      },
+      "findingsCount": 1,
+      "severityMix": {
+        "blocking": 1,
+        "warning": 0,
+        "suggestion": 0
+      },
+      "findingsPerRule": {
+        "benchmark-correctness": 1
+      },
+      "dispatchChars": 17635,
+      "diffChars": 169,
+      "findingTextChars": 140,
+      "renderedChars": 970,
       "anchoredInline": 1,
       "missed": []
     },
@@ -122,6 +152,7 @@
       "dispatchChars": 17945,
       "diffChars": 289,
       "findingTextChars": 307,
+      "renderedChars": 1505,
       "anchoredInline": 2,
       "missed": []
     }

@@ -6,6 +6,9 @@
 // stubbed: the provider (a fixture is not a live pull request), the model
 // under `--mode recorded`, and the two steps that need a git worktree. A
 // harness that reimplemented the pipeline would measure the harness.
+import { mkdtemp, realpath, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { review, type CliArgs } from "../cli.js";
 import type { ResolvedConfig } from "../config.js";
@@ -47,9 +50,19 @@ export async function runFixture(
   const measurement: DispatchMeasurement = { dispatchChars: 0, diffChars: 0, rulesDispatched: 0 };
   let produced: readonly Finding[] = [];
   let inlineCount = 0;
+  let renderedChars = 0;
   let modelsUsed: readonly string[] | undefined;
 
-  const args = fixtureArgs(fixture, model);
+  // Isolated per run. Without this the flow opens the machine's real state
+  // root (TGD_REVIEW_STATE_DIR / XDG_STATE_HOME / HOME), and any memory stored
+  // there for the synthetic benchmark repository would enter the prompt —
+  // making `dispatchChars` a function of local history rather than of the
+  // fixture, which is the one thing a fixed benchmark cannot allow (Codex
+  // review of PR #118).
+  // `realpath` because the store refuses a state path containing a symbolic
+  // link, and macOS puts the temp directory under /var, which is one.
+  const stateDir = await mkdtemp(path.join(await realpath(os.tmpdir()), "tgd-benchmark-state-"));
+  const args = { ...fixtureArgs(fixture, model), stateDir };
   const startedAt = performance.now();
   // The review prints a full dry-run preview of the comment it would post.
   // That is the right behaviour for `--dry-run` and pure noise here, where the
@@ -58,8 +71,9 @@ export async function runFixture(
   // failed to load, a context step that gave up — must not do so quietly.
   const realLog = console.log;
   console.log = () => undefined;
+  let exitCode: number;
   try {
-    await review(args, {
+    exitCode = await review(args, {
       resolveConfig: () => fixtureConfig(args, fixture),
       dispatchRules: async (input) => {
         measure(measurement, input);
@@ -67,14 +81,28 @@ export async function runFixture(
         modelsUsed = result.modelsUsed;
         return result;
       },
-      // The REAL orchestrator, wrapped only to observe. What it is handed is the
-      // finding set after every post-dispatch stage the flow applies; what it
-      // returns says how many of those a reader will see anchored to a line
-      // rather than folded into the summary — the variable #114 would move.
+      // The REAL orchestrator, wrapped only to observe.
+      //
+      // Scored on what it RETURNS, not on what it was handed. Reading
+      // `dispatchResult.findings` measured raw dispatcher output, which
+      // orchestration then filters — it drops `addressed` findings and
+      // collapses duplicates into one per root cause. So the benchmark counted
+      // findings no reader receives, and a change to the suppression or dedup
+      // path moved nothing, even though covering that path is the whole claim
+      // recorded mode makes (Codex review of PR #118).
+      //
+      // `allFindings` is the deduped set the summary counts: inline plus
+      // unanchored, which together are everything a reader sees.
       orchestrate: (dispatchResult, diff, options) => {
-        produced = [...dispatchResult.findings];
         const result = orchestrateReal(dispatchResult, diff, options);
+        produced = [...result.summaryInput.allFindings];
         inlineCount = result.inlineComments.length;
+        // The bytes a reader actually receives. `findingTextChars` sums the
+        // fields BEFORE rendering, so a formatter that dropped a message left
+        // it unchanged and `--check` reported a clean baseline for a review
+        // that had lost content (Codex review).
+        renderedChars = result.commentBody.length +
+          result.inlineComments.reduce((total, comment) => total + comment.body.length, 0);
         return result;
       },
       // Neither step is what this benchmark measures, and both need a real git
@@ -98,8 +126,14 @@ export async function runFixture(
     });
   } finally {
     console.log = realLog;
+    await rm(stateDir, { recursive: true, force: true });
   }
   const durationMs = performance.now() - startedAt;
+  // A review that failed produced no findings for a REASON, and scoring it as
+  // "found nothing" turns a missing API key or an unloadable rule into false
+  // negatives blamed on the model — while the benchmark still exits 0 (Codex
+  // review). The caller reports this fixture as skipped instead.
+  if (exitCode !== 0) throw new Error(`review exited ${exitCode}`);
 
   const match = matchFindings(fixture.expected, produced);
   const quality = qualityOf(match);
@@ -117,6 +151,7 @@ export async function runFixture(
     dispatchChars: measurement.dispatchChars,
     diffChars: measurement.diffChars,
     findingTextChars: findingTextChars(produced),
+    renderedChars,
     anchoredInline: inlineCount,
     missed: [...match.falseNegatives].sort(),
   };

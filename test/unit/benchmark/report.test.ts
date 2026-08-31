@@ -15,6 +15,7 @@ function entry(overrides: Partial<BaselineEntry> = {}): BaselineEntry {
     dispatchChars: 1000,
     diffChars: 100,
     findingTextChars: 50,
+    renderedChars: 400,
     anchoredInline: 2,
     missed: [],
     ...overrides,
@@ -99,7 +100,7 @@ describe("formatReport", () => {
     mode: "recorded",
     generatedAt: "2026-08-31T00:00:00.000Z",
     results: [result()],
-    skipped: [{ fixture: "broken", reason: "no recorded.json; real mode only" }],
+    skipped: [{ fixture: "broken", kind: "no-recording" as const, reason: "no recorded.json; real mode only" }],
   };
 
   it("says a total was computed over fewer fixtures than exist", () => {
@@ -134,6 +135,18 @@ describe("parseArgs", () => {
 
   it("refuses --update together with --check", () => {
     expect(() => parseArgs(["--update", "--check"])).toThrow(/mutually exclusive/);
+  });
+
+  it("refuses --only with --update or --check", () => {
+    // The baseline covers the whole suite. Written from a filtered run it
+    // deletes every unselected row; compared against one it reports them all
+    // as vanished. Both are data loss dressed as a result.
+    expect(() => parseArgs(["--only", "x", "--update"])).toThrow(/whole suite/);
+    expect(() => parseArgs(["--only", "x", "--check"])).toThrow(/whole suite/);
+  });
+
+  it("allows --only on its own", () => {
+    expect(parseArgs(["--only", "x"])).toMatchObject({ only: "x", update: false, check: false });
   });
 
   it("rejects an unknown argument rather than ignoring it", () => {

@@ -45,13 +45,13 @@ export async function main(argv: readonly string[]): Promise<number> {
   }
 
   const results: FixtureRunResult[] = [];
-  const skipped: { fixture: string; reason: string }[] = [];
+  const skipped: RunReport["skipped"][number][] = [];
   for (const fixture of fixtures) {
     // A fixture with no recording cannot be replayed. Reported as skipped
     // rather than run to an empty result, which would score as "found
     // nothing" and quietly drag the totals down.
     if (options.mode === "recorded" && fixture.recordedFindings === undefined) {
-      skipped.push({ fixture: fixture.name, reason: "no recorded.json; real mode only" });
+      skipped.push({ fixture: fixture.name, kind: "no-recording", reason: "no recorded.json; real mode only" });
       continue;
     }
     try {
@@ -59,7 +59,7 @@ export async function main(argv: readonly string[]): Promise<number> {
     } catch (error) {
       // One broken fixture must not take the suite down, and must not be
       // mistaken for a fixture that ran and found nothing.
-      skipped.push({ fixture: fixture.name, reason: `run failed: ${(error as Error).message}` });
+      skipped.push({ fixture: fixture.name, kind: "failed", reason: `run failed: ${(error as Error).message}` });
     }
   }
 
@@ -78,7 +78,18 @@ export async function main(argv: readonly string[]): Promise<number> {
       console.error("benchmark: --update and --check apply to recorded mode only");
       return EXIT_FAILED;
     }
-    return skipped.length > 0 ? EXIT_FAILED : EXIT_OK;
+    return skipped.some((entry) => entry.kind === "failed") ? EXIT_FAILED : EXIT_OK;
+  }
+
+  // A fixture that should have measured and did not makes the run PARTIAL.
+  // Writing that as the baseline deletes its row and blesses the smaller
+  // suite; comparing against it reports the missing row as a change that was
+  // never a change. Neither is a thing to do quietly (Codex review).
+  const failures = skipped.filter((entry) => entry.kind === "failed");
+  if (failures.length > 0) {
+    console.error(`\nbenchmark: ${failures.length} fixture(s) failed to run; the measurement is incomplete`);
+    for (const failure of failures) console.error(`  ${failure.fixture}: ${failure.reason}`);
+    return EXIT_FAILED;
   }
 
   const baseline = toBaseline(results);
@@ -146,6 +157,13 @@ export function parseArgs(argv: readonly string[]): Options {
   }
 
   if (update && check) throw new Error("--update and --check are mutually exclusive");
+  // The baseline is a WHOLE-SUITE artifact. Written from a filtered run it
+  // keeps only the selected fixture and deletes every other row; compared
+  // against a filtered run it reports every unselected fixture as vanished.
+  // Both are silent data loss dressed as a result (Codex review of PR #118).
+  if (only !== undefined && (update || check)) {
+    throw new Error("--only cannot be combined with --update or --check: the baseline covers the whole suite");
+  }
   if (mode === "recorded" && model !== undefined) {
     // Silently ignoring it would let someone believe they had measured a model
     // when they had replayed a recording.

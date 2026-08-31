@@ -80,6 +80,7 @@ function compareEntries(fixture: string, left: BaselineEntry, right: BaselineEnt
   note("dispatchChars", left.dispatchChars, right.dispatchChars);
   note("diffChars", left.diffChars, right.diffChars);
   note("findingTextChars", left.findingTextChars, right.findingTextChars);
+  note("renderedChars", left.renderedChars, right.renderedChars);
   note("missed", left.missed, right.missed);
   return deltas;
 }
