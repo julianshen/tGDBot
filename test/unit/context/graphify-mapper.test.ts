@@ -153,6 +153,9 @@ describe("GraphifyMapper — the subprocess boundary", () => {
     expect(result.status).toBe("failed");
     expect(result.failure?.code).toBe("mapper-subprocess-failed");
     expect(result.failure?.message).toMatch(/not found on PATH/);
+    // The remediation must name the PINNED release: an unpinned install gets
+    // refused by the version gate immediately after (PR #116 review round two).
+    expect(result.failure?.message).toContain("pipx install graphifyy==0.9.50");
     expect(result.failure?.message).toMatch(/--context-mapper tgd/);
   });
 

@@ -416,7 +416,7 @@ export class GraphifyMapper implements ContextMapper {
       if (isMissing(error) || err.code === "ENOENT") {
         return failed(
           "mapper-subprocess-failed",
-          "the graphify executable was not found on PATH; install it (e.g. `pipx install graphifyy`) or run with --context-mapper tgd",
+          `the graphify executable was not found on PATH; install it (e.g. pipx install graphifyy==${GRAPHIFY_VERSION}) or run with --context-mapper tgd`,
         );
       }
       return failed(
@@ -445,7 +445,7 @@ export class GraphifyMapper implements ContextMapper {
         // the review.
         return failed(
           "mapper-subprocess-failed",
-          "the graphify executable was not found on PATH; install it (e.g. `pipx install graphifyy`) or run with --context-mapper tgd",
+          `the graphify executable was not found on PATH; install it (e.g. pipx install graphifyy==${GRAPHIFY_VERSION}) or run with --context-mapper tgd`,
         );
       }
       const detail = (err.stderr ?? errorMessage(error)).slice(0, MAX_STDERR_CHARS);

@@ -462,7 +462,7 @@ tgd-review-agent review \
   --context-mapper <tgd|graphify> # default tgd: which implementation builds the index. "graphify"
                                   # runs the deterministic AST indexer as a subprocess — no model,
                                   # no API key, no 30-minute timeout — and needs Python 3 plus
-                                  # graphify (pipx install graphifyy) on PATH. See
+                                  # graphify (pipx install graphifyy==0.9.50) on PATH. See
                                   # "Repository context" below.
   --allow-degraded-context       # optional: let mapping report a partial result instead of failing
                                   # outright. Note a degraded map has no knowledge graph, and a pack
@@ -494,7 +494,7 @@ relevant to the files this PR changes.
 **Mapper backends** (`--context-mapper`): `tgd` (the default) runs the
 model-driven `/tgd-map` session; `graphify` runs the deterministic AST indexer
 as a subprocess. The graphify backend needs **Python 3** and the `graphify`
-CLI (Apache-2.0, `pipx install graphifyy`) on PATH — a real runtime
+CLI (Apache-2.0, `pipx install graphifyy==0.9.50`) on PATH — a real runtime
 dependency, and the reason it is opt-in rather than the default. Its code
 pass resolves no LLM backend, reads no provider API key (the subprocess
 environment is scrubbed of provider credentials), and is deterministic: one
