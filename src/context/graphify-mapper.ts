@@ -556,7 +556,25 @@ export class GraphifyMapper implements ContextMapper {
       layers: [],
       tour: [],
     };
-    await writeFile(path.join(outputRoot, KNOWLEDGE_PATH), `${JSON.stringify(graphDocument, null, 2)}\n`, "utf8");
+    // Serialized COMPACTLY and size-checked BEFORE anything is written:
+    // adaptation inflates the document (each label becomes both `name` and
+    // `summary`, provenance fields are added), so a graph.json under the
+    // input limit can still produce a knowledge artifact publication would
+    // reject - and with it, all context, fatally under --context require
+    // (PR #116 review). Over the ceiling degrades with a stated reason.
+    const serializedGraph = `${JSON.stringify(graphDocument)}\n`;
+    if (Buffer.byteLength(serializedGraph, "utf8") > MAX_JSON_ARTIFACT_BYTES) {
+      this.#onProgress({ stage: "adapt", status: "failed" });
+      return {
+        status: "degraded",
+        manifestPath,
+        artifactPaths: [],
+        analyzedFiles: 0,
+        degradedReasons: [`the adapted knowledge graph exceeds the ${MAX_JSON_ARTIFACT_BYTES}-byte safe-size limit; choose --context-mapper tgd or narrow the indexed tree`],
+        failure: undefined,
+      };
+    }
+    await writeFile(path.join(outputRoot, KNOWLEDGE_PATH), serializedGraph, "utf8");
     await writeFile(path.join(outputRoot, ZERO_DOMAINS_PATH), `${JSON.stringify({ version: 1, status: "zero-domains" }, null, 2)}\n`, "utf8");
     await writeFile(path.join(outputRoot, CONTEXT_PATH), synthesizeContextDocument({ repositoryName: request.repository.repo, baseSha: request.baseSha, nodes: adapted.nodes, edges: adapted.edges, analyzedCodeFiles: adapted.analyzedFiles }), "utf8");
     await writeFile(

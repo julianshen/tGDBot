@@ -277,6 +277,35 @@ describe("GraphifyMapper — degradation, never a throw", () => {
     expect(result.degradedReasons.join(" ")).toMatch(/safe-size limit/);
   });
 
+  it("degrades when the ADAPTED graph would exceed the safe-size limit", async () => {
+    const sourceRoot = await tempRoot("graphify-src-");
+    const outputRoot = await tempRoot("graphify-out-");
+    const runner: GraphifyRunner = async (args) => {
+      if (args[0] === "--version") return { stdout: `graphify ${GRAPHIFY_VERSION}`, stderr: "" };
+      const outRoot = args[args.indexOf("--out") + 1] as string;
+      // Under the INPUT limit, but the adaptation adds name/summary/fields
+      // per node, so the serialized knowledge graph crosses the ceiling.
+      const bigNode = {
+        id: `n${"x".repeat(40)}`,
+        label: "x".repeat(200),
+        node_type: "function",
+        source_file: "src/big.ts",
+        source_location: "L1",
+      };
+      const nodes = Array.from(
+        { length: Math.ceil((MAX_JSON_ARTIFACT_BYTES * 0.9) / 400) },
+        (_, index) => ({ ...bigNode, id: `n${index}-${"x".repeat(40)}` }),
+      );
+      const links = [];
+      await mkdir(outRoot, { recursive: true });
+      await writeFile(path.join(outRoot, "graph.json"), JSON.stringify({ directed: true, multigraph: false, graph: {}, nodes, links }), "utf8");
+      return { stdout: "", stderr: "" };
+    };
+    const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
+    expect(result.status).toBe("degraded");
+    expect(result.degradedReasons.join(" ")).toMatch(/adapted knowledge graph exceeds/);
+  });
+
   it("degrades when the output is not valid JSON", async () => {
     const sourceRoot = await tempRoot("graphify-src-");
     const outputRoot = await tempRoot("graphify-out-");
