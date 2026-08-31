@@ -1,3 +1,4 @@
+import type { RunMetrics } from "./types.js";
 import { createHash } from "node:crypto";
 import {
   bindFindingLedgerIdentity,
@@ -58,6 +59,8 @@ export interface ReviewPublicationStatusLog {
   rulesFailed: string[];
   reason?: string;
   loadErrors?: string[];
+  /** Issue #109: per-run cost/size telemetry; present on runs that dispatched. */
+  metrics?: RunMetrics;
 }
 
 export interface ReviewPublicationContext {
@@ -353,6 +356,8 @@ export async function publishReviewFromManifest(options: {
   readonly hooks?: PublicationExecutorHooks;
   readonly now: () => string;
   readonly orchestration?: OrchestrationResult;
+  /** Issue #109: per-run cost/size telemetry for the terminal status line. */
+  readonly metrics?: RunMetrics;
   readonly loadErrors?: readonly { readonly sourcePath: string; readonly message: string }[];
   readonly buildBody?: (
     o: OrchestrationResult,
@@ -824,6 +829,7 @@ export async function publishReviewFromManifest(options: {
         rulesRun: [...terminalResult.rulesRun],
         rulesFailed: [...terminalResult.rulesFailed],
         loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
+        ...(options.metrics === undefined ? {} : { metrics: options.metrics }),
         ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
       });
       return terminalResult.exitCode;
@@ -841,6 +847,7 @@ export async function publishReviewFromManifest(options: {
     rulesRun: [...terminalResult.rulesRun],
     rulesFailed: [...terminalResult.rulesFailed],
     loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
+    ...(options.metrics === undefined ? {} : { metrics: options.metrics }),
     ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
   });
   return terminalResult.exitCode === 0 ? EXIT_OK : terminalResult.exitCode;

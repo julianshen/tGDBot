@@ -27,7 +27,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { RuleDefinition } from "../rules/types.js";
-import { buildDispatchPrompt } from "./dispatch-prompt.js";
+import { buildDispatchPrompt, buildTaskText } from "./dispatch-prompt.js";
 import type { PrIntent } from "./pr-intent.js";
 import { validateDispatchContext } from "./dispatch-context.js";
 import {
@@ -375,6 +375,17 @@ async function runDispatch(
 
     const session = await createSession(useAdvisor, sessionCwd, modelRequest);
     const prompt = buildDispatchPrompt(effective, diff, useAdvisor, conversationContext, packsByRule, prIntent);
+    // Issue #109: the honest per-run prompt cost is the sum of the per-rule
+    // task texts. buildDispatchPrompt embeds them inside the orchestration
+    // prompt, which is not the number a per-rule cost metric means, so each
+    // task text is rebuilt here purely for its length. Legacy is the
+    // non-default engine; the direct engine accumulates during dispatch
+    // instead of paying this second pass.
+    const taskTextChars = effective.reduce(
+      (total, rule) =>
+        total + buildTaskText(rule, diff, packsByRule?.get(rule.name), conversationContext, prIntent).length,
+      0,
+    );
 
     // Capture the subagent tool's structured per-task results (details.results)
     // so we can deterministically reconcile the orchestrator's self-reported
@@ -463,12 +474,11 @@ async function runDispatch(
     // ADR-007: a suggestion is committable code. It may only survive if a dispatched
     // reviewer actually proposed it for that exact file/line — never because the
     // orchestrator said so. Unverifiable => stripped.
-    return withUnresolved(
-      enforceSuggestionProvenance(
-        reconciled,
-        suggestionProvenanceKeys(capturedTaskResults, effective),
-      ),
+    const withProvenance = enforceSuggestionProvenance(
+      reconciled,
+      suggestionProvenanceKeys(capturedTaskResults, effective),
     );
+    return withUnresolved({ ...withProvenance, taskTextChars });
   } catch (err) {
     // Setup/session-creation failure (createIsolatedSessionCwd,
     // createIsolatedAgentDir, or createSession threw). Degrade to

@@ -124,6 +124,26 @@ function makeFactory(outputs: Record<string, string | Error>): {
 }
 
 describe("dispatchRulesDirect", () => {
+  // Issue #109: the engine reports the per-run prompt cost it actually paid —
+  // the sum of the task texts it built, one per dispatched rule.
+  it("reports taskTextChars as the sum of the task texts it dispatched", async () => {
+    const { factory, prompts } = makeFactory({
+      "rule-a": JSON.stringify({ findings: [], rulesRun: ["rule-a"], rulesFailed: [] }),
+      "rule-b": JSON.stringify({ findings: [], rulesRun: ["rule-b"], rulesFailed: [] }),
+    });
+    const result = await dispatchRulesDirectObject({
+      rules: [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })],
+      diff: "diff --git a/x b/x",
+      useAdvisor: false,
+    }, { createSession: factory });
+
+    const expected = Object.values(prompts).reduce((total, text) => total + text.length, 0);
+    expect(Object.keys(prompts)).toHaveLength(2);
+    expect(result.taskTextChars).toBe(expected);
+    expect(result.taskTextChars!).toBeGreaterThan(0);
+  });
+
+
   it("rejects invalid workflow and context input before reviewer or advisor factories run", async () => {
     const createSession = vi.fn();
     const createAdvisorSession = vi.fn();

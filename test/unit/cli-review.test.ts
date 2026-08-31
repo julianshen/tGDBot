@@ -2677,6 +2677,77 @@ describe("inline review comments", () => {
     vi.restoreAllMocks();
   });
 
+  // Issue #109: per-run cost/size telemetry on the posted/partial status line.
+  describe("issue #109: run metrics", () => {
+    it("carries cost and size metrics on a posted run", async () => {
+      const h = makeHarness({
+        dispatchResult: {
+          findings: [{
+            file: "src/x.ts",
+            line: 3,
+            severity: "warning",
+            category: "correctness",
+            message: "Off by one.",
+            ruleName: "rule-a",
+            title: "Bad loop",
+            suggestion: "for (let i = 0; i < n; i++)",
+            hostCheck: { status: "resolved", references: [], occurrences: 1, unresolved: [], unresolvedOccurrences: 0, filesSearched: 2, filesResolved: 2 },
+          }],
+          rulesRun: ["rule-a"],
+          rulesFailed: [],
+          taskTextChars: 4321,
+        },
+      });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await review(h.args, depsFrom(h));
+
+      // The publication module logs its own intermediate "posted" line; the
+      // metrics live on the TERMINAL status line (the documented last-line-
+      // of-stdout contract), so take the last one.
+      const status = logSpy.mock.calls.map(([line]) => String(line))
+        .filter((line) => line.startsWith("TGD_REVIEW_RESULT: "))
+        .at(-1);
+      const parsed = JSON.parse(status!.slice("TGD_REVIEW_RESULT: ".length));
+
+      expect(parsed.status).toBe("posted");
+      expect(parsed.metrics).toEqual({
+        durationMs: expect.any(Number),
+        diffChars: "diff --git a/x b/x".length,
+        // From the stub engine's result: engines report what they built.
+        dispatchChars: 4321,
+        contextPackChars: 0,
+        prIntentChars: expect.any(Number),
+        conversationChars: 0,
+        findingsPerRule: { "rule-a": 1 },
+        findingTextChars: "Bad loop".length + "Off by one.".length + "for (let i = 0; i < n; i++)".length,
+        hostChecks: { resolved: 1, lexical: 0, notChecked: 0 },
+      });
+      expect(parsed.metrics.prIntentChars).toBeGreaterThan(0);
+      vi.restoreAllMocks();
+    });
+
+    it("omits metrics from a skipped run so its shape never changes", async () => {
+      const pr = makePr({ headSha: "cafef00d" });
+      const cfg = expectedConfigHash(makeArgs());
+      const botComment: BotComment = { id: "999", body: formatMarker("cafef00d", cfg), lastReviewedSha: "cafef00d", reviewedConfig: cfg };
+      const h = makeHarness({ botComment, pr });
+      const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await review(h.args, depsFrom(h));
+
+      const status = logSpy.mock.calls.map(([line]) => String(line))
+        .find((line) => line.startsWith("TGD_REVIEW_RESULT: "));
+      expect(JSON.parse(status!.slice("TGD_REVIEW_RESULT: ".length))).toEqual({
+        status: "skipped",
+        findingsCount: 0,
+        rulesRun: [],
+        rulesFailed: [],
+      });
+      vi.restoreAllMocks();
+    });
+  });
+
   // Issue #59: the PR's stated intent reaches dispatch as sanitized
   // untrusted evidence, and editing the prose re-triggers a review.
   describe("issue #59: PR intent as untrusted evidence", () => {
