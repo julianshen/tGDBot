@@ -30,6 +30,7 @@ import {
   METADATA_PATH,
   ZERO_DOMAINS_PATH,
 } from "./artifact-paths.js";
+import { EDGE_TYPES } from "./artifact-validator.js";
 import type {
   ContextMapper,
   ContextMapRequest,
@@ -257,11 +258,23 @@ export function adaptGraphifyGraph(raw: unknown): AdaptedGraph | undefined {
       skippedEdges += 1;
       continue;
     }
-    const weight = typeof value.weight === "number" && Number.isFinite(value.weight) ? value.weight : 1;
+    // The validator's edge types are a CLOSED set, and graphify names
+    // relations the set does not contain ("references", "dynamic_import",
+    // "re_exports", ...). Copying one unchanged would fail the whole graph
+    // at publication and take every pack with it (PR #116 review), so an
+    // unmapped relation normalizes to "related" — availability over
+    // taxonomy, since nothing downstream reads the relation name.
+    const relation = typeof value.relation === "string" && value.relation.length > 0
+      ? singleLine(value.relation)
+      : "related";
+    // Weights are validator-bounded to [0, 1]; graphify emits counts.
+    const weight = typeof value.weight === "number" && Number.isFinite(value.weight)
+      ? Math.min(1, Math.max(0, value.weight))
+      : 1;
     edges.push({
       source: value.source,
       target: value.target,
-      type: typeof value.relation === "string" && value.relation.length > 0 ? singleLine(value.relation) : "related",
+      type: EDGE_TYPES.has(relation) ? relation : "related",
       direction: "forward",
       weight,
       ...(typeof value.confidence === "string" && value.confidence.length > 0

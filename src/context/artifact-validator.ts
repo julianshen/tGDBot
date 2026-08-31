@@ -27,7 +27,7 @@ const NODE_TYPES = new Set([
   "pipeline", "schema", "resource", "domain", "flow", "step", "article", "entity", "topic", "claim", "source",
 ]);
 const DOMAIN_NODE_TYPES = new Set(["domain", "flow", "step"]);
-const EDGE_TYPES = new Set([
+export const EDGE_TYPES = new Set([
   "imports", "exports", "contains", "inherits", "implements", "calls", "subscribes", "publishes", "middleware",
   "reads_from", "writes_to", "transforms", "validates", "depends_on", "tested_by", "configures", "related",
   "similar_to", "deploys", "serves", "provisions", "triggers", "migrates", "documents", "routes",

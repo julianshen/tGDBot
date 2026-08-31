@@ -377,6 +377,31 @@ describe("adaptGraphifyGraph — the total node-type mapping", () => {
     expect(adapted?.skippedEdges).toBe(1);
   });
 
+  it("normalizes relations the validator does not know and clamps weights", () => {
+    const adapted = adaptGraphifyGraph({
+      nodes: [
+        { id: "n1", label: "a", node_type: "function" },
+        { id: "n2", label: "b", node_type: "function" },
+      ],
+      links: [
+        // graphify names relations tGDBot's closed set does not contain...
+        { source: "n1", target: "n2", relation: "dynamic_import", weight: 7 },
+        // ...and weights that are counts, not [0, 1] scores.
+        { source: "n2", target: "n1", relation: "calls", weight: 42 },
+        { source: "n1", target: "n2", relation: "references", weight: -3 },
+      ],
+    });
+    expect(adapted).toBeDefined();
+    // Unmapped relations normalize to "related"; known ones survive...
+    expect(adapted?.edges[0]?.type).toBe("related");
+    expect(adapted?.edges[1]?.type).toBe("calls");
+    // ...and weights clamp into the validator's range instead of failing
+    // the whole graph at publication.
+    expect(adapted?.edges[0]?.weight).toBe(1);
+    expect(adapted?.edges[1]?.weight).toBe(1);
+    expect(adapted?.edges[2]?.weight).toBe(0);
+  });
+
   it("returns undefined for a document with no usable nodes", () => {
     expect(adaptGraphifyGraph({ nodes: [], links: [] })).toBeUndefined();
     expect(adaptGraphifyGraph("not an object")).toBeUndefined();
