@@ -296,7 +296,7 @@ describe("GraphifyMapper — degradation, never a throw", () => {
         { length: Math.ceil((MAX_JSON_ARTIFACT_BYTES * 0.9) / 400) },
         (_, index) => ({ ...bigNode, id: `n${index}-${"x".repeat(40)}` }),
       );
-      const links = [];
+      const links: unknown[] = [];
       await mkdir(outRoot, { recursive: true });
       await writeFile(path.join(outRoot, "graph.json"), JSON.stringify({ directed: true, multigraph: false, graph: {}, nodes, links }), "utf8");
       return { stdout: "", stderr: "" };
