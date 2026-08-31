@@ -14,9 +14,13 @@ search in the repo for the last reference). Focus on:
   `x = nil`, default cases in exhaustive switches, redundant nil checks
   after a non-nil assertion, or `else` arms that can never execute)
 - unused functions, methods, or variable declarations that are added in the
-  diff but never called or referenced — including private helpers, exported
-  symbols that have zero callers in the repo, and dead branches in a newly
-  added switch/if-else chain where every valid input hits the first arm
+  diff but never called or referenced — restrict this to **unexported** symbols
+  only (exported symbols may have callers outside the repo or behind interfaces
+  invisible to a file-level search)
+- dead branches in a newly added switch/if-else chain where every valid input
+  hits the first arm — require language/API or control-flow evidence before
+  identifying a default switch arm as unreachable (a default case that exists
+  "just in case" is not dead code)
 - written-but-never-read fields: struct fields assigned in the diff and
   never subsequently referenced by any code path, or values computed,
   stored, or serialized but never consumed by the caller or a downstream
@@ -26,8 +30,7 @@ search in the repo for the last reference). Focus on:
   mock implementations committed to non-test files, or stub handlers that
   always return a canned response
 - "orphan" changes: variables that are declared, exported, or computed purely
-  to be passed to a function that ignores them, or method receivers that are
-  never used inside the method body
+  to be passed to a function that ignores them
 
 For each finding:
 - identify the exact file, line, and symbol or code path that is dead
