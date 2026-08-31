@@ -4,7 +4,7 @@
 // subprocess args and environment), output that the existing artifact
 // validator and pack builder accept unchanged, and degradation — never a
 // throw — for anything this adapter does not recognise.
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -15,7 +15,7 @@ import {
   adaptGraphifyGraph,
   type GraphifyRunner,
 } from "../../../src/context/graphify-mapper.js";
-import { digestArtifactInputs, validateArtifactRecords } from "../../../src/context/artifact-validator.js";
+import { digestArtifactInputs, MAX_JSON_ARTIFACT_BYTES, validateArtifactRecords } from "../../../src/context/artifact-validator.js";
 import { declareMappedArtifacts } from "../../../src/context/artifact-paths.js";
 import { buildContextPack } from "../../../src/context/context-pack.js";
 import type { RepositoryRef } from "../../../src/target/types.js";
@@ -255,6 +255,23 @@ describe("GraphifyMapper — degradation, never a throw", () => {
     const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
     expect(result.status).toBe("degraded");
     expect(result.degradedReasons.join(" ")).toMatch(/does not match the schema/);
+  });
+
+  it("degrades when the graph document exceeds the safe-size limit instead of reading it", async () => {
+    const sourceRoot = await tempRoot("graphify-src-");
+    const outputRoot = await tempRoot("graphify-out-");
+    const runner: GraphifyRunner = async (args) => {
+      if (args[0] === "--version") return { stdout: `graphify ${GRAPHIFY_VERSION}`, stderr: "" };
+      const outRoot = args[args.indexOf("--out") + 1] as string;
+      // Sparse write: claim the size without materialising 64 MiB.
+      const handle = await open(path.join(outRoot, "graph.json"), "w");
+      await handle.truncate(MAX_JSON_ARTIFACT_BYTES + 1);
+      await handle.close();
+      return { stdout: "", stderr: "" };
+    };
+    const result = await new GraphifyMapper({ run: runner }).map(request(sourceRoot, outputRoot));
+    expect(result.status).toBe("degraded");
+    expect(result.degradedReasons.join(" ")).toMatch(/safe-size limit/);
   });
 
   it("degrades when the output is not valid JSON", async () => {

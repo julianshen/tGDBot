@@ -30,7 +30,7 @@ import {
   METADATA_PATH,
   ZERO_DOMAINS_PATH,
 } from "./artifact-paths.js";
-import { EDGE_TYPES } from "./artifact-validator.js";
+import { EDGE_TYPES, MAX_JSON_ARTIFACT_BYTES } from "./artifact-validator.js";
 import type {
   ContextMapper,
   ContextMapRequest,
@@ -454,9 +454,38 @@ export class GraphifyMapper implements ContextMapper {
     this.#onProgress({ stage: "extract", status: "completed" });
 
     this.#onProgress({ stage: "adapt", status: "started" });
+    // Bound the read BEFORE it happens: a huge repository produces a huge
+    // graph, and reading it unbounded exhausts the Node heap and kills the
+    // review process — the one failure mode that is not a degradation. The
+    // limit matches the validator's own parsed-JSON ceiling, so anything this
+    // refuses would have been refused at publication anyway (PR #116 review).
+    const graphPath = path.join(outputRoot, GRAPHIFY_OUTPUT_GRAPH);
+    const graphInfo = await lstat(graphPath).catch(() => undefined);
+    if (graphInfo === undefined) {
+      this.#onProgress({ stage: "adapt", status: "failed" });
+      return {
+        status: "degraded",
+        manifestPath,
+        artifactPaths: [],
+        analyzedFiles: 0,
+        degradedReasons: ["graphify produced no graph document at the expected output path"],
+        failure: undefined,
+      };
+    }
+    if (graphInfo.size > MAX_JSON_ARTIFACT_BYTES) {
+      this.#onProgress({ stage: "adapt", status: "failed" });
+      return {
+        status: "degraded",
+        manifestPath,
+        artifactPaths: [],
+        analyzedFiles: 0,
+        degradedReasons: [`graphify graph document exceeds the ${MAX_JSON_ARTIFACT_BYTES}-byte safe-size limit; choose --context-mapper tgd or narrow the indexed tree`],
+        failure: undefined,
+      };
+    }
     let rawGraph: unknown;
     try {
-      rawGraph = JSON.parse(await readFile(path.join(outputRoot, GRAPHIFY_OUTPUT_GRAPH), "utf8"));
+      rawGraph = JSON.parse(await readFile(graphPath, "utf8"));
     } catch (error) {
       this.#onProgress({ stage: "adapt", status: "failed" });
       if (isMissing(error)) {

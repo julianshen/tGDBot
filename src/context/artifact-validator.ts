@@ -39,7 +39,10 @@ const DIRECTIONS = new Set(["forward", "backward", "bidirectional"]);
 const COMPLEXITIES = new Set(["simple", "moderate", "complex"]);
 const ENTRY_TYPES = new Set(["http", "cli", "event", "cron", "manual"]);
 /** Caps any single parsed JSON artifact at 64 MiB to bound local CLI memory use. */
-const MAX_JSON_ARTIFACT_BYTES = 64 * 1024 * 1024;
+// Exported for mappers to bound their own reads to the same ceiling —
+// a mapper that reads an unbounded graph.json exhausts the heap before
+// validation ever runs (PR #116 review).
+export const MAX_JSON_ARTIFACT_BYTES = 64 * 1024 * 1024;
 
 export class ContextValidationError extends Error {
   constructor(message: string, options?: ErrorOptions) {
