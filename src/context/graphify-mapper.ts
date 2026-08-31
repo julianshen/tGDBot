@@ -292,22 +292,32 @@ export function adaptGraphifyGraph(raw: unknown): AdaptedGraph | undefined {
  * Includes the caveat-4 statement: graphify silently skips files it flags as
  * sensitive, so absence from the graph is NOT evidence of absence in the code.
  */
-function synthesizeContextDocument(
-  repositoryName: string,
-  graph: AdaptedGraph,
-  baseSha: string,
-): string {
-  const fileNodes = graph.nodes.filter((node) => node.type === "file").length;
-  const extracted = graph.edges.filter((edge) => edge.confidence === "EXTRACTED").length;
-  const inferred = graph.edges.filter((edge) => edge.confidence === "INFERRED").length;
+/**
+ * Builds the prose document a graphify entry ships. Exported because the
+ * incremental patch must REGENERATE it — the counts and the base commit in a
+ * carried-forward copy would describe the parent entry, not the patched graph
+ * (PR #116 review, round two). `analyzedCodeFiles` is omitted after a patch:
+ * the code-file count cannot be kept current across a merge, and a stale
+ * number is worse than its absence.
+ */
+export function synthesizeContextDocument(input: {
+  readonly repositoryName: string;
+  readonly baseSha: string;
+  readonly nodes: readonly AdaptedNode[];
+  readonly edges: readonly AdaptedEdge[];
+  readonly analyzedCodeFiles?: number;
+}): string {
+  const fileNodes = input.nodes.filter((node) => node.type === "file").length;
+  const extracted = input.edges.filter((edge) => edge.confidence === "EXTRACTED").length;
+  const inferred = input.edges.filter((edge) => edge.confidence === "INFERRED").length;
   return [
-    `# Repository context: ${repositoryName}`,
+    `# Repository context: ${input.repositoryName}`,
     "",
     `Deterministic AST index produced by graphify (no language model involved)`,
-    `from the base commit ${baseSha}.`,
+    `from the base commit ${input.baseSha}.`,
     "",
-    `- Indexed files: ${fileNodes} (${graph.analyzedFiles} code files analyzed)`,
-    `- Graph entries: ${graph.nodes.length} nodes, ${graph.edges.length} relations`,
+    `- Indexed files: ${fileNodes}${input.analyzedCodeFiles === undefined ? "" : ` (${input.analyzedCodeFiles} code files analyzed)`}`,
+    `- Graph entries: ${input.nodes.length} nodes, ${input.edges.length} relations`,
     `- Relations read from the AST: ${extracted}; resolved by graphify: ${inferred}`,
     "",
     "This index describes structure, not intent: entries name what exists and",
@@ -548,7 +558,7 @@ export class GraphifyMapper implements ContextMapper {
     };
     await writeFile(path.join(outputRoot, KNOWLEDGE_PATH), `${JSON.stringify(graphDocument, null, 2)}\n`, "utf8");
     await writeFile(path.join(outputRoot, ZERO_DOMAINS_PATH), `${JSON.stringify({ version: 1, status: "zero-domains" }, null, 2)}\n`, "utf8");
-    await writeFile(path.join(outputRoot, CONTEXT_PATH), synthesizeContextDocument(request.repository.repo, adapted, request.baseSha), "utf8");
+    await writeFile(path.join(outputRoot, CONTEXT_PATH), synthesizeContextDocument({ repositoryName: request.repository.repo, baseSha: request.baseSha, nodes: adapted.nodes, edges: adapted.edges, analyzedCodeFiles: adapted.analyzedFiles }), "utf8");
     await writeFile(
       path.join(outputRoot, METADATA_PATH),
       `${JSON.stringify({ version: 1, status: "complete", baseSha: request.baseSha }, null, 2)}\n`,

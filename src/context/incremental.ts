@@ -69,6 +69,17 @@ export interface IncrementalPatchInput {
    */
   readonly zeroDomains?: boolean;
   /**
+   * Present when the cached CONTEXT.md is SYNTHESIZED from the graph (the
+   * graphify mapper, #62): the patch regenerates it from the patched graph
+   * instead of carrying forward counts and a provenance sentence that
+   * describe the parent entry. Absent means carry forward verbatim, which is
+   * right for a hand- or agent-authored document.
+   */
+  readonly synthesizeContext?: (input: {
+    readonly graph: GraphLike;
+    readonly toSha: string;
+  }) => string;
+  /**
    * The scoped sub-map's knowledge graph — nodes and edges the mapper produced
    * for the delta paths at the NEW base. May be undefined when the scoped
    * session degraded; the patch then ships dropped-and-marked, and says so.
@@ -311,7 +322,18 @@ export async function patchEntryArtifacts(
     repinGraphDocument(domainDocument, input.delta.toSha, new Set());
     await writeGraph(path.join(input.stagingPath, DOMAIN_PATH), domainDocument as unknown as GraphLike);
   }
-  await copyFile(path.join(input.entryRoot, CONTEXT_PATH), path.join(input.stagingPath, CONTEXT_PATH));
+  if (input.synthesizeContext === undefined) {
+    await copyFile(path.join(input.entryRoot, CONTEXT_PATH), path.join(input.stagingPath, CONTEXT_PATH));
+  } else {
+    // A synthesized document must describe the PATCHED graph: regenerate it
+    // from the merged nodes and edges, or its counts and provenance sentence
+    // keep describing the parent entry forever (PR #116 review, round two).
+    await writeFile(
+      path.join(input.stagingPath, CONTEXT_PATH),
+      input.synthesizeContext({ graph: patched.graph, toSha: input.delta.toSha }),
+      "utf8",
+    );
+  }
   await writeFile(
     path.join(input.stagingPath, METADATA_PATH),
     `${JSON.stringify({ version: 1, status: "complete", baseSha: input.delta.toSha }, null, 2)}\n`,

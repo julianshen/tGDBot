@@ -27,7 +27,9 @@ import {
   ContextCacheConflictError,
   ContextCachePublicationInProgressError,
 } from "./cache.js";
+import { GRAPHIFY_MAPPER_VERSION, synthesizeContextDocument } from "./graphify-mapper.js";
 import { computeBaseDelta, mirrorGitRunner, type ClassifiedBaseDelta } from "./delta.js";
+import type { GraphLike as GraphifyGraphLike } from "./incremental.js";
 import { loadDomainStepPaths, patchEntryArtifacts } from "./incremental.js";
 import { contextCacheKeyForRepository, type ContextCacheKey, type ContextManifest } from "./types.js";
 import { withPreparedWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
@@ -664,6 +666,18 @@ export async function prepareReviewContext(
           ) as Parameters<typeof patchEntryArtifacts>[0]["scopedGraph"];
         }
       }
+      // A graphify entry's CONTEXT.md is synthesized from its graph, so the
+      // patch regenerates it from the merged result; a tgd entry's document
+      // is agent-authored and carries forward verbatim (#62).
+      const synthesizeContext = incremental.manifest.key.tgdVersion === GRAPHIFY_MAPPER_VERSION
+        ? (input: { readonly graph: GraphifyGraphLike; readonly toSha: string }): string =>
+          synthesizeContextDocument({
+            repositoryName: request.repository.repo,
+            baseSha: input.toSha,
+            nodes: input.graph.nodes as never,
+            edges: input.graph.edges as never,
+          })
+        : undefined;
       const patched = await patchEntryArtifacts({
         entryRoot: cache.entryPath(key),
         stagingPath,
@@ -671,6 +685,7 @@ export async function prepareReviewContext(
         delta: incremental.delta.delta,
         zeroDomains: incremental.zeroDomains,
         scopedMapRequired: deltaPaths.length > 0,
+        ...(synthesizeContext === undefined ? {} : { synthesizeContext }),
         ...(scopedGraph === undefined ? {} : { scopedGraph }),
       });
       onProgress({ stage: "map", status: "completed" });
