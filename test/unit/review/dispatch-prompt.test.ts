@@ -242,6 +242,37 @@ describe("the severity contract states a defensible bar", () => {
   });
 });
 
+// Issue #110: message length is a CONTRACT decision, not an emergent property.
+// Superpowers 6.0 measured -41% output size from a concise contract with
+// unchanged conclusions; #117's findingTextChars field is the instrument that
+// verifies the cap on real runs.
+describe("the message contract states a length budget", () => {
+  const agent = readFileSync(
+    fileURLToPath(new URL("../../../src/review/builtin-agents/reviewer.md", import.meta.url)),
+    "utf-8",
+  );
+
+  it("caps the message at ~120 words on both the dispatch contract and the reviewer agent", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/HARD CAP ~120 words/i);
+    expect(agent).toMatch(/HARD CAP ~120 words/i);
+  });
+
+  it("says what the cap excludes, so the budget is not spent on redundancy", () => {
+    for (const text of [FINDING_JSON_CONTRACT, agent]) {
+      expect(text).toMatch(/restating the rule/);
+      expect(text).toMatch(/the file name/);
+      expect(text).toMatch(/the title/);
+    }
+  });
+
+  // The cap must not invite truncating the one field where verbatim code is
+  // the whole point: suggestion semantics stay untouched.
+  it("leaves suggestion semantics untouched by the budget", () => {
+    expect(FINDING_JSON_CONTRACT).toMatch(/Verbatim code only/);
+    expect(agent).toMatch(/Verbatim code only/);
+  });
+});
+
 describe("buildDispatchPrompt trusted-base context", () => {
   it("embeds each rule's pack in its own task text", () => {
     const rules = [
