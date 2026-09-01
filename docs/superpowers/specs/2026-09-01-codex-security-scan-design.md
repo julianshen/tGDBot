@@ -288,16 +288,16 @@ is created `0o700`, and is removed after the findings are read unless
 rule dispatch:
 
 ```text
-withPreparedWorkspace( prepare + isolated clone ) → [codex scan] → dispatch rules → merge → dedup → publish
+withPreparedWorkspace( prepare + isolated clone ) → release lock → [codex scan] → dispatch rules → merge → dedup → publish
 ```
 
-**The scan runs INSIDE the repository lock, via `withPreparedWorkspace`** —
-not after a `prepareWorkspace` call. This is not a refinement; a scan outside
-the lock is incorrect. `prepareWorkspace` releases the lock before it returns,
-so two reviews on the same repository and base can have one running
-`reset --hard` / `clean -ffdx` over the shared worktree while the other reads
-it. Issue #78 already worked this out for structural checks, and its reasoning
-transfers exactly: an unlocked race was tolerable while readers produced
+**Preparation and the clone run INSIDE the repository lock, via
+`withPreparedWorkspace`; the scan itself runs after the lock is released.**
+Both halves matter. `prepareWorkspace` releases the lock before it returns, so
+reading the shared worktree afterwards lets another job run `reset --hard` /
+`clean -ffdx` mid-read — which is why the clone is taken under the lock. Issue
+#78 worked this out for structural checks, and its reasoning transfers: an
+unlocked race was tolerable while readers produced
 *context*, which is framed as untrusted and which a reader weighs, but a
 structural check derives a host-authored fact — "the one line a reader is
 invited to trust without re-deriving" — and a scan finding anchored to
@@ -339,9 +339,8 @@ leaving "isolated environment" to interpretation. `core.hooksPath` pointed at
 an empty directory for managed git invocations is the defense-in-depth layer
 underneath it, not the primary control.
 
-That changes the locking answer for the better. The clone is made **under**
-`withPreparedWorkspace`, and the lock is released before the scan itself runs.
-The clone is a private, immutable copy, so #78's hazard — a host-authored fact
+The clone is what lets the lock be released early rather than held for the
+scan's whole duration. It is a private, immutable copy, so #78's hazard — a host-authored fact
 derived from a tree another job can `reset --hard` underneath — is closed by
 construction rather than by serialising every other job on that repository for
 the scan's whole duration. `--codex-scan-timeout` no longer has to sit below
@@ -367,6 +366,8 @@ readonly scanCoverage?: {
   readonly deferred: readonly string[];
   /** How many deferred entries were reported in total, including unrenderable ones. */
   readonly deferredCount: number;
+  /** Findings the scan reported that the host could not map. Forces `partial`. */
+  readonly droppedFindings: number;
 };
 ```
 
@@ -395,9 +396,18 @@ So what crosses is bounded and inert:
 - **Reasons go to stderr**, with the rest of the raw scan output, where an
   operator can read them and no reader is asked to trust them.
 
-`"codex-security"` is a reserved rule name: `loadRulesForReview` rejects a
-user rule that claims it, the same way `planReviewWorkflow` already rejects
-duplicate rule names.
+`"codex-security"` is a reserved rule name **only while the scan is enabled**.
+With `--codex-scan on`, `loadRulesForReview` rejects a user rule claiming it,
+the same way `planReviewWorkflow` already rejects duplicate names.
+
+The gate is not a nicety. Reserving it unconditionally would mean that a
+repository which already has a valid rule by that name has it skipped, and a
+load error reported, **on the default path with the scan off** — changing the
+published review and the dispatched task text for someone who never enabled
+this feature. That is a direct breach of AC-1, and the kind of upgrade damage
+the dedup-hash rule already guards against elsewhere: a flag that is off must
+cost nothing. A collision is therefore surfaced only to the operator who turned
+the scan on, and it is their conflict to resolve.
 
 #### Conversation and verification need explicit handling
 
@@ -440,7 +450,7 @@ Field mapping, and what is deliberately refused:
 | SDK field | Treatment |
 |---|---|
 | *(none — host-owned)* | **`category` is set by the host to the constant `"security"`.** The gateway rejects any object without a string `category` (`dispatch-results.ts:192`), so an unset one silently drops every scan finding at the very boundary this design routes them through. It is host-owned rather than mapped from the scanner for the usual reason: a scanner-supplied category is prose, and `category` is rendered inside a code span. |
-| `severity.level` | Mapped into the closed `blocking \| warning \| suggestion` set. An unrecognized level **drops the severity mapping and the finding**, rather than defaulting — a mis-tiered security finding is worse than an absent one. |
+| `severity.level` | Mapped into the closed `blocking \| warning \| suggestion` set. An unrecognized level **drops the finding** rather than defaulting — a mis-tiered security finding is worse than an absent one — but never silently: see below. |
 | `locations[0].path`, `startLine` | `file` / `line`, re-anchored through `diff-anchors.ts`. A finding that cannot anchor inside the diff still posts, in the summary comment. |
 | `title` | `title`, subject to the existing ≤80-char one-line contract (ADR-008). |
 | finding body | `message`, subject to ADR-006 defanging in full: the `suggestion` info-string is neutralized like any other finding-derived text. |
@@ -448,6 +458,19 @@ Field mapping, and what is deliberately refused:
 | remediation text | **Never becomes `suggestion`.** ADR-007 permits a committable suggestion only from a validated field authorized by rule text. Codex remediation prose is not that, and a one-click commit button is the highest-consequence surface in the renderer. |
 | `claim` / `hostCheck` | Never accepted. `hostCheck` is host-computed by construction; accepting one from a scanner would forge the one part a reader is meant to trust without re-deriving. |
 | `codeEvidence`, `rootCause`, `attackPath`, … | Not carried in v1. `dependency-advisories.ts`'s rule stands: structured fields only, prose excluded rather than escaped. |
+
+**A dropped finding is accounted for, never absorbed.** Dropping an
+unmappable-severity finding while `rulesRun` records success and
+`completeness` stays `"complete"` publishes a zero-finding all-clear that omits
+a vulnerability the scanner actually reported — the manufactured clean bill of
+health this design refuses everywhere else, reached by a new route. A newer SDK
+adding a severity level is enough to trigger it.
+
+So any dropped finding forces `completeness` to at most `"partial"` and
+increments a host-computed `droppedFindings` count that the coverage section
+renders. The reader learns that the scan reported more than was shown, without
+being shown a value the host could not map. Same rule as `furtherAdvisories` in
+`dependency-advisories.ts`: reported, never absorbed.
 
 ### Coverage honesty
 
@@ -846,6 +869,12 @@ wins and the AC is the bug**.
 - **AC-25** Given a worker whose stdout exceeds the byte cap, when the parent
   reads it, then the read is abandoned at the cap, the run reports the
   too-much-output phrase, and the parent's memory use stays bounded.
+- **AC-26** Given a repository with a user rule named `codex-security` and the
+  scan off, when a review runs, then the rule loads normally, no load error is
+  reported, and AC-1's byte-identical guarantee holds.
+- **AC-27** Given a scan returning one finding with an unrecognized severity,
+  when the review publishes, then `completeness` is not `"complete"` and
+  `droppedFindings` is 1.
 
 ## Open questions
 
