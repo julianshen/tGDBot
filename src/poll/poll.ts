@@ -1134,15 +1134,19 @@ async function planConversationReply(input: {
 
   const metadata = await loadReviewMetadata(item.event.reviewNumber, options);
   if (metadata === undefined) return { status: "transient" };
-  const rules = await loadActiveRules(item.event.reviewNumber, metadata, options);
-  if (rules.error !== undefined) {
-    console.warn(`tgd-review-agent: conversation rule loading failed (${rules.error.message})`);
-    return { status: "transient" };
+  const importedScanFinding = resolution.ledger.reviewOptions.codexScanResults === true &&
+    resolution.ledger.finding.ruleName === "codex-security";
+  let currentRule: RuleDefinition | undefined;
+  if (importedScanFinding) {
+    currentRule = CODEX_SECURITY_POLICY;
+  } else {
+    const rules = await loadActiveRules(item.event.reviewNumber, metadata, options);
+    if (rules.error !== undefined) {
+      console.warn(`tgd-review-agent: conversation rule loading failed (${rules.error.message})`);
+      return { status: "transient" };
+    }
+    currentRule = rules.rules.find((rule) => rule.name === resolution.ledger.finding.ruleName);
   }
-  const currentRule = resolution.ledger.reviewOptions.codexScanResults === true &&
-      resolution.ledger.finding.ruleName === "codex-security"
-    ? CODEX_SECURITY_POLICY
-    : rules.rules.find((rule) => rule.name === resolution.ledger.finding.ruleName);
   if (currentRule === undefined) {
     return { status: "ready", plan: { kind: "inactive", ruleName: resolution.ledger.finding.ruleName } };
   }
@@ -2753,7 +2757,14 @@ async function queueVerifications(input: {
   const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
   if (metadata === undefined) return holdAll;
 
-  const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
+  const needsRules = queue.some((pending) => {
+    const ledger = findings.find((entry) => entry.id === pending.findingId);
+    return ledger !== undefined && !(ledger.reviewOptions.codexScanResults === true &&
+      ledger.finding.ruleName === "codex-security");
+  });
+  const rules = needsRules
+    ? await loadActiveRules(input.reviewNumber, metadata, input.options)
+    : { rules: [] as readonly RuleDefinition[] };
   if (rules.error !== undefined) {
     // A LOAD failure, not a verdict that the rules are gone.
     console.warn(`tgd-review-agent: verification rule loading failed (${rules.error.message})`);

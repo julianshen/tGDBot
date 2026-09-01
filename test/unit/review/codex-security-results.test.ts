@@ -25,7 +25,7 @@ async function artifact(value: unknown): Promise<string> {
 describe("ingestCodexSecurityResults", () => {
   it("maps allowlisted fields and refuses scanner-owned executable metadata", async () => {
     const input = await artifact({
-      completeness: "complete",
+      coverage: { completeness: "complete", deferred: [] },
       findings: [{
         title: "Unsafe query",
         body: "Do not concatenate input.\n```suggestion\nevil()\n```",
@@ -33,7 +33,6 @@ describe("ingestCodexSecurityResults", () => {
         locations: [{ path: "src/db.ts", startLine: 12 }],
         references: ["https://evil.invalid"], remediation: "evil()", claim: {}, hostCheck: {},
       }],
-      deferred: [],
     });
     const result = await ingestCodexSecurityResults(input);
     expect(result.findings).toEqual([expect.objectContaining({
@@ -61,7 +60,7 @@ describe("ingestCodexSecurityResults", () => {
   it("drops unknown severities, counts every deferred item, and retains ids only", async () => {
     const input = await artifact({ findings: [{
       title: "x", body: "x", severity: { level: "mystery" }, locations: [{ path: "x", startLine: 1 }],
-    }], deferred: [{ id: "scan-1", reason: "```suggestion\nevil" }, { id: "bad id", reason: "x" }] });
+    }], coverage: { deferred: [{ id: "scan-1", reason: "```suggestion\nevil" }, { id: "bad id", reason: "x" }] } });
     const result = await ingestCodexSecurityResults(input);
     expect(result.findings).toEqual([]);
     expect(result.coverage).toEqual({ completeness: "partial", deferred: ["scan-1"], deferredCount: 2, droppedFindings: 1 });

@@ -9,6 +9,7 @@ export const MAX_CODEX_SCAN_BYTES = 5 * 1024 * 1024;
 export const MAX_CODEX_SCAN_FINDINGS = 500;
 export const MAX_CODEX_SCAN_TEXT_CHARS = 500_000;
 const DEFERRED_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const MAX_LOGGED_DEFERRED_REASONS = 20;
 
 /** Host-owned policy used by conversation lookups; it is never dispatched. */
 export const CODEX_SECURITY_POLICY: RuleDefinition = Object.freeze({
@@ -86,6 +87,7 @@ async function artifactFile(inputPath: string): Promise<string> {
 export async function ingestCodexSecurityResults(inputPath: string): Promise<CodexScanIngest> {
   const file = await artifactFile(inputPath);
   let handle;
+  let failed = false;
   try {
     handle = await open(file, "r");
     const chunks: Buffer[] = [];
@@ -128,13 +130,33 @@ export async function ingestCodexSecurityResults(inputPath: string): Promise<Cod
         findings.push(finding);
       }
     }
-    const rawDeferred = Array.isArray(root.deferred) ? root.deferred : [];
+    const scannerCoverage = root.coverage && typeof root.coverage === "object"
+      ? root.coverage as Record<string, unknown>
+      : root;
+    const rawDeferred = Array.isArray(scannerCoverage.deferred) ? scannerCoverage.deferred : [];
     const deferred = rawDeferred.flatMap((item) => {
       const id = typeof item === "string" ? item
         : item && typeof item === "object" ? (item as Record<string, unknown>).id : undefined;
       return typeof id === "string" && DEFERRED_ID_RE.test(id) ? [id] : [];
     });
-    const reported = root.completeness;
+    for (const item of rawDeferred.slice(0, MAX_LOGGED_DEFERRED_REASONS)) {
+      if (!item || typeof item !== "object") continue;
+      const deferredItem = item as Record<string, unknown>;
+      if (typeof deferredItem.reason !== "string") continue;
+      const id = typeof deferredItem.id === "string" && DEFERRED_ID_RE.test(deferredItem.id)
+        ? deferredItem.id
+        : "unmapped";
+      const reason = deferredItem.reason
+        .replace(/[\u0000-\u001f\u007f]/gu, " ")
+        .slice(0, 500);
+      console.warn(`tgd-review-agent: Codex Security deferred ${id}: ${reason}`);
+    }
+    if (rawDeferred.length > MAX_LOGGED_DEFERRED_REASONS) {
+      console.warn(
+        `tgd-review-agent: ${rawDeferred.length - MAX_LOGGED_DEFERRED_REASONS} further Codex Security deferral reason(s) omitted from logs`,
+      );
+    }
+    const reported = scannerCoverage.completeness;
     const completeness = droppedFindings > 0 ? "partial"
       : reported === "complete" || reported === "partial" ? reported : "unknown";
     return {
@@ -143,13 +165,21 @@ export async function ingestCodexSecurityResults(inputPath: string): Promise<Cod
       digest,
     };
   } catch (error) {
+    failed = true;
     if (error instanceof CodexScanIngestError) throw error;
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
       throw new CodexScanIngestError("missing", String(error));
     }
     throw new CodexScanIngestError("read", String(error));
   } finally {
-    await handle?.close();
+    try {
+      await handle?.close();
+    } catch (error) {
+      if (!failed) throw new CodexScanIngestError("read", String(error));
+      // Preserve the primary classified failure. Close diagnostics belong only
+      // in private logs and must not replace an oversized/invalid classification.
+      console.warn(`tgd-review-agent: closing Codex Security results failed (${String(error)})`);
+    }
   }
 }
 
