@@ -81,7 +81,7 @@ import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
-import { codexScanFailureReason, ingestCodexSecurityResults } from "./review/codex-security-results.js";
+import { codexScanArtifactDigest, codexScanFailureReason, ingestCodexSecurityResults } from "./review/codex-security-results.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
@@ -229,6 +229,8 @@ export interface ReviewDependencies {
   ) => OrchestrationResult;
   createStateStore?: typeof createConversationStateStore;
   publicationHooks?: PublicationExecutorHooks;
+  /** Reads the untrusted external artifact; injected so tests never touch disk. */
+  ingestCodexSecurityResults?: typeof ingestCodexSecurityResults;
   /**
    * Prepares trusted-base repository context. Injectable so a review test
    * never has to build a git worktree or start a mapping session — the same
@@ -333,6 +335,7 @@ function reviewOptionsSnapshot(config: ResolvedConfig): FindingReviewOptions {
     trustLocalRules: config.trustLocalRules,
     rulesDir: config.rulesDir,
     dispatch: config.dispatch,
+    ...(config.codexScanResults === undefined ? {} : { codexScanResults: true as const }),
     ...(config.model === undefined ? {} : { model: config.model }),
   };
 }
@@ -966,6 +969,7 @@ export async function review(
   const fetchJsonFn = deps.fetchJson ?? fetchJsonReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
   const publicationHooks = deps.publicationHooks;
+  const ingestScanResults = deps.ingestCodexSecurityResults ?? ingestCodexSecurityResults;
   const now = deps.now ?? (() => new Date().toISOString());
 
   const config = resolveConfigFn(args);
@@ -1112,7 +1116,7 @@ export async function review(
   let scanIngestError: unknown;
   if (config.codexScanResults !== undefined) {
     try {
-      scanIngest = await ingestCodexSecurityResults(config.codexScanResults);
+      scanIngest = await ingestScanResults(config.codexScanResults);
     } catch (error) {
       scanIngestError = error;
       console.warn(`tgd-review-agent: Codex Security ingest failed: ${redactedMessage(error)}`);
@@ -1130,7 +1134,7 @@ export async function review(
     ...(contextIdentity === undefined ? [undefined] : [contextIdentity]),
     ...(config.codexScanResults === undefined
       ? []
-      : [`${path.resolve(config.codexScanResults)}:${scanIngest?.digest ?? "failed"}`]),
+      : [`${path.resolve(config.codexScanResults)}:${scanIngest?.digest ?? codexScanArtifactDigest(scanIngestError) ?? "unreadable"}`]),
   );
   const storeBinding = storeBindingOf(stateStore, repository);
   const publicationIdentity = reviewPublicationIdentity({
@@ -1291,6 +1295,14 @@ export async function review(
     ? loadedRules.rules
     : loadedRules.rules.filter((rule) => rule.name !== "codex-security");
   const loadErrors = [...loadedRules.errors];
+  if (config.codexScanResults !== undefined) {
+    for (const reserved of loadedRules.rules.filter((rule) => rule.name === "codex-security")) {
+      loadErrors.push({
+        sourcePath: reserved.sourcePath,
+        message: 'rule name "codex-security" is reserved while --codex-scan-results is set',
+      });
+    }
+  }
 
   // Task 8 review fix #1: surface load errors via console.error whenever
   // ANY rule file failed to load — not just when every rule failed. A
@@ -1304,7 +1316,7 @@ export async function review(
   }
 
   // AC-8.5: every rule failed to load -> exit 1 before any VCS write.
-  if (rules.length === 0) {
+  if (rules.length === 0 && config.codexScanResults === undefined) {
     console.error("tgd-review-agent: no rules could be loaded; aborting before posting a comment");
     return EXIT_FATAL;
   }
@@ -1606,17 +1618,19 @@ export async function review(
         ...(item.state === undefined ? {} : { state: item.state }),
       })),
     });
-  const dispatchResult = await dispatchRulesFn({
-    rules,
-    diff,
-    useAdvisor: config.advisor === "on",
-    orchestratorModel: config.model,
-    ...(contextPacks === undefined ? {} : { contextPacks }),
-    ...(loadedContext.conversationContext === undefined
-      ? {}
-      : { conversationContext: loadedContext.conversationContext }),
-    ...(prIntent === undefined ? {} : { prIntent }),
-  });
+  const dispatchResult: DispatchResult = rules.length === 0
+    ? { findings: [], rulesRun: [], rulesFailed: [] }
+    : await dispatchRulesFn({
+        rules,
+        diff,
+        useAdvisor: config.advisor === "on",
+        orchestratorModel: config.model,
+        ...(contextPacks === undefined ? {} : { contextPacks }),
+        ...(loadedContext.conversationContext === undefined
+          ? {}
+          : { conversationContext: loadedContext.conversationContext }),
+        ...(prIntent === undefined ? {} : { prIntent }),
+      });
   if (config.codexScanResults !== undefined) {
     if (scanIngest !== undefined) {
       dispatchResult.findings.push(...scanIngest.findings);

@@ -286,6 +286,8 @@ export interface FindingReviewOptions {
   readonly rulesDir: string;
   readonly model?: string;
   readonly dispatch: "direct" | "legacy";
+  /** The run reserved codex-security for host-owned imported findings. */
+  readonly codexScanResults?: true;
 }
 
 export interface FindingLedgerEntry {
@@ -1316,12 +1318,15 @@ function findingSnapshot(value: unknown, name: string): FindingSnapshot {
 
 function findingReviewOptions(value: unknown, name: string): FindingReviewOptions {
   const object = exact(value, name, ["advisor", "suggestions", "disableBuiltinRule", "trustLocalRules", "rulesDir", "dispatch"],
-    ["model"]);
+    ["model", "codexScanResults"]);
   if (object.advisor !== "on" && object.advisor !== "off") throw new Error(`${name}.advisor is invalid`);
   if (object.suggestions !== "on" && object.suggestions !== "off") throw new Error(`${name}.suggestions is invalid`);
   if (typeof object.disableBuiltinRule !== "boolean") throw new Error(`${name}.disableBuiltinRule must be boolean`);
   if (typeof object.trustLocalRules !== "boolean") throw new Error(`${name}.trustLocalRules must be boolean`);
   if (object.dispatch !== "direct" && object.dispatch !== "legacy") throw new Error(`${name}.dispatch is invalid`);
+  if (object.codexScanResults !== undefined && object.codexScanResults !== true) {
+    throw new Error(`${name}.codexScanResults is invalid`);
+  }
   return {
     advisor: object.advisor,
     suggestions: object.suggestions,
@@ -1329,6 +1334,7 @@ function findingReviewOptions(value: unknown, name: string): FindingReviewOption
     trustLocalRules: object.trustLocalRules,
     rulesDir: text(object.rulesDir, `${name}.rulesDir`, 4_096),
     dispatch: object.dispatch,
+    ...(object.codexScanResults === true ? { codexScanResults: true as const } : {}),
     ...(object.model === undefined ? {} : { model: text(object.model, `${name}.model`, 256) }),
   };
 }

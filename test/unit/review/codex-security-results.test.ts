@@ -6,6 +6,7 @@ import {
   MAX_CODEX_SCAN_BYTES,
   ingestCodexSecurityResults,
 } from "../../../src/review/codex-security-results.js";
+import { renderSummaryComment } from "../../../src/review/comment-format.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -44,6 +45,17 @@ describe("ingestCodexSecurityResults", () => {
     expect(result.findings[0]).not.toHaveProperty("claim");
     expect(result.findings[0]).not.toHaveProperty("hostCheck");
     expect(result.coverage.completeness).toBe("complete");
+    const rendered = renderSummaryComment({
+      allFindings: result.findings,
+      inlineCount: 0,
+      unanchored: result.findings,
+      filesReviewed: ["src/db.ts"],
+      rulesRun: ["codex-security"],
+      rulesFailed: [],
+      scanCoverage: result.coverage,
+    });
+    expect(rendered).not.toContain("```suggestion");
+    expect(rendered).toContain("```text");
   });
 
   it("drops unknown severities, counts every deferred item, and retains ids only", async () => {
@@ -53,11 +65,30 @@ describe("ingestCodexSecurityResults", () => {
     const result = await ingestCodexSecurityResults(input);
     expect(result.findings).toEqual([]);
     expect(result.coverage).toEqual({ completeness: "partial", deferred: ["scan-1"], deferredCount: 2, droppedFindings: 1 });
+    const rendered = renderSummaryComment({
+      allFindings: [], inlineCount: 0, unanchored: [], filesReviewed: [],
+      rulesRun: ["codex-security"], rulesFailed: [], scanCoverage: result.coverage,
+    });
+    expect(rendered).toContain("coverage is **partial**");
+    expect(rendered).toContain("absence of security findings is not an all-clear");
+    expect(rendered).not.toContain("suggestion");
+    expect(rendered).not.toContain("evil");
   });
 
-  it("rejects an artifact before reading it when it exceeds the byte cap", async () => {
+  it("abandons an artifact at the byte cap before parsing it", async () => {
     const file = await artifact({ findings: [] });
     await writeFile(path.join(file, "findings.json"), Buffer.alloc(MAX_CODEX_SCAN_BYTES + 1));
     await expect(ingestCodexSecurityResults(file)).rejects.toMatchObject({ kind: "too-large" });
+  });
+
+  it("keeps scanner titles only when they satisfy the one-line 80-char contract", async () => {
+    const input = await artifact({ findings: [{
+      title: `bad\n${"x".repeat(81)}`,
+      body: "body",
+      severity: { level: "low" },
+      locations: [{ path: "x.ts", startLine: 1 }],
+    }] });
+    const result = await ingestCodexSecurityResults(input);
+    expect(result.findings[0]).not.toHaveProperty("title");
   });
 });

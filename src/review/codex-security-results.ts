@@ -3,11 +3,20 @@ import { open, stat } from "node:fs/promises";
 import path from "node:path";
 import { normalizeUnknownFinding } from "./dispatch-results.js";
 import type { Finding, ScanCoverage } from "./types.js";
+import type { RuleDefinition } from "../rules/types.js";
 
 export const MAX_CODEX_SCAN_BYTES = 5 * 1024 * 1024;
 export const MAX_CODEX_SCAN_FINDINGS = 500;
 export const MAX_CODEX_SCAN_TEXT_CHARS = 500_000;
 const DEFERRED_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+
+/** Host-owned policy used by conversation lookups; it is never dispatched. */
+export const CODEX_SECURITY_POLICY: RuleDefinition = Object.freeze({
+  name: "codex-security",
+  dependsOn: Object.freeze([]),
+  body: "This finding was imported from a separately produced Codex Security artifact. Explain it using the recorded finding and current code; do not invent scanner evidence.",
+  sourcePath: "<host:codex-security>",
+});
 
 export interface CodexScanIngest {
   readonly findings: Finding[];
@@ -16,7 +25,11 @@ export interface CodexScanIngest {
 }
 
 export class CodexScanIngestError extends Error {
-  constructor(readonly kind: "missing" | "read" | "too-large" | "invalid", message?: string) {
+  constructor(
+    readonly kind: "missing" | "read" | "too-large" | "invalid",
+    message?: string,
+    readonly artifactDigest?: string,
+  ) {
     super(message ?? kind);
     this.name = "CodexScanIngestError";
   }
@@ -47,13 +60,16 @@ function mapFinding(value: unknown): Finding | undefined {
   if (severity === undefined || typeof location?.path !== "string" || message === undefined) {
     return undefined;
   }
+  const title = typeof raw.title === "string" && raw.title.length <= 80 && !/[\r\n]/u.test(raw.title)
+    ? raw.title
+    : undefined;
   return normalizeUnknownFinding({
     file: location.path,
     line: Number.isInteger(location.startLine) ? location.startLine : undefined,
     severity,
     category: "security",
     message,
-    title: typeof raw.title === "string" ? raw.title : undefined,
+    ...(title === undefined ? {} : { title }),
     ruleName: "codex-security",
   });
 }
@@ -72,17 +88,32 @@ export async function ingestCodexSecurityResults(inputPath: string): Promise<Cod
   let handle;
   try {
     handle = await open(file, "r");
-    const info = await handle.stat();
-    if (info.size > MAX_CODEX_SCAN_BYTES) throw new CodexScanIngestError("too-large");
-    const buffer = Buffer.alloc(Number(info.size));
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (bytesRead !== buffer.length) throw new CodexScanIngestError("read", "short read");
+    const chunks: Buffer[] = [];
+    let total = 0;
+    const artifactHash = createHash("sha256");
+    for (;;) {
+      // Read one byte beyond the limit so the cap is enforced by the read,
+      // rather than trusting mutable stat metadata (the artifact is untrusted).
+      const chunk = Buffer.alloc(Math.min(64 * 1024, MAX_CODEX_SCAN_BYTES + 1 - total));
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      artifactHash.update(chunk.subarray(0, bytesRead));
+      if (total > MAX_CODEX_SCAN_BYTES) {
+        throw new CodexScanIngestError("too-large", undefined, artifactHash.digest("hex"));
+      }
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    const buffer = Buffer.concat(chunks, total);
+    const digest = artifactHash.digest("hex");
     const text = buffer.toString("utf8");
     let document: unknown;
     try { document = JSON.parse(text); } catch (error) {
-      throw new CodexScanIngestError("invalid", String(error));
+      throw new CodexScanIngestError("invalid", String(error), digest);
     }
-    if (!document || typeof document !== "object") throw new CodexScanIngestError("invalid");
+    if (!document || typeof document !== "object") {
+      throw new CodexScanIngestError("invalid", undefined, digest);
+    }
     const root = document as Record<string, unknown>;
     const rawFindings = Array.isArray(root.findings) ? root.findings : [];
     const findings: Finding[] = [];
@@ -109,10 +140,13 @@ export async function ingestCodexSecurityResults(inputPath: string): Promise<Cod
     return {
       findings,
       coverage: { completeness, deferred, deferredCount: rawDeferred.length, droppedFindings },
-      digest: createHash("sha256").update(buffer).digest("hex"),
+      digest,
     };
   } catch (error) {
     if (error instanceof CodexScanIngestError) throw error;
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      throw new CodexScanIngestError("missing", String(error));
+    }
     throw new CodexScanIngestError("read", String(error));
   } finally {
     await handle?.close();
@@ -125,4 +159,8 @@ export function codexScanFailureReason(error: unknown): string {
   if (error.kind === "too-large") return "the scan results were too large";
   if (error.kind === "read") return "the scan results could not be read";
   return "the scan results could not be ingested";
+}
+
+export function codexScanArtifactDigest(error: unknown): string | undefined {
+  return error instanceof CodexScanIngestError ? error.artifactDigest : undefined;
 }
