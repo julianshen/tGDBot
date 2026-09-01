@@ -97,6 +97,7 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
   return {
     pr: "42",
     vcs: "github",
+    contextMapper: "tgd",
     rulesDir: ".review/rules",
     disableBuiltinRule: false,
     advisor: "on",

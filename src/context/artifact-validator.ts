@@ -27,7 +27,7 @@ const NODE_TYPES = new Set([
   "pipeline", "schema", "resource", "domain", "flow", "step", "article", "entity", "topic", "claim", "source",
 ]);
 const DOMAIN_NODE_TYPES = new Set(["domain", "flow", "step"]);
-const EDGE_TYPES = new Set([
+export const EDGE_TYPES = new Set([
   "imports", "exports", "contains", "inherits", "implements", "calls", "subscribes", "publishes", "middleware",
   "reads_from", "writes_to", "transforms", "validates", "depends_on", "tested_by", "configures", "related",
   "similar_to", "deploys", "serves", "provisions", "triggers", "migrates", "documents", "routes",
@@ -39,7 +39,10 @@ const DIRECTIONS = new Set(["forward", "backward", "bidirectional"]);
 const COMPLEXITIES = new Set(["simple", "moderate", "complex"]);
 const ENTRY_TYPES = new Set(["http", "cli", "event", "cron", "manual"]);
 /** Caps any single parsed JSON artifact at 64 MiB to bound local CLI memory use. */
-const MAX_JSON_ARTIFACT_BYTES = 64 * 1024 * 1024;
+// Exported for mappers to bound their own reads to the same ceiling —
+// a mapper that reads an unbounded graph.json exhausts the heap before
+// validation ever runs (PR #116 review).
+export const MAX_JSON_ARTIFACT_BYTES = 64 * 1024 * 1024;
 
 export class ContextValidationError extends Error {
   constructor(message: string, options?: ErrorOptions) {

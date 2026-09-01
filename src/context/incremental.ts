@@ -27,7 +27,9 @@
 // header says so. A reviewer who knows a node is stale can weigh it; a
 // reviewer given a silently-outdated graph as trusted context cannot.
 
+import { Buffer } from "node:buffer";
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { MAX_JSON_ARTIFACT_BYTES } from "./artifact-validator.js";
 import path from "node:path";
 import { CONTEXT_PATH, DOMAIN_PATH, KNOWLEDGE_PATH, METADATA_PATH, ZERO_DOMAINS_PATH } from "./artifact-paths.js";
 import type { BaseDelta } from "./delta.js";
@@ -68,6 +70,17 @@ export interface IncrementalPatchInput {
    * repin, and the knowledge graph is patched exactly as always.
    */
   readonly zeroDomains?: boolean;
+  /**
+   * Present when the cached CONTEXT.md is SYNTHESIZED from the graph (the
+   * graphify mapper, #62): the patch regenerates it from the patched graph
+   * instead of carrying forward counts and a provenance sentence that
+   * describe the parent entry. Absent means carry forward verbatim, which is
+   * right for a hand- or agent-authored document.
+   */
+  readonly synthesizeContext?: (input: {
+    readonly graph: GraphLike;
+    readonly toSha: string;
+  }) => string;
   /**
    * The scoped sub-map's knowledge graph — nodes and edges the mapper produced
    * for the delta paths at the NEW base. May be undefined when the scoped
@@ -150,8 +163,18 @@ async function readGraph(graphPath: string): Promise<GraphLike> {
 }
 
 async function writeGraph(graphPath: string, graph: GraphLike): Promise<void> {
+  // Serialized COMPACTLY and bounded before writing: pretty-printing added
+  // enough whitespace that a graph whose compact form sat just under the
+  // validator's ceiling crossed it on the next incremental rewrite, and
+  // every later patch then failed publication the same way (PR #116 review,
+  // round two). The error is deliberately a clear failure, not a silent
+  // skip: prepare reports it and the review proceeds without context.
+  const serialized = `${JSON.stringify(graph)}\n`;
+  if (Buffer.byteLength(serialized, "utf8") > MAX_JSON_ARTIFACT_BYTES) {
+    throw new Error(`patched graph exceeds the ${MAX_JSON_ARTIFACT_BYTES}-byte safe-size limit; a full re-map is required`);
+  }
   await mkdir(path.dirname(graphPath), { recursive: true });
-  await writeFile(graphPath, `${JSON.stringify(graph, null, 2)}\n`, "utf8");
+  await writeFile(graphPath, serialized, "utf8");
 }
 
 /**
@@ -162,7 +185,7 @@ export function patchKnowledgeGraph(
   cached: GraphLike,
   delta: BaseDelta,
   scopedGraph: GraphLike | undefined,
-): { graph: GraphLike; staleMarked: number; merged: number } {
+): { graph: GraphLike; droppedIds: ReadonlySet<string>; staleMarked: number; merged: number } {
   const changedPaths = new Set<string>(
     [...delta.added, ...delta.changed, ...delta.deleted]
       .map((filePath) => normalizePath(filePath))
@@ -226,6 +249,7 @@ export function patchKnowledgeGraph(
 
   return {
     graph: { nodes: [...nodes, ...scopedNodes], edges },
+    droppedIds,
     staleMarked,
     merged,
   };
@@ -276,16 +300,10 @@ export async function patchEntryArtifacts(
     input.delta,
     input.scopedGraph,
   );
-  const droppedIds = new Set(
-    (cachedKnowledgeDocument.nodes as Array<Record<string, unknown>>)
-      .map((node) => node.id)
-      .filter((id): id is string => typeof id === "string")
-      .filter((id) => !patched.graph.nodes.some((node) => node.id === id)),
-  );
   const knowledgeDocument = cachedKnowledgeDocument as Record<string, unknown>;
   knowledgeDocument.nodes = patched.graph.nodes;
   knowledgeDocument.edges = patched.graph.edges;
-  repinGraphDocument(knowledgeDocument, input.delta.toSha, droppedIds);
+  repinGraphDocument(knowledgeDocument, input.delta.toSha, patched.droppedIds);
   // Written from the FULL document — project, layers and tour travel with it
   // — not the trimmed nodes/edges pair.
   await writeGraph(path.join(input.stagingPath, KNOWLEDGE_PATH), knowledgeDocument as unknown as GraphLike);
@@ -311,7 +329,18 @@ export async function patchEntryArtifacts(
     repinGraphDocument(domainDocument, input.delta.toSha, new Set());
     await writeGraph(path.join(input.stagingPath, DOMAIN_PATH), domainDocument as unknown as GraphLike);
   }
-  await copyFile(path.join(input.entryRoot, CONTEXT_PATH), path.join(input.stagingPath, CONTEXT_PATH));
+  if (input.synthesizeContext === undefined) {
+    await copyFile(path.join(input.entryRoot, CONTEXT_PATH), path.join(input.stagingPath, CONTEXT_PATH));
+  } else {
+    // A synthesized document must describe the PATCHED graph: regenerate it
+    // from the merged nodes and edges, or its counts and provenance sentence
+    // keep describing the parent entry forever (PR #116 review, round two).
+    await writeFile(
+      path.join(input.stagingPath, CONTEXT_PATH),
+      input.synthesizeContext({ graph: patched.graph, toSha: input.delta.toSha }),
+      "utf8",
+    );
+  }
   await writeFile(
     path.join(input.stagingPath, METADATA_PATH),
     `${JSON.stringify({ version: 1, status: "complete", baseSha: input.delta.toSha }, null, 2)}\n`,

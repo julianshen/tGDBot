@@ -14,6 +14,7 @@ import {
   METADATA_PATH,
   ZERO_DOMAINS_PATH,
 } from "../../../src/context/artifact-paths.js";
+import { MAX_JSON_ARTIFACT_BYTES } from "../../../src/context/artifact-validator.js";
 import type { BaseDelta } from "../../../src/context/delta.js";
 
 const FROM = "a".repeat(40);
@@ -325,6 +326,89 @@ describe("patchKnowledgeGraph — review round two (PR #107)", () => {
 });
 
 describe("patchEntryArtifacts — degradation only when a scoped map was required (PR #107 review, round three)", () => {
+  it("regenerates a synthesized context document instead of carrying stale counts forward", async () => {
+    const entryRoot = await tempRoot("incremental-synth-");
+    const stagingPath = await tempRoot("incremental-synth-stage-");
+    await mkdir(path.join(entryRoot, ".understand-anything"), { recursive: true });
+    await writeFile(path.join(entryRoot, KNOWLEDGE_PATH), JSON.stringify(
+      knowledgeGraph([node("fn:kept", "src/kept.ts")], []),
+    ));
+    await writeFile(path.join(entryRoot, DOMAIN_PATH), JSON.stringify({
+      version: "1.0.0", project: { name: "octo-repo", gitCommitHash: FROM }, nodes: [], edges: [], layers: [], tour: [],
+    }));
+    // The parent's document names the OLD base commit and its counts.
+    await writeFile(path.join(entryRoot, CONTEXT_PATH), `# old\nfrom the base commit ${FROM}\n`, "utf8");
+
+    await patchEntryArtifacts({
+      entryRoot,
+      stagingPath,
+      manifest: { builtFromSha: FROM },
+      // Deletion-only: the kept node survives, so the regenerated counts
+      // describe it.
+      delta: delta({ deleted: ["src/gone.ts"] }),
+      scopedMapRequired: false,
+      synthesizeContext: ({ graph, toSha }) => [
+        `# regenerated for ${toSha}`,
+        `nodes: ${graph.nodes.length}, edges: ${graph.edges.length}`,
+      ].join("\n"),
+    });
+
+    const context = await readFile(path.join(stagingPath, CONTEXT_PATH), "utf8");
+    expect(context).toContain(`regenerated for ${TO}`);
+    expect(context).toContain("nodes: 1");
+    expect(context).not.toContain(FROM);
+  });
+
+  it("carries a non-synthesized context document forward verbatim", async () => {
+    const entryRoot = await tempRoot("incremental-verb-");
+    const stagingPath = await tempRoot("incremental-verb-stage-");
+    await mkdir(path.join(entryRoot, ".understand-anything"), { recursive: true });
+    await writeFile(path.join(entryRoot, KNOWLEDGE_PATH), JSON.stringify(
+      knowledgeGraph([node("fn:kept", "src/kept.ts")], []),
+    ));
+    await writeFile(path.join(entryRoot, DOMAIN_PATH), JSON.stringify({
+      version: "1.0.0", project: { name: "octo-repo", gitCommitHash: FROM }, nodes: [], edges: [], layers: [], tour: [],
+    }));
+    await writeFile(path.join(entryRoot, CONTEXT_PATH), "# hand-authored prose\n", "utf8");
+
+    await patchEntryArtifacts({
+      entryRoot,
+      stagingPath,
+      manifest: { builtFromSha: FROM },
+      delta: delta({ changed: ["src/kept.ts"] }),
+    });
+
+    await expect(readFile(path.join(stagingPath, CONTEXT_PATH), "utf8")).resolves.toBe("# hand-authored prose\n");
+  });
+
+  it("fails a patched graph whose serialization crosses the safe-size limit", async () => {
+    const entryRoot = await tempRoot("incremental-big-");
+    const stagingPath = await tempRoot("incremental-big-stage-");
+    await mkdir(path.join(entryRoot, ".understand-anything"), { recursive: true });
+    // A graph whose COMPACT form is just under the ceiling but whose
+    // pretty-printed form crosses it: the bound is on the compact bytes.
+    const bigLabel = "x".repeat(400);
+    const nodes = Array.from(
+      { length: Math.ceil(MAX_JSON_ARTIFACT_BYTES / 500) },
+      (_, index) => node(`fn:${index}-${bigLabel.slice(0, 60)}-${index}`, `src/f-${index}.ts`),
+    ).map((n) => ({ ...n, summary: bigLabel }));
+    await writeFile(path.join(entryRoot, KNOWLEDGE_PATH), JSON.stringify(
+      { nodes, edges: [], layers: [], tour: [], project: { gitCommitHash: FROM } },
+    ));
+    await writeFile(path.join(entryRoot, DOMAIN_PATH), JSON.stringify({
+      version: "1.0.0", project: { name: "octo-repo", gitCommitHash: FROM }, nodes: [], edges: [], layers: [], tour: [],
+    }));
+    await writeFile(path.join(entryRoot, CONTEXT_PATH), "# c\n", "utf8");
+
+    await expect(patchEntryArtifacts({
+      entryRoot,
+      stagingPath,
+      manifest: { builtFromSha: FROM },
+      delta: delta({ deleted: ["src/gone.ts"] }),
+      scopedMapRequired: false,
+    })).rejects.toThrow(/safe-size limit/);
+  });
+
   it("does not degrade a deletion-only delta that legitimately ran no scoped map", async () => {
     const entryRoot = await tempRoot("incremental-del-");
     const stagingPath = await tempRoot("incremental-del-stage-");

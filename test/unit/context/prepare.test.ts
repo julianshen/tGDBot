@@ -1,4 +1,4 @@
-import { chmod, chown, mkdir, mkdtemp, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { chmod, chown, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -13,6 +13,7 @@ import {
   contextFingerprint,
   prepareReviewContext,
 } from "../../../src/context/prepare.js";
+import { GRAPHIFY_MAPPER_VERSION } from "../../../src/context/graphify-mapper.js";
 import type { ContextManifest } from "../../../src/context/types.js";
 import type { ContextMapRequest, ContextMapper, MappingResult } from "../../../src/context/mapper.js";
 import type { PrepareContextDependencies } from "../../../src/context/prepare.js";
@@ -1286,6 +1287,46 @@ describe("prepareReviewContext — the warm index (#60)", () => {
     expect(patched.generation).toBe(1);
   });
 
+  // PR #116 review, round two: a graphify entry's CONTEXT.md is synthesized
+  // from its graph, so the patch must regenerate it - a carried-forward copy
+  // keeps describing the parent entry's counts and base commit.
+  it("regenerates a graphify entry's synthesized context during the patch", async () => {
+    const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
+    const graphifyRequest = (baseSha: string): Parameters<typeof prepareReviewContext>[0] =>
+      ({ ...request, baseSha, mapperVersion: GRAPHIFY_MAPPER_VERSION } as unknown as Parameters<typeof prepareReviewContext>[0]);
+    // Warm the cache under the graphify mapper identity. The stub's own
+    // CONTEXT.md does NOT name a commit, so only regeneration can produce a
+    // document naming the new one.
+    await prepareReviewContext(graphifyRequest(BASE_SHA), {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => stubDomainMapper(),
+    });
+
+    const real = new ContextCache(request.cacheRoot as string);
+    const key = contextCacheKey({ repository, mapperVersion: GRAPHIFY_MAPPER_VERSION });
+    const parent = await real.lookupContext(key);
+    expect(parent).toBeDefined();
+    if (parent === undefined) return;
+    const entryPath = real.entryPath(key);
+    const parentContext = await readFile(path.join(entryPath, "CONTEXT.md"), "utf8");
+    expect(parentContext).not.toContain(`from the base commit ${NEW_SHA}`);
+
+    const mapper = stubDomainMapper();
+    const prepared = await prepareReviewContext(graphifyRequest(NEW_SHA), {
+      prepareWorkspace: stubWorkspace(worktree) as unknown as PrepareContextDependencies["prepareWorkspace"],
+      createMapper: () => mapper,
+      computeDelta: () => Promise.resolve(incrementalDelta()),
+    });
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") return;
+    expect(prepared.incremental).toBe(true);
+
+    // The published document names the NEW base commit - only regeneration
+    // can produce that.
+    const patchedContext = await readFile(path.join(entryPath, "CONTEXT.md"), "utf8");
+    expect(patchedContext).toContain(`from the base commit ${NEW_SHA}`);
+  });
+
   it("publishes the patch atomically with parent provenance and a new manifest hash", async () => {
     const { worktree, request } = await baseRequest({ baseSha: NEW_SHA });
     await warmCacheAtBase(request, BASE_SHA);
@@ -1309,5 +1350,23 @@ describe("prepareReviewContext — the warm index (#60)", () => {
     expect(patched.parentManifestHash).toBe(parent.manifestHash);
     expect(patched.generation).toBe(parent.generation + 1);
     expect(patched.manifestHash).not.toBe(parent.manifestHash);
+  });
+});
+
+// PR #116 review: the policy version exists so a rendering change re-reviews
+// an already-reviewed PR. Pin the bump that went with the #62 pack changes.
+describe("CONTEXT_POLICY_VERSION", () => {
+  it("was bumped for the #62 rendering changes, so old markers do not suppress re-review", () => {
+    expect(Number(CONTEXT_POLICY_VERSION)).toBeGreaterThanOrEqual(2);
+    // And it is the value the cache key and the fingerprint agree on.
+    const key = contextCacheKey({ repository });
+    expect(key.policyVersion).toBe(CONTEXT_POLICY_VERSION);
+    const fingerprintWith = contextFingerprint({
+      mode: "auto",
+      baseSha: BASE_SHA,
+      allowDegraded: false,
+      mapperVersion: "x",
+    });
+    expect(fingerprintWith).toBeTypeOf("string");
   });
 });

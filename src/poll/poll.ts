@@ -910,6 +910,9 @@ function isReviewCommand(command: ConversationCommand): command is
 function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): ReviewCommandArgs {
   return {
     pr: String(reviewNumber),
+    // The operator's --context-mapper selection carries through to reviews
+    // poll dispatches, exactly like every other review option (PR #116 review).
+    contextMapper: config.contextMapper,
     vcs: config.vcs,
     repo: config.repo,
     rulesDir: config.rulesDir,

@@ -27,7 +27,9 @@ import {
   ContextCacheConflictError,
   ContextCachePublicationInProgressError,
 } from "./cache.js";
+import { GRAPHIFY_MAPPER_VERSION, synthesizeContextDocument } from "./graphify-mapper.js";
 import { computeBaseDelta, mirrorGitRunner, type ClassifiedBaseDelta } from "./delta.js";
+import type { GraphLike as GraphifyGraphLike } from "./incremental.js";
 import { loadDomainStepPaths, patchEntryArtifacts } from "./incremental.js";
 import { contextCacheKeyForRepository, type ContextCacheKey, type ContextManifest } from "./types.js";
 import { withPreparedWorkspace as realPrepareWorkspace } from "../workspace/manager.js";
@@ -51,8 +53,14 @@ export const CONTEXT_SCHEMA_VERSION = 2;
  */
 export const CONTEXT_MAPPER_VERSION = "tgd-pi-mapper@1";
 
-/** Bumped when selection/rendering policy changes what a pack says. */
-export const CONTEXT_POLICY_VERSION = "1";
+/**
+ * Bumped when selection/rendering policy changes what a pack says. v2: the
+ * Trust Boundary gained the graph-coverage caveat and knowledge nodes render
+ * location anchors and relation-confidence counts (#62) — an existing review
+ * marker at the same head and base must not keep a review silent under the
+ * old pack text (PR #116 review).
+ */
+export const CONTEXT_POLICY_VERSION = "2";
 
 /**
  * After this many incremental publications the next one is a full map, whatever
@@ -80,6 +88,13 @@ export class ContextRequiredError extends Error {
 export interface ContextPreparationRequest {
   readonly mode: ContextMode;
   readonly repository: RepositoryRef;
+  /**
+   * Which mapper implementation will run, as a cache-key identity (#62).
+   * Absent means the tgd mapper's version. Switching --context-mapper — or
+   * upgrading graphify behind its mapper — must invalidate cached context,
+   * and this is the field that does it.
+   */
+  readonly mapperVersion?: string;
   readonly baseSha: string;
   /** Only ever compared against, never mapped. See invariant 1 above. */
   readonly headSha: string;
@@ -170,10 +185,11 @@ function errorMessage(error: unknown): string {
  */
 export function contextCacheKey(request: {
   readonly repository: RepositoryRef;
+  readonly mapperVersion?: string;
 }): ContextCacheKey {
   return contextCacheKeyForRepository(request.repository, {
     schemaVersion: CONTEXT_SCHEMA_VERSION,
-    tgdVersion: CONTEXT_MAPPER_VERSION,
+    tgdVersion: request.mapperVersion ?? CONTEXT_MAPPER_VERSION,
     policyVersion: CONTEXT_POLICY_VERSION,
   });
 }
@@ -213,6 +229,7 @@ export function contextFingerprint(request: {
   readonly baseSha: string;
   readonly maxChars?: number;
   readonly allowDegraded: boolean;
+  readonly mapperVersion?: string;
 }): string | undefined {
   // `off` contributes nothing, and returns nothing. A review that asks for no
   // context has exactly the inputs it had before this feature existed, so its
@@ -228,7 +245,7 @@ export function contextFingerprint(request: {
     request.mode,
     request.baseSha,
     CONTEXT_SCHEMA_VERSION,
-    CONTEXT_MAPPER_VERSION,
+    request.mapperVersion ?? CONTEXT_MAPPER_VERSION,
     CONTEXT_POLICY_VERSION,
     request.maxChars ?? null,
     request.allowDegraded,
@@ -649,6 +666,18 @@ export async function prepareReviewContext(
           ) as Parameters<typeof patchEntryArtifacts>[0]["scopedGraph"];
         }
       }
+      // A graphify entry's CONTEXT.md is synthesized from its graph, so the
+      // patch regenerates it from the merged result; a tgd entry's document
+      // is agent-authored and carries forward verbatim (#62).
+      const synthesizeContext = incremental.manifest.key.tgdVersion === GRAPHIFY_MAPPER_VERSION
+        ? (input: { readonly graph: GraphifyGraphLike; readonly toSha: string }): string =>
+          synthesizeContextDocument({
+            repositoryName: request.repository.repo,
+            baseSha: input.toSha,
+            nodes: input.graph.nodes as never,
+            edges: input.graph.edges as never,
+          })
+        : undefined;
       const patched = await patchEntryArtifacts({
         entryRoot: cache.entryPath(key),
         stagingPath,
@@ -656,6 +685,7 @@ export async function prepareReviewContext(
         delta: incremental.delta.delta,
         zeroDomains: incremental.zeroDomains,
         scopedMapRequired: deltaPaths.length > 0,
+        ...(synthesizeContext === undefined ? {} : { synthesizeContext }),
         ...(scopedGraph === undefined ? {} : { scopedGraph }),
       });
       onProgress({ stage: "map", status: "completed" });

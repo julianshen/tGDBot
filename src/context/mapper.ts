@@ -17,8 +17,20 @@ export interface ContextMapRequest {
   scopePaths?: readonly string[];
 }
 
-export type MappingFailureCode = "invalid-request" | "pi-session-failed" | "invalid-artifacts";
-export type DegradedReason = "knowledge-graph-unavailable" | "domain-context-unavailable";
+export type MappingFailureCode =
+  | "invalid-request"
+  | "pi-session-failed"
+  | "invalid-artifacts"
+  /** A subprocess-backed mapper (graphify, #62) exited non-zero or was not found. */
+  | "mapper-subprocess-failed";
+/**
+ * Closed for the two reasons the tgd mapper produces, open to free text for
+ * mappers whose degradation has detail worth stating (#62 — a graphify schema
+ * the adapter does not recognise must name itself). Free-text reasons reach
+ * the operator's stderr and the pack header's degraded-reasons line, never
+ * diff-derived prose channels.
+ */
+export type DegradedReason = "knowledge-graph-unavailable" | "domain-context-unavailable" | (string & {});
 
 export interface MappingFailure {
   stage: "context-map";

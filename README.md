@@ -459,6 +459,11 @@ tgd-review-agent review \
                                   # "off" never maps. See "Repository context" below.
   --context-max-chars <n>        # default 30000 (bounds 4000-120000): per-rule ceiling on the
                                   # context pack. Like the diff, the pack is embedded once per rule.
+  --context-mapper <tgd|graphify> # default tgd: which implementation builds the index. "graphify"
+                                  # runs the deterministic AST indexer as a subprocess — no model,
+                                  # no API key, no 30-minute timeout — and needs Python 3 plus
+                                  # graphify (pipx install graphifyy==0.9.50) on PATH. See
+                                  # "Repository context" below.
   --allow-degraded-context       # optional: let mapping report a partial result instead of failing
                                   # outright. Note a degraded map has no knowledge graph, and a pack
                                   # without one is not something a rule can reason over — so this
@@ -485,6 +490,21 @@ the failure is noted in it).
 By default (`--context auto`) each dispatched rule is given a **trusted-base
 context pack** alongside the diff: the part of the repository map that is
 relevant to the files this PR changes.
+
+**Mapper backends** (`--context-mapper`): `tgd` (the default) runs the
+model-driven `/tgd-map` session; `graphify` runs the deterministic AST indexer
+as a subprocess. The graphify backend needs **Python 3** and the `graphify`
+CLI (Apache-2.0, `pipx install graphifyy==0.9.50`) on PATH — a real runtime
+dependency, and the reason it is opt-in rather than the default. Its code
+pass resolves no LLM backend, reads no provider API key (the subprocess
+environment is scrubbed of provider credentials), and is deterministic: one
+tree yields one graph, which is what the cache key has always assumed. Its
+knowledge nodes carry a line-anchored `Location:` and their relations state
+whether they were read from the AST (`EXTRACTED`) or resolved by graphify
+(`INFERRED`). One warning applies to BOTH backends, and the pack states it:
+**graph coverage is partial by construction, and absence from this graph is
+not evidence of absence in the code** — graphify in particular silently skips
+files it classifies as potentially sensitive.
 
 Why it exists: the built-in rule defines `severity: "blocking"` as *"a
 reachable execution path leads to data loss, corruption, a security failure,
