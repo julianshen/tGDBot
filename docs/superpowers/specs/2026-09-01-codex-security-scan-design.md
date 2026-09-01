@@ -106,6 +106,18 @@ keeps the SDK's typed results while regaining the env control the in-process
 path cannot offer. The rules are below; this paragraph deliberately does not
 restate them.
 
+**The protocol is bounded before it is parsed.** "Writes one JSON document to
+stdout" is an unbounded read: a scan producing a large or runaway result would
+have the reviewing process buffer and parse whatever it emitted, so a
+prompt-influenced scan could exhaust the parent's memory while staying inside
+both the cost limit and the deadline — neither of which bounds *output*. So the
+parent applies hard byte caps to stdout and stderr **while streaming**,
+treating overflow as a classified scan failure (`the scan produced too much
+output`) rather than as data, and caps the finding count and the total
+scanner-authored text before building the document. This is the same ceiling
+discipline the codebase already applies elsewhere — `--max-diff-chars`,
+`--context-max-chars`, `MAX_ADVISORIES_PER_PACKAGE`.
+
 Environment rule, **allowlist rather than denylist** — and stricter than
 graphify's for a reason graphify does not face.
 
@@ -427,6 +439,7 @@ Field mapping, and what is deliberately refused:
 
 | SDK field | Treatment |
 |---|---|
+| *(none — host-owned)* | **`category` is set by the host to the constant `"security"`.** The gateway rejects any object without a string `category` (`dispatch-results.ts:192`), so an unset one silently drops every scan finding at the very boundary this design routes them through. It is host-owned rather than mapped from the scanner for the usual reason: a scanner-supplied category is prose, and `category` is rendered inside a code span. |
 | `severity.level` | Mapped into the closed `blocking \| warning \| suggestion` set. An unrecognized level **drops the severity mapping and the finding**, rather than defaulting — a mis-tiered security finding is worse than an absent one. |
 | `locations[0].path`, `startLine` | `file` / `line`, re-anchored through `diff-anchors.ts`. A finding that cannot anchor inside the diff still posts, in the summary comment. |
 | `title` | `title`, subject to the existing ≤80-char one-line contract (ADR-008). |
@@ -587,6 +600,7 @@ scan produced findings worth reading, and a failed one produced nothing.
 | `ScanInterruptedError` | the scan was interrupted |
 | unsupported Node major | the scan needs Node 22, 24 or 26 |
 | scan deadline reached | the scan stopped at its time limit |
+| output over the byte cap | the scan produced too much output |
 | anything else | the scan failed to run |
 
 The last row is not decoration. Open question 2 promises a classified phrase
@@ -628,6 +642,19 @@ review's own abort path, with `AbortSignal` passed through to `run()`.
    and not the credentials of the account running the CLI. That precision
    matters because the process-level measures do not deliver it: same UID,
    same filesystem view, predictable managed layout.
+
+   **The boundary is not filesystem-only.** The scan holds outbound network
+   access by necessity, so a filesystem-only sandbox still lets a
+   prompt-injected agent reach whatever the network reaches — and in CI that
+   routinely includes the cloud metadata endpoint (`169.254.169.254`, which
+   hands out instance credentials on request) and internal services on the
+   private ranges. A container or unprivileged account provides none of that
+   protection by itself. The assertion therefore also covers **egress policy**:
+   only the endpoints the scanner needs, with link-local and private ranges
+   blocked. Naming the metadata endpoint explicitly rather than saying
+   "restrict networking" is deliberate — it is the specific address that turns
+   a code-review tool into a cloud-credential compromise, and an operator
+   writing an egress rule should not have to infer it.
 
    The CLI **refuses to scan unless the operator makes that assertion**.
    Refusing by default is deliberate: an unsandboxed scan is the dangerous
@@ -671,6 +698,7 @@ have to re-derive which of its reassurances are load-bearing:
 |---|---|
 | The scan cannot read the operator's credentials. | It runs as the same user with ordinary filesystem permissions. Only the external boundary prevents this. |
 | The scan cannot reach or write the managed mirror. | The clone removes the *need* and the recorded path. Reachability ends at the external boundary, not here. |
+| The sandbox is a filesystem boundary. | It must also be a network boundary. Filesystem isolation alone leaves the metadata endpoint and internal services reachable. |
 | The environment allowlist contains the scan. | It stops inheritance of secrets the scan never needed. It is not a sandbox. |
 | Structured-looking scanner output is safe to render. | Only bounded, pattern-validated fields are. Any free-text field is prose and is excluded, never escaped. |
 | Existing machinery carries a new value automatically. | Each of `rulesFailed`, `scanCoverage`, the ancestry candidate lists and the config hash had to be extended by hand. |
@@ -812,6 +840,12 @@ wins and the AC is the bug**.
 - **AC-23** Given a conversation command on a scan finding, when its rule is
   resolved, then it is not reported as `inactive-rule`, and a command needing a
   rule prompt answers with the scanner-specific reason instead.
+- **AC-24** Given an SDK finding with every field populated, when it is
+  mapped, then `category` is `"security"` and the finding survives
+  `normalizeUnknownFinding` rather than being dropped.
+- **AC-25** Given a worker whose stdout exceeds the byte cap, when the parent
+  reads it, then the read is abandoned at the cap, the run reports the
+  too-much-output phrase, and the parent's memory use stays bounded.
 
 ## Open questions
 
