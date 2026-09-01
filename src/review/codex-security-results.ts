@@ -90,6 +90,10 @@ export async function ingestCodexSecurityResults(inputPath: string): Promise<Cod
   let failed = false;
   try {
     handle = await open(file, "r");
+    const handleInfo = await handle.stat();
+    if (!handleInfo.isFile()) {
+      throw new CodexScanIngestError("invalid", "scan results path is not a regular file");
+    }
     const chunks: Buffer[] = [];
     let total = 0;
     const artifactHash = createHash("sha256");

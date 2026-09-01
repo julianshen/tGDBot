@@ -2766,9 +2766,10 @@ async function queueVerifications(input: {
     ? await loadActiveRules(input.reviewNumber, metadata, input.options)
     : { rules: [] as readonly RuleDefinition[] };
   if (rules.error !== undefined) {
-    // A LOAD failure, not a verdict that the rules are gone.
+    // Preserve the error in the queue context. Imported scan findings do not
+    // need this rule set and must still settle; ordinary findings inspect the
+    // error in verifyQueued and remain retryable rather than becoming inactive.
     console.warn(`tgd-review-agent: verification rule loading failed (${rules.error.message})`);
-    return holdAll;
   }
 
   // Resolved WITHOUT touching the provider: which finding, which event. This is
@@ -2921,6 +2922,8 @@ async function verifyQueued(input: {
   if (ledger.reviewOptions.codexScanResults === true && ledger.finding.ruleName === "codex-security") {
     return { kind: "settled", reason: "Codex Security findings require a new external scan" };
   }
+
+  if (input.context.rules.error !== undefined) return { kind: "transient" };
 
   // The same fallback the command path uses, and the same refusal: a review
   // records the model it ran under, so a finding raised by a configured run
