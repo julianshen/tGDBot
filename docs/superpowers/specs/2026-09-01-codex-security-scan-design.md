@@ -120,6 +120,17 @@ So the child's environment is **built up from empty**:
 - **Allowed:** `PATH`, `LANG`/`LC_*`, `TZ`, and the proxy variables
   (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`,
   `NODE_EXTRA_CA_CERTS`).
+- **Allowlisting a name does not bless its value.** `HTTP_PROXY` and
+  `HTTPS_PROXY` commonly carry credentials inline —
+  `http://user:password@proxy:3128` — so passing them through unchanged hands
+  every tool subprocess a working secret, in the one environment this section
+  spent its length emptying. A proxy URL containing **userinfo is rejected**:
+  the scan refuses to start rather than silently forwarding it, and rather
+  than silently stripping it and failing behind a proxy that needs auth.
+  An authenticated proxy is an open question (8), not a supported
+  configuration, because the honest fix is the same as for the Codex key —
+  deliver it out of band — and that needs a mechanism the SDK does not
+  obviously offer.
 - **Everything else is dropped**, including anything the review's own process
   needs. A variable is added to the allowlist only with a stated reason.
 - **The Codex credential is not on that list**, and is not an environment
@@ -680,6 +691,17 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 
 ## Acceptance criteria
 
+Three review rounds found an acceptance criterion still asserting a rule the
+design had already changed — AC-7 requiring the Codex key in the child
+environment after the key moved out of it, AC-15 deleting the output directory
+after retention was introduced. An AC that restates a rule is a second copy
+that can drift, and a stale one is worse than a missing one, because an
+implementer satisfying it reintroduces the defect while the suite goes green.
+
+So: an AC names the behaviour and **points at** the rule rather than
+re-specifying it, and where an AC and the rule it tests disagree, **the rule
+wins and the AC is the bug**.
+
 - **AC-1** Given `--codex-scan off` (the default), when a review runs, then no
   SDK resolution, child process, or credential read occurs, and the dispatched
   task text is byte-identical to today's.
@@ -703,9 +725,16 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
   incomplete — carried through `DispatchResult.scanCoverage`, not inferred.
 - **AC-7** Given `--codex-scan on` and an ambient environment carrying
   `GH_TOKEN`, `NPM_TOKEN`, `DATABASE_URL` and a provider key, when the child is
-  spawned, then its environment contains only the allowlisted names and the one
-  Codex key, and its `HOME` is a fresh empty directory rather than the
-  operator's.
+  spawned, then its environment equals the non-secret allowlist exactly — **no
+  Codex key of any kind** — and its `HOME` is a fresh empty directory rather
+  than the operator's.
+- **AC-7b** Given `HTTPS_PROXY` carrying inline userinfo, when the scan is
+  requested, then it refuses to start and the credential never reaches the
+  child.
+- **AC-8** Given `--dry-run --codex-scan on`, when the review runs, then
+  `preflight` runs and its plan prints, and no scan starts.
+- **AC-9** Given two runs on the same head differing only in `--codex-scan`,
+  when dedup is evaluated, then the second is not suppressed.
 - **AC-10** Given a scan in progress, when a second review on the same
   repository and base runs `reset --hard` / `clean -ffdx`, then the scan's
   findings are unaffected, because it reads a private clone made under the
@@ -723,22 +752,10 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 - **AC-14b** Given a run with `--codex-scan on` and no sandbox assertion,
   followed by a run on the same head with the assertion, then the second run is
   not suppressed by dedup and the scan executes.
-- **AC-20** Given a completed scan, when the worker's tool subprocesses are
-  inspected, then no Codex API key appears in their environment.
-- **AC-21** Given `--codex-scan-keep-output`, or an interrupted scan, when
-  cleanup runs, then the clone and temp `HOME` are gone and the output
-  directory remains.
-- **AC-22** Given Windows, when the scan is requested, then either the process
-  tree is terminated via `taskkill /T /F` on timeout and abort, or the scan
-  refuses to start.
-- **AC-19** Given a scan whose `coverage.deferred` entries carry fenced
-  markup, marker lookalikes, or oversized text, when the summary renders, then
-  no scanner-authored prose appears and `deferredCount` still reflects every
-  reported entry.
 - **AC-15** Given `--codex-scan-timeout`, when the scan is dispatched, then no
   deep-mode setting is passed, and when the deadline passes, the whole child
-  process group is terminated and the clone, temp `HOME` and output directory
-  are removed.
+  process tree is terminated and the clone and temp `HOME` are removed. The
+  output directory follows AC-21, not this criterion.
 - **AC-16** Given a fork pull request, when the scan is prepared, then the head
   is fetched from the fork ref and the scanned checkout's `HEAD` equals
   `pr.headSha`.
@@ -747,10 +764,18 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
   directory.
 - **AC-18** Given a failure with no table entry, when the review publishes,
   then the catch-all phrase renders and the raw error appears only on stderr.
-- **AC-8** Given `--dry-run --codex-scan on`, when the review runs, then
-  `preflight` runs and its plan prints, and no scan starts.
-- **AC-9** Given two runs on the same head differing only in `--codex-scan`,
-  when dedup is evaluated, then the second is not suppressed.
+- **AC-19** Given a scan whose `coverage.deferred` entries carry fenced
+  markup, marker lookalikes, or oversized text, when the summary renders, then
+  no scanner-authored prose appears and `deferredCount` still reflects every
+  reported entry.
+- **AC-20** Given a completed scan, when the worker's tool subprocesses are
+  inspected, then no Codex API key appears in their environment.
+- **AC-21** Given `--codex-scan-keep-output`, or an interrupted scan, when
+  cleanup runs, then the clone and temp `HOME` are gone and the output
+  directory remains.
+- **AC-22** Given Windows, when the scan is requested, then either the process
+  tree is terminated via `taskkill /T /F` on timeout and abort, or the scan
+  refuses to start.
 
 ## Open questions
 
@@ -786,3 +811,9 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
    scope-limited credential — minted for one scan and useless afterwards —
    would make a leak survivable instead of merely unlikely. Worth checking
    whether the provider supports one.
+8. **Authenticated proxies.** A proxy URL with inline credentials is refused,
+   so an operator who needs one has no supported path today. The honest fix is
+   the same as for the Codex key — deliver it out of band — but the SDK offers
+   no obvious mechanism, and silently stripping the userinfo would just fail
+   against a proxy that requires it. Left explicitly unsupported rather than
+   half-supported, until someone needs it.
