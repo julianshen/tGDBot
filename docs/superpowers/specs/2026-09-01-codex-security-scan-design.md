@@ -168,22 +168,60 @@ Two facts make this the only correct option, and both cost work:
    file-by-file reconstruction for >20,000-line diffs), never applied to a
    tree.
 
-So the workspace manager needs to additionally fetch `headSha` into the mirror
-and expose it to the worktree — a bounded, well-scoped change, but a real one,
-with its own owner-marker and path-derivation work under the existing
-`assertInside` invariants.
-
 A path-scoped scan of the base worktree (`target: [...changed paths]`) is
 explicitly rejected as the cheap alternative: it scans the code *before* the
 change, which answers a question nobody asked.
+
+#### The head and fork contract
+
+The SDK resolves a `refs` target against the checkout it is given and rejects
+the scan when that checkout's `HEAD` is not the requested head. So the tree
+handed to the scan must be **checked out at `pr.headSha`**, and the host must
+verify `git rev-parse HEAD === pr.headSha` before starting rather than
+discovering it as an `InvalidTargetError` afterwards.
+
+That is more than a checkout argument, because of where the head comes from:
+
+- The managed mirror fetches `origin` only. For a same-repository PR the head
+  arrives with an ordinary fetch. **For a fork PR it does not exist in the
+  mirror at all** and must be fetched explicitly — `refs/pull/<n>/head` on
+  GitHub, the equivalent MR ref on GitLab.
+- Fork PRs are not an edge case here. They are the *main* case: the whole
+  premise of this feature is reviewing contributions from people who cannot
+  push to the repository. A design that only works for same-repo branches
+  would work for exactly the population that needs it least.
+- The head fetch brings attacker-authored objects into the shared mirror. That
+  is already true of any diff this tool reads, but it is one more reason the
+  scan reads an isolated clone rather than anything mirror-backed.
+
+So the workspace manager gains an explicit head contract: fetch the head from
+the correct provider ref (including forks), record it with its own ownership
+marker, and expose a `headWorktreePath` derived under the same `assertInside`
+invariants as every other managed path. Same-repo and fork PRs each need a
+test, covering cleanup and reuse.
 
 ### Output directory
 
 `outputDir` must sit outside the scanned worktree or the SDK raises
 `OutputInsideProtectedRootError`. It is placed under a new `scans/` sibling of
-`worktrees/` inside the managed repository root, derived through
-`deriveWorkspacePaths` so `assertInside` and `assertNoSymlinkedAncestors`
-cover it like every other managed path.
+`worktrees/` inside the managed repository root.
+
+**One exclusive directory per scan run**, keyed by scan id and `headSha`, and
+created exclusively (`mkdir` that fails if it exists) rather than reused. A
+single shared `scans/` directory would let two concurrent reviews — or a retry
+overlapping its predecessor — read each other's artifacts, and would make
+cleanup delete a directory another run is still writing. Removal targets that
+one run-specific directory and nothing else. A concurrent-run test pins it.
+
+**The ancestry checks do not extend themselves.** `manager.ts` passes
+*hard-coded* candidate lists to `assertNoSymlinkedAncestors`, so adding
+`scans`, the per-run output path, or `headWorktreePath` to
+`deriveWorkspacePaths` does not put them under that protection — the earlier
+draft of this document asserted it would, which was the same
+assume-the-machinery-carries-it error as the `rulesFailed` and coverage
+findings. Every new managed path is added to every relevant candidate list, at
+create, read, preserve and delete, with a test that plants a pre-existing
+symlinked `scans` parent.
 
 Scan results contain source excerpts and vulnerability detail. The directory
 is created `0o700`, and is removed after the findings are read unless
@@ -194,8 +232,8 @@ is created `0o700`, and is removed after the findings are read unless
 `review()` gains one step, after the diff and base SHA are pinned and before
 rule dispatch:
 
-```
-withPreparedWorkspace( prepare → [codex scan] ) → dispatch rules → merge → dedup → publish
+```text
+withPreparedWorkspace( prepare + isolated clone ) → [codex scan] → dispatch rules → merge → dedup → publish
 ```
 
 **The scan runs INSIDE the repository lock, via `withPreparedWorkspace`** —
@@ -297,7 +335,7 @@ Field mapping, and what is deliberately refused:
 was not covered (`coverage.deferred` ids and reasons, which are structured).
 
 This is the `dependency-advisories.ts` lesson applied directly: a scan that
-was cut short by `maxTimeHours`, a cost limit, or an interruption must not
+was cut short by the host deadline, a cost limit, or an interruption must not
 render as "no security findings". A clean bill of health manufactured out of
 an incomplete run is the worst output this feature could produce.
 
@@ -317,19 +355,50 @@ documented as such.
 
 ### Dedup
 
-`computeReviewConfigHash` must include the codex-scan flags. Otherwise
-enabling the scan on an already-reviewed head is suppressed by the marker and
-silently does nothing — the failure mode config-aware dedup exists to prevent.
+`computeReviewConfigHash` must include the codex-scan settings that change
+what a review produces — enabled state, cost limit, timeout — or enabling the
+scan on an already-reviewed head is suppressed by the marker and silently does
+nothing, the failure mode config-aware dedup exists to prevent.
+
+**But only when the scan is on.** An unconditional field — even one hashing
+`"codex-scan: off"` — changes the hash of every existing default review, so
+upgrading the CLI would invalidate every published marker and re-review every
+open PR across every repository at once. The disabled default must hash
+**byte-identically to a pre-feature run**. Tested both ways: a pre-feature
+marker still matches after the upgrade, and each result-affecting setting
+changes the hash when the scan is on.
 
 ## CLI surface
 
-```
+```text
 --codex-scan on|off            (default: off)
 --codex-scan-sandboxed         (required assertion; see Security bounds item 2)
 --codex-scan-max-cost <usd>
---codex-scan-timeout <hours>   → maxTimeHours
+--codex-scan-timeout <hours>   (enforced by the parent; NOT maxTimeHours)
 --codex-scan-keep-output       (retain the scan directory)
 ```
+
+**`--codex-scan-timeout` is enforced in the parent process, not passed to the
+SDK.** An earlier draft mapped it to `maxTimeHours`, which is wrong and would
+have failed every scan: `maxTimeHours` is one of the deep-mode settings
+(alongside `workers`, `subagents`, `stopAfterNoNew`, `maxDiscoveryRuns`) and
+requires `mode: "deep"`, which v1 does not use. Passing it with a standard
+scan is rejected outright — a flag that breaks the feature whenever anyone
+sets it.
+
+So the deadline lives where the host already controls it: a timer that fires
+the `AbortSignal` already threaded into the scan, followed by terminating the
+child. `maxTimeHours` is passed only if deep mode is ever added.
+
+**Termination must target the process group.** `subprocess.kill()` signals the
+immediate child only, and the worker is not the leaf — it starts the Codex
+runtime, which starts its own plugin and Python processes. Killing the worker
+alone leaves an agent running against attacker-controlled code with no
+supervisor and no deadline, which is worse than the timeout the kill was
+enforcing. The child is spawned `detached` and the group is signalled
+(`process.kill(-pid, …)`), escalating `SIGTERM` → `SIGKILL`, with the same
+teardown on the abort path and in a `finally` that also removes the clone, the
+temp `HOME`, and the run's output directory.
 
 `--codex-scan on` in `poll` mode requires the flag to be set explicitly per
 invocation; it is never inherited from a repository default.
@@ -373,6 +442,17 @@ scan produced findings worth reading, and a failed one produced nothing.
 | `ScanCostLimitExceededError` | the scan stopped at its cost limit |
 | `IncompleteScanError`, `ContractValidationError` | the scan did not produce a usable result |
 | `ScanInterruptedError` | the scan was interrupted |
+| unsupported Node major | the scan needs Node 22, 24 or 26 |
+| scan deadline reached | the scan stopped at its time limit |
+| anything else | the scan failed to run |
+
+The last row is not decoration. Open question 2 promises a classified phrase
+for an unsupported Node version and the table had none, and any unanticipated
+SDK or worker error — a bug, a version skew, a malformed worker response —
+must still resolve to *some* publishable phrase. Without a catch-all, an
+unclassified failure either publishes nothing (an all-clear after a failed
+scan, the AC-5 failure again) or leaks a raw error into a world-readable
+comment. The raw text stays on stderr in every case, including this one.
 
 `ScanInterruptedError` carries `scanDir`; that path is logged to stderr and
 the directory preserved regardless of `--codex-scan-keep-output`.
@@ -502,6 +582,20 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 - **AC-13** Given `--codex-scan on` without the sandbox assertion, when the
   review runs, then the scan refuses to start and says why, and the review
   still publishes its rule findings.
+- **AC-14** Given a review run with the scan off, when its marker is compared
+  to one written before this feature existed, then the config hashes match.
+- **AC-15** Given `--codex-scan-timeout`, when the scan is dispatched, then no
+  deep-mode setting is passed, and when the deadline passes, the whole child
+  process group is terminated and the clone, temp `HOME` and output directory
+  are removed.
+- **AC-16** Given a fork pull request, when the scan is prepared, then the head
+  is fetched from the fork ref and the scanned checkout's `HEAD` equals
+  `pr.headSha`.
+- **AC-17** Given two scans running concurrently on the same repository, when
+  each completes, then neither has read or deleted the other's output
+  directory.
+- **AC-18** Given a failure with no table entry, when the review publishes,
+  then the catch-all phrase renders and the raw error appears only on stderr.
 - **AC-8** Given `--dry-run --codex-scan on`, when the review runs, then
   `preflight` runs and its plan prints, and no scan starts.
 - **AC-9** Given two runs on the same head differing only in `--codex-scan`,
@@ -519,9 +613,15 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 3. **Trusted Access.** The SDK reports `granted` / `not_granted` / `unknown`
    and warns when access is missing. Should `not_granted` be a hard refusal
    rather than a warning, given a degraded scan's findings still publish?
-4. **Bundling the worker.** `dist/review/codex-scan-worker.js` is a new build
-   output; the `build` script currently only compiles and copies two `.md`
-   files.
+4. **Bundling the worker** is a requirement, not an open question — recorded
+   here because it is the one part that cannot be deferred to implementation.
+   `npm run build` compiles TypeScript and copies exactly two `.md` files, so
+   `dist/review/codex-scan-worker.js` does not exist unless the build makes
+   it, and `bin`/`files` must ship it. The acceptance test runs against the
+   **packed** artifact with `@openai/codex-security` both absent and present.
+   The worker may `import` the SDK statically: it is a separate process, so
+   that import never enters the main process's graph and the default path
+   still resolves nothing.
 5. **Clone cost.** One full checkout per scan, on top of the managed base
    worktree. Acceptable for a flag that is off by default and already requires
    a disposable environment, but it should be measured on a large repository
