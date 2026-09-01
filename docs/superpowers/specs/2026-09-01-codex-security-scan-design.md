@@ -264,12 +264,25 @@ flag.
 What the scan is pointed at is **an isolated clone, not the managed
 worktree**: `git clone --no-hardlinks --no-local`-equivalent into the
 per-scan temp directory, carrying base and head, with no shared object store
-and no inherited hooks. The managed mirror is never exposed to the scan,
-because a scan that can write `repository.git/hooks/post-checkout` has left
-something behind that a **later parent-side** `git worktree add` executes —
-persistence that outlives the scan, its temp directory and its environment.
-Managed git invocations additionally set `core.hooksPath` to an empty
-directory, so a hook planted by any other means is inert.
+and no inherited hooks. The clone's `origin` remote is removed, so the mirror's
+path is not recorded in the tree the scan reads.
+
+**This does not make the mirror unreachable, and an earlier draft of this
+document said it did.** `--no-local`/`--no-hardlinks` stop object *sharing*;
+they revoke nothing. The scan child runs as the same UID as the parent with the
+same filesystem view, and the managed layout is predictable, so a scan that
+goes looking can still find and write `repository.git` — its config, its hooks
+— and affect a later parent-side git operation. Dropping the remote raises the
+cost of finding it; it is obfuscation, not a boundary.
+
+What the clone genuinely buys is narrower and still worth having: the scan no
+longer *needs* the mirror, nothing it writes in its own tree is observed by a
+later consumer, and findings derive from a private copy no other job rewrites.
+The mirror-write vector is closed by the boundary in Security bounds item 2 —
+which is why that item now specifies what the boundary must expose, rather than
+leaving "isolated environment" to interpretation. `core.hooksPath` pointed at
+an empty directory for managed git invocations is the defense-in-depth layer
+underneath it, not the primary control.
 
 That changes the locking answer for the better. The clone is made **under**
 `withPreparedWorkspace`, and the lock is released before the scan itself runs.
@@ -295,15 +308,37 @@ therefore adds a typed optional field:
 ```ts
 readonly scanCoverage?: {
   readonly completeness: "complete" | "partial" | "unknown";
-  readonly deferred: readonly { readonly id: string; readonly reason: string }[];
+  /** Scanner-supplied ids that matched DEFERRED_ID_RE. Nothing else survives. */
+  readonly deferred: readonly string[];
+  /** How many deferred entries were reported in total, including unrenderable ones. */
+  readonly deferredCount: number;
 };
 ```
 
 carried on `DispatchResult`, threaded into the renderer input, and rendered by
 a dedicated section. Optional, so every existing engine and test double that
-never sets it is unaffected. `deferred` is structured (an id and a reason), so
-no scanner prose reaches the comment — the same rule the finding mapping
-follows.
+never sets it is unaffected.
+
+**The `reason` field is deliberately gone, and calling the earlier
+`{ id, reason }` shape "structured" was wrong.** A `reason` is
+scanner-authored prose over an attacker-controlled tree. Putting it inside an
+object does not sanitize it, and because it is not a `Finding` it reaches the
+renderer without `normalizeUnknownFinding` or ADR-006 defanging — so a crafted
+reason could carry a ` ```suggestion ` fence, mimic the bot's own signature or
+HTML marker, or simply be long enough to blow the comment size limit. That is
+precisely the rule `dependency-advisories.ts` already settled and this
+document cites two sections earlier: prose is **excluded rather than escaped**.
+
+So what crosses is bounded and inert:
+
+- **`id`** must match a `DEFERRED_ID_RE` in the spirit of
+  `dependency-advisories.ts`'s `ADVISORY_ID_RE` — short, identifier-shaped,
+  incapable of forming a sentence. An id that does not match is dropped.
+- **`deferredCount`** is host-computed from what the scan reported, so
+  dropping unrenderable ids never manufactures a cleaner picture: the section
+  says how many were deferred even when it can name none of them.
+- **Reasons go to stderr**, with the rest of the raw scan output, where an
+  operator can read them and no reader is asked to trust them.
 
 `"codex-security"` is a reserved rule name: `loadRulesForReview` rejects a
 user rule that claims it, the same way `planReviewWorkflow` already rejects
@@ -356,9 +391,18 @@ documented as such.
 ### Dedup
 
 `computeReviewConfigHash` must include the codex-scan settings that change
-what a review produces — enabled state, cost limit, timeout — or enabling the
-scan on an already-reviewed head is suppressed by the marker and silently does
-nothing, the failure mode config-aware dedup exists to prevent.
+what a review produces — enabled state, cost limit, timeout, **and the
+`--codex-scan-sandboxed` assertion** — or enabling the scan on an
+already-reviewed head is suppressed by the marker and silently does nothing,
+the failure mode config-aware dedup exists to prevent.
+
+The assertion belongs in that list precisely because AC-13 makes its absence
+*publish*: a first run with `--codex-scan on` and no assertion posts a review
+whose scan failed, marker and all. Adding the assertion and re-running changes
+whether the scan happens at all — but if the hash cannot see it, dedup
+suppresses the corrected run on the same head, and the operator who did exactly
+what the error told them to gets silence. A retry test covers
+absent-then-present on one head.
 
 **But only when the scan is on.** An unconditional field — even one hashing
 `"codex-scan: off"` — changes the hash of every existing default review, so
@@ -477,14 +521,19 @@ review's own abort path, with `AbortSignal` passed through to `run()`.
    scan "cannot read a token off disk"; that was wrong, and the correction is
    the reason this item is now first among the concrete bounds.
 
-   The only real boundary is external: a container, VM, or dedicated
-   unprivileged user that exposes the scan inputs and nothing else. The CLI
-   therefore **refuses to scan unless the operator explicitly asserts that
-   boundary** (`--codex-scan-sandboxed`, or the equivalent environment
-   assertion for CI). Refusing by default is deliberate: an unsandboxed scan
-   is the dangerous case, so it must not be reachable by forgetting a flag.
-   The CLI cannot verify the assertion, and says so rather than implying it
-   checked.
+   The only real boundary is external, and the assertion names something
+   specific rather than a vibe. `--codex-scan-sandboxed` asserts that the
+   scan child runs in a container, VM, or dedicated unprivileged account
+   **that exposes only the isolated clone and the run's output directory** —
+   and in particular not the managed workspace root, not the operator's home,
+   and not the credentials of the account running the CLI. That precision
+   matters because the process-level measures do not deliver it: same UID,
+   same filesystem view, predictable managed layout.
+
+   The CLI **refuses to scan unless the operator makes that assertion**.
+   Refusing by default is deliberate: an unsandboxed scan is the dangerous
+   case, so it must not be reachable by forgetting a flag. The CLI cannot
+   verify the assertion, and says so rather than implying it checked.
 3. **Environment allowlisted and `HOME` isolated** as specified above. This
    narrows what is trivially reachable — it does not make the operator's
    credentials unreadable, per item 2. Its real value is that the scan cannot
@@ -504,6 +553,32 @@ review's own abort path, with `AbortSignal` passed through to `run()`.
    names the isolated clone's tree, which no other job can rewrite.
 8. The `--codex-scan` flag is recorded in the published marker's config hash,
    so a reader can tell whether a given review included a scan.
+
+## What this design does not claim
+
+Three review rounds each caught the same class of error in this document: a
+property asserted about machinery that does not provide it — `rulesFailed`
+carrying a reason nobody put in the array, coverage rendering from a field that
+did not exist, ancestry checks extending to paths their hard-coded lists never
+mention, `HOME` redirection described as making credentials unreadable, a
+private clone described as making the mirror unreachable, and prose called
+"structured" because it sat inside an object.
+
+Each was fixed where it appeared. The pattern is worth stating once, as a
+standing inventory, because the next reader of this document will otherwise
+have to re-derive which of its reassurances are load-bearing:
+
+| Not claimed | What is actually true |
+|---|---|
+| The scan cannot read the operator's credentials. | It runs as the same user with ordinary filesystem permissions. Only the external boundary prevents this. |
+| The scan cannot reach or write the managed mirror. | The clone removes the *need* and the recorded path. Reachability ends at the external boundary, not here. |
+| The environment allowlist contains the scan. | It stops inheritance of secrets the scan never needed. It is not a sandbox. |
+| Structured-looking scanner output is safe to render. | Only bounded, pattern-validated fields are. Any free-text field is prose and is excluded, never escaped. |
+| Existing machinery carries a new value automatically. | Each of `rulesFailed`, `scanCoverage`, the ancestry candidate lists and the config hash had to be extended by hand. |
+
+The single control this feature's safety actually rests on is the external
+boundary in Security bounds item 2. Everything else is defense-in-depth, and
+should be read that way.
 
 ## Testing strategy
 
@@ -541,6 +616,11 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 - **Coverage plumbing test** — a `partial` scan with zero findings renders the
   incomplete-coverage section, asserted end to end through
   `DispatchResult.scanCoverage` rather than at the mapper.
+- **Deferred-id sanitation test** — a scan whose `deferred` entries carry a
+  ` ```suggestion ` fence, a bot-signature lookalike, and a 100 KB reason
+  renders none of that text, still reports the correct `deferredCount`, and
+  keeps the reasons on stderr. Sits beside the existing ADR-006 cases in
+  `comment-format.test.ts`.
 
 ## Acceptance criteria
 
@@ -584,6 +664,13 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
   still publishes its rule findings.
 - **AC-14** Given a review run with the scan off, when its marker is compared
   to one written before this feature existed, then the config hashes match.
+- **AC-14b** Given a run with `--codex-scan on` and no sandbox assertion,
+  followed by a run on the same head with the assertion, then the second run is
+  not suppressed by dedup and the scan executes.
+- **AC-19** Given a scan whose `coverage.deferred` entries carry fenced
+  markup, marker lookalikes, or oversized text, when the summary renders, then
+  no scanner-authored prose appears and `deferredCount` still reflects every
+  reported entry.
 - **AC-15** Given `--codex-scan-timeout`, when the scan is dispatched, then no
   deep-mode setting is passed, and when the deadline passes, the whole child
   process group is terminated and the clone, temp `HOME` and output directory
