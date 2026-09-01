@@ -104,14 +104,37 @@ carrying exactly the keys the scan needs**, and writes one JSON document to
 stdout. This keeps the SDK's typed results while regaining the env control
 the in-process path cannot offer.
 
-Environment rule, stricter than graphify's:
+Environment rule, **allowlist rather than denylist** — and stricter than
+graphify's for a reason graphify does not face.
 
-- **Removed:** every provider credential pattern graphify already strips,
-  plus `GH_TOKEN`, `GITHUB_TOKEN`, `GH_REPO`, `GITHUB_REPOSITORY`,
-  `GLAB_TOKEN`, and the `GIT_*` path overrides `workspace/manager.ts` already
-  enumerates.
-- **Kept:** `OPENAI_API_KEY` **or** `CODEX_API_KEY` (exactly one, chosen by
-  the operator), proxy variables, `PATH`, `HOME`.
+graphify can afford a denylist: it is a deterministic AST indexer, so an
+unrecognized variable reaching it is inert. This child runs an agent with
+command and network access over attacker-controlled code, where every
+variable that is not refused is a variable that can be exfiltrated. A
+denylist enumerating `ANTHROPIC|OPENAI|AWS|…` plus the VCS tokens silently
+passes `NPM_TOKEN`, `DATABASE_URL`, `SENTRY_DSN`, `SSH_AUTH_SOCK` and
+whatever the next CI system invents. The default must be *refuse*.
+
+So the child's environment is **built up from empty**:
+
+- **Allowed:** `PATH`, `LANG`/`LC_*`, `TZ`, the proxy variables
+  (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`,
+  `NODE_EXTRA_CA_CERTS`), and `OPENAI_API_KEY` **or** `CODEX_API_KEY` —
+  exactly one, chosen by the operator.
+- **Everything else is dropped**, including anything the review's own process
+  needs. A variable is added to the allowlist only with a stated reason.
+
+`HOME` is **not** inherited, which is the half a denylist cannot fix at all.
+Removing `GH_TOKEN` from the environment accomplishes nothing while the agent
+can read `~/.config/gh/hosts.yml`, which stores the same token — and beside it
+`~/.ssh`, `~/.npmrc`, `~/.aws/credentials`, and `~/.pi/auth.json`. An
+environment boundary that a filesystem read walks around is not a boundary.
+
+The child therefore gets a **fresh, empty `HOME`**: a `mkdtemp` directory
+created per scan and removed with the scan output. `session-hermetics.ts`
+already establishes this pattern for dispatch (`createIsolatedAgentDir`,
+pointed at via `PI_CODING_AGENT_DIR`) — the difference is that dispatch
+symlinks credentials in deliberately, and this one links nothing.
 
 The scan is `auth: "api-key"`, always. A file-backed sign-in is deliberately
 not used: it would make the scan's identity depend on ambient state the CLI
@@ -168,12 +191,33 @@ is created `0o700`, and is removed after the findings are read unless
 
 ### Pipeline placement
 
-`review()` gains one step, after the diff and base SHA are pinned and the
-workspace is prepared, and before rule dispatch:
+`review()` gains one step, after the diff and base SHA are pinned and before
+rule dispatch:
 
 ```
-prepare workspace → [codex scan] → dispatch rules → merge → dedup → publish
+withPreparedWorkspace( prepare → [codex scan] ) → dispatch rules → merge → dedup → publish
 ```
+
+**The scan runs INSIDE the repository lock, via `withPreparedWorkspace`** —
+not after a `prepareWorkspace` call. This is not a refinement; a scan outside
+the lock is incorrect. `prepareWorkspace` releases the lock before it returns,
+so two reviews on the same repository and base can have one running
+`reset --hard` / `clean -ffdx` over the shared worktree while the other reads
+it. Issue #78 already worked this out for structural checks, and its reasoning
+transfers exactly: an unlocked race was tolerable while readers produced
+*context*, which is framed as untrusted and which a reader weighs, but a
+structural check derives a host-authored fact — "the one line a reader is
+invited to trust without re-deriving" — and a scan finding anchored to
+`file:line` is the same kind of claim. A scan racing another job's `clean`
+can report a vulnerability at a line that only ever existed in that job's
+scratch tree.
+
+The cost is the one #78 already accepted and documented: a long consumer
+serialises other jobs against the same repository and base. `withPreparedWorkspace`
+already carries the timeouts for that (`SCOPED_LOCK_TIMEOUT_MS`,
+`SCOPED_LOCK_MAX_WAIT_MS`), and `--codex-scan-timeout` must be set below the
+scoped lock timeout so the holder's own budget expires first and a waiter
+reports a genuine deadlock rather than pre-empting live work.
 
 Scan findings are merged into `DispatchResult.findings` carrying
 `ruleName: "codex-security"`. Everything downstream — clustering, inline
@@ -260,6 +304,22 @@ publish** — the raw error goes to stderr, per the existing rule that published
 failure reasons must not echo provider request detail into a world-readable
 comment.
 
+**A reason alone is not enough: `"codex-security"` must also be pushed onto
+`rulesFailed`.** The renderer looks up `ruleFailureReasons` only while
+iterating `rulesFailed` (`comment-format.ts:1488-1495`), and the terminal
+status line derives from the same array — so a failure recorded only as a
+reason renders nothing at all, and the review publishes an all-clear that
+silently omits a scan that never ran. That is precisely the "clean bill of
+health manufactured out of a rejection" failure this design refuses elsewhere,
+and it would defeat AC-5. Symmetrically, a completed scan appends
+`"codex-security"` to `rulesRun`, so the two arrays keep accounting for every
+dispatched source.
+
+A scan that completes with `coverage.completeness: "partial"` is **not** a
+failure and does not enter `rulesFailed`; it renders through the
+incomplete-coverage path below. The two must not be conflated — a partial
+scan produced findings worth reading, and a failed one produced nothing.
+
 | SDK error | Published phrase |
 |---|---|
 | `AuthenticationRequiredError` | no API key for the Codex Security scan |
@@ -282,14 +342,17 @@ review's own abort path, with `AbortSignal` passed through to `run()`.
 1. **Off by default**, and documented in the README's "⚠️ Security
    Considerations" section as requiring an ephemeral, isolated environment —
    not as a recommendation but as the condition under which it is supported.
-2. **Environment scrubbed** as specified above. The scan never receives a VCS
-   token; it has no reason to talk to `gh`/`glab`, and that token is the
-   write path to the PR.
+2. **Environment allowlisted and `HOME` isolated** as specified above. The
+   scan never receives a VCS token, and cannot read one off disk either; it
+   has no reason to talk to `gh`/`glab`, and that token is the write path to
+   the PR.
 3. **Output outside the worktree**, `0o700`, removed by default.
 4. **No new publication surface.** Scan findings reach the reader through the
    same renderer, with the same ADR-006 defanging and the same ADR-007
    suggestion restriction.
 5. **No committable suggestions from scan output**, ever.
+   The scan holds the repository lock for its whole run (see above), so a
+   published finding names a tree no other job could rewrite underneath it.
 6. The `--codex-scan` flag is recorded in the published marker's config hash,
    so a reader can tell whether a given review included a scan.
 
@@ -307,9 +370,12 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
   finding with none of them. A fixture whose message contains a
   ` ```suggestion ` fence renders defanged, asserted in
   `comment-format.test.ts` alongside the existing ADR-006 cases.
-- **Environment scrubbing test** — the child's env contains no
-  `GH_TOKEN`/`GITHUB_TOKEN`/`ANTHROPIC_API_KEY`, and contains the one Codex
-  key. Mirrors the existing graphify scrubbing test.
+- **Environment allowlist test** — the child's env is asserted by *equality*
+  against the expected allowlisted set, not by absence of known-bad names: an
+  absence test passes for every secret nobody thought to enumerate, which is
+  the failure mode that made this an allowlist. Includes an unrecognized
+  `NPM_TOKEN`-style variable that must not survive, and asserts `HOME` points
+  at the per-scan temp directory.
 - **Failure classification tests** — one per error class, asserting the
   published phrase and that the raw message does not appear in it.
 - **Coverage honesty test** — `completeness: "partial"` renders the
@@ -319,6 +385,9 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
   a child, or reads a Codex key. Asserted by a resolver double that fails the
   test if called.
 - **Dedup test** — flipping `--codex-scan` changes `computeReviewConfigHash`.
+- **Lock-scoping test** — the scan runs inside `withPreparedWorkspace`'s
+  callback, asserted with a workspace double that fails if the scan is invoked
+  after the lock is released.
 
 ## Acceptance criteria
 
@@ -335,13 +404,21 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
   when it is rendered, then the fence is defanged and no committable
   suggestion is produced.
 - **AC-5** Given any scan failure, when the review completes, then the review
-  still publishes, and the reason appears as a classified phrase with the raw
-  error only on stderr.
+  still publishes, `"codex-security"` appears in `rulesFailed`, and the reason
+  renders as a classified phrase with the raw error only on stderr.
+- **AC-5b** Given a scan that completes with `completeness: "partial"`, when
+  the review publishes, then `"codex-security"` appears in `rulesRun` and not
+  in `rulesFailed`.
 - **AC-6** Given `coverage.completeness` of `partial` or `unknown`, when the
   summary renders, then it states that coverage was incomplete.
-- **AC-7** Given `--codex-scan on`, when the child is spawned, then its
-  environment contains no VCS token and no provider key other than the Codex
-  key.
+- **AC-7** Given `--codex-scan on` and an ambient environment carrying
+  `GH_TOKEN`, `NPM_TOKEN`, `DATABASE_URL` and a provider key, when the child is
+  spawned, then its environment contains only the allowlisted names and the one
+  Codex key, and its `HOME` is a fresh empty directory rather than the
+  operator's.
+- **AC-10** Given a scan in progress, when a second review on the same
+  repository and base begins, then it blocks on the repository lock until the
+  scan completes, rather than resetting the worktree underneath it.
 - **AC-8** Given `--dry-run --codex-scan on`, when the review runs, then
   `preflight` runs and its plan prints, and no scan starts.
 - **AC-9** Given two runs on the same head differing only in `--codex-scan`,
