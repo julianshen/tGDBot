@@ -99,10 +99,12 @@ does". The same reasoning applies with more force here, since this child
 *does* execute an agent.
 
 So: a small bundled worker (`dist/review/codex-scan-worker.js`) that imports
-the SDK, is spawned by `codex-scan.ts` with a **denylist-scrubbed environment
-carrying exactly the keys the scan needs**, and writes one JSON document to
-stdout. This keeps the SDK's typed results while regaining the env control
-the in-process path cannot offer.
+the SDK, is spawned by `codex-scan.ts` with **an environment built up from an
+allowlist and containing no credential of any kind** — the Codex key reaches
+it out of band, over a pipe — and writes one JSON document to stdout. This
+keeps the SDK's typed results while regaining the env control the in-process
+path cannot offer. The rules are below; this paragraph deliberately does not
+restate them.
 
 Environment rule, **allowlist rather than denylist** — and stricter than
 graphify's for a reason graphify does not face.
@@ -385,6 +387,36 @@ So what crosses is bounded and inert:
 user rule that claims it, the same way `planReviewWorkflow` already rejects
 duplicate rule names.
 
+#### Conversation and verification need explicit handling
+
+Reserving the name has a consequence the "works unchanged" claim above does
+**not** cover, and this is where it stops being true. The conversation and
+verification paths resolve a finding's rule by looking its `ruleName` up in the
+actively loaded rule set — `poll.ts:1141`, `poll.ts:2916` — and
+`conversation/actions.ts:306` turns a miss into `inactive-rule`. A reserved
+name is never in that set **by construction**, so without new handling every
+scan finding is reported as belonging to a rule the maintainer has removed.
+That is not merely unhelpful, it is a false statement about the repository's
+configuration, offered to someone asking why a finding exists.
+
+Two things are therefore specified rather than inherited:
+
+1. **A synthetic, host-owned policy record for `codex-security`** is supplied
+   to those lookups, so a scan finding resolves to something real. It is
+   host-authored and never loaded from disk, which keeps the reserved name
+   un-forgeable — the property reserving it was for.
+2. **Model-driven verification is disabled for scan findings**, with its own
+   reason rather than a borrowed one. Verifying a rule finding means re-running
+   that rule's prompt against the current code; the equivalent for a scan
+   finding is re-running the entire scan, at its full cost, to re-check one
+   line. A conversation command that needs a rule prompt answers "this finding
+   came from the security scanner, not a rule" — which is true, actionable, and
+   not the same sentence as "that rule is no longer enabled".
+
+What genuinely does work unchanged is narrower than the earlier claim: finding
+clustering, inline anchoring, publication, the marker, and re-review
+suppression, none of which resolve a rule by name.
+
 ### Trust boundary
 
 Codex findings are model output over an attacker-controlled tree. They pass
@@ -642,6 +674,7 @@ have to re-derive which of its reassurances are load-bearing:
 | The environment allowlist contains the scan. | It stops inheritance of secrets the scan never needed. It is not a sandbox. |
 | Structured-looking scanner output is safe to render. | Only bounded, pattern-validated fields are. Any free-text field is prose and is excluded, never escaped. |
 | Existing machinery carries a new value automatically. | Each of `rulesFailed`, `scanCoverage`, the ancestry candidate lists and the config hash had to be extended by hand. |
+| Everything downstream of a `Finding` treats scan findings like rule findings. | Anything that resolves a rule **by name** does not: conversation actions and verification need the synthetic policy record above. |
 
 The single control this feature's safety actually rests on is the external
 boundary in Security bounds item 2. Everything else is defense-in-depth, and
@@ -776,6 +809,9 @@ wins and the AC is the bug**.
 - **AC-22** Given Windows, when the scan is requested, then either the process
   tree is terminated via `taskkill /T /F` on timeout and abort, or the scan
   refuses to start.
+- **AC-23** Given a conversation command on a scan finding, when its rule is
+  resolved, then it is not reported as `inactive-rule`, and a command needing a
+  rule prompt answers with the scanner-specific reason instead.
 
 ## Open questions
 
