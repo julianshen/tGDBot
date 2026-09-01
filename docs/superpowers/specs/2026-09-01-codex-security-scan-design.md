@@ -117,12 +117,42 @@ whatever the next CI system invents. The default must be *refuse*.
 
 So the child's environment is **built up from empty**:
 
-- **Allowed:** `PATH`, `LANG`/`LC_*`, `TZ`, the proxy variables
+- **Allowed:** `PATH`, `LANG`/`LC_*`, `TZ`, and the proxy variables
   (`HTTPS_PROXY`, `HTTP_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`,
-  `NODE_EXTRA_CA_CERTS`), and `OPENAI_API_KEY` **or** `CODEX_API_KEY` —
-  exactly one, chosen by the operator.
+  `NODE_EXTRA_CA_CERTS`).
 - **Everything else is dropped**, including anything the review's own process
   needs. A variable is added to the allowlist only with a stated reason.
+- **The Codex credential is not on that list**, and is not an environment
+  variable at all — see below.
+
+#### The one credential the allowlist cannot simply keep
+
+An allowlist that ends with "…and the API key" hands the agent the single
+secret it still has. The scan needs outbound network by definition, so no
+filesystem boundary contains a stolen key, and `maxCostUsd` bounds this run's
+spend, not what someone else does with the credential afterwards. An
+attacker-controlled diff that talks the agent into printing its own
+environment gets a working key — which is the exact outcome the rest of this
+section exists to prevent, reintroduced by the one exception.
+
+So the key is **delivered out of band and kept out of the environment the
+agent's tool subprocesses inherit**:
+
+1. The parent passes it to the worker over a pipe (an inherited fd or stdin),
+   never as a variable in the child's environment.
+2. The worker authenticates the runtime with it — `loginApiKey(apiKey)` exists
+   precisely to take a key programmatically — and holds it in a local, so no
+   command the agent runs inherits it.
+3. If a future SDK version can only read the key from the environment, the
+   worker sets it, lets the runtime consume it, and **deletes it from
+   `process.env` before the scan starts**, so it is absent from every tool
+   subprocess spawned thereafter.
+
+The residual is stated rather than papered over: a key the worker holds
+in-process is still reachable by anything executing in that process, and step 3
+is a race the SDK's internals could reopen. Tool subprocesses are the exposure
+that actually matters here and they are closed; a per-run brokered or
+short-lived credential is the real answer, and is open question 7.
 
 `HOME` is **not** inherited, which is the half a denylist cannot fix at all.
 Removing `GH_TOKEN` from the environment accomplishes nothing while the agent
@@ -366,8 +396,13 @@ Field mapping, and what is deliberately refused:
 ### Coverage honesty
 
 `coverage.completeness` is `complete`, `partial`, or `unknown`. A `partial` or
-`unknown` scan renders an explicit line in the published summary naming what
-was not covered (`coverage.deferred` ids and reasons, which are structured).
+`unknown` scan renders an explicit line in the published summary reporting
+`deferredCount` and the validated `deferred` ids — **never a reason**, per the
+sanitation rule below. This sentence previously said "ids and reasons, which
+are structured", which survived the edit that removed `reason` from the type
+and would have re-authorized the exact prose that rule exists to keep out. A
+requirement stated in two places is a requirement that can disagree with
+itself, so the rendering rule now lives only with the type that carries it.
 
 This is the `dependency-advisories.ts` lesson applied directly: a scan that
 was cut short by the host deadline, a cost limit, or an interruption must not
@@ -439,10 +474,31 @@ immediate child only, and the worker is not the leaf — it starts the Codex
 runtime, which starts its own plugin and Python processes. Killing the worker
 alone leaves an agent running against attacker-controlled code with no
 supervisor and no deadline, which is worse than the timeout the kill was
-enforcing. The child is spawned `detached` and the group is signalled
+enforcing. On POSIX the child is spawned `detached` and the group is signalled
 (`process.kill(-pid, …)`), escalating `SIGTERM` → `SIGKILL`, with the same
-teardown on the abort path and in a `finally` that also removes the clone, the
-temp `HOME`, and the run's output directory.
+teardown on the abort path.
+
+**On Windows that call cannot work.** `process.kill(-pid, …)` has no meaning
+there, and `detached` makes the worker independent rather than reachable — so
+a timeout or abort would report the scan stopped while the agent kept running,
+the precise failure this whole mechanism exists to prevent. The repository does
+carry Windows paths (`state-paths.ts` branches on `win32`; `protect.ts:88`
+returns early there). So Windows terminates the tree with
+`taskkill /T /F /PID <pid>`, and **if that is not implemented, the scan refuses
+to start on Windows** rather than running without an enforceable deadline.
+`protect.ts` sets the precedent for saying this out loud: it names its Windows
+gap as a product decision "stated here rather than silently chosen".
+
+Cleanup runs in a `finally` and is **not uniform**, because two rules in this
+document require retention:
+
+- The isolated clone and the temp `HOME` are **always** removed. Nothing needs
+  them afterwards and both may hold attacker-controlled content.
+- The run's output directory is removed **only** when neither
+  `--codex-scan-keep-output` nor a preserved `ScanInterruptedError` `scanDir`
+  applies. An unconditional removal here would have quietly broken both
+  promises — the retention flag and the interrupted-scan evidence — from a
+  sentence in a different section.
 
 `--codex-scan on` in `poll` mode requires the flag to be set explicitly per
 invocation; it is never inherited from a repository default.
@@ -667,6 +723,14 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 - **AC-14b** Given a run with `--codex-scan on` and no sandbox assertion,
   followed by a run on the same head with the assertion, then the second run is
   not suppressed by dedup and the scan executes.
+- **AC-20** Given a completed scan, when the worker's tool subprocesses are
+  inspected, then no Codex API key appears in their environment.
+- **AC-21** Given `--codex-scan-keep-output`, or an interrupted scan, when
+  cleanup runs, then the clone and temp `HOME` are gone and the output
+  directory remains.
+- **AC-22** Given Windows, when the scan is requested, then either the process
+  tree is terminated via `taskkill /T /F` on timeout and abort, or the scan
+  refuses to start.
 - **AC-19** Given a scan whose `coverage.deferred` entries carry fenced
   markup, marker lookalikes, or oversized text, when the summary renders, then
   no scanner-authored prose appears and `deferredCount` still reflects every
@@ -717,3 +781,8 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
    claim by the operator. Worth investigating whether a cheap positive signal
    (a container marker, a namespace check, an unprivileged-user check) can
    turn some of it into something the CLI actually verifies.
+7. **A brokered scan credential.** Steps 1-3 above keep the key out of tool
+   subprocesses but not out of the worker process. A per-run, short-lived or
+   scope-limited credential — minted for one scan and useless afterwards —
+   would make a leak survivable instead of merely unlikely. Worth checking
+   whether the provider supports one.
