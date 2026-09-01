@@ -271,6 +271,19 @@ describe("the message contract states a length budget", () => {
     expect(FINDING_JSON_CONTRACT).toMatch(/Verbatim code only/);
     expect(agent).toMatch(/Verbatim code only/);
   });
+
+  // Codex review of PR #119: the severity bar two bullets up explicitly
+  // permits blocking build/test/package failures with NO runtime path and
+  // warnings whose path cannot be demonstrated. Demanding a reachable path
+  // universally would hand the reviewer contradictory instructions — the
+  // pressure valve is concrete evidence per finding class.
+  it("does not demand a reachable path for findings that have none", () => {
+    for (const text of [FINDING_JSON_CONTRACT, agent]) {
+      expect(text).toMatch(/CONCRETE EVIDENCE/);
+      // The path demand is scoped to runtime defects, not universal.
+      expect(text).toMatch(/runtime defect that is the\s+reachable path/);
+    }
+  });
 });
 
 describe("buildDispatchPrompt trusted-base context", () => {

@@ -105,11 +105,13 @@ the whole review unusable.
     State the problem, e.g. `"The loop uses <= n, so it sums one element too
     many."` Not a restatement of the file name, and not a full paragraph.
   - `message`: the full explanation — what's wrong and, where useful, the
-    suggested fix. Cite the specific evidence: the reachable path and the fix,
-    then stop. HARD CAP ~120 words — do not spend them restating the rule, the
-    file name, the diff, the title, or how important the problem is. Long
-    messages cost twice (prompt tokens and the published comment) and read
-    worse than the same finding stated once, concretely.
+    suggested fix. Cite the CONCRETE EVIDENCE (for a runtime defect that is the
+    reachable path; for a build/test/packaging breakage the failing step; for
+    an undemonstrable warning whatever you CAN show) and the fix, then stop.
+    HARD CAP ~120 words — do not spend them restating the rule, the file name,
+    the diff, the title, or how important the problem is. Long messages cost
+    twice (prompt tokens and the published comment) and read worse than the
+    same finding stated once, concretely.
   - `suggestion`: the EXACT replacement text for lines `line`..`endLine`, or
     `null`.
 
