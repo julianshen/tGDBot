@@ -506,12 +506,23 @@ documented as such.
 
 `computeReviewConfigHash` must include the codex-scan settings that change
 what a review produces — enabled state, cost limit, timeout, **and the
-`--codex-scan-sandboxed` assertion** — or enabling the scan on an
+`--codex-scan-sandbox-cmd` runner** — or enabling the scan on an
 already-reviewed head is suppressed by the marker and silently does nothing,
 the failure mode config-aware dedup exists to prevent.
 
-The assertion belongs in that list precisely because AC-13 makes its absence
-*publish*: a first run with `--codex-scan on` and no assertion posts a review
+**Prerequisite readiness belongs in the hash too.** A scan that failed because
+the API key, the optional SDK, a supported Node major, or Python was missing
+still publishes and finalizes a marker under AC-5. Fixing the prerequisite
+changes none of the settings above, so `decideDedup` sees the same head and
+config and skips the retry — the operator installs the missing runtime, re-runs,
+and gets silence. So while the scan is enabled the hash also covers a
+**non-secret readiness fingerprint**: booleans and coarse versions only —
+credential present, SDK resolvable, Node major, Python present, runner
+configured. Never the key, never a path. Correcting any of them changes the
+hash and the retry runs.
+
+The sandbox runner belongs in that list for the same reason, and AC-13 makes
+its absence *publish*: a first run with `--codex-scan on` and no assertion posts a review
 whose scan failed, marker and all. Adding the assertion and re-running changes
 whether the scan happens at all — but if the hash cannot see it, dedup
 suppresses the corrected run on the same head, and the operator who did exactly
@@ -530,7 +541,7 @@ changes the hash when the scan is on.
 
 ```text
 --codex-scan on|off            (default: off)
---codex-scan-sandboxed         (required assertion; see Security bounds item 2)
+--codex-scan-sandbox-cmd <cmd> (required runner; see Security bounds item 2)
 --codex-scan-max-cost <usd>
 --codex-scan-timeout <hours>   (enforced by the parent; NOT maxTimeHours)
 --codex-scan-keep-output       (retain the scan directory)
@@ -657,14 +668,36 @@ review's own abort path, with `AbortSignal` passed through to `run()`.
    scan "cannot read a token off disk"; that was wrong, and the correction is
    the reason this item is now first among the concrete bounds.
 
-   The only real boundary is external, and the assertion names something
-   specific rather than a vibe. `--codex-scan-sandboxed` asserts that the
-   scan child runs in a container, VM, or dedicated unprivileged account
-   **that exposes only the isolated clone and the run's output directory** —
-   and in particular not the managed workspace root, not the operator's home,
-   and not the credentials of the account running the CLI. That precision
-   matters because the process-level measures do not deliver it: same UID,
-   same filesystem view, predictable managed layout.
+   The only real boundary is external — and **nothing in this design creates
+   it**, which an earlier draft obscured by asking the operator to assert it.
+   Running the whole CLI in a container does not produce it either: the worker
+   is spawned by the parent and inherits the parent's mounts, user and network
+   namespace, and the parent must be able to see the managed workspace, since
+   it just made the clone there. "Put the CLI in a container" therefore gives
+   the child exactly the parent's view, which is the view the boundary is
+   supposed to withhold. An assertion the design provides no way to satisfy is
+   not a control; it is a request that the operator solve the problem
+   unaided.
+
+   So the boundary is a **launch mechanism, not a promise**.
+   `--codex-scan-sandbox-cmd <command>` supplies the runner used to start the
+   worker — `bwrap`, `unshare`, `firejail`, `docker run`, a job-runner
+   primitive — and the scan **refuses to start without one**. The design
+   specifies what the runner must provide rather than which tool provides it:
+
+   - a mount view containing **only** the isolated clone and the run's output
+     directory — not the managed workspace root, not the operator's home;
+   - a user with no access to the CLI account's credentials;
+   - the egress policy below.
+
+   What the CLI can and cannot do here is worth stating exactly, because this
+   document has over-claimed before. It **can** guarantee the worker is
+   launched through the configured runner and nowhere else, and it does. It
+   **cannot** verify that the runner delivers those three properties — a
+   command that ignores them looks identical from here. So this is still
+   ultimately the operator's guarantee; the change is that they now have a
+   place to put it, and that forgetting produces a refusal rather than an
+   unsandboxed scan.
 
    **The boundary is not filesystem-only.** The scan holds outbound network
    access by necessity, so a filesystem-only sandbox still lets a
@@ -679,10 +712,11 @@ review's own abort path, with `AbortSignal` passed through to `run()`.
    a code-review tool into a cloud-credential compromise, and an operator
    writing an egress rule should not have to infer it.
 
-   The CLI **refuses to scan unless the operator makes that assertion**.
-   Refusing by default is deliberate: an unsandboxed scan is the dangerous
-   case, so it must not be reachable by forgetting a flag. The CLI cannot
-   verify the assertion, and says so rather than implying it checked.
+   The CLI **refuses to scan unless a runner is configured**. Refusing by
+   default is deliberate: an unsandboxed scan is the dangerous case, so it
+   must not be reachable by forgetting a flag. The egress policy is part of
+   what the runner must provide, and — like the mount view — is something the
+   CLI requires and cannot verify.
 3. **Environment allowlisted and `HOME` isolated** as specified above. This
    narrows what is trivially reachable — it does not make the operator's
    credentials unreadable, per item 2. Its real value is that the scan cannot
@@ -828,12 +862,12 @@ wins and the AC is the bug**.
 - **AC-12** Given a scan that writes to `hooks/post-checkout` in the tree it
   was given, when the next managed `git worktree add` runs, then no scan-written
   hook executes.
-- **AC-13** Given `--codex-scan on` without the sandbox assertion, when the
+- **AC-13** Given `--codex-scan on` without a configured sandbox runner, when the
   review runs, then the scan refuses to start and says why, and the review
   still publishes its rule findings.
 - **AC-14** Given a review run with the scan off, when its marker is compared
   to one written before this feature existed, then the config hashes match.
-- **AC-14b** Given a run with `--codex-scan on` and no sandbox assertion,
+- **AC-14b** Given a run with `--codex-scan on` and no sandbox runner,
   followed by a run on the same head with the assertion, then the second run is
   not suppressed by dedup and the scan executes.
 - **AC-15** Given `--codex-scan-timeout`, when the scan is dispatched, then no
@@ -875,6 +909,12 @@ wins and the AC is the bug**.
 - **AC-27** Given a scan returning one finding with an unrecognized severity,
   when the review publishes, then `completeness` is not `"complete"` and
   `droppedFindings` is 1.
+- **AC-28** Given a scan that failed for a missing prerequisite, when the
+  prerequisite is corrected and the review re-runs on the same head, then dedup
+  does not suppress it and the scan executes.
+- **AC-29** Given `--codex-scan on` with no `--codex-scan-sandbox-cmd`, when
+  the review runs, then the scan refuses to start; and when a runner is
+  configured, then the worker is launched through it and not spawned directly.
 
 ## Open questions
 
@@ -901,8 +941,8 @@ wins and the AC is the bug**.
    worktree. Acceptable for a flag that is off by default and already requires
    a disposable environment, but it should be measured on a large repository
    before this is called settled.
-6. **Asserting the sandbox.** `--codex-scan-sandboxed` is an unverifiable
-   claim by the operator. Worth investigating whether a cheap positive signal
+6. **Asserting the sandbox.** the sandbox runner's properties are unverifiable
+   from here. Worth investigating whether a cheap positive signal
    (a container marker, a namespace check, an unprivileged-user check) can
    turn some of it into something the CLI actually verifies.
 7. **A brokered scan credential.** Steps 1-3 above keep the key out of tool
