@@ -114,6 +114,7 @@ export function computeReviewConfigHash(
    * when that one is absent.
    */
   contextFingerprint?: string,
+  scanFingerprint?: string,
 ): string {
   // A positional array (not an object) so the serialization can't drift on key
   // ordering; every field that affects review output is included explicitly.
@@ -149,6 +150,7 @@ export function computeReviewConfigHash(
     relatedWorkFingerprint ?? null,
     ...(conversationFingerprint === undefined ? [] : [conversationFingerprint]),
     ...(contextFingerprint === undefined ? [] : [{ context: contextFingerprint }]),
+    ...(scanFingerprint === undefined ? [] : [{ codexScan: scanFingerprint }]),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
 }

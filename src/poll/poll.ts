@@ -117,6 +117,7 @@ import type {
 } from "../conversation/state-schema.js";
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
+import { CODEX_SECURITY_POLICY } from "../review/codex-security-results.js";
 import type {
   ConversationAdapter,
   ReviewActivityEvent,
@@ -1133,12 +1134,19 @@ async function planConversationReply(input: {
 
   const metadata = await loadReviewMetadata(item.event.reviewNumber, options);
   if (metadata === undefined) return { status: "transient" };
-  const rules = await loadActiveRules(item.event.reviewNumber, metadata, options);
-  if (rules.error !== undefined) {
-    console.warn(`tgd-review-agent: conversation rule loading failed (${rules.error.message})`);
-    return { status: "transient" };
+  const importedScanFinding = resolution.ledger.reviewOptions.codexScanResults === true &&
+    resolution.ledger.finding.ruleName === "codex-security";
+  let currentRule: RuleDefinition | undefined;
+  if (importedScanFinding) {
+    currentRule = CODEX_SECURITY_POLICY;
+  } else {
+    const rules = await loadActiveRules(item.event.reviewNumber, metadata, options);
+    if (rules.error !== undefined) {
+      console.warn(`tgd-review-agent: conversation rule loading failed (${rules.error.message})`);
+      return { status: "transient" };
+    }
+    currentRule = rules.rules.find((rule) => rule.name === resolution.ledger.finding.ruleName);
   }
-  const currentRule = rules.rules.find((rule) => rule.name === resolution.ledger.finding.ruleName);
   if (currentRule === undefined) {
     return { status: "ready", plan: { kind: "inactive", ruleName: resolution.ledger.finding.ruleName } };
   }
@@ -2749,11 +2757,19 @@ async function queueVerifications(input: {
   const metadata = await loadReviewMetadata(input.reviewNumber, input.options);
   if (metadata === undefined) return holdAll;
 
-  const rules = await loadActiveRules(input.reviewNumber, metadata, input.options);
+  const needsRules = queue.some((pending) => {
+    const ledger = findings.find((entry) => entry.id === pending.findingId);
+    return ledger !== undefined && !(ledger.reviewOptions.codexScanResults === true &&
+      ledger.finding.ruleName === "codex-security");
+  });
+  const rules = needsRules
+    ? await loadActiveRules(input.reviewNumber, metadata, input.options)
+    : { rules: [] as readonly RuleDefinition[] };
   if (rules.error !== undefined) {
-    // A LOAD failure, not a verdict that the rules are gone.
+    // Preserve the error in the queue context. Imported scan findings do not
+    // need this rule set and must still settle; ordinary findings inspect the
+    // error in verifyQueued and remain retryable rather than becoming inactive.
     console.warn(`tgd-review-agent: verification rule loading failed (${rules.error.message})`);
-    return holdAll;
   }
 
   // Resolved WITHOUT touching the provider: which finding, which event. This is
@@ -2899,6 +2915,15 @@ async function verifyQueued(input: {
   const metadata = input.context.metadata;
   if (metadata === undefined) return { kind: "transient" };
   const ledger = item.ledger;
+
+  // There is no rule prompt to re-run for an imported scan finding. Settling
+  // the queue is explicit and terminal; treating the synthetic policy as a
+  // reviewer rule would manufacture a verification the scanner never made.
+  if (ledger.reviewOptions.codexScanResults === true && ledger.finding.ruleName === "codex-security") {
+    return { kind: "settled", reason: "Codex Security findings require a new external scan" };
+  }
+
+  if (input.context.rules.error !== undefined) return { kind: "transient" };
 
   // The same fallback the command path uses, and the same refusal: a review
   // records the model it ran under, so a finding raised by a configured run

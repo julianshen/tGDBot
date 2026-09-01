@@ -150,6 +150,15 @@ describe("computeReviewConfigHash", () => {
       computeReviewConfigHash(makeConfig({ rulesDir: ".tgd-review/rules" })),
     );
   });
+
+  it("keeps flag-off hashes unchanged and fingerprints enabled scan artifacts", () => {
+    const legacy = computeReviewConfigHash(makeConfig());
+    expect(computeReviewConfigHash(makeConfig(), undefined, undefined, undefined, undefined)).toBe(legacy);
+    const first = computeReviewConfigHash(makeConfig(), undefined, undefined, undefined, "/scan:a");
+    const replaced = computeReviewConfigHash(makeConfig(), undefined, undefined, undefined, "/scan:b");
+    expect(first).not.toBe(legacy);
+    expect(replaced).not.toBe(first);
+  });
 });
 
 describe("conversationDedupFingerprint", () => {

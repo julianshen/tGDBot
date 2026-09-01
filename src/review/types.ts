@@ -219,6 +219,15 @@ export interface DispatchResult {
 
   /** Present only when every dispatched rule used a pack from one validated manifest. */
   contextManifestHash?: string;
+  /** Completeness reported by an externally produced security scan artifact. */
+  scanCoverage?: ScanCoverage;
+}
+
+export interface ScanCoverage {
+  readonly completeness: "complete" | "partial" | "unknown";
+  readonly deferred: readonly string[];
+  readonly deferredCount: number;
+  readonly droppedFindings: number;
 }
 
 export type RuleContextPacks = Readonly<Record<string, ContextPackResult>>;

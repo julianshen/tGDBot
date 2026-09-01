@@ -9,7 +9,7 @@
 // Both are plain string builders: pure, synchronous, no I/O.
 import { describeCheck, describeCheckCompact } from "./structural-check.js";
 import { crossFileGroups } from "./finding-clusters.js";
-import type { Finding } from "./types.js";
+import type { Finding, ScanCoverage } from "./types.js";
 import type { HunkSnippet } from "./diff-anchors.js";
 import type { DiscussionMemory } from "./existing-discussion.js";
 import {
@@ -612,6 +612,7 @@ export interface SummaryInput {
   rulesRun: string[];
   rulesFailed: string[];
   ruleFailureReasons?: Record<string, string>;
+  scanCoverage?: ScanCoverage;
   relatedWork?: readonly RelatedWorkItem[];
   /** Bounded summaries of human-authored active review discussion. */
   discussionMemories?: readonly DiscussionMemory[];
@@ -1204,6 +1205,13 @@ function compactFailureReasons(input: SummaryInput, failed: ReadonlySet<Finding>
   return `:\n> ${shown.map((reason) => `- ${reason}`).join("\n> ")}${more}`;
 }
 
+function renderScanCoverage(coverage: ScanCoverage | undefined): string | undefined {
+  if (coverage === undefined || coverage.completeness === "complete") return undefined;
+  return `> [!WARNING]\n> Codex Security coverage is **${coverage.completeness}** (` +
+    `${coverage.deferredCount} deferred, ${coverage.droppedFindings} unmappable); ` +
+    "absence of security findings is not an all-clear.";
+}
+
 function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // Compact mode must carry the SAME finding set as the full renderer — it is a
   // size fallback, not a scope fallback. Publication failures were previously
@@ -1236,6 +1244,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
       ? `\n> ${unshownReferences} further reference(s) omitted; one is shown per finding`
       : "");
   const contextUnavailable = renderContextUnavailable(input);
+  const scanCoverage = renderScanCoverage(input.scanCoverage);
   const clarification = renderClarificationSection(input);
   const disputedFindings = input.disputed ?? [];
   const failedRules = input.rulesFailed.length > 0
@@ -1301,7 +1310,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   // the messages then compete for the remaining space through the shared
   // allocator, so the section shrinks instead of vanishing.
   const disputedSkeleton = renderDisputedSection(input, true, disputedFindings.map(() => 0));
-  const fixed = [header, notice, contextUnavailable, clarification, disputedSkeleton, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
+  const fixed = [header, notice, contextUnavailable, scanCoverage, clarification, disputedSkeleton, discussionMemory, failedRules, relatedWork, crossFile, ...findings.map(({ prefix, reference }) => `${prefix}${reference}`)]
     .filter((part): part is string => part !== undefined)
     .join("\n\n");
   const available = Math.max(0, maxLength - fixed.length);
@@ -1323,6 +1332,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
     header,
     notice,
     contextUnavailable,
+    scanCoverage,
     clarification,
     disputed,
     discussionMemory,
@@ -1347,6 +1357,7 @@ function renderCompactSummary(input: SummaryInput, maxLength: number): string {
   const compactStatus = [
     header,
     notice,
+    scanCoverage,
     input.rulesFailed.length > 0
       ? `${input.rulesFailed.length} rule(s) failed to run.`
       : undefined,
@@ -1415,6 +1426,9 @@ function renderSummaryCommentWithIncludedSuggestions(
 
   const contextUnavailable = renderContextUnavailable(input);
   if (contextUnavailable) parts.push(contextUnavailable);
+
+  const scanCoverage = renderScanCoverage(input.scanCoverage);
+  if (scanCoverage) parts.push(scanCoverage);
 
   // Anchors were VALID; the provider refused the write. Named separately so the
   // reader chases the right problem — and so nobody re-checks line numbers that
