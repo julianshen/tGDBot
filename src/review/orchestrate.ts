@@ -383,6 +383,7 @@ export function orchestrate(
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
     ruleFailureReasons: dispatchResult.ruleFailureReasons,
+    scanCoverage: dispatchResult.scanCoverage,
     relatedWork: options.relatedWork,
     discussionMemories: options.discussionMemories,
     inlineUnavailable: !inlineEnabled && dedupedFindings.length > 0,

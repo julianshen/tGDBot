@@ -81,6 +81,7 @@ import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
+import { codexScanFailureReason, ingestCodexSecurityResults } from "./review/codex-security-results.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
@@ -1107,6 +1108,16 @@ export async function review(
     allowDegraded: config.allowDegradedContext,
     mapperVersion: selectedMapperVersion(config.contextMapper),
   });
+  let scanIngest: Awaited<ReturnType<typeof ingestCodexSecurityResults>> | undefined;
+  let scanIngestError: unknown;
+  if (config.codexScanResults !== undefined) {
+    try {
+      scanIngest = await ingestCodexSecurityResults(config.codexScanResults);
+    } catch (error) {
+      scanIngestError = error;
+      console.warn(`tgd-review-agent: Codex Security ingest failed: ${redactedMessage(error)}`);
+    }
+  }
   const configHash = computeReviewConfigHash(
     config,
     // Issue #59: when intent is enabled, the normalized title + description
@@ -1116,7 +1127,10 @@ export async function review(
     // and the hash is what it always was.
     relatedWorkFingerprintWithIntent(config, extracted, pr.title, pr.description),
     loadedContext.fingerprint,
-    ...(contextIdentity === undefined ? [] : [contextIdentity]),
+    ...(contextIdentity === undefined ? [undefined] : [contextIdentity]),
+    ...(config.codexScanResults === undefined
+      ? []
+      : [`${path.resolve(config.codexScanResults)}:${scanIngest?.digest ?? "failed"}`]),
   );
   const storeBinding = storeBindingOf(stateStore, repository);
   const publicationIdentity = reviewPublicationIdentity({
@@ -1272,7 +1286,11 @@ export async function review(
     return recovery.terminalResult.exitCode;
   }
 
-  const { rules, errors: loadErrors } = await loadRulesForReview(config, pr, loadRulesFn);
+  const loadedRules = await loadRulesForReview(config, pr, loadRulesFn);
+  const rules = config.codexScanResults === undefined
+    ? loadedRules.rules
+    : loadedRules.rules.filter((rule) => rule.name !== "codex-security");
+  const loadErrors = [...loadedRules.errors];
 
   // Task 8 review fix #1: surface load errors via console.error whenever
   // ANY rule file failed to load — not just when every rule failed. A
@@ -1599,6 +1617,19 @@ export async function review(
       : { conversationContext: loadedContext.conversationContext }),
     ...(prIntent === undefined ? {} : { prIntent }),
   });
+  if (config.codexScanResults !== undefined) {
+    if (scanIngest !== undefined) {
+      dispatchResult.findings.push(...scanIngest.findings);
+      dispatchResult.rulesRun.push("codex-security");
+      dispatchResult.scanCoverage = scanIngest.coverage;
+    } else {
+      dispatchResult.rulesFailed.push("codex-security");
+      dispatchResult.ruleFailureReasons = {
+        ...dispatchResult.ruleFailureReasons,
+        "codex-security": codexScanFailureReason(scanIngestError),
+      };
+    }
+  }
 
   // Issue #75: check the structural claims the reviewer chose to make, against
   // the trusted BASE tree. Best-effort throughout — a check that cannot run

@@ -9,7 +9,7 @@
 // Both are plain string builders: pure, synchronous, no I/O.
 import { describeCheck, describeCheckCompact } from "./structural-check.js";
 import { crossFileGroups } from "./finding-clusters.js";
-import type { Finding } from "./types.js";
+import type { Finding, ScanCoverage } from "./types.js";
 import type { HunkSnippet } from "./diff-anchors.js";
 import type { DiscussionMemory } from "./existing-discussion.js";
 import {
@@ -612,6 +612,7 @@ export interface SummaryInput {
   rulesRun: string[];
   rulesFailed: string[];
   ruleFailureReasons?: Record<string, string>;
+  scanCoverage?: ScanCoverage;
   relatedWork?: readonly RelatedWorkItem[];
   /** Bounded summaries of human-authored active review discussion. */
   discussionMemories?: readonly DiscussionMemory[];
@@ -1415,6 +1416,18 @@ function renderSummaryCommentWithIncludedSuggestions(
 
   const contextUnavailable = renderContextUnavailable(input);
   if (contextUnavailable) parts.push(contextUnavailable);
+
+  if (input.scanCoverage !== undefined && input.scanCoverage.completeness !== "complete") {
+    const coverage = input.scanCoverage;
+    const details = [
+      `${coverage.deferredCount} deferred`,
+      `${coverage.droppedFindings} unmappable`,
+    ].join(", ");
+    parts.push(
+      `> [!WARNING]\n> Codex Security coverage is **${coverage.completeness}** (${details}); ` +
+        "absence of security findings is not an all-clear.",
+    );
+  }
 
   // Anchors were VALID; the provider refused the write. Named separately so the
   // reader chases the right problem — and so nobody re-checks line numbers that

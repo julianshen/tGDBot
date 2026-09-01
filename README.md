@@ -95,6 +95,16 @@ npm run build      # emits dist/cli.js and copies the vendored builtin rule
 Run it directly with `node dist/cli.js review --pr <number>`, or install the
 package so the `tgd-review-agent` bin is on your `PATH`.
 
+### Ingesting Codex Security results
+
+`--codex-scan-results <path>` adds findings from a `findings.json` artifact
+produced by a **separate** Codex Security job. The path may name the JSON file
+or its containing directory. tGDBot never launches the scanner: run that job
+inside an appropriately sandboxed, egress-limited environment, then pass its
+artifact to the review command. The artifact is size-bounded and treated as
+untrusted input; scanner references, remediation suggestions, claims, and
+host-check fields are not published.
+
 ### Running it
 
 `tgd-review-agent` is a CLI you run yourself against an open PR — from your

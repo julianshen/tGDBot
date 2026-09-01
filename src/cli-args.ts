@@ -58,6 +58,8 @@ export interface SharedReviewOptions {
   /** Absolute root for the managed base worktree and the context cache. */
   contextDir?: string;
   stateDir?: string;
+  /** Codex Security artifact produced by a separate, sandboxed job. */
+  codexScanResults?: string;
 }
 
 export interface ReviewArgs extends SharedReviewOptions {
@@ -125,6 +127,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "allow-degraded-context": { type: "boolean" },
       "context-dir": { type: "string" },
       "state-dir": { type: "string" },
+      "codex-scan-results": { type: "string" },
     },
   });
 
@@ -260,6 +263,11 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     throw new Error(`Invalid --state-dir value: "${stateDir}" (expected an absolute path)`);
   }
 
+  const codexScanResults = values["codex-scan-results"] as string | undefined;
+  if (codexScanResults !== undefined && codexScanResults.length === 0) {
+    throw new Error('Invalid --codex-scan-results value: expected a path');
+  }
+
   const shared: SharedReviewOptions = {
     repo: values.repo as string | undefined,
     vcs,
@@ -282,6 +290,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,
     trustLocalRules: (values["trust-local-rules"] as boolean | undefined) ?? DEFAULTS.trustLocalRules,
     stateDir,
+    ...(codexScanResults === undefined ? {} : { codexScanResults }),
   };
   const result: CommandArgs = command === "review"
     ? { command, pr: values.pr as string, ...shared }
