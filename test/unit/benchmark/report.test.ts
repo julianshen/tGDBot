@@ -2,6 +2,7 @@
 // these pin the ways a benchmark can look better than it is.
 import { describe, expect, it } from "vitest";
 import { parseArgs } from "../../../src/benchmark/cli.js";
+import { publishedBytes } from "../../../src/benchmark/run.js";
 import { aggregate, diffBaselines, formatReport, toBaseline, type Baseline } from "../../../src/benchmark/report.js";
 import type { BaselineEntry, FixtureRunResult, RunReport } from "../../../src/benchmark/types.js";
 
@@ -119,6 +120,26 @@ describe("formatReport", () => {
     });
     expect(text).toMatch(/n\/a/);
     expect(text).not.toMatch(/0\.0%/);
+  });
+});
+
+describe("publishedBytes", () => {
+  const review = ["----- summary comment -----", "**2 findings**", "body text"];
+
+  it("counts the review preview", () => {
+    expect(publishedBytes(review)).toBe(review.join("\n").length);
+  });
+
+  it("is unmoved by operational logging", () => {
+    // A change to a progress message must not read as a rendering regression:
+    // the findings and the published bytes are the same, only the machinery
+    // said something different.
+    expect(publishedBytes([
+      "tgd-review-agent: repository context ready for 1 rule(s)",
+      ...review,
+      "TGD_REVIEW_SEVERITIES: {\"blocking\":1}",
+      "TGD_REVIEW_RESULT: {\"status\":\"posted\"}",
+    ])).toBe(publishedBytes(review));
   });
 });
 

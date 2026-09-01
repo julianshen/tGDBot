@@ -132,11 +132,7 @@ export async function runFixture(
     await rm(stateDir, { recursive: true, force: true });
   }
   const durationMs = performance.now() - startedAt;
-  // The status lines are machine output ABOUT the run, not review a reader
-  // receives, so they are excluded from the published byte count.
-  renderedChars = printed
-    .filter((line) => !line.startsWith("TGD_REVIEW_RESULT:") && !line.startsWith("TGD_REVIEW_SEVERITIES:"))
-    .join("\n").length;
+  renderedChars = publishedBytes(printed);
   // A review that failed produced no findings for a REASON, and scoring it as
   // "found nothing" turns a missing API key or an unloadable rule into false
   // negatives blamed on the model — while the benchmark still exits 0 (Codex
@@ -208,6 +204,35 @@ function measure(into: DispatchMeasurement, input: ReviewDispatchInput): void {
     ).length;
   }
 }
+
+/**
+ * The bytes of the captured dry run that are REVIEW, not machinery.
+ *
+ * The CLI writes two kinds of thing to stdout: the preview of what it would
+ * publish, and operational output about the run — progress notes prefixed
+ * `tgd-review-agent:` and the two machine-readable status lines. Counting all
+ * of it meant a change to a log message moved a rendered-size baseline and
+ * reported a rendering regression that had not happened (CodeRabbit review of
+ * PR #118).
+ *
+ * Exported and pure so the exclusion is testable on its own, rather than only
+ * observable through a full fixture run.
+ */
+export function publishedBytes(printed: readonly string[]): number {
+  return printed
+    .filter((line) => !OPERATIONAL_PREFIXES.some((prefix) => line.startsWith(prefix)))
+    .join("\n").length;
+}
+
+/**
+ * What stdout carries that is not review.
+ *
+ * `tgd-review-agent: ` is the CLI's own convention for progress and degradation
+ * notes; the other two are the machine-readable result lines. A future log line
+ * that used neither would leak into the count, which is what the unit test on
+ * this function exists to make visible rather than silent.
+ */
+const OPERATIONAL_PREFIXES = ["tgd-review-agent:", "TGD_REVIEW_RESULT:", "TGD_REVIEW_SEVERITIES:"] as const;
 
 function severityMix(findings: readonly Finding[]): BaselineEntry["severityMix"] {
   const mix = { blocking: 0, warning: 0, suggestion: 0 };

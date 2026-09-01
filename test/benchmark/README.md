@@ -39,7 +39,7 @@ them as fixture design rather than as measurement.
 
 `--check` prints one line per changed metric:
 
-```
+```text
 3 change(s) against test/benchmark/baseline.json:
   unguarded-dereference falseNegatives: 0 -> 1
   unguarded-dereference missed: [] -> ["deref-missing-guard"]
@@ -103,9 +103,12 @@ this diff makes commentable.
 `expected` is a list of **matchers**, not copies of findings — pinning exact
 prose would make every wording change a regression and train you to ignore the
 diff. A finding matches when the file agrees, its line overlaps `lines`, and
-the message matches `messagePattern`. Only `id` and `file` are required, but a
-matcher with neither `lines` nor `messagePattern` rewards a reviewer for saying
-anything at all about the right file.
+the message matches `messagePattern`.
+
+At least one of `lines` or `messagePattern` is **required**, and the loader
+refuses a fixture without one. A matcher naming only a file matches any finding
+in that file, so an unrelated finding would count as the defect and inflate both
+precision and recall.
 
 An empty `expected` is a legitimate fixture: a change the reviewer should stay
 quiet about. Its only meaningful number is the false-positive count.

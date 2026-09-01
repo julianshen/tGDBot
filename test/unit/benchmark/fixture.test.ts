@@ -49,8 +49,8 @@ describe("loadFixture", () => {
   it("rejects duplicate expectation ids", async () => {
     // Ids name rows in a baseline diff; two rows with one name is unreadable.
     const root = await fixtureDir(manifest([
-      { id: "a", file: "src/a.ts" },
-      { id: "a", file: "src/b.ts" },
+      { id: "a", file: "src/a.ts", lines: [1, 2] },
+      { id: "a", file: "src/b.ts", lines: [1, 2] },
     ]));
     await expect(loadFixture(path.join(root, "case"), "case")).rejects.toThrow(/duplicate expectation id/);
   });
@@ -67,8 +67,25 @@ describe("loadFixture", () => {
   });
 
   it("rejects an unknown severity instead of ignoring it", async () => {
-    const root = await fixtureDir(manifest([{ id: "a", file: "src/a.ts", severity: "critical" }]));
+    const root = await fixtureDir(manifest([{ id: "a", file: "src/a.ts", lines: [1, 2], severity: "critical" }]));
     await expect(loadFixture(path.join(root, "case"), "case")).rejects.toThrow(/severity is invalid/);
+  });
+
+  it("rejects an expectation that names only a file", async () => {
+    // A file alone matches ANY finding in that file, so an unrelated one counts
+    // as the defect and inflates precision and recall together. The README used
+    // to warn about this shape; a warning is not a guard.
+    const root = await fixtureDir(manifest([{ id: "a", file: "src/a.ts" }]));
+    await expect(loadFixture(path.join(root, "case"), "case"))
+      .rejects.toThrow(/must give lines or messagePattern/);
+  });
+
+  it("accepts an expectation discriminated by message alone", async () => {
+    // File-scoped defects are legitimate — a missing import, a manifest-wide
+    // problem — as long as something beyond the path narrows the match.
+    const root = await fixtureDir(manifest([{ id: "a", file: "src/a.ts", messagePattern: "undefined" }]));
+    const fixture = await loadFixture(path.join(root, "case"), "case");
+    expect(fixture.expected[0]).toMatchObject({ messagePattern: "undefined" });
   });
 
   it("rejects a recorded finding the production parser would not accept", async () => {

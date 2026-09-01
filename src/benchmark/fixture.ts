@@ -116,6 +116,13 @@ function expectedFinding(value: unknown, where: string): ExpectedFinding {
       throw new Error(`${where}.messagePattern is not a valid regular expression`, { cause: error });
     }
   }
+  // An expectation naming only a file matches ANY finding in that file, so an
+  // unrelated one counts as the defect and inflates both precision and recall.
+  // The README warned about this shape; a warning is not a guard, and a fixture
+  // is ground truth (CodeRabbit review of PR #118).
+  if (range === undefined && object.messagePattern === undefined) {
+    throw new Error(`${where} must give lines or messagePattern: a file alone matches any finding in it`);
+  }
   return {
     id: requireString(object.id, `${where}.id`),
     file: requireString(object.file, `${where}.file`),
