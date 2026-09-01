@@ -212,18 +212,60 @@ invited to trust without re-deriving" — and a scan finding anchored to
 can report a vulnerability at a line that only ever existed in that job's
 scratch tree.
 
-The cost is the one #78 already accepted and documented: a long consumer
-serialises other jobs against the same repository and base. `withPreparedWorkspace`
-already carries the timeouts for that (`SCOPED_LOCK_TIMEOUT_MS`,
-`SCOPED_LOCK_MAX_WAIT_MS`), and `--codex-scan-timeout` must be set below the
-scoped lock timeout so the holder's own budget expires first and a waiter
-reports a genuine deadlock rather than pre-empting live work.
+The request must pass **`rejectPreviouslySharedRoot: true`**. It defaults to
+false, and every existing consumer that runs tooling out of a prepared tree
+sets it — `cli.ts:1647` for structural checks, `prepare.ts:540` for context
+mapping, `poll.ts:2058`. Without it, a workspace root that was once writable
+by another user lets an attacker pre-create an expected-origin mirror whose
+`hooks/post-checkout` runs during `git worktree add` — in the **parent**
+process, before the scan child exists, and therefore under the parent's full
+environment rather than the allowlisted one. `manager.ts:129` documents that
+vector directly. Every managed-workspace request this feature makes sets the
+flag.
+
+What the scan is pointed at is **an isolated clone, not the managed
+worktree**: `git clone --no-hardlinks --no-local`-equivalent into the
+per-scan temp directory, carrying base and head, with no shared object store
+and no inherited hooks. The managed mirror is never exposed to the scan,
+because a scan that can write `repository.git/hooks/post-checkout` has left
+something behind that a **later parent-side** `git worktree add` executes —
+persistence that outlives the scan, its temp directory and its environment.
+Managed git invocations additionally set `core.hooksPath` to an empty
+directory, so a hook planted by any other means is inert.
+
+That changes the locking answer for the better. The clone is made **under**
+`withPreparedWorkspace`, and the lock is released before the scan itself runs.
+The clone is a private, immutable copy, so #78's hazard — a host-authored fact
+derived from a tree another job can `reset --hard` underneath — is closed by
+construction rather than by serialising every other job on that repository for
+the scan's whole duration. `--codex-scan-timeout` no longer has to sit below
+`SCOPED_LOCK_TIMEOUT_MS`. The cost moves from contention to disk: one full
+checkout per scan, removed with the scan output.
 
 Scan findings are merged into `DispatchResult.findings` carrying
-`ruleName: "codex-security"`. Everything downstream — clustering, inline
-anchoring, re-review suppression, the conversation state store, the published
-marker — then works unchanged, because they are ordinary findings by the time
-they reach it.
+`ruleName: "codex-security"`. Clustering, inline anchoring, re-review
+suppression, the conversation state store and the published marker then work
+unchanged, because they are ordinary findings by the time they reach it.
+
+**Coverage is the exception, and needs new plumbing.** `DispatchResult` and
+the renderer's input (`comment-format.ts:1579`) carry findings and rule
+accounting only — there is no field a completeness value could live in, so
+"the summary renders an incomplete-coverage line" is not something the
+existing pipeline can do. AC-6 is unimplementable without it. The design
+therefore adds a typed optional field:
+
+```ts
+readonly scanCoverage?: {
+  readonly completeness: "complete" | "partial" | "unknown";
+  readonly deferred: readonly { readonly id: string; readonly reason: string }[];
+};
+```
+
+carried on `DispatchResult`, threaded into the renderer input, and rendered by
+a dedicated section. Optional, so every existing engine and test double that
+never sets it is unaffected. `deferred` is structured (an id and a reason), so
+no scanner prose reaches the comment — the same rule the finding mapping
+follows.
 
 `"codex-security"` is a reserved rule name: `loadRulesForReview` rejects a
 user rule that claims it, the same way `planReviewWorkflow` already rejects
@@ -283,6 +325,7 @@ silently does nothing — the failure mode config-aware dedup exists to prevent.
 
 ```
 --codex-scan on|off            (default: off)
+--codex-scan-sandboxed         (required assertion; see Security bounds item 2)
 --codex-scan-max-cost <usd>
 --codex-scan-timeout <hours>   → maxTimeHours
 --codex-scan-keep-output       (retain the scan directory)
@@ -342,18 +385,44 @@ review's own abort path, with `AbortSignal` passed through to `run()`.
 1. **Off by default**, and documented in the README's "⚠️ Security
    Considerations" section as requiring an ephemeral, isolated environment —
    not as a recommendation but as the condition under which it is supported.
-2. **Environment allowlisted and `HOME` isolated** as specified above. The
-   scan never receives a VCS token, and cannot read one off disk either; it
-   has no reason to talk to `gh`/`glab`, and that token is the write path to
-   the PR.
-3. **Output outside the worktree**, `0o700`, removed by default.
-4. **No new publication surface.** Scan findings reach the reader through the
+2. **An OS-level boundary is a precondition, not a recommendation.** This is
+   the item everything else depends on, and it must not be overstated: the
+   process-level measures below are defense-in-depth, **not** a sandbox.
+
+   The scan keeps ordinary operating-system permissions. Giving it a fresh
+   `HOME` does not remove its read access to the operator's real home — it can
+   open `/home/<user>/.config/gh/hosts.yml`, `~/.ssh` or `~/.pi/auth.json` by
+   absolute path — and nothing at the process level stops it writing anywhere
+   the invoking user can write. An earlier draft of this document claimed the
+   scan "cannot read a token off disk"; that was wrong, and the correction is
+   the reason this item is now first among the concrete bounds.
+
+   The only real boundary is external: a container, VM, or dedicated
+   unprivileged user that exposes the scan inputs and nothing else. The CLI
+   therefore **refuses to scan unless the operator explicitly asserts that
+   boundary** (`--codex-scan-sandboxed`, or the equivalent environment
+   assertion for CI). Refusing by default is deliberate: an unsandboxed scan
+   is the dangerous case, so it must not be reachable by forgetting a flag.
+   The CLI cannot verify the assertion, and says so rather than implying it
+   checked.
+3. **Environment allowlisted and `HOME` isolated** as specified above. This
+   narrows what is trivially reachable — it does not make the operator's
+   credentials unreadable, per item 2. Its real value is that the scan cannot
+   accidentally *inherit* a token it never needed, and that a leak now
+   requires the agent to go looking rather than to read what it was handed.
+4. **The managed mirror is never exposed to the scan**, and every workspace
+   request passes `rejectPreviouslySharedRoot: true`. The scan reads an
+   isolated clone; managed git runs with `core.hooksPath` pointed at an empty
+   directory. Together these close the persistence vector: a hook written
+   into shared state and executed later by the parent, outside every bound
+   above.
+5. **Output outside the worktree**, `0o700`, removed by default.
+6. **No new publication surface.** Scan findings reach the reader through the
    same renderer, with the same ADR-006 defanging and the same ADR-007
    suggestion restriction.
-5. **No committable suggestions from scan output**, ever.
-   The scan holds the repository lock for its whole run (see above), so a
-   published finding names a tree no other job could rewrite underneath it.
-6. The `--codex-scan` flag is recorded in the published marker's config hash,
+7. **No committable suggestions from scan output**, ever. A published finding
+   names the isolated clone's tree, which no other job can rewrite.
+8. The `--codex-scan` flag is recorded in the published marker's config hash,
    so a reader can tell whether a given review included a scan.
 
 ## Testing strategy
@@ -385,9 +454,13 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
   a child, or reads a Codex key. Asserted by a resolver double that fails the
   test if called.
 - **Dedup test** — flipping `--codex-scan` changes `computeReviewConfigHash`.
-- **Lock-scoping test** — the scan runs inside `withPreparedWorkspace`'s
-  callback, asserted with a workspace double that fails if the scan is invoked
-  after the lock is released.
+- **Clone-isolation tests** — the workspace request carries
+  `rejectPreviouslySharedRoot: true`; the path handed to the scan is not the
+  managed worktree and does not reach the managed mirror; the clone is created
+  inside `withPreparedWorkspace`'s callback.
+- **Coverage plumbing test** — a `partial` scan with zero findings renders the
+  incomplete-coverage section, asserted end to end through
+  `DispatchResult.scanCoverage` rather than at the mapper.
 
 ## Acceptance criteria
 
@@ -409,16 +482,26 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 - **AC-5b** Given a scan that completes with `completeness: "partial"`, when
   the review publishes, then `"codex-security"` appears in `rulesRun` and not
   in `rulesFailed`.
-- **AC-6** Given `coverage.completeness` of `partial` or `unknown`, when the
-  summary renders, then it states that coverage was incomplete.
+- **AC-6** Given `coverage.completeness` of `partial` or `unknown` and zero
+  findings, when the summary renders, then it states that coverage was
+  incomplete — carried through `DispatchResult.scanCoverage`, not inferred.
 - **AC-7** Given `--codex-scan on` and an ambient environment carrying
   `GH_TOKEN`, `NPM_TOKEN`, `DATABASE_URL` and a provider key, when the child is
   spawned, then its environment contains only the allowlisted names and the one
   Codex key, and its `HOME` is a fresh empty directory rather than the
   operator's.
 - **AC-10** Given a scan in progress, when a second review on the same
-  repository and base begins, then it blocks on the repository lock until the
-  scan completes, rather than resetting the worktree underneath it.
+  repository and base runs `reset --hard` / `clean -ffdx`, then the scan's
+  findings are unaffected, because it reads a private clone made under the
+  lock rather than the shared worktree.
+- **AC-11** Given a managed-workspace request made for a scan, when it is
+  built, then `rejectPreviouslySharedRoot` is `true`.
+- **AC-12** Given a scan that writes to `hooks/post-checkout` in the tree it
+  was given, when the next managed `git worktree add` runs, then no scan-written
+  hook executes.
+- **AC-13** Given `--codex-scan on` without the sandbox assertion, when the
+  review runs, then the scan refuses to start and says why, and the review
+  still publishes its rule findings.
 - **AC-8** Given `--dry-run --codex-scan on`, when the review runs, then
   `preflight` runs and its plan prints, and no scan starts.
 - **AC-9** Given two runs on the same head differing only in `--codex-scan`,
@@ -439,3 +522,11 @@ network calls, the scan boundary is **injected**, exactly as `FetchJson` is in
 4. **Bundling the worker.** `dist/review/codex-scan-worker.js` is a new build
    output; the `build` script currently only compiles and copies two `.md`
    files.
+5. **Clone cost.** One full checkout per scan, on top of the managed base
+   worktree. Acceptable for a flag that is off by default and already requires
+   a disposable environment, but it should be measured on a large repository
+   before this is called settled.
+6. **Asserting the sandbox.** `--codex-scan-sandboxed` is an unverifiable
+   claim by the operator. Worth investigating whether a cheap positive signal
+   (a container marker, a namespace check, an unprivileged-user check) can
+   turn some of it into something the CLI actually verifies.
