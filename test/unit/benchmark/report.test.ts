@@ -124,10 +124,31 @@ describe("formatReport", () => {
 });
 
 describe("publishedBytes", () => {
-  const review = ["----- summary comment -----", "**2 findings**", "body text"];
+  // Review content only. The dry run's `----- ... -----` headers are framing
+  // and are asserted separately below.
+  const review = ["**2 findings · 2 inline comments posted**", "body text"];
 
   it("counts the review preview", () => {
     expect(publishedBytes(review)).toBe(review.join("\n").length);
+  });
+
+  it("is unmoved by the dry run's own section headers", () => {
+    // Preview scaffolding, not published bytes — and the inline header carries
+    // the comment's path and line, so counting it made a placement change look
+    // like a rendering change.
+    expect(publishedBytes([
+      "\n----- review body -----",
+      "\n----- inline comment: src/a.ts:14 -----",
+      "\n----- summary comment -----",
+      ...review,
+    ])).toBe(publishedBytes(review));
+  });
+
+  it("keeps a finding body that contains a rule-like line", () => {
+    // Each console.log call is one entry, so framing is matched whole. A body
+    // that happens to contain such a line is review, and must still count.
+    const body = ["some prose", "----- not framing -----", "more prose"].join("\n");
+    expect(publishedBytes([body])).toBe(body.length);
   });
 
   it("is unmoved by operational logging", () => {

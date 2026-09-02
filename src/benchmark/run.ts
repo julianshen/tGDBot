@@ -221,8 +221,26 @@ function measure(into: DispatchMeasurement, input: ReviewDispatchInput): void {
 export function publishedBytes(printed: readonly string[]): number {
   return printed
     .filter((line) => !OPERATIONAL_PREFIXES.some((prefix) => line.startsWith(prefix)))
+    .filter((line) => !PREVIEW_FRAMING.test(line.trim()))
     .join("\n").length;
 }
+
+/**
+ * The dry run's own section headers: `----- review body -----`,
+ * `----- inline comment: src/a.ts:14 -----`, `----- summary comment -----`.
+ *
+ * Preview scaffolding, printed so a human can tell the surfaces apart. None of
+ * it is published, and the inline header embeds the comment's PATH AND LINE —
+ * so moving an otherwise identical finding changed the byte count and reported
+ * a rendering regression for a placement change (Codex review of PR #118).
+ * Placement already has its own metric in `anchoredInline`; conflating the two
+ * makes both harder to read.
+ *
+ * Matched against the WHOLE captured entry, not against lines within one. Each
+ * `console.log` call is one entry, so a finding whose own text contained a
+ * similar rule is never mistaken for framing.
+ */
+const PREVIEW_FRAMING = /^-{5} .+ -{5}$/u;
 
 /**
  * What stdout carries that is not review.

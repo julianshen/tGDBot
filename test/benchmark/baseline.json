@@ -24,7 +24,7 @@
       "dispatchChars": 20735,
       "diffChars": 219,
       "findingTextChars": 150,
-      "renderedChars": 1759,
+      "renderedChars": 1661,
       "anchoredInline": 1,
       "missed": []
     },
@@ -74,7 +74,7 @@
       "dispatchChars": 18025,
       "diffChars": 216,
       "findingTextChars": 145,
-      "renderedChars": 1755,
+      "renderedChars": 1655,
       "anchoredInline": 1,
       "missed": []
     },
@@ -100,7 +100,7 @@
       "dispatchChars": 18087,
       "diffChars": 271,
       "findingTextChars": 145,
-      "renderedChars": 1748,
+      "renderedChars": 1648,
       "anchoredInline": 1,
       "missed": []
     },
@@ -126,7 +126,7 @@
       "dispatchChars": 17635,
       "diffChars": 169,
       "findingTextChars": 140,
-      "renderedChars": 1880,
+      "renderedChars": 1782,
       "anchoredInline": 1,
       "missed": []
     },
@@ -152,7 +152,7 @@
       "dispatchChars": 17945,
       "diffChars": 289,
       "findingTextChars": 307,
-      "renderedChars": 2485,
+      "renderedChars": 2337,
       "anchoredInline": 2,
       "missed": []
     }
