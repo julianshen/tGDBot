@@ -52,7 +52,15 @@ const FINDING_FIELD_NOTES = `- "title": a SHORT one-line headline for the findin
   reviewer reads first to decide where to start, so marking everything blocking
   destroys the ordering they depend on and makes the label mean nothing. Reach
   for it only when you have actually traced the path.
-- "message": the full explanation — why it is wrong and what to do.
+- "message": the full explanation — cite the CONCRETE EVIDENCE for the problem
+  (for a runtime defect that is the reachable path: which lines, what happens;
+  for a build/test/packaging breakage it is the failing step; for a warning you
+  cannot fully demonstrate, it is what you CAN show) and the fix, then stop.
+  HARD CAP ~120 words. Do not spend them on: restating the rule, the file name,
+  the diff, the title, or the general importance of the problem — every one of
+  those is already in front of the reader. Long messages are paid for twice
+  (dispatch tokens and the published comment) and read worse than the same
+  finding stated once, concretely.
 - "effort": how much work the fix you just described is, or null if unsure.
     * "quick" — a local edit: a guard, a condition, an argument, a call moved.
       Roughly, something the author could land in one sitting without design work.
