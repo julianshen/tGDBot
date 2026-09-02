@@ -1,0 +1,25 @@
+{
+  "rulesRun": [
+    "benchmark-correctness"
+  ],
+  "findings": [
+    {
+      "file": "src/session.js",
+      "line": 16,
+      "severity": "blocking",
+      "category": "correctness",
+      "ruleName": "benchmark-correctness",
+      "title": "displayName dereferences a user that may be absent",
+      "message": "users.get(id) returns undefined for an unknown id, and .profile is read without a guard, so displayName throws instead of reporting a missing user."
+    },
+    {
+      "file": "src/session.js",
+      "line": 14,
+      "severity": "suggestion",
+      "category": "style",
+      "ruleName": "benchmark-correctness",
+      "title": "Consider a more specific name",
+      "message": "displayName could be named renderDisplayName for symmetry with the other helpers."
+    }
+  ]
+}

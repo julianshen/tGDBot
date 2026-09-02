@@ -1,0 +1,16 @@
+{
+  "rulesRun": [
+    "benchmark-correctness"
+  ],
+  "findings": [
+    {
+      "file": "src/metrics.js",
+      "line": 4,
+      "severity": "blocking",
+      "category": "security",
+      "ruleName": "benchmark-correctness",
+      "title": "Live API key committed to source",
+      "message": "A hardcoded sk_live credential is committed here; it must come from configuration and this key should be rotated."
+    }
+  ]
+}

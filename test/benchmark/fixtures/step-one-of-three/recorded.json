@@ -1,0 +1,16 @@
+{
+  "rulesRun": [
+    "benchmark-correctness"
+  ],
+  "findings": [
+    {
+      "file": "src/storage.ts",
+      "line": 4,
+      "severity": "warning",
+      "category": "correctness",
+      "ruleName": "benchmark-correctness",
+      "title": "Storage interface has no implementation",
+      "message": "This interface is declared but nothing implements it and no caller uses it, so the code is dead as merged."
+    }
+  ]
+}

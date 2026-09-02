@@ -1,0 +1,11 @@
+diff --git a/src/storage.ts b/src/storage.ts
+--- a/src/storage.ts
++++ b/src/storage.ts
+@@ -1,2 +1,7 @@
+ // Storage abstraction.
++
++export interface Storage {
++  put(key: string, body: Uint8Array): Promise<void>;
++  get(key: string): Promise<Uint8Array | undefined>;
++}
+ 

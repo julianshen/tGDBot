@@ -1,0 +1,38 @@
+{
+  "rulesRun": [
+    "benchmark-correctness"
+  ],
+  "findings": [
+    {
+      "file": "src/cache.js",
+      "line": 4,
+      "severity": "blocking",
+      "category": "correctness",
+      "ruleName": "benchmark-correctness",
+      "decision": "new",
+      "title": "get() assumes the key is present",
+      "message": "store[key] is undefined for a key that was never set, so .value throws instead of returning a missing entry."
+    },
+    {
+      "file": "src/cache.js",
+      "line": 4,
+      "severity": "warning",
+      "category": "correctness",
+      "ruleName": "benchmark-correctness",
+      "decision": "addressed",
+      "title": "Previously raised, now fixed",
+      "message": "An earlier review raised this and the current diff addresses it."
+    },
+    {
+      "file": "src/cache.js",
+      "line": 3,
+      "severity": "suggestion",
+      "category": "correctness",
+      "ruleName": "benchmark-correctness",
+      "decision": "needs-clarification",
+      "question": "Is store guaranteed to be initialised before get runs?",
+      "title": "Initialisation order unclear",
+      "message": "It is not clear from this diff whether store is initialised before get is called."
+    }
+  ]
+}

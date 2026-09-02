@@ -1,0 +1,10 @@
+diff --git a/src/cache.js b/src/cache.js
+--- a/src/cache.js
++++ b/src/cache.js
+@@ -1,2 +1,6 @@
+ // Cache.
++
++export function get(key) {
++  return store[key].value;
++}
+ 

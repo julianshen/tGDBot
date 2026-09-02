@@ -1,0 +1,8 @@
+diff --git a/src/upload.js b/src/upload.js
+--- a/src/upload.js
++++ b/src/upload.js
+@@ -4,3 +4,3 @@ const client = createClient({
+   endpoint: UPLOAD_ENDPOINT,
+-  timeoutMs: 30_000,
++  timeoutMs: 5_000,
+ });

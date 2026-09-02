@@ -1,0 +1,28 @@
+{
+  "description": "A manifest-only change mixing a safe patch bump with a breaking major one.",
+  "pr": {
+    "id": "4",
+    "title": "Bump dependencies",
+    "description": "Routine dependency refresh.",
+    "baseSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "headSha": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+    "url": "https://github.com/benchmark/fixture/pull/4"
+  },
+  "baseFiles": {
+    "package.json": "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"lodash\": \"4.17.20\",\n    \"react\": \"18.2.0\"\n  }\n}\n"
+  },
+  "headFiles": {
+    "package.json": "{\n  \"name\": \"app\",\n  \"version\": \"1.0.0\",\n  \"dependencies\": {\n    \"lodash\": \"4.17.21\",\n    \"react\": \"19.0.0\"\n  }\n}\n"
+  },
+  "expected": [
+    {
+      "id": "react-major-bump",
+      "file": "package.json",
+      "lines": [
+        8,
+        9
+      ],
+      "messagePattern": "major|breaking|19"
+    }
+  ]
+}

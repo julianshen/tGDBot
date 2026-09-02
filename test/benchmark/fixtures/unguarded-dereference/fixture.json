@@ -1,0 +1,23 @@
+{
+  "description": "A genuine null dereference. The baseline case: one real defect, found.",
+  "pr": {
+    "id": "1",
+    "title": "Add displayName helper",
+    "description": "Adds a helper that renders a user's display name.",
+    "baseSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "headSha": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+    "url": "https://github.com/benchmark/fixture/pull/1"
+  },
+  "expected": [
+    {
+      "id": "deref-missing-guard",
+      "file": "src/session.js",
+      "lines": [
+        15,
+        17
+      ],
+      "messagePattern": "undefined|absent|missing|guard",
+      "severity": "blocking"
+    }
+  ]
+}

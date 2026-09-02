@@ -12,7 +12,8 @@
     "test:type": "tsc -p tsconfig.type-tests.json",
     "test:smoke": "vitest run test/smoke",
     "test:all": "vitest run",
-    "lint": "eslint src test"
+    "lint": "eslint src test",
+    "benchmark": "npm run build && node dist/benchmark/cli.js"
   },
   "engines": {
     "node": ">=22.19.0"

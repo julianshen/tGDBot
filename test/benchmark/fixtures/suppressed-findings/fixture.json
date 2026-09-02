@@ -1,0 +1,23 @@
+{
+  "description": "Findings the orchestrator drops before publication. Scores the published set, not the dispatcher's.",
+  "pr": {
+    "id": "6",
+    "title": "Add cache getter",
+    "description": "Adds a cache getter.",
+    "baseSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "headSha": "hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh",
+    "url": "https://github.com/benchmark/fixture/pull/6"
+  },
+  "expected": [
+    {
+      "id": "cache-missing-key",
+      "file": "src/cache.js",
+      "lines": [
+        3,
+        5
+      ],
+      "messagePattern": "undefined|absent|missing",
+      "severity": "blocking"
+    }
+  ]
+}
