@@ -854,3 +854,82 @@ describe("dispatchRulesDirect: unparseable rule output is diagnosable", () => {
     expect(warned.length).toBeLessThan(4000);
   });
 });
+
+// Issue #111: the advisor pass is a model call, and there is nothing for it
+// to filter when the merged findings are empty. The direct engine's gate is
+// in code (unlike the legacy engine, where the condition lives in the
+// orchestrator instruction) — these tests pin both sides of it.
+describe("dispatchRulesDirect — the advisor gate (issue #111)", () => {
+  it("skips the advisor session entirely when every rule returns zero findings", async () => {
+    const createSession: DirectSessionFactory = async () => ({
+      async prompt() {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      },
+      getLastAssistantText: () => JSON.stringify([]),
+    });
+    const createAdvisorSession = vi.fn();
+
+    const result = await dispatchRulesDirect(
+      [makeRule({ name: "rule-a" }), makeRule({ name: "rule-b" })],
+      "diff",
+      true,
+      { createSession, createAdvisorSession },
+    );
+
+    expect(result.findings).toEqual([]);
+    expect(result.rulesRun.sort()).toEqual(["rule-a", "rule-b"]);
+    expect(createAdvisorSession).not.toHaveBeenCalled();
+  });
+
+  it("runs the advisor session when at least one finding exists", async () => {
+    const createSession: DirectSessionFactory = async (rule) => ({
+      async prompt() {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      },
+      getLastAssistantText: () => JSON.stringify([finding(`${rule.name}.ts`, `finding from ${rule.name}`)]),
+    });
+    const createAdvisorSession = vi.fn(async (): Promise<DispatchSession> => ({
+      async prompt() {},
+      getLastAssistantText: () => '{"drop": []}',
+    }));
+
+    const result = await dispatchRulesDirect(
+      [makeRule({ name: "rule-a" })],
+      "diff",
+      true,
+      { createSession, createAdvisorSession },
+    );
+
+    expect(result.findings).toHaveLength(1);
+    expect(createAdvisorSession).toHaveBeenCalledTimes(1);
+  });
+
+  // The failed-rule edge, documented at the gate: the direct engine's advisor
+  // only FILTERS findings, so with zero findings there is nothing for it to
+  // act on even when a rule failed and coverage is uncertain. (The legacy
+  // engine keeps its advisor on rule failure — there the condition lives in
+  // the orchestrator instruction.)
+  it("skips the advisor when a rule failed but the merged findings are empty", async () => {
+    const createSession: DirectSessionFactory = async (rule) => {
+      if (rule.name === "rule-broken") throw new Error("no parseable output");
+      return {
+        async prompt() {
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        },
+        getLastAssistantText: () => JSON.stringify([]),
+      };
+    };
+    const createAdvisorSession = vi.fn();
+
+    const result = await dispatchRulesDirect(
+      [makeRule({ name: "rule-ok" }), makeRule({ name: "rule-broken" })],
+      "diff",
+      true,
+      { createSession, createAdvisorSession },
+    );
+
+    expect(result.findings).toEqual([]);
+    expect(result.rulesFailed).toEqual(["rule-broken"]);
+    expect(createAdvisorSession).not.toHaveBeenCalled();
+  });
+});

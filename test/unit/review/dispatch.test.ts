@@ -503,6 +503,33 @@ describe("dispatchRules advisor integration (Task 6)", () => {
     expect(promptWithoutAdvisor).not.toContain('call the "advisor" tool');
   });
 
+  // Issue #111: the advisor pass costs a model call, and there is nothing to
+  // second-opinion when the merge is empty and every rule succeeded. The
+  // orchestrator is the only party that knows the merge outcome at decision
+  // time, so the condition lives in the instruction. Both prompt shapes are
+  // pinned here, and the final-JSON contract that follows is identical in
+  // either case (the same shape block, unconditionally).
+  it("issue #111: the advisor instruction is conditional on a non-empty merge, with the failed-rule carve-out", () => {
+    const rules = [makeRule({ name: "rule-a" })];
+
+    const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", true);
+
+    // The skip: empty merge + every rule succeeded -> no advisor call.
+    expect(prompt).toMatch(/empty AND every rule succeeded, do NOT call the "advisor" tool/);
+    // The keep: a non-empty merge, or a failed rule (coverage uncertainty).
+    expect(prompt).toMatch(/at least one of the following holds/);
+    expect(prompt).toMatch(/at least one rule is in "rulesFailed"/);
+    // The response contract is unchanged and unconditional: the final-JSON
+    // shape block appears exactly once, after the advisor instruction, in
+    // both advisor states.
+    const withAdvisor = buildDispatchPrompt(rules, "diff", true);
+    const withoutAdvisor = buildDispatchPrompt(rules, "diff", false);
+    const shape = 'matching exactly this shape:';
+    expect(withAdvisor.split(shape)).toHaveLength(2);
+    expect(withoutAdvisor.split(shape)).toHaveLength(2);
+    expect(withoutAdvisor).not.toContain("Only IF at least one of the following holds");
+  });
+
   // Bug fix (found via a real multi-model run against hmchangw/chat#490): the
   // orchestrating LLM sometimes chose `context: "fork"` for its subagent
   // call. Fork requires a PERSISTED parent session, but dispatchRules uses
