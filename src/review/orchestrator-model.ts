@@ -226,6 +226,70 @@ export interface EffectiveRulesResult {
 }
 
 /**
+ * A model's published pricing, when the registry carries it. Costs are per
+ * what the registry records (pi models.json uses dollars per million tokens);
+ * only their RELATIVE order matters here, never the unit.
+ */
+interface ModelCost {
+  readonly input: number;
+  readonly output: number;
+}
+
+function totalCost(model: { cost?: ModelCost }): number | undefined {
+  // cost is optional in the registry schema; a model without published
+  // pricing cannot take part in an expense comparison — it is excluded, not
+  // treated as free.
+  if (model.cost === undefined) return undefined;
+  return model.cost.input + model.cost.output;
+}
+
+/**
+ * Issue #112 (model discipline): "an omitted model silently inherits the
+ * session's most expensive one" — Superpowers 6.0's phrasing of the exact trap
+ * our default-fill shares. Two log lines, and only when unpinned rules exist:
+ *
+ * 1. ALWAYS: name the model the unpinned rules will run on. Silent inheritance
+ *    becomes visible inheritance — the operator can see what the absence of a
+ *    pin chose.
+ * 2. When pricing data is available and the resolved default is the most
+ *    expensive credentialed model on this machine, say so and name the
+ *    cheapest alternative. Deliberately a WARNING, not a block, and
+ *    deliberately not "use the cheapest": turn count beats token price — the
+ *    cheapest models routinely take 2-3x the turns on multi-step work and cost
+ *    more overall — so the default stays the default and the choice stays
+ *    visible. Resolution ORDER is unchanged (issue #112's own constraint).
+ */
+function warnOnInheritedModelCost(
+  unpinned: readonly RuleDefinition[],
+  defaultSpec: string,
+  runtime: ModelRuntime,
+): void {
+  console.warn(
+    `tgd-review-agent: ${unpinned.length} rule(s) without a provider/model pin ` +
+      `will run on "${defaultSpec}" (the deployment default)`,
+  );
+
+  const defaultRef = parseModelRef(defaultSpec);
+  if (defaultRef === undefined) return;
+  const available = runtime.getAvailableSnapshot();
+  const defaultCost = totalCost(available.find((m) => m.provider === defaultRef.provider && m.id === defaultRef.modelId) ?? {});
+  if (defaultCost === undefined) return; // no pricing on the default — nothing to compare
+  const cheaper = available
+    .map((m) => ({ spec: `${m.provider}/${m.id}`, cost: totalCost(m) }))
+    .filter((entry): entry is { spec: string; cost: number } =>
+      entry.cost !== undefined && entry.cost < defaultCost)
+    .sort((a, b) => a.cost - b.cost);
+  if (cheaper.length === 0) return; // nothing cheaper credentialed — the default IS the floor
+  const ratio = Math.round((cheaper[0]!.cost / defaultCost) * 100);
+  console.warn(
+    `tgd-review-agent: "${defaultSpec}" is the most expensive credentialed model on this ` +
+      `machine; the cheapest alternative is "${cheaper[0]!.spec}" (~${ratio}% of its price). ` +
+      `Consider pinning a mid-tier model on review rules — though turn count beats token ` +
+      `price, so the cheapest is not automatically right (issue #112).`,
+  );
+}
+
+/**
  * Design-review #6 (model decoupling): a rule's `provider`/`model` are now
  * optional. This fills every UNPINNED rule with the deployment's default
  * model, resolved once, in priority order:
@@ -308,6 +372,8 @@ export async function resolveEffectiveRules(
       unresolved,
     };
   }
+
+  warnOnInheritedModelCost(unpinned, defaultSpec, runtime);
 
   const slash = defaultSpec.indexOf("/");
   const defaultProvider = defaultSpec.slice(0, slash);
