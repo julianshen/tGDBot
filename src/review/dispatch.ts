@@ -402,6 +402,13 @@ async function runDispatch(
     // Sessions without subscribe (test stubs) skip capture → no reconciliation.
     let capturedTaskResults: CapturedTaskResult[] = [];
     let unsubscribe: (() => void) | undefined;
+    // Whether the advisor tool ACTUALLY ran (issue #111): the advisor
+    // instruction is now conditional, so "advisor on" no longer implies
+    // "advisor filtered the findings" — an empty merge with every rule
+    // succeeded skips it. Recovery's ambiguity (a rule's zero findings could
+    // be a buggy drop OR advisor filtering) only exists when the advisor ran,
+    // so the flag below is what recovery actually needs.
+    let advisorRan = false;
     if (typeof session.subscribe === "function") {
       unsubscribe = session.subscribe((event: DispatchSessionEvent) => {
         if (event.type === "tool_execution_end" && event.toolName === "subagent") {
@@ -409,6 +416,9 @@ async function runDispatch(
           if (Array.isArray(results)) {
             capturedTaskResults = results;
           }
+        }
+        if (event.type === "tool_execution_end" && event.toolName === "advisor") {
+          advisorRan = true;
         }
       });
     }
@@ -470,14 +480,16 @@ async function runDispatch(
     }
 
     const orchestratorResult = parseDispatchResult(finalText, effective);
-    // Recover dropped findings only when advisor is OFF — see
-    // reconcileWithCapturedResults' doc comment for why recovering while the
-    // advisor pass is active would undo its false-positive filtering.
+    // Recover dropped findings whenever the advisor did NOT actually run —
+    // see reconcileWithCapturedResults' doc comment. With the advisor OFF or
+    // skipped (the #111 conditional), a rule's zero findings can only be a
+    // buggy drop; only an advisor that actually filtered the set makes zero
+    // findings ambiguous, and only then is recovery suppressed.
     const reconciled = reconcileWithCapturedResults(
       orchestratorResult,
       capturedTaskResults,
       effective,
-      !useAdvisor,
+      !useAdvisor || !advisorRan,
     );
 
     // ADR-007: a suggestion is committable code. It may only survive if a dispatched

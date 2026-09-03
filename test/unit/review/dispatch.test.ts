@@ -147,7 +147,11 @@ function makeRule(
 // tool_execution_end event with the given details.results to its subscriber,
 // then resolves; getLastAssistantText returns the orchestrator's final JSON.
 // Shared by the reconciliation and prose-recovery describe blocks below.
-function makeSubscribableSession(detailsResults: unknown[], finalMessage: string): DispatchSession {
+function makeSubscribableSession(
+  detailsResults: unknown[],
+  finalMessage: string,
+  options: { advisorRan?: boolean } = {},
+): DispatchSession {
   let listener: ((event: unknown) => void) | undefined;
   return {
     subscribe(l: (event: unknown) => void) {
@@ -162,6 +166,12 @@ function makeSubscribableSession(detailsResults: unknown[], finalMessage: string
         toolName: "subagent",
         result: { details: { results: detailsResults } },
       });
+      // Issue #111: an advisor tool event is how dispatch knows the advisor
+      // actually filtered the findings. Emit it only when the fixture says
+      // the orchestrator ran the pass.
+      if (options.advisorRan === true) {
+        listener?.({ type: "tool_execution_end", toolName: "advisor", result: {} });
+      }
     },
     getLastAssistantText() {
       return finalMessage;
@@ -891,9 +901,10 @@ describe("dispatchRules deterministic reconciliation (details.results)", () => {
     ];
     // Orchestrator ran the advisor pass and it removed ALL of terra's findings
     // (legitimately, as false positives) → zero findings for terra, but terra
-    // DID run. With advisor on we must NOT re-add terra's raw finalOutput.
+    // DID run. The advisor tool event tells dispatch the pass actually ran.
+    // With it, we must NOT re-add terra's raw finalOutput.
     const finalWithAdvisor = JSON.stringify({ findings: [], rulesRun: ["grok-review", "terra-review"], rulesFailed: [] });
-    const session = makeSubscribableSession(details, finalWithAdvisor);
+    const session = makeSubscribableSession(details, finalWithAdvisor, { advisorRan: true });
 
     // useAdvisor = true (4th arg)
     const result = await dispatchRules(twoRules(), "diff", true, async () => session);
@@ -2767,5 +2778,43 @@ describe("referencesDeclaredBy — URLs with delimiters", () => {
 
     expect(declared.has("https://x.example.com/a")).toBe(true);
     expect(declared.has("https://y.example.com/b")).toBe(true);
+  });
+});
+
+// Issue #111: the advisor instruction is conditional, so "advisor on" no
+// longer implies the advisor ran. Recovery of a dropped rule's findings is
+// suppressed only when the advisor ACTUALLY filtered the set — detected by
+// its tool event — and re-enabled when the skip left zero findings that can
+// only be a buggy drop.
+describe("dispatchRules — recovery follows whether the advisor actually ran (#111)", () => {
+  const twoRules = () => [
+    makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" }),
+    makeRule({ name: "terra-review", provider: "openai-codex", model: "gpt-5.6-terra" }),
+  ];
+  const terraFinding = { file: "a.go", line: 1, severity: "warning", category: "correctness", message: "bug" };
+  const droppedFinal = JSON.stringify({ findings: [], rulesRun: ["grok-review", "terra-review"], rulesFailed: [] });
+  const details = [
+    { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: "[]" },
+    { model: "openai-codex/gpt-5.6-terra:high", exitCode: 0, finalOutput: JSON.stringify([terraFinding]) },
+  ];
+
+  it("recovers a dropped rule when the advisor was skipped (empty merge, all rules succeeded)", async () => {
+    const session = makeSubscribableSession(details, droppedFinal);
+
+    // useAdvisor = true, but no advisor tool event: the conditional
+    // instruction skipped the pass.
+    const result = await dispatchRules(twoRules(), "diff", true, async () => session);
+
+    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review", decision: "new" });
+  });
+
+  it("still suppresses recovery when the advisor actually filtered the set", async () => {
+    const session = makeSubscribableSession(details, droppedFinal, { advisorRan: true });
+
+    const result = await dispatchRules(twoRules(), "diff", true, async () => session);
+
+    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.findings).toEqual([]);
   });
 });
