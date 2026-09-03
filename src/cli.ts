@@ -1525,12 +1525,22 @@ export async function review(
       ((dependencyPack?.text.length ?? 0) + (dependencyPack?.untrustedText?.length ?? 0)),
   );
   // Trusted-base repository context. Deliberately prepared HERE — after the
-  // dedup skip above and after the rule set is known to be non-empty — because
-  // mapping is by far the most expensive step in a review, and a run that is
-  // going to be skipped, or that has no rules to hand a pack to, must never
-  // pay for it.
+  // dedup skip above — because mapping is by far the most expensive step in a
+  // review, and a run that is going to be skipped, or that has no rules to
+  // hand a pack to, must never pay for it. The "rule set is non-empty" half of
+  // that used to be guaranteed by the abort above; since #115 it is not, so
+  // the empty case is handled explicitly below rather than assumed.
   let contextPreparation: Awaited<ReturnType<typeof prepareReviewContextReal>>;
-  try {
+  // Nothing to build context FOR. `prepareReviewContext` treats an empty rule
+  // list as a reason to refuse, which under `--context require` is fatal — so
+  // scoping every rule out of a review turned "no rule applies to these files"
+  // into an abort, and the promise that it is a legitimate outcome held only
+  // under some context settings (Codex review of PR #126). Short-circuited
+  // rather than special-cased downstream, because a pack keyed by rule name is
+  // meaningless when there are no rule names.
+  if (rules.length === 0) {
+    contextPreparation = { status: "off" };
+  } else try {
     // Root selection can itself throw — it reads HOME/XDG_CACHE_HOME, and a
     // container may set neither. It sits INSIDE the try so that failure
     // degrades like any other context failure instead of killing a review
@@ -1975,6 +1985,10 @@ export async function review(
       // same terminal telemetry as any other dispatched run (Codex review of
       // PR #117).
       metrics: pendingMetrics,
+      // Issue #115: same reasoning as `metrics` — a focused run dispatches
+      // under the same scoping, so its terminal line owes the same account of
+      // what did not run (Codex review of PR #126).
+      ...(scopedRules.skipped.length === 0 ? {} : { rulesSkipped: scopedRules.skipped }),
       logStatus,
     });
   } else {

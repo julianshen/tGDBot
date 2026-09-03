@@ -53,6 +53,16 @@ describe("globToRegExp", () => {
     expect(matches("src/(x).ts", "src/(x).ts")).toBe(true);
   });
 
+  it("normalizes the pattern on the same terms as the candidates", () => {
+    // Normalizing only one side meant `./src/*.ts` compiled with its `./`
+    // intact while every candidate arrived as `src/a.ts` — so the rule matched
+    // nothing and was silently skipped, which is the failure this whole module
+    // exists to prevent.
+    expect(matches("./src/*.ts", "src/a.ts")).toBe(true);
+    expect(matches("/src/*.ts", "src/a.ts")).toBe(true);
+    expect(matches("src//*.ts", "src/a.ts")).toBe(true);
+  });
+
   it("refuses syntax it does not implement rather than matching loosely", () => {
     // A rule declaring one of these and silently matching nothing would stop
     // running with no explanation. The loader turns each throw into a load
@@ -69,9 +79,18 @@ describe("globToRegExp", () => {
 describe("normalizeGlobPath", () => {
   it("collapses equivalent spellings of one path", () => {
     // A cosmetic difference must never be the reason a rule did not run.
-    for (const spelling of ["./src/a.ts", "src//a.ts", "/src/a.ts", "src\\a.ts"]) {
+    for (const spelling of ["./src/a.ts", "src//a.ts", "/src/a.ts"]) {
       expect(normalizeGlobPath(spelling)).toBe("src/a.ts");
     }
+  });
+
+  it("leaves a backslash alone, because git paths separate on / everywhere", () => {
+    // A backslash in a git diff path is a literal character in the filename,
+    // not a separator. Rewriting it invented a directory: a root-level file
+    // named `src\payload.ts` became `src/payload.ts` and matched a rule
+    // scoped to `src/*.ts`, dispatching it over a file outside that directory.
+    expect(normalizeGlobPath("src\\payload.ts")).toBe("src\\payload.ts");
+    expect(matches("src/*.ts", "src\\payload.ts")).toBe(false);
   });
 });
 

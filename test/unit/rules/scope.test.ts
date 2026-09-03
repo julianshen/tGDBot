@@ -59,6 +59,33 @@ describe("scopeRulesToChangedFiles", () => {
     expect(scoped.skipped).toEqual(["alpha", "zeta"]);
   });
 
+  it("drops a dependency edge to a rule the scoping removed", () => {
+    // `planReviewWorkflow` rejects a dependency on a rule it cannot see, so
+    // leaving the name behind aborted the WHOLE review: a broad rule depending
+    // on a narrowly scoped prerequisite failed on any diff that prerequisite
+    // did not match. Dropping the edge is what the dependency already means —
+    // it establishes order, and there is no order left to establish.
+    const dependent: RuleDefinition = { ...rule("broad"), dependsOn: ["sql-only", "also-broad"] };
+    const scoped = scopeRulesToChangedFiles(
+      [dependent, rule("sql-only", ["**/*.sql"]), rule("also-broad")],
+      ["src/a.ts"],
+    );
+
+    expect(scoped.skipped).toEqual(["sql-only"]);
+    // The dependent rule still runs: a dependency establishes order, and a
+    // prerequisite that does not run does not suppress what came after it.
+    expect(scoped.applicable.map((entry) => entry.name)).toEqual(["broad", "also-broad"]);
+    expect(scoped.applicable[0]?.dependsOn).toEqual(["also-broad"]);
+  });
+
+  it("leaves an untouched rule object alone rather than copying it", () => {
+    // Only a rule whose edges actually changed is rebuilt, so nothing else in
+    // the flow sees a different object identity than it did before.
+    const original = rule("plain");
+    const scoped = scopeRulesToChangedFiles([original], ["src/a.ts"]);
+    expect(scoped.applicable[0]).toBe(original);
+  });
+
   it("matches a rule declaring several globs when any one of them hits", () => {
     const scoped = scopeRulesToChangedFiles(
       [rule("manifests", ["**/package.json", "**/Cargo.toml"])],

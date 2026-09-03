@@ -1258,6 +1258,29 @@ describe("review", () => {
       vi.restoreAllMocks();
     });
 
+    it("does not fail a --context require run when no rule applies", async () => {
+      // The "no rule applies is not fatal" promise held only under some
+      // context settings: with nothing to build context FOR, the mapper
+      // reported "no rules to build context for", and under `require` that is
+      // fatal — so an empty applicable set aborted (Codex review of PR #126).
+      const h = makeHarness({
+        args: makeArgs({ context: "require" }),
+        loadResult: { rules: [makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] })], errors: [] },
+        botComment: null,
+      });
+      h.vcsAdapter.getDiff.mockResolvedValue(tsDiff);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      // Context preparation is short-circuited rather than asked about an
+      // empty rule set: a pack keyed by rule name means nothing without them.
+      expect(h.prepareContext).not.toHaveBeenCalled();
+      expect(h.dispatchRules).not.toHaveBeenCalled();
+
+      vi.restoreAllMocks();
+    });
+
     it("still posts a review when no rule applies, rather than aborting", async () => {
       // "No rule applies to these files" is a legitimate outcome, distinct
       // from "no rules could be loaded" — which is fatal and stays fatal.

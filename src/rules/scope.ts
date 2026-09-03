@@ -40,18 +40,35 @@ export function scopeRulesToChangedFiles(
 ): ScopedRules {
   if (changedFiles.length === 0) return { applicable: [...rules], skipped: [] };
 
-  const applicable: RuleDefinition[] = [];
+  const kept: RuleDefinition[] = [];
   const skipped: string[] = [];
   for (const rule of rules) {
     if (rule.appliesTo === undefined || rule.appliesTo.length === 0) {
-      applicable.push(rule);
+      kept.push(rule);
       continue;
     }
     // Patterns were validated at load, so compiling cannot throw here. A rule
     // whose scope could not compile never reached this list.
     const patterns = rule.appliesTo.map(globToRegExp);
-    if (matchesAnyPath(patterns, changedFiles)) applicable.push(rule);
+    if (matchesAnyPath(patterns, changedFiles)) kept.push(rule);
     else skipped.push(rule.name);
   }
+
+  // A dependency on a rule that will not run has no order left to establish,
+  // so the edge goes with it.
+  //
+  // Without this, a broad rule depending on a narrowly scoped prerequisite
+  // aborted the entire review: `planReviewWorkflow` rejects a dependency on a
+  // rule it cannot see, and scoping had removed the prerequisite while leaving
+  // its name behind (Codex review of PR #126). Dropping the edge rather than
+  // keeping a phantom node is what the dependency already means — the README
+  // is explicit that dependencies establish ORDER rather than success gating,
+  // and a failed prerequisite does not suppress the rules after it either.
+  const removed = new Set(skipped);
+  const applicable = kept.map((rule) =>
+    rule.dependsOn.some((dependency) => removed.has(dependency))
+      ? { ...rule, dependsOn: Object.freeze(rule.dependsOn.filter((d) => !removed.has(d))) }
+      : rule);
+
   return { applicable, skipped: skipped.sort() };
 }

@@ -31,7 +31,14 @@ const MAX_BRACE_DEPTH = 1;
  * stop running with no explanation, and the loader turns this throw into a
  * load error naming the file.
  */
-export function globToRegExp(glob: string): RegExp {
+export function globToRegExp(rawGlob: string): RegExp {
+  if (rawGlob.length === 0) throw new Error("a path pattern must not be empty");
+  // The PATTERN is normalized on the same terms as the candidates it is
+  // compared against. Normalizing only one side meant `./src/*.ts` compiled
+  // with its `./` intact while every candidate arrived as `src/a.ts`, so the
+  // rule matched nothing and was silently skipped — the exact failure this
+  // module exists to prevent (Codex review of PR #126).
+  const glob = normalizeGlobPath(rawGlob);
   if (glob.length === 0) throw new Error("a path pattern must not be empty");
   if (glob.includes("[") || glob.includes("]")) {
     throw new Error("character classes are not supported in a path pattern");
@@ -95,13 +102,18 @@ function escapeLiteral(char: string): string {
 /**
  * One canonical spelling, so two names for a path compare equal.
  *
- * The same normalisation the structural checker applies, and for the same
- * reason: a finding's path comes from somewhere that does not promise a
- * spelling, and `./src/a.ts` failing to match `src/**` would be a rule
- * silently not running over a cosmetic difference.
+ * `./src/a.ts` failing to match `src/**` would be a rule silently not running
+ * over a cosmetic difference, which is the whole hazard here.
+ *
+ * A backslash is deliberately NOT treated as a separator. Git diff paths use
+ * `/` on every platform, so a backslash in one is a literal character in the
+ * filename — and rewriting it invented a directory that does not exist: a
+ * root-level file named `src\payload.ts` became `src/payload.ts` and matched
+ * a rule scoped to `src/*.ts`, dispatching it over a file outside the
+ * directory it declared (Codex review of PR #126).
  */
 export function normalizeGlobPath(value: string): string {
-  return value.replace(/\\/gu, "/").replace(/\/+/gu, "/").replace(/^\.\//u, "").replace(/^\/+/u, "");
+  return value.replace(/\/+/gu, "/").replace(/^\.\//u, "").replace(/^\/+/u, "");
 }
 
 /**
