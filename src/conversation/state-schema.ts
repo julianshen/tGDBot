@@ -259,6 +259,13 @@ export type MemoryEntry = MemoryCreateEntry | MemoryTombstoneEntry;
 export interface FindingSnapshot {
   readonly file: string;
   readonly line?: number;
+  /**
+   * Issue #114: the reviewer's verbatim excerpt the host located the finding
+   * by. Present here for the same reason `title` and `suggestion` are — the
+   * ledger round-trips findings into later renders and clarifications, and a
+   * field the snapshot cannot hold is a field the reader never sees.
+   */
+  readonly existingCode?: string;
   readonly severity: "blocking" | "warning" | "suggestion";
   readonly category: string;
   readonly message: string;
@@ -1279,7 +1286,7 @@ export function materializeMemories(entries: readonly MemoryEntry[]): readonly M
 
 function findingSnapshot(value: unknown, name: string): FindingSnapshot {
   const object = exact(value, name, ["file", "severity", "category", "message", "ruleName"],
-    ["line", "decision", "question", "title", "suggestion", "endLine", "effort", "references"]);
+    ["line", "existingCode", "decision", "question", "title", "suggestion", "endLine", "effort", "references"]);
   if (object.severity !== "blocking" && object.severity !== "warning" && object.severity !== "suggestion") {
     throw new Error(`${name}.severity is invalid`);
   }
@@ -1296,6 +1303,9 @@ function findingSnapshot(value: unknown, name: string): FindingSnapshot {
   };
   if (object.line !== undefined) result.line = positiveInteger(object.line, `${name}.line`);
   if (object.endLine !== undefined) result.endLine = positiveInteger(object.endLine, `${name}.endLine`);
+  if (object.existingCode !== undefined) {
+    result.existingCode = text(object.existingCode, `${name}.existingCode`, 2_000);
+  }
   if (object.decision !== undefined) result.decision = object.decision;
   if (object.question !== undefined) result.question = text(object.question, `${name}.question`, 4_096);
   if (object.title !== undefined) result.title = text(object.title, `${name}.title`, 1_000);

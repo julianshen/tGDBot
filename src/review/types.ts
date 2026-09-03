@@ -16,6 +16,13 @@ export type FindingDecision =
 export interface Finding {
   file: string;
   line?: number;
+  /**
+   * Issue #114: verbatim code the reviewer is commenting on. The host locates
+   * it in the diff and derives the finding's location from the match — a
+   * line number no quote supports is never published as a location. Absent
+   * on older reviewer output, which keeps the model's line as the fallback.
+   */
+  existingCode?: string;
   severity: "blocking" | "warning" | "suggestion";
   category: string;
   message: string;

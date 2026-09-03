@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { ContextPackResult } from "../../../src/context/context-pack.js";
-import { buildDispatchPrompt, buildTaskText } from "../../../src/review/dispatch-prompt.js";
+import { buildDispatchPrompt, buildTaskText, FINDING_OBJECT_CONTRACT } from "../../../src/review/dispatch-prompt.js";
 import type { ReviewConversationContext } from "../../../src/review/types.js";
 import type { EffectiveRule } from "../../../src/rules/types.js";
 import { readFileSync } from "node:fs";
@@ -558,5 +558,23 @@ describe("buildTaskText — untrusted context section", () => {
     const text = buildTaskText(makeRule(), "diff body", makePack("trusted", "ids"));
 
     expect(text).toMatch(/untrusted context section/i);
+  });
+});
+
+// Issue #114: the reviewer returns a verbatim excerpt, and the host derives
+// the finding's location by locating it. The contract must carry the field
+// end to end — reviewer shape, field note, and the orchestrator's
+// copy-through list, or the legacy merge strips it at the last hop.
+describe("finding contract — existingCode (#114)", () => {
+  it("FINDING_OBJECT_CONTRACT documents existingCode and how to quote", () => {
+    expect(FINDING_OBJECT_CONTRACT).toContain('"existingCode": string | null');
+    expect(FINDING_OBJECT_CONTRACT).toMatch(/VERBATIM excerpt/);
+    expect(FINDING_OBJECT_CONTRACT).toMatch(/zero or multiple locations/);
+  });
+
+  it("the orchestrator copy-through list includes existingCode", () => {
+    const prompt = buildDispatchPrompt([makeRule()], "diff", true);
+    expect(prompt).toContain('"existingCode"');
+    expect(prompt).toMatch(/"existingCode", "decision"/);
   });
 });

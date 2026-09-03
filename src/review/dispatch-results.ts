@@ -180,6 +180,9 @@ export function referencesDeclaredBy(ruleBody: string): Set<string> {
   return declared;
 }
 
+/** Cap on a reviewer's verbatim excerpt — a quote longer than this is not a quote. */
+const MAX_EXISTING_CODE_CHARS = 2000;
+
 export function normalizeUnknownFinding(
   value: unknown,
   ruleName?: string,
@@ -238,6 +241,16 @@ export function normalizeUnknownFinding(
   const suggestion = stateSafeSuggestion(candidate.suggestion);
   if (suggestion !== undefined) finding.suggestion = suggestion;
   if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;
+  // Issue #114: the verbatim excerpt the host locates to derive the finding's
+  // real position. Trimmed at the outer edges only — the match is
+  // whitespace-insensitive per line — and bounded, because a quote longer
+  // than this is not a quote.
+  if (typeof candidate.existingCode === "string") {
+    const excerpt = candidate.existingCode.trim();
+    if (excerpt.length > 0 && excerpt.length <= MAX_EXISTING_CODE_CHARS) {
+      finding.existingCode = excerpt;
+    }
+  }
   if (contract.question !== undefined) finding.question = contract.question;
   return finding;
 }

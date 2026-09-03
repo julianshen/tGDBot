@@ -123,6 +123,7 @@ import {
   extractFindingsArray,
   referencesDeclaredBy,
   parseFindingsFromFinalOutput,
+  normalizeUnknownFinding,
 } from "../../../src/review/dispatch-results.js";
 import { renderInlineComment } from "../../../src/review/comment-format.js";
 
@@ -2870,5 +2871,36 @@ describe("dispatchRules — recovery follows whether the advisor actually ran (#
 
     expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
     expect(result.findings).toEqual([]);
+  });
+});
+
+// Issue #114: the verbatim excerpt travels into the Finding, trimmed at the
+// outer edges only and bounded, so the host can locate the code the reviewer
+// quoted.
+describe("normalizeUnknownFinding — existingCode (#114)", () => {
+  it("parses a verbatim excerpt, trimming only the outer edges", () => {
+    const finding = normalizeUnknownFinding({
+      file: "src/a.ts",
+      line: 11,
+      severity: "warning",
+      category: "correctness",
+      message: "m",
+      ruleName: "rule-a",
+      existingCode: "  const added = 2;\nconst added2 = 3;  ",
+    });
+    expect(finding?.existingCode).toBe("const added = 2;\nconst added2 = 3;");
+  });
+
+  it("drops an empty or oversized excerpt rather than carrying junk", () => {
+    const empty = normalizeUnknownFinding({
+      file: "src/a.ts", severity: "warning", category: "c", message: "m", ruleName: "rule-a",
+      existingCode: "   ",
+    });
+    expect(empty?.existingCode).toBeUndefined();
+    const oversized = normalizeUnknownFinding({
+      file: "src/a.ts", severity: "warning", category: "c", message: "m", ruleName: "rule-a",
+      existingCode: "x".repeat(2001),
+    });
+    expect(oversized?.existingCode).toBeUndefined();
   });
 });

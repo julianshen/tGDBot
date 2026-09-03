@@ -22,6 +22,7 @@ const FINDING_SHAPE = `{
   "file": string,
   "line": number | null,
   "endLine": number | null,
+  "existingCode": string | null,
   "severity": "blocking" | "warning" | "suggestion",
   "category": string,
   "title": string,
@@ -88,6 +89,21 @@ const FINDING_FIELD_NOTES = `- "title": a SHORT one-line headline for the findin
       a contiguous line range (design changes, "add a test elsewhere", etc.).
 - "endLine": the last line the suggestion replaces (inclusive). Omit/null when
   the suggestion replaces only "line", or when there is no suggestion.
+- "existingCode": a VERBATIM excerpt of the code this finding is about, copied
+  exactly from the diff (a few contiguous lines including the line you are
+  reporting; exactly as it appears, with its original indentation). The host
+  locates this excerpt and derives the finding's position from where it
+  matches, so it — not "line" — determines where the comment lands. Rules:
+    * Verbatim code only. Not a paraphrase, not a description, no "..." or
+      elisions, no markdown fences.
+    * Quote from the diff you were given. The host matches it against the
+      changed files; an excerpt that matches zero or multiple locations means
+      the finding cannot be anchored and will be reported in the summary
+      instead of inline.
+    * Null when the finding is not about specific code (a process or docs
+      observation) — but note that without it, only your "line" number
+      positions the finding, and a line number you miscounted publishes the
+      comment on the wrong line.
 - "claim": set this ONLY when your finding depends on the assertion that a
   symbol is not referenced anywhere else — "this function is never called",
   "this is the only caller", "nothing else uses this". Give the bare symbol
@@ -420,7 +436,7 @@ export function buildDispatchPrompt(
 
   parts.push(
     `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
-    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "claim": { "kind": "no-other-references", "symbol": string } | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
+    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "existingCode": string | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "claim": { "kind": "no-other-references", "symbol": string } | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
     // ADR-007/ADR-008: the orchestrator MERGES the subagents' findings and re-emits
     // them, so every field it is not told to keep is silently dropped at this last
     // hop. That is exactly what happened on the first live run: the reviewers were
@@ -429,7 +445,7 @@ export function buildDispatchPrompt(
     // Copy them through VERBATIM; never rewrite a suggestion (it is literal code
     // destined for the file, and a paraphrase would commit something the reviewer
     // never proposed).
-    `Copy each finding's "title", "message", "suggestion", "endLine", "decision", "question", "effort", "references" and "claim" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
+    `Copy each finding's "title", "message", "suggestion", "endLine", "existingCode", "decision", "question", "effort", "references" and "claim" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
     // Attribution fix (see order-mapping note above): the old wording defined
     // rulesFailed as tasks that "produced no usable output", which the
     // orchestrator wrongly applied to a task that RAN and returned an empty or

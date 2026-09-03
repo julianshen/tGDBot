@@ -19,6 +19,7 @@ import {
   rangeIsCommentable,
 } from "./diff-anchors.js";
 import { clusterFindings } from "./finding-clusters.js";
+import { resolveQuoteAnchor } from "./quote-anchor.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
 import { acceptanceKey } from "../conversation/disposition.js";
@@ -175,13 +176,50 @@ export function orchestrate(
   diff = "",
   options: OrchestrateOptions = {},
 ): OrchestrationResult {
+  // Issue #114: a reviewer's verbatim excerpt is host-verified evidence of
+  // where the finding actually lives. Relocate BEFORE anything else consumes
+  // a location — addressed-key suppression, clarification selection,
+  // clustering, anchoring — so every downstream surface sees the
+  // quote-derived position, not the model's possibly-miscounted one.
+  // Strictness (resolveQuoteAnchor): a quote with zero or multiple matches
+  // DECLINES — the model's line is dropped and the finding falls to the
+  // summary, because a line number no quote supports is never published as a
+  // location. Findings without a quote keep the model's line (the additive
+  // fallback the issue specifies).
+  const locatedFindings: Finding[] = dispatchResult.findings.map((finding): Finding => {
+    if (finding.existingCode === undefined) return finding;
+    const anchor = resolveQuoteAnchor(diff, finding.file, finding.existingCode);
+    if (anchor === undefined) {
+      // Declined: drop the unverified location entirely. Omitting the keys
+      // (not just setting undefined) keeps `line` optional-shaped exactly as
+      // older reviewer output looks.
+      const withoutLocation: Finding = { ...finding };
+      delete withoutLocation.line;
+      delete withoutLocation.endLine;
+      return withoutLocation;
+    }
+    return {
+      ...finding,
+      file: anchor.file,
+      line: anchor.line,
+      ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
+    };
+  });
+  // The quote itself never reaches the published finding: it is positioning
+  // evidence the host consumed, not content a reader needs.
+  const findingsWithQuoteStripped: Finding[] = locatedFindings.map((finding) => {
+    const withoutQuote: Finding = { ...finding };
+    delete withoutQuote.existingCode;
+    return withoutQuote;
+  });
+
   // Addressed findings are removed before ordinary dedup, and their keys
   // suppress a repeated new/still-valid copy of the same issue.
   const addressedKeys = new Set(
-    dispatchResult.findings.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
+    findingsWithQuoteStripped.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
   );
   const waivedKeys = options.waivedKeys ?? new Set<string>();
-  const remaining = dispatchResult.findings.filter((finding) => !waivedKeys.has(acceptanceKey(finding)));
+  const remaining = findingsWithQuoteStripped.filter((finding) => !waivedKeys.has(acceptanceKey(finding)));
   const actionable = remaining.filter(
     (finding) => isActionableDecision(decisionOf(finding)) && !addressedKeys.has(dedupeKey(finding)),
   );

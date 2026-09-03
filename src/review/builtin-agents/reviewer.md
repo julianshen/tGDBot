@@ -70,7 +70,7 @@ the whole review unusable.
   be `]`.
 - Each element is one finding, in exactly this shape:
 
-  `{ "file": string, "line": number | null, "endLine": number | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "claim": { "kind": "no-other-references", "symbol": string } | null }`
+  `{ "file": string, "line": number | null, "endLine": number | null, "existingCode": string | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "claim": { "kind": "no-other-references", "symbol": string } | null }`
 
   - `file`: the repo-relative path the finding is about (must be a real path
     from the diff/files you inspected — never null, never a placeholder).
@@ -78,6 +78,13 @@ the whole review unusable.
     specific line.
   - `endLine`: the LAST line a `suggestion` replaces (inclusive). Omit or `null`
     when the suggestion replaces only `line`, or when there is no suggestion.
+  - `existingCode`: a VERBATIM excerpt of the code the finding is about, copied
+    exactly from the diff you inspected (a few contiguous lines, original
+    indentation). The host locates this excerpt and positions the comment from
+    where it matches — so it, not your `line` count, decides where the comment
+    lands. `null` only when the finding is not about specific code. An excerpt
+    that matches zero or multiple locations means the finding cannot be
+    anchored and will be reported in the summary instead of inline.
   - `severity`: exactly one of these three lowercase strings, on a bar you must
     be able to defend:
     - `blocking` — either a reachable execution path leads to data loss,

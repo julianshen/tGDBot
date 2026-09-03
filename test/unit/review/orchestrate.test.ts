@@ -1266,3 +1266,152 @@ describe("orchestrate — counts and attribution span every member", () => {
     expect(result.commentBody).toContain("🔴 2 blocking");
   });
 });
+
+// Issue #114: the reviewer's verbatim excerpt is host-verified evidence of
+// where a finding lives. The quote — not the model's line — decides the
+// inline anchor, and a quote that matches zero or multiple locations
+// DECLINES: the model's line is dropped and the finding falls to the
+// summary, because a line number no quote supports is never published as a
+// location.
+describe("quote-anchored findings (#114)", () => {
+  const DIFF = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -10,1 +10,3 @@",
+    " ctx",
+    "+added",
+    "+added2",
+    "",
+    "diff --git a/src/b.ts b/src/b.ts",
+    "--- a/src/b.ts",
+    "+++ b/src/b.ts",
+    "@@ -20,0 +20,1 @@",
+    "+quoted elsewhere",
+    "",
+  ].join("\n");
+
+  it("relocates an inline comment to the quote-derived line when the model miscounted", () => {
+    // The model said line 10 (context, not commentable) but quoted the code
+    // at new line 12.
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 10,
+            severity: "blocking",
+            existingCode: "added2",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 12 });
+  });
+
+  it("moves the finding to another changed file when the quote is unique there", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 10,
+            severity: "blocking",
+            existingCode: "quoted elsewhere",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/b.ts", line: 20 });
+  });
+
+  it("drops the model's line to the summary when the quote matches nothing", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 11,
+            severity: "blocking",
+            message: "Bad thing here.",
+            existingCode: "not in this diff at all",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    // Line 11 was commentable — but the quote does not support it, and a
+    // line number no quote supports is never published as a location.
+    expect(result.inlineComments).toHaveLength(0);
+    expect(result.commentBody).toContain("Bad thing here.");
+  });
+
+  it("drops the model's line to the summary when the quote matches multiple locations", () => {
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -10,1 +10,4 @@",
+      " ctx",
+      "+return null",
+      " ctx2",
+      "+return null",
+      "",
+    ].join("\n");
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 11,
+            severity: "blocking",
+            existingCode: "return null",
+          }),
+        ],
+      }),
+      diff,
+    );
+
+    expect(result.inlineComments).toHaveLength(0);
+  });
+
+  it("anchors a finding that had NO line at all, from its quote", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: undefined,
+            severity: "suggestion",
+            existingCode: "added",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 11 });
+  });
+
+  it("keeps the model's line as the fallback when no quote was returned", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({ file: "src/a.ts", line: 11, severity: "blocking", message: "Bad thing here." }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 11 });
+  });
+});
