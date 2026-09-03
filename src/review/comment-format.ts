@@ -611,6 +611,16 @@ export interface SummaryInput {
   filesReviewed: string[];
   rulesRun: string[];
   rulesFailed: string[];
+  /**
+   * Issue #115: rules not dispatched because this pull request touches none of
+   * the paths they declare.
+   *
+   * Rendered beside the rules that ran, and never folded into them. A summary
+   * that listed only what ran would imply a coverage the review did not have —
+   * a rule that did not run is not a rule that found nothing, the same reason
+   * `rulesFailed` is its own list rather than silence.
+   */
+  rulesSkipped?: string[];
   ruleFailureReasons?: Record<string, string>;
   scanCoverage?: ScanCoverage;
   relatedWork?: readonly RelatedWorkItem[];
@@ -1541,6 +1551,17 @@ function renderSummaryCommentWithIncludedSuggestions(
         // is a property of the code span rather than of the source: sanitized
         // for the same reason the finding table sanitizes `finding.ruleName`.
         input.rulesRun.map((r) => `* \`${sanitizeInline(r)}\``),
+      ),
+    );
+  }
+  // Issue #115. Says WHY they did not run, because "skipped" alone reads as a
+  // failure, and this is the opposite: the rule declared it had nothing to say
+  // about these files.
+  if (input.rulesSkipped !== undefined && input.rulesSkipped.length > 0) {
+    collapsed.push(
+      detailsBlock(
+        `🚫 Rules not applicable to the changed paths (${input.rulesSkipped.length})`,
+        input.rulesSkipped.map((r) => `* \`${sanitizeInline(r)}\``),
       ),
     );
   }

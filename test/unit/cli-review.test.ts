@@ -1183,6 +1183,100 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+  // Issue #115: a rule declares the paths it reviews, and is not dispatched
+  // when the pull request touches none of them.
+  describe("path-scoped rules", () => {
+    const tsDiff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,1 +1,2 @@",
+      " keep",
+      "+added",
+    ].join("\n");
+
+    function scopedHarness(rules: RuleDefinition[]) {
+      const h = makeHarness({ loadResult: { rules, errors: [] }, botComment: null });
+      h.vcsAdapter.getDiff.mockResolvedValue(tsDiff);
+      return h;
+    }
+
+    it("dispatches only the rules whose declared paths the diff touches", async () => {
+      const h = scopedHarness([
+        makeRule({ name: "ts-rule", appliesTo: ["**/*.ts"] }),
+        makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] }),
+        makeRule({ name: "unscoped-rule" }),
+      ]);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+      const dispatched = (h.dispatchRules.mock.calls[0]?.[0].rules ?? []).map((rule) => rule.name);
+      // A rule with no declared scope still runs: that is what keeps every
+      // existing rule set behaving exactly as it did.
+      expect(dispatched).toEqual(["ts-rule", "unscoped-rule"]);
+
+      vi.restoreAllMocks();
+    });
+
+    it("reports the rules it did not dispatch rather than implying they found nothing", async () => {
+      const h = scopedHarness([
+        makeRule({ name: "ts-rule", appliesTo: ["**/*.ts"] }),
+        makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] }),
+      ]);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      // Into the summary, so a reader learns which coverage the review had...
+      expect(h.orchestrate).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ rulesSkipped: ["sql-rule"] }),
+      );
+      // ...and onto the machine-readable line, for anyone counting across runs.
+      const statuses = log.mock.calls.flat().join("\n")
+        .split("\n").filter((line) => line.startsWith("TGD_REVIEW_RESULT: "));
+      expect(JSON.parse(statuses.at(-1)!.slice("TGD_REVIEW_RESULT: ".length)).rulesSkipped).toEqual(["sql-rule"]);
+
+      vi.restoreAllMocks();
+    });
+
+    it("keeps the status line unchanged when every rule applies", async () => {
+      // Omitted rather than empty, so a run without scoped rules produces the
+      // exact line anyone already parsing it has always seen.
+      const h = scopedHarness([makeRule({ name: "ts-rule", appliesTo: ["**/*.ts"] })]);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      const statuses = log.mock.calls.flat().join("\n")
+        .split("\n").filter((line) => line.startsWith("TGD_REVIEW_RESULT: "));
+      expect(JSON.parse(statuses.at(-1)!.slice("TGD_REVIEW_RESULT: ".length))).not.toHaveProperty("rulesSkipped");
+
+      vi.restoreAllMocks();
+    });
+
+    it("still posts a review when no rule applies, rather than aborting", async () => {
+      // "No rule applies to these files" is a legitimate outcome, distinct
+      // from "no rules could be loaded" — which is fatal and stays fatal.
+      const h = scopedHarness([makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] })]);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      expect(h.dispatchRules).not.toHaveBeenCalled();
+      expect(h.orchestrate).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ rulesSkipped: ["sql-rule"] }),
+      );
+
+      vi.restoreAllMocks();
+    });
+  });
+
   it("design-review #13: a diff exactly at (not over) --max-diff-chars still reviews normally", async () => {
     const h = makeHarness({
       args: makeArgs({ maxDiffChars: 18 }), // getDiff stub returns exactly 18 chars

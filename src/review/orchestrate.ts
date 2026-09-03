@@ -70,6 +70,12 @@ export type OrchestrateOptions = {
   contextUnavailable?: readonly ContextUnavailableLabel[];
   clarification?: ClarificationPresentation;
   excludeClarificationIds?: readonly string[];
+  /**
+   * Issue #115: rules not dispatched because no changed path matched the
+   * globs they declare. Passed through to the summary so the review reports
+   * the coverage it actually had.
+   */
+  rulesSkipped?: readonly string[];
   deferredClarificationCount?: number;
   existingIssues?: readonly ExistingReviewIssue[];
   discussionMemories?: readonly DiscussionMemory[];
@@ -382,6 +388,9 @@ export function orchestrate(
     filesReviewed: changedFiles(diff),
     rulesRun: dispatchResult.rulesRun,
     rulesFailed: dispatchResult.rulesFailed,
+    ...(options.rulesSkipped === undefined || options.rulesSkipped.length === 0
+      ? {}
+      : { rulesSkipped: [...options.rulesSkipped] }),
     ruleFailureReasons: dispatchResult.ruleFailureReasons,
     scanCoverage: dispatchResult.scanCoverage,
     relatedWork: options.relatedWork,

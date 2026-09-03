@@ -61,6 +61,12 @@ export interface ReviewPublicationStatusLog {
   loadErrors?: string[];
   /** Issue #109: per-run cost/size telemetry; present on runs that dispatched. */
   metrics?: RunMetrics;
+  /**
+   * Issue #115: rules not dispatched because no changed path matched their
+   * declared `applies_to`. Omitted when empty, so an unscoped run keeps its
+   * exact pre-existing line shape.
+   */
+  rulesSkipped?: string[];
 }
 
 /**
@@ -370,6 +376,8 @@ export async function publishReviewFromManifest(options: {
   readonly orchestration?: OrchestrationResult;
   /** Issue #109: per-run cost/size telemetry for the terminal status line. */
   readonly metrics?: PendingRunMetrics;
+  /** Issue #115: rules the changed paths did not call for; see the status log. */
+  readonly rulesSkipped?: readonly string[];
   readonly loadErrors?: readonly { readonly sourcePath: string; readonly message: string }[];
   readonly buildBody?: (
     o: OrchestrationResult,
@@ -823,6 +831,9 @@ export async function publishReviewFromManifest(options: {
         // The run dispatched and paid its full prompt cost, so the ambiguous
         // partial still owes the terminal telemetry (Codex review of PR #117).
         ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
+        ...(options.rulesSkipped === undefined || options.rulesSkipped.length === 0
+          ? {}
+          : { rulesSkipped: [...options.rulesSkipped] }),
       });
       return EXIT_PARTIAL;
     }
@@ -845,6 +856,9 @@ export async function publishReviewFromManifest(options: {
         rulesFailed: [...terminalResult.rulesFailed],
         loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
         ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
+        ...(options.rulesSkipped === undefined || options.rulesSkipped.length === 0
+          ? {}
+          : { rulesSkipped: [...options.rulesSkipped] }),
         ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
       });
       return terminalResult.exitCode;
@@ -863,6 +877,9 @@ export async function publishReviewFromManifest(options: {
     rulesFailed: [...terminalResult.rulesFailed],
     loadErrors: terminalResult.loadErrors === undefined ? undefined : [...terminalResult.loadErrors],
     ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
+        ...(options.rulesSkipped === undefined || options.rulesSkipped.length === 0
+          ? {}
+          : { rulesSkipped: [...options.rulesSkipped] }),
     ...(options.orchestration === undefined ? { reason: "recovered-pending-review" } : {}),
   });
   return terminalResult.exitCode === 0 ? EXIT_OK : terminalResult.exitCode;
@@ -1072,6 +1089,8 @@ export async function publishFocusedReview(options: {
   readonly hooks?: PublicationExecutorHooks;
   /** Issue #109: focused commands dispatch every rule, so they emit the same terminal telemetry. */
   readonly metrics?: PendingRunMetrics;
+  /** Issue #115: rules the changed paths did not call for; see the status log. */
+  readonly rulesSkipped?: readonly string[];
   readonly logStatus?: (log: ReviewPublicationStatusLog) => void;
 }): Promise<number> {
   const adapter = options.context.vcsAdapter as unknown as ConversationAdapter;
@@ -1213,6 +1232,9 @@ export async function publishFocusedReview(options: {
     rulesRun: [...options.orchestration.rulesRun],
     rulesFailed: [...options.orchestration.rulesFailed],
     ...(options.metrics === undefined ? {} : { metrics: finalizeRunMetrics(options.metrics) }),
+        ...(options.rulesSkipped === undefined || options.rulesSkipped.length === 0
+          ? {}
+          : { rulesSkipped: [...options.rulesSkipped] }),
   });
   return published.state === "completed" ? 0 : 2;
 }

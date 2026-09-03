@@ -119,6 +119,7 @@ import type { ContextPackResult } from "./context/context-pack.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import type { LoadResult } from "./rules/loader.js";
+import { scopeRulesToChangedFiles } from "./rules/scope.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
 import type { RepositoryRef } from "./target/types.js";
 import type { PullRequestInfo } from "./vcs/adapter.js";
@@ -225,6 +226,7 @@ export interface ReviewDependencies {
       clarification?: ClarificationPresentation;
       deferredClarificationCount?: number;
       excludeClarificationIds?: readonly string[];
+      rulesSkipped?: readonly string[];
     },
   ) => OrchestrationResult;
   createStateStore?: typeof createConversationStateStore;
@@ -696,6 +698,12 @@ interface StatusLog {
   // (via JSON.stringify dropping `undefined` values) when there were no
   // load errors, so the "skipped"/all-succeeded log shape is unchanged.
   loadErrors?: readonly string[];
+  /**
+   * Issue #115: rules not dispatched because no changed path matched their
+   * `applies_to`. Omitted when empty, so a run with no scoped rules keeps its
+   * exact pre-existing line shape for anyone already parsing it.
+   */
+  rulesSkipped?: readonly string[];
   // Issue #109: per-run cost and size telemetry, present ONLY on runs that
   // actually dispatched (posted/partial) — a skipped run keeps its exact
   // pre-#109 shape. All sizes in characters (~4 chars/token), which is the
@@ -1291,7 +1299,7 @@ export async function review(
   }
 
   const loadedRules = await loadRulesForReview(config, pr, loadRulesFn);
-  const rules = config.codexScanResults === undefined
+  const loadedRuleSet = config.codexScanResults === undefined
     ? loadedRules.rules
     : loadedRules.rules.filter((rule) => rule.name !== "codex-security");
   const loadErrors = [...loadedRules.errors];
@@ -1316,9 +1324,31 @@ export async function review(
   }
 
   // AC-8.5: every rule failed to load -> exit 1 before any VCS write.
-  if (rules.length === 0 && config.codexScanResults === undefined) {
+  if (loadedRuleSet.length === 0 && config.codexScanResults === undefined) {
     console.error("tgd-review-agent: no rules could be loaded; aborting before posting a comment");
     return EXIT_FATAL;
+  }
+
+  // Issue #115: a rule that declares the paths it reviews is not dispatched
+  // when this pull request touches none of them. Deterministic, and before any
+  // model call — the per-rule diff cost is paid whether or not the rule can
+  // apply, and a rule prompted with code it was not written for still has to
+  // answer.
+  //
+  // Rename SOURCES are included, so a rule scoped to `**\/*.go` still sees a
+  // pull request that renamed a Go file away: the deletion is exactly the kind
+  // of change that rule exists to look at.
+  //
+  // Deliberately NOT a fatal condition when it empties the set. "No rule
+  // applies to these files" is a legitimate outcome of a review, distinct from
+  // "no rules could be loaded" above, and it is reported rather than aborted.
+  const scopedRules = scopeRulesToChangedFiles(loadedRuleSet, changedFilesWithRenameSources(diff));
+  const rules = scopedRules.applicable;
+  if (scopedRules.skipped.length > 0) {
+    console.log(
+      `tgd-review-agent: ${scopedRules.skipped.length} rule(s) not dispatched — ` +
+        `no changed path matches their applies_to (${scopedRules.skipped.join(", ")})`,
+    );
   }
 
   // Issue #50: dependency facts the HOST parsed out of the changed manifests,
@@ -1793,6 +1823,7 @@ export async function review(
     reviewBinding,
     ...(clarificationPresentation === undefined ? {} : { clarification: clarificationPresentation }),
     ...(reviewContextLabels.length === 0 ? {} : { contextUnavailable: reviewContextLabels }),
+    ...(scopedRules.skipped.length === 0 ? {} : { rulesSkipped: scopedRules.skipped }),
   });
   // Issue #36: the severity mix, on its own machine-readable line so
   // calibration drift is trackable ACROSS runs. A rule set returning 80%
@@ -2030,6 +2061,10 @@ export async function review(
       // AT publication completion), so it travels here rather than on
       // terminalResult, which is SERIALIZED into pending markers.
       metrics: pendingMetrics,
+      // Issue #115: travels beside `metrics` and for the same reason — the
+      // terminal line should carry it, but `terminalResult` is serialized into
+      // pending markers and must not gain fields for reporting alone.
+      ...(scopedRules.skipped.length === 0 ? {} : { rulesSkipped: scopedRules.skipped }),
     });
   }
 
@@ -2039,6 +2074,7 @@ export async function review(
     rulesRun: orchestration.rulesRun,
     rulesFailed: orchestration.rulesFailed,
     loadErrors: loadErrors.length > 0 ? loadErrors.map((e) => `${e.sourcePath}: ${e.message}`) : undefined,
+    rulesSkipped: scopedRules.skipped.length > 0 ? scopedRules.skipped : undefined,
     // Dry run: this IS the terminal emitter, so the duration freezes here.
     metrics: finalizeRunMetrics(pendingMetrics),
   });

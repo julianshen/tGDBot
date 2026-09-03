@@ -10,6 +10,7 @@ import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import matter from "gray-matter";
+import { globToRegExp } from "./glob.js";
 import type { RuleDefinition } from "./types.js";
 
 export interface LoadResult {
@@ -84,6 +85,31 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
     return { error: `frontmatter field "depends_on" contains a duplicate dependency` };
   }
 
+  // Issue #115. A string or a list of them; one glob is the common case and
+  // demanding a single-element array for it would be pointless ceremony.
+  const appliesToValue = data.applies_to;
+  let appliesTo: string[] | undefined;
+  if (appliesToValue !== undefined) {
+    const candidates = Array.isArray(appliesToValue) ? appliesToValue : [appliesToValue];
+    if (candidates.length === 0 || !candidates.every(isNonEmptyString)) {
+      return {
+        error: `frontmatter field "applies_to" must be a non-empty string or an array of them`,
+      };
+    }
+    // Compiled HERE so an unsupported pattern is a load error naming the file,
+    // rather than a rule that silently matches nothing and stops running with
+    // no explanation.
+    for (const candidate of candidates as string[]) {
+      try {
+        globToRegExp(candidate);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { error: `frontmatter field "applies_to" contains an unusable pattern "${candidate}": ${message}` };
+      }
+    }
+    appliesTo = [...(candidates as string[])];
+  }
+
   const parallelGroupValue = data.parallel_group;
   if (
     parallelGroupValue !== undefined &&
@@ -100,6 +126,7 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
     rule: {
       name: data.name,
       ...(hasProvider ? { provider: data.provider as string, model: data.model as string } : {}),
+      ...(appliesTo === undefined ? {} : { appliesTo: Object.freeze(appliesTo) }),
       dependsOn: Object.freeze([...(dependsOn as string[])]),
       ...(parallelGroupValue === undefined
         ? {}
