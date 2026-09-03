@@ -155,15 +155,17 @@ trusted context, report the finding anyway and say the description asserts other
 // run inside its session), so the condition lives in the instruction rather
 // than in the prompt-building code.
 //
-// The failure signal is the subagent tool's OWN "K/N succeeded" summary, not
-// the orchestrator's "rulesFailed" array: the accounting the orchestrator
-// constructs is exactly what deterministic reconciliation exists to correct,
-// so a task that errored but was mislabelled successful would make an
-// uncertain-coverage run skip the advisor with no way to trigger it
-// afterwards (PR #123 review). The summary line is produced by the tool from
-// actual task exit codes, and is authoritative at decision time.
+// The failure signals are TWO, because neither alone covers every shape a
+// task can fail in (PR #123 review, two rounds). The subagent tool's OWN
+// "K/N succeeded" summary is produced from actual task exit codes and is
+// authoritative for a task that ERRORED — but it counts exit codes only, so
+// an exit-0 task returning prose or malformed JSON reads as "succeeded"
+// there; that shape is what the "rulesFailed" array catches, because the
+// prompt defines it as exactly "no parseable findings array" (a judgement
+// the orchestrator CAN make reliably from block content, unlike exit-code
+// accounting). The advisor runs when either signal fires.
 const ADVISOR_INSTRUCTION =
-  'After merging the task blocks, decide whether to call the "advisor" tool for a second opinion on your merged findings. Call it ONLY IF at least one of the following holds: (a) the merged "findings" array contains at least one finding, or (b) the subagent result summary line reported any task that did NOT succeed (K is less than the number of dispatched tasks) — a task that did not succeed makes coverage uncertain, and that is exactly when a second opinion is most valuable. If the merged "findings" array is empty AND every dispatched task succeeded, do NOT call the "advisor" tool at all; respond with the final JSON immediately. When you do call it and the advisor flags a finding as a false positive, remove it before responding.';
+  'After merging the task blocks, decide whether to call the "advisor" tool for a second opinion on your merged findings. Call it ONLY IF at least one of the following holds: (a) the merged "findings" array contains at least one finding; (b) the subagent result summary line reported any task that did NOT succeed (K is less than the number of dispatched tasks); or (c) any dispatched rule name from the list below appears in "rulesFailed". Any of these makes coverage uncertain, and that is exactly when a second opinion is most valuable. If the merged "findings" array is empty AND every dispatched task succeeded AND "rulesFailed" is empty, do NOT call the "advisor" tool at all; respond with the final JSON immediately. When you do call it and the advisor flags a finding as a false positive, remove it before responding.';
 
 // Review finding (code-review fix): the diff IS embedded once per rule
 // here, and that duplication is NECESSARY, not an oversight — verified

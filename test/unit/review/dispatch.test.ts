@@ -548,14 +548,16 @@ describe("dispatchRules advisor integration (Task 6)", () => {
 
     const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", true);
 
-    // The skip: empty merge + every task succeeded -> no advisor call.
-    expect(prompt).toMatch(/empty AND every dispatched task succeeded, do NOT call the "advisor" tool/);
-    // The keep: a non-empty merge, or a task that did not succeed — grounded
-    // in the subagent tool's OWN summary line, never the orchestrator's
-    // unreliable rulesFailed accounting (PR #123 review).
+    // The skip: empty merge + every task succeeded + no failures -> no
+    // advisor call.
+    expect(prompt).toMatch(/AND every dispatched task succeeded AND "rulesFailed" is empty, do NOT call the "advisor" tool/);
+    // The keep: a non-empty merge, a task that did not succeed per the
+    // tool's OWN summary line (errors), or a rule with no parseable output
+    // per rulesFailed — two signals, because neither covers every failure
+    // shape (PR #123 review, two rounds).
     expect(prompt).toMatch(/at least one of the following holds/);
     expect(prompt).toMatch(/the subagent result summary line reported any task that did NOT succeed/);
-    expect(prompt).not.toMatch(/rule is in "rulesFailed" —/);
+    expect(prompt).toMatch(/any dispatched rule name from the list below appears in "rulesFailed"/);
     // The response contract is unchanged and unconditional: the final-JSON
     // shape block appears exactly once, after the advisor instruction, in
     // both advisor states.
