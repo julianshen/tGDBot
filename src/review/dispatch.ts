@@ -425,17 +425,20 @@ async function runDispatch(
           // A FAILED advisor call filtered nothing: when the tool itself
           // throws, Pi sets isError on the EVENT; rpiv-advisor reports
           // auth/provider/abort/empty-response failures as normal
-          // tool_execution_end results carrying details.errorMessage.
+          // tool_execution_end results carrying details.errorMessage, and
+          // model-level failures as details.stopReason === "error" (with
+          // errorMessage present only when the provider supplied one).
           // Recovery must stay enabled in those cases, or valid raw
           // findings stay lost behind a pass that did nothing
-          // (PR #123 review).
+          // (PR #123 review, two rounds).
           const result = event.result as
-            | { isError?: unknown; details?: { errorMessage?: unknown } }
+            | { isError?: unknown; details?: { errorMessage?: unknown; stopReason?: unknown } }
             | undefined;
           const failed =
             event.isError === true ||
             result?.isError === true ||
-            typeof result?.details?.errorMessage === "string";
+            typeof result?.details?.errorMessage === "string" ||
+            result?.details?.stopReason === "error";
           if (!failed) advisorRan = true;
         }
       });

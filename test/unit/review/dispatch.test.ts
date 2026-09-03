@@ -150,7 +150,7 @@ function makeRule(
 function makeSubscribableSession(
   detailsResults: unknown[],
   finalMessage: string,
-  options: { advisorRan?: boolean; advisorFailed?: boolean; advisorThrew?: boolean } = {},
+  options: { advisorRan?: boolean; advisorFailed?: boolean; advisorThrew?: boolean; advisorStopError?: boolean } = {},
 ): DispatchSession {
   let listener: ((event: unknown) => void) | undefined;
   return {
@@ -186,6 +186,15 @@ function makeSubscribableSession(
       // pinned SDK's ToolExecutionEndEvent shape) — same rule.
       if (options.advisorThrew === true) {
         listener?.({ type: "tool_execution_end", toolName: "advisor", isError: true, result: {} });
+      }
+      // A model-level failure surfaces as details.stopReason === "error",
+      // with errorMessage present only when the provider supplied one.
+      if (options.advisorStopError === true) {
+        listener?.({
+          type: "tool_execution_end",
+          toolName: "advisor",
+          result: { isError: false, details: { stopReason: "error" } },
+        });
       }
     },
     getLastAssistantText() {
@@ -2830,6 +2839,14 @@ describe("dispatchRules — recovery follows whether the advisor actually ran (#
     const result = await dispatchRules(twoRules(), "diff", true, async () => session);
 
     expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review", decision: "new" });
+  });
+
+  it("recovers a dropped rule when the advisor model failed (stopReason error, no message)", async () => {
+    const session = makeSubscribableSession(details, droppedFinal, { advisorStopError: true });
+
+    const result = await dispatchRules(twoRules(), "diff", true, async () => session);
+
     expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review", decision: "new" });
   });
 
