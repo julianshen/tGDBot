@@ -199,7 +199,11 @@ const SUGGESTION_FENCE_RE = /^([ \t>*+\-]*(?:`{3,}|~{3,})[ \t]*)suggestions?\b/g
 function sanitizeText(text: string): string {
   return text
     .replace(/<!--/g, "&lt;!--") // can't OPEN an HTML comment (would swallow the rest)
-    .replace(/-->/g, "--&gt;") // ...nor CLOSE one — our dedup marker is an HTML comment
+    // ...nor CLOSE one — our dedup marker is an HTML comment. HTML's error
+    // tolerance also accepts `--!>` as a comment end, so the defang covers
+    // both spellings, preserving the text verbatim up to the escaped `>`
+    // (CodeQL js/bad-tag-filter).
+    .replace(/--!?>/g, (match) => `${match.slice(0, -1)}&gt;`)
     .replace(/<\/?(?:details|summary|script|style|iframe|img|a)\b/gi, (m) => `&lt;${m.slice(1)}`)
     // A committable suggestion must never originate from finding text.
     .replace(SUGGESTION_FENCE_RE, "$1text")

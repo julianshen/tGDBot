@@ -52,7 +52,10 @@ function stripInvisible(value: string): string {
 function defangGeneratedMarkup(value: string): string {
   return value
     .replace(/<!--/g, "&lt;!--")
-    .replace(/-->/g, "--&gt;")
+    // HTML also accepts `--!>` as a comment end (the spec's error tolerance),
+    // so the defang must cover it too — an author could otherwise close a
+    // comment the renderer thought was still open (CodeQL js/bad-tag-filter).
+    .replace(/--!?>/g, (match) => `${match.slice(0, -1)}&gt;`)
     .replace(/<\/?(?:details|summary|script|style|iframe|img|a)\b/gi, (match) => `&lt;${match.slice(1)}`)
     .replace(SUGGESTION_FENCE_RE, "$1text");
 }

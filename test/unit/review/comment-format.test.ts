@@ -208,6 +208,22 @@ describe("renderInlineComment — injection hardening", () => {
     expect(body).not.toContain("<!-- tgd-review-agent:sha=deadbeef -->");
   });
 
+  // CodeQL js/bad-tag-filter: HTML's error tolerance accepts `--!>` as a
+  // comment end, so content carrying `<!-- ... --!>` must be defanged too,
+  // with the text preserved verbatim up to the escaped `>`.
+  it("defangs the --!> comment-end spelling without altering the text", () => {
+    // Through the public surface: the finding's message carries both comment
+    // spellings; the rendered body must contain no closable comment at all
+    // apart from the tool's own trailing marker.
+    const findingBody = renderInlineComment(
+      makeFinding({ message: "a <!-- s --!> b --> c" }),
+    );
+    const content = findingBody.replace(INLINE_COMMENT_MARKER, "");
+    expect(content).toContain("&lt;!-- s --!&gt; b --&gt; c");
+    expect([...content.matchAll(/<!--/g)]).toHaveLength(0);
+    expect(content).not.toMatch(/--!?>/);
+  });
+
   it("always ends with the inline marker (what stale-thread resolution keys on)", () => {
     expect(renderInlineComment(makeFinding({})).trimEnd().endsWith(INLINE_COMMENT_MARKER)).toBe(
       true,
