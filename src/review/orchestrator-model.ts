@@ -304,10 +304,16 @@ function warnOnInheritedModelCost(
   const pricier = priced.filter((entry) => entry.cost > defaultCost);
   if (cheaper.length === 0 || pricier.length > 0) return;
   const ratio = Math.round((cheaper[0]!.cost / defaultCost) * 100);
+  // Codex review of PR #124, round three: an UNPRICED credentialed model's
+  // cost is unknown, so the ceiling claim must be scoped to what the registry
+  // actually prices — "priciest credentialed model" outright would be
+  // unfalsifiable against the excluded entries. The qualification IS the fix;
+  // suppressing the warning entirely would silence the feature exactly for
+  // custom models.json setups, which are where unknown pricing lives.
   console.warn(
-    `tgd-review-agent: "${defaultSpec}" is the priciest credentialed model on this ` +
-      `machine for a review-shaped token mix (90% input / 10% output); the cheapest ` +
-      `alternative is "${cheaper[0]!.spec}" (~${ratio}% of its price). ` +
+    `tgd-review-agent: "${defaultSpec}" is the priciest credentialed model with published ` +
+      `pricing for a review-shaped token mix (90% input / 10% output); the cheapest ` +
+      `such alternative is "${cheaper[0]!.spec}" (~${ratio}% of its price). ` +
       `Consider pinning a mid-tier model on review rules — though turn count beats token ` +
       `price, so the cheapest is not automatically right (issue #112).`,
   );

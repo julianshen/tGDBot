@@ -2073,6 +2073,10 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
         // under the documented review-shaped token mix.
         const expensive = warnings.find((w) => w.includes("priciest credentialed model"));
         expect(expensive).toBeDefined();
+        // The claim is scoped to priced models — an unpriced credentialed
+        // entry's cost is unknown, so the categorical version would be
+        // unfalsifiable (Codex review, round three).
+        expect(expensive).toContain("with published pricing");
         expect(expensive).toContain('"openai/gpt-5.6-mini"');
         expect(expensive).toContain("90% input / 10% output");
         // Deliberately advisory: turn count beats token price.
