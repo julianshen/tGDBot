@@ -94,8 +94,12 @@ export interface DispatchSession {
 export interface DispatchSessionEvent {
   type: string;
   toolName?: string;
+  /** Pi sets this on the EVENT when a tool throws (not inside `result`). */
+  isError?: boolean;
   result?: {
+    isError?: unknown;
     details?: {
+      errorMessage?: unknown;
       results?: CapturedTaskResult[];
     };
   };
@@ -418,17 +422,20 @@ async function runDispatch(
           }
         }
         if (event.type === "tool_execution_end" && event.toolName === "advisor") {
-          // A FAILED advisor call filtered nothing: rpiv-advisor reports
-          // auth, provider, abort and empty-response failures as normal
-          // tool_execution_end results carrying details.errorMessage (or
-          // isError). Recovery must stay enabled in those cases, or valid
-          // raw findings stay lost behind a pass that did nothing
-          // (PR #116 review round three applies the same rule here).
+          // A FAILED advisor call filtered nothing: when the tool itself
+          // throws, Pi sets isError on the EVENT; rpiv-advisor reports
+          // auth/provider/abort/empty-response failures as normal
+          // tool_execution_end results carrying details.errorMessage.
+          // Recovery must stay enabled in those cases, or valid raw
+          // findings stay lost behind a pass that did nothing
+          // (PR #123 review).
           const result = event.result as
             | { isError?: unknown; details?: { errorMessage?: unknown } }
             | undefined;
           const failed =
-            result?.isError === true || typeof result?.details?.errorMessage === "string";
+            event.isError === true ||
+            result?.isError === true ||
+            typeof result?.details?.errorMessage === "string";
           if (!failed) advisorRan = true;
         }
       });

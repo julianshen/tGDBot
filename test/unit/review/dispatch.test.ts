@@ -150,7 +150,7 @@ function makeRule(
 function makeSubscribableSession(
   detailsResults: unknown[],
   finalMessage: string,
-  options: { advisorRan?: boolean; advisorFailed?: boolean } = {},
+  options: { advisorRan?: boolean; advisorFailed?: boolean; advisorThrew?: boolean } = {},
 ): DispatchSession {
   let listener: ((event: unknown) => void) | undefined;
   return {
@@ -181,6 +181,11 @@ function makeSubscribableSession(
           toolName: "advisor",
           result: { isError: false, details: { errorMessage: "provider auth failed" } },
         });
+      }
+      // A THROWN advisor tool call sets isError on the EVENT itself (the
+      // pinned SDK's ToolExecutionEndEvent shape) — same rule.
+      if (options.advisorThrew === true) {
+        listener?.({ type: "tool_execution_end", toolName: "advisor", isError: true, result: {} });
       }
     },
     getLastAssistantText() {
@@ -2825,6 +2830,14 @@ describe("dispatchRules — recovery follows whether the advisor actually ran (#
     const result = await dispatchRules(twoRules(), "diff", true, async () => session);
 
     expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review", decision: "new" });
+  });
+
+  it("recovers a dropped rule when the advisor tool THREW (event-level isError)", async () => {
+    const session = makeSubscribableSession(details, droppedFinal, { advisorThrew: true });
+
+    const result = await dispatchRules(twoRules(), "diff", true, async () => session);
+
     expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review", decision: "new" });
   });
 
