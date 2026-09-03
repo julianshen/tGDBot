@@ -128,6 +128,30 @@ instead of the parsed changes. `dependency-major-bump` shows the shape.
 Then `npm run benchmark -- --update` and commit `baseline.json` with the
 fixture.
 
+## Keeping the baseline honest
+
+`test/unit/benchmark/baseline.test.ts` runs this comparison as part of the
+ordinary suite, so a change that moves a number fails `npm test` immediately
+rather than waiting for someone to remember `--check`.
+
+**If it fails, do not reach for `--update` first.** The failure is the
+measurement. Read which metric moved and decide whether you meant to move it:
+
+- `dispatchChars` on **every** fixture by the **same** amount is shared prompt
+  text — the builtin rule, or the contract in `dispatch-prompt.ts`. Multiply
+  the per-rule delta by the number of rules a fixture runs to confirm.
+- `dispatchChars` on **one** fixture is that fixture's own diff or context.
+- anything under `quality`, `findingsCount` or `anchoredInline` is the
+  pipeline behaving differently, which is rarely what a prompt change intends.
+
+Then run `--update` and say in the commit message **which** change moved it.
+A baseline refreshed without that sentence records a number nobody has
+examined.
+
+This went wrong once already (#125): the benchmark landed with a baseline
+recorded against an older `main`, six pull requests merged while it was open,
+and the numbers were stale from the moment it merged.
+
 ## What the fixtures cover
 
 | Fixture | Asserts |
