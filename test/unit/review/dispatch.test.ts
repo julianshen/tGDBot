@@ -150,7 +150,7 @@ function makeRule(
 function makeSubscribableSession(
   detailsResults: unknown[],
   finalMessage: string,
-  options: { advisorRan?: boolean } = {},
+  options: { advisorRan?: boolean; advisorFailed?: boolean } = {},
 ): DispatchSession {
   let listener: ((event: unknown) => void) | undefined;
   return {
@@ -171,6 +171,16 @@ function makeSubscribableSession(
       // the orchestrator ran the pass.
       if (options.advisorRan === true) {
         listener?.({ type: "tool_execution_end", toolName: "advisor", result: {} });
+      }
+      // A FAILED advisor call (rpiv-advisor reports these as normal
+      // tool_execution_end results with details.errorMessage) filtered
+      // nothing, so it must not suppress recovery.
+      if (options.advisorFailed === true) {
+        listener?.({
+          type: "tool_execution_end",
+          toolName: "advisor",
+          result: { isError: false, details: { errorMessage: "provider auth failed" } },
+        });
       }
     },
     getLastAssistantText() {
@@ -2803,6 +2813,15 @@ describe("dispatchRules — recovery follows whether the advisor actually ran (#
 
     // useAdvisor = true, but no advisor tool event: the conditional
     // instruction skipped the pass.
+    const result = await dispatchRules(twoRules(), "diff", true, async () => session);
+
+    expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);
+    expect(result.findings).toContainEqual({ ...terraFinding, ruleName: "terra-review", decision: "new" });
+  });
+
+  it("recovers a dropped rule when the advisor call FAILED without filtering", async () => {
+    const session = makeSubscribableSession(details, droppedFinal, { advisorFailed: true });
+
     const result = await dispatchRules(twoRules(), "diff", true, async () => session);
 
     expect([...result.rulesRun].sort()).toEqual(["grok-review", "terra-review"]);

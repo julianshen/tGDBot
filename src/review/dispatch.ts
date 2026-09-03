@@ -418,7 +418,18 @@ async function runDispatch(
           }
         }
         if (event.type === "tool_execution_end" && event.toolName === "advisor") {
-          advisorRan = true;
+          // A FAILED advisor call filtered nothing: rpiv-advisor reports
+          // auth, provider, abort and empty-response failures as normal
+          // tool_execution_end results carrying details.errorMessage (or
+          // isError). Recovery must stay enabled in those cases, or valid
+          // raw findings stay lost behind a pass that did nothing
+          // (PR #116 review round three applies the same rule here).
+          const result = event.result as
+            | { isError?: unknown; details?: { errorMessage?: unknown } }
+            | undefined;
+          const failed =
+            result?.isError === true || typeof result?.details?.errorMessage === "string";
+          if (!failed) advisorRan = true;
         }
       });
     }
