@@ -846,7 +846,7 @@ before lookup, so it resolves the same way it does for the rule's own subagent.
 
 When rules run unpinned, the review logs what they inherited:
 
-```
+```text
 tgd-review-agent: 3 rule(s) without a provider/model pin will run on "anthropic/claude-opus-4-5" (the deployment default)
 ```
 
