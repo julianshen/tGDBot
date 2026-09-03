@@ -2125,6 +2125,61 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
       }
     });
 
+    it("does not misdescribe a mid-priced default as the most expensive", async () => {
+      // Codex review of PR #124: costs of 5, 10 (default), 20 — cheaper
+      // alternatives exist, but so does a pricier model, so the default is
+      // NOT the ceiling and the "most expensive" warning must stay quiet.
+      withCosts([
+        { provider: "openai", id: "gpt-5.6-terra", cost: { input: 15, output: 75 } },
+        { provider: "anthropic", id: "claude-opus-4-5", cost: { input: 2, output: 8 } },
+        { provider: "groq", id: "kimi-k2", cost: { input: 1, output: 2 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        // Pin the default explicitly so the mid-priced one is the inherited
+        // default (the snapshot's first entry would otherwise win).
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session, "anthropic/claude-opus-4-5");
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "anthropic/claude-opus-4-5"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    it("excludes an unpriced (zero-normalized) model from the comparison instead of calling it free", async () => {
+      // Codex review of PR #124: the SDK normalizes a custom models.json
+      // model's omitted pricing to zeros. A zero-cost entry must not be
+      // reported as the cheapest alternative at ~0% — and with only that
+      // entry priced alongside the default, there is nothing to compare.
+      withCosts([
+        { provider: "anthropic", id: "claude-opus-4-5", cost: { input: 15, output: 75 } },
+        { provider: "custom", id: "free-proxy", cost: { input: 0, output: 0 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session);
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "anthropic/claude-opus-4-5"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
+        expect(warnings.some((w) => w.includes("free-proxy"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
     it("says nothing at all when every rule is pinned", async () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       const stub = createPiSessionStub(

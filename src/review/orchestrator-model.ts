@@ -236,10 +236,18 @@ interface ModelCost {
 }
 
 function totalCost(model: { cost?: ModelCost }): number | undefined {
-  // cost is optional in the registry schema; a model without published
-  // pricing cannot take part in an expense comparison — it is excluded, not
-  // treated as free.
+  // A model without published pricing cannot take part in an expense
+  // comparison — it is excluded, not treated as free. Two shapes of "no
+  // pricing" exist here: the field absent outright, AND — the pinned SDK
+  // normalizes a custom models.json model's required cost field to all zeros
+  // when the author omitted it (provider-composer.js:
+  // `cost: definition.cost ?? { input: 0, output: 0, ... }`) — input AND
+  // output both zero. A genuine 0/0 published price is indistinguishable from
+  // that default and is excluded the same way; conservative, since a
+  // zero-priced model would otherwise be reported as the cheapest
+  // alternative at ~0% (Codex review of PR #124).
   if (model.cost === undefined) return undefined;
+  if (model.cost.input === 0 && model.cost.output === 0) return undefined;
   return model.cost.input + model.cost.output;
 }
 
@@ -274,12 +282,16 @@ function warnOnInheritedModelCost(
   const available = runtime.getAvailableSnapshot();
   const defaultCost = totalCost(available.find((m) => m.provider === defaultRef.provider && m.id === defaultRef.modelId) ?? {});
   if (defaultCost === undefined) return; // no pricing on the default — nothing to compare
-  const cheaper = available
+  const priced = available
     .map((m) => ({ spec: `${m.provider}/${m.id}`, cost: totalCost(m) }))
-    .filter((entry): entry is { spec: string; cost: number } =>
-      entry.cost !== undefined && entry.cost < defaultCost)
-    .sort((a, b) => a.cost - b.cost);
-  if (cheaper.length === 0) return; // nothing cheaper credentialed — the default IS the floor
+    .filter((entry): entry is { spec: string; cost: number } => entry.cost !== undefined);
+  const cheaper = priced.filter((entry) => entry.cost < defaultCost).sort((a, b) => a.cost - b.cost);
+  // "Most expensive" requires BOTH something cheaper and NOTHING pricier: a
+  // mid-priced default (say costs of 5, 10, 20 with the default at 10) has
+  // cheaper alternatives but is not the ceiling, and warning would misdescribe
+  // it (Codex review of PR #124).
+  const pricier = priced.filter((entry) => entry.cost > defaultCost);
+  if (cheaper.length === 0 || pricier.length > 0) return;
   const ratio = Math.round((cheaper[0]!.cost / defaultCost) * 100);
   console.warn(
     `tgd-review-agent: "${defaultSpec}" is the most expensive credentialed model on this ` +
