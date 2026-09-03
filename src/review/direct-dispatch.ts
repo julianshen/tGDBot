@@ -412,6 +412,16 @@ interface RuleOutcome {
     // Advisor pass: filters the COMPLETE merged set (so, unlike the legacy
     // path, advisor-on can never mask a dropped rule). Best-effort by
     // design — any failure keeps every finding and says so.
+    //
+    // Gated on findings.length > 0 (issue #111): an empty merged set has
+    // nothing to filter, so the advisor model call is skipped. The issue's
+    // failed-rule edge resolves the same way HERE, deliberately: the direct
+    // engine's advisor only FILTERS findings — it cannot review coverage —
+    // so with zero findings there is literally nothing for it to act on,
+    // however uncertain coverage is. (The legacy engine keeps its advisor on
+    // rule failure, because there the orchestrator could still be talked
+    // into a bad merge shape.) A failed rule alongside non-empty findings
+    // still runs the advisor, since there IS something to filter.
     if (useAdvisor && findings.length > 0) {
       const createAdvisorSession =
         deps.createAdvisorSession ??

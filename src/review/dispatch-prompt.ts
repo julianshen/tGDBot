@@ -156,8 +156,24 @@ trusted context, report the finding anyway and say the description asserts other
 // the orchestrating session to call rpiv-advisor's `advisor` tool on its
 // merged findings before emitting the final JSON, and to drop anything the
 // advisor flags as a false positive.
+// TASKS.md Task 6, made conditional by issue #111: the advisor pass costs a
+// model call every round, and there is nothing to second-opinion when the
+// merged findings array is empty and every task succeeded. The orchestrator
+// is the only party that knows the merge outcome at decision time (the rules
+// run inside its session), so the condition lives in the instruction rather
+// than in the prompt-building code.
+//
+// The failure signals are TWO, because neither alone covers every shape a
+// task can fail in (PR #123 review, two rounds). The subagent tool's OWN
+// "K/N succeeded" summary is produced from actual task exit codes and is
+// authoritative for a task that ERRORED — but it counts exit codes only, so
+// an exit-0 task returning prose or malformed JSON reads as "succeeded"
+// there; that shape is what the "rulesFailed" array catches, because the
+// prompt defines it as exactly "no parseable findings array" (a judgement
+// the orchestrator CAN make reliably from block content, unlike exit-code
+// accounting). The advisor runs when either signal fires.
 const ADVISOR_INSTRUCTION =
-  'Before responding with the final JSON, call the "advisor" tool for a second opinion on your merged findings; if the advisor flags a finding as a false positive, remove it before responding.';
+  'After merging the task blocks, decide whether to call the "advisor" tool for a second opinion on your merged findings. Call it ONLY IF at least one of the following holds: (a) the merged "findings" array contains at least one finding; (b) the subagent result summary line reported any task that did NOT succeed (K is less than the number of dispatched tasks); or (c) any dispatched rule name from the list below appears in "rulesFailed". Any of these makes coverage uncertain, and that is exactly when a second opinion is most valuable. If the merged "findings" array is empty AND every dispatched task succeeded AND "rulesFailed" is empty, do NOT call the "advisor" tool at all; respond with the final JSON immediately. When you do call it and the advisor flags a finding as a false positive, remove it before responding.';
 
 // Review finding (code-review fix): the diff IS embedded once per rule
 // here, and that duplication is NECESSARY, not an oversight — verified

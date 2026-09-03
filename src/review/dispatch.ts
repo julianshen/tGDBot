@@ -94,8 +94,12 @@ export interface DispatchSession {
 export interface DispatchSessionEvent {
   type: string;
   toolName?: string;
+  /** Pi sets this on the EVENT when a tool throws (not inside `result`). */
+  isError?: boolean;
   result?: {
+    isError?: unknown;
     details?: {
+      errorMessage?: unknown;
       results?: CapturedTaskResult[];
     };
   };
@@ -402,6 +406,13 @@ async function runDispatch(
     // Sessions without subscribe (test stubs) skip capture → no reconciliation.
     let capturedTaskResults: CapturedTaskResult[] = [];
     let unsubscribe: (() => void) | undefined;
+    // Whether the advisor tool ACTUALLY ran (issue #111): the advisor
+    // instruction is now conditional, so "advisor on" no longer implies
+    // "advisor filtered the findings" — an empty merge with every rule
+    // succeeded skips it. Recovery's ambiguity (a rule's zero findings could
+    // be a buggy drop OR advisor filtering) only exists when the advisor ran,
+    // so the flag below is what recovery actually needs.
+    let advisorRan = false;
     if (typeof session.subscribe === "function") {
       unsubscribe = session.subscribe((event: DispatchSessionEvent) => {
         if (event.type === "tool_execution_end" && event.toolName === "subagent") {
@@ -409,6 +420,26 @@ async function runDispatch(
           if (Array.isArray(results)) {
             capturedTaskResults = results;
           }
+        }
+        if (event.type === "tool_execution_end" && event.toolName === "advisor") {
+          // A FAILED advisor call filtered nothing: when the tool itself
+          // throws, Pi sets isError on the EVENT; rpiv-advisor reports
+          // auth/provider/abort/empty-response failures as normal
+          // tool_execution_end results carrying details.errorMessage, and
+          // model-level failures as details.stopReason === "error" (with
+          // errorMessage present only when the provider supplied one).
+          // Recovery must stay enabled in those cases, or valid raw
+          // findings stay lost behind a pass that did nothing
+          // (PR #123 review, two rounds).
+          const result = event.result as
+            | { isError?: unknown; details?: { errorMessage?: unknown; stopReason?: unknown } }
+            | undefined;
+          const failed =
+            event.isError === true ||
+            result?.isError === true ||
+            typeof result?.details?.errorMessage === "string" ||
+            result?.details?.stopReason === "error";
+          if (!failed) advisorRan = true;
         }
       });
     }
@@ -470,14 +501,16 @@ async function runDispatch(
     }
 
     const orchestratorResult = parseDispatchResult(finalText, effective);
-    // Recover dropped findings only when advisor is OFF — see
-    // reconcileWithCapturedResults' doc comment for why recovering while the
-    // advisor pass is active would undo its false-positive filtering.
+    // Recover dropped findings whenever the advisor did NOT actually run —
+    // see reconcileWithCapturedResults' doc comment. With the advisor OFF or
+    // skipped (the #111 conditional), a rule's zero findings can only be a
+    // buggy drop; only an advisor that actually filtered the set makes zero
+    // findings ambiguous, and only then is recovery suppressed.
     const reconciled = reconcileWithCapturedResults(
       orchestratorResult,
       capturedTaskResults,
       effective,
-      !useAdvisor,
+      !useAdvisor || !advisorRan,
     );
 
     // ADR-007: a suggestion is committable code. It may only survive if a dispatched
