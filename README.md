@@ -852,7 +852,10 @@ tgd-review-agent: 3 rule(s) without a provider/model pin will run on "anthropic/
 
 and, when the registry carries pricing and that default is the most expensive
 credentialed model on the machine, a second line names the cheapest
-alternative. Two principles behind that warning (both from the same lesson
+alternative (ranked under a review-shaped token mix — 90% input / 10% output —
+because reviews embed the diff and context in every prompt and emit bounded
+output; the per-class rates cannot be summed into a scalar price). Two
+principles behind that warning (both from the same lesson
 that produced the visibility):
 
 - **An unpinned rule inherits by omission, not by choice.** The default ladder

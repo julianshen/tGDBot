@@ -2069,10 +2069,12 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
         const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
         // The inheritance itself is always visible...
         expect(warnings.some((w) => w.includes('1 rule(s) without a provider/model pin will run on "anthropic/claude-opus-4-5"'))).toBe(true);
-        // ...and the most-expensive default names the cheapest alternative.
-        const expensive = warnings.find((w) => w.includes("most expensive credentialed model"));
+        // ...and the priciest default names the cheapest alternative, ranked
+        // under the documented review-shaped token mix.
+        const expensive = warnings.find((w) => w.includes("priciest credentialed model"));
         expect(expensive).toBeDefined();
         expect(expensive).toContain('"openai/gpt-5.6-mini"');
+        expect(expensive).toContain("90% input / 10% output");
         // Deliberately advisory: turn count beats token price.
         expect(expensive).toContain("turn count beats token price");
       } finally {
@@ -2173,6 +2175,34 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
         expect(warnings.some((w) => w.includes('will run on "anthropic/claude-opus-4-5"'))).toBe(true);
         expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
         expect(warnings.some((w) => w.includes("free-proxy"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    // Codex review of PR #124, second round: the per-class rates cannot be
+    // summed into a scalar — which model is pricier depends on the workload's
+    // input/output mix. The comparison uses a documented review-shaped profile
+    // (90% input / 10% output): under it, a high-output default loses to a
+    // high-input alternative even though the raw rate SUM would rank the
+    // default pricier (o3-pro 20+80 vs gpt-4 30+60).
+    it("ranks models by a review-shaped token mix, not a raw rate sum", async () => {
+      withCosts([
+        { provider: "openai", id: "o3-pro", cost: { input: 20, output: 80 } },
+        { provider: "openai", id: "gpt-4", cost: { input: 30, output: 60 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session, "openai/o3-pro");
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "openai/o3-pro"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
       } finally {
         warnSpy.mockRestore();
         hoisted.findModelMock.mockRestore();

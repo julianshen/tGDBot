@@ -226,7 +226,7 @@ export interface EffectiveRulesResult {
 }
 
 /**
- * A model's published pricing, when the registry carries it. Costs are per
+ * A model's published pricing, when the registry carries it. Rates are per
  * what the registry records (pi models.json uses dollars per million tokens);
  * only their RELATIVE order matters here, never the unit.
  */
@@ -235,7 +235,18 @@ interface ModelCost {
   readonly output: number;
 }
 
-function totalCost(model: { cost?: ModelCost }): number | undefined {
+// The per-class rates CANNOT be summed into a scalar price — they price
+// different token classes, so which model is pricier depends on the workload's
+// input/output mix (Codex review of PR #124: 20+80 vs 30+60 flips under an
+// input-heavy mix). Reviews ARE input-heavy — every prompt embeds the diff and
+// trusted context, and the output is the bounded findings JSON (#110 caps its
+// prose) — so the comparison uses a documented, review-shaped profile. It is
+// an approximation by construction: cache rates and volume tiers are ignored,
+// and the claim stays advisory (the resolution order is untouched).
+const INPUT_TOKEN_WEIGHT = 0.9;
+const OUTPUT_TOKEN_WEIGHT = 0.1;
+
+function reviewShapedCost(model: { cost?: ModelCost }): number | undefined {
   // A model without published pricing cannot take part in an expense
   // comparison — it is excluded, not treated as free. Two shapes of "no
   // pricing" exist here: the field absent outright, AND — the pinned SDK
@@ -248,7 +259,7 @@ function totalCost(model: { cost?: ModelCost }): number | undefined {
   // alternative at ~0% (Codex review of PR #124).
   if (model.cost === undefined) return undefined;
   if (model.cost.input === 0 && model.cost.output === 0) return undefined;
-  return model.cost.input + model.cost.output;
+  return INPUT_TOKEN_WEIGHT * model.cost.input + OUTPUT_TOKEN_WEIGHT * model.cost.output;
 }
 
 /**
@@ -280,10 +291,10 @@ function warnOnInheritedModelCost(
   const defaultRef = parseModelRef(defaultSpec);
   if (defaultRef === undefined) return;
   const available = runtime.getAvailableSnapshot();
-  const defaultCost = totalCost(available.find((m) => m.provider === defaultRef.provider && m.id === defaultRef.modelId) ?? {});
+  const defaultCost = reviewShapedCost(available.find((m) => m.provider === defaultRef.provider && m.id === defaultRef.modelId) ?? {});
   if (defaultCost === undefined) return; // no pricing on the default — nothing to compare
   const priced = available
-    .map((m) => ({ spec: `${m.provider}/${m.id}`, cost: totalCost(m) }))
+    .map((m) => ({ spec: `${m.provider}/${m.id}`, cost: reviewShapedCost(m) }))
     .filter((entry): entry is { spec: string; cost: number } => entry.cost !== undefined);
   const cheaper = priced.filter((entry) => entry.cost < defaultCost).sort((a, b) => a.cost - b.cost);
   // "Most expensive" requires BOTH something cheaper and NOTHING pricier: a
@@ -294,8 +305,9 @@ function warnOnInheritedModelCost(
   if (cheaper.length === 0 || pricier.length > 0) return;
   const ratio = Math.round((cheaper[0]!.cost / defaultCost) * 100);
   console.warn(
-    `tgd-review-agent: "${defaultSpec}" is the most expensive credentialed model on this ` +
-      `machine; the cheapest alternative is "${cheaper[0]!.spec}" (~${ratio}% of its price). ` +
+    `tgd-review-agent: "${defaultSpec}" is the priciest credentialed model on this ` +
+      `machine for a review-shaped token mix (90% input / 10% output); the cheapest ` +
+      `alternative is "${cheaper[0]!.spec}" (~${ratio}% of its price). ` +
       `Consider pinning a mid-tier model on review rules — though turn count beats token ` +
       `price, so the cheapest is not automatically right (issue #112).`,
   );
