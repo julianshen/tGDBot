@@ -842,6 +842,35 @@ authenticated candidate is used instead — rather than failing the whole review
 A model id may carry a thinking suffix (`claude-opus-4-5:high`); it is stripped
 before lookup, so it resolves the same way it does for the rule's own subagent.
 
+#### Model tiers: what the absence of a pin chooses for you
+
+When rules run unpinned, the review logs what they inherited:
+
+```text
+tgd-review-agent: 3 rule(s) without a provider/model pin will run on "anthropic/claude-opus-4-5" (the deployment default)
+```
+
+and, when the registry carries pricing and that default is the most expensive
+credentialed model on the machine, a second line names the cheapest
+alternative (ranked under a review-shaped token mix — 90% input / 10% output —
+because reviews embed the diff and context in every prompt and emit bounded
+output; the per-class rates cannot be summed into a scalar price). Two
+principles behind that warning (both from the same lesson
+that produced the visibility):
+
+- **An unpinned rule inherits by omission, not by choice.** The default ladder
+  above is deterministic, but nothing in it knows what the RULE needed. Pin
+  models on rules whose quality or cost profile matters; leave unpinned only
+  what should follow the deployment default.
+- **Turn count beats token price.** The warning suggests considering a cheaper
+  model, but deliberately does not use one: the cheapest models routinely take
+  2–3× the turns on multi-step work (tool calls, file reads, re-deriving
+  context) and cost more overall. Review rules that read a diff and judge are
+  usually fine mid-tier; the orchestrator's merge-and-attribute job is
+  mechanical and safe mid-tier; heavy multi-step implementation work is where
+  a cheap model quietly gets expensive. Match the tier to the task's turn
+  count, not its sticker price.
+
 Use `--dry-run` to test locally before wiring up CI — it runs the full
 pipeline (fetch the review and diff via `gh` or `glab`, load rules, dispatch,
 orchestrate) but

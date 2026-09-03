@@ -226,6 +226,100 @@ export interface EffectiveRulesResult {
 }
 
 /**
+ * A model's published pricing, when the registry carries it. Rates are per
+ * what the registry records (pi models.json uses dollars per million tokens);
+ * only their RELATIVE order matters here, never the unit.
+ */
+interface ModelCost {
+  readonly input: number;
+  readonly output: number;
+}
+
+// The per-class rates CANNOT be summed into a scalar price — they price
+// different token classes, so which model is pricier depends on the workload's
+// input/output mix (Codex review of PR #124: 20+80 vs 30+60 flips under an
+// input-heavy mix). Reviews ARE input-heavy — every prompt embeds the diff and
+// trusted context, and the output is the bounded findings JSON (#110 caps its
+// prose) — so the comparison uses a documented, review-shaped profile. It is
+// an approximation by construction: cache rates and volume tiers are ignored,
+// and the claim stays advisory (the resolution order is untouched).
+const INPUT_TOKEN_WEIGHT = 0.9;
+const OUTPUT_TOKEN_WEIGHT = 0.1;
+
+function reviewShapedCost(model: { cost?: ModelCost }): number | undefined {
+  // A model without published pricing cannot take part in an expense
+  // comparison — it is excluded, not treated as free. Two shapes of "no
+  // pricing" exist here: the field absent outright, AND — the pinned SDK
+  // normalizes a custom models.json model's required cost field to all zeros
+  // when the author omitted it (provider-composer.js:
+  // `cost: definition.cost ?? { input: 0, output: 0, ... }`) — input AND
+  // output both zero. A genuine 0/0 published price is indistinguishable from
+  // that default and is excluded the same way; conservative, since a
+  // zero-priced model would otherwise be reported as the cheapest
+  // alternative at ~0% (Codex review of PR #124).
+  if (model.cost === undefined) return undefined;
+  if (model.cost.input === 0 && model.cost.output === 0) return undefined;
+  return INPUT_TOKEN_WEIGHT * model.cost.input + OUTPUT_TOKEN_WEIGHT * model.cost.output;
+}
+
+/**
+ * Issue #112 (model discipline): "an omitted model silently inherits the
+ * session's most expensive one" — Superpowers 6.0's phrasing of the exact trap
+ * our default-fill shares. Two log lines, and only when unpinned rules exist:
+ *
+ * 1. ALWAYS: name the model the unpinned rules will run on. Silent inheritance
+ *    becomes visible inheritance — the operator can see what the absence of a
+ *    pin chose.
+ * 2. When pricing data is available and the resolved default is the most
+ *    expensive credentialed model on this machine, say so and name the
+ *    cheapest alternative. Deliberately a WARNING, not a block, and
+ *    deliberately not "use the cheapest": turn count beats token price — the
+ *    cheapest models routinely take 2-3x the turns on multi-step work and cost
+ *    more overall — so the default stays the default and the choice stays
+ *    visible. Resolution ORDER is unchanged (issue #112's own constraint).
+ */
+function warnOnInheritedModelCost(
+  unpinned: readonly RuleDefinition[],
+  defaultSpec: string,
+  runtime: ModelRuntime,
+): void {
+  console.warn(
+    `tgd-review-agent: ${unpinned.length} rule(s) without a provider/model pin ` +
+      `will run on "${defaultSpec}" (the deployment default)`,
+  );
+
+  const defaultRef = parseModelRef(defaultSpec);
+  if (defaultRef === undefined) return;
+  const available = runtime.getAvailableSnapshot();
+  const defaultCost = reviewShapedCost(available.find((m) => m.provider === defaultRef.provider && m.id === defaultRef.modelId) ?? {});
+  if (defaultCost === undefined) return; // no pricing on the default — nothing to compare
+  const priced = available
+    .map((m) => ({ spec: `${m.provider}/${m.id}`, cost: reviewShapedCost(m) }))
+    .filter((entry): entry is { spec: string; cost: number } => entry.cost !== undefined);
+  const cheaper = priced.filter((entry) => entry.cost < defaultCost).sort((a, b) => a.cost - b.cost);
+  // "Most expensive" requires BOTH something cheaper and NOTHING pricier: a
+  // mid-priced default (say costs of 5, 10, 20 with the default at 10) has
+  // cheaper alternatives but is not the ceiling, and warning would misdescribe
+  // it (Codex review of PR #124).
+  const pricier = priced.filter((entry) => entry.cost > defaultCost);
+  if (cheaper.length === 0 || pricier.length > 0) return;
+  const ratio = Math.round((cheaper[0]!.cost / defaultCost) * 100);
+  // Codex review of PR #124, round three: an UNPRICED credentialed model's
+  // cost is unknown, so the ceiling claim must be scoped to what the registry
+  // actually prices — "priciest credentialed model" outright would be
+  // unfalsifiable against the excluded entries. The qualification IS the fix;
+  // suppressing the warning entirely would silence the feature exactly for
+  // custom models.json setups, which are where unknown pricing lives.
+  console.warn(
+    `tgd-review-agent: "${defaultSpec}" is the priciest credentialed model with published ` +
+      `pricing for a review-shaped token mix (90% input / 10% output); the cheapest ` +
+      `such alternative is "${cheaper[0]!.spec}" (~${ratio}% of its price). ` +
+      `Consider pinning a mid-tier model on review rules — though turn count beats token ` +
+      `price, so the cheapest is not automatically right (issue #112).`,
+  );
+}
+
+/**
  * Design-review #6 (model decoupling): a rule's `provider`/`model` are now
  * optional. This fills every UNPINNED rule with the deployment's default
  * model, resolved once, in priority order:
@@ -308,6 +402,8 @@ export async function resolveEffectiveRules(
       unresolved,
     };
   }
+
+  warnOnInheritedModelCost(unpinned, defaultSpec, runtime);
 
   const slash = defaultSpec.indexOf("/");
   const defaultProvider = defaultSpec.slice(0, slash);

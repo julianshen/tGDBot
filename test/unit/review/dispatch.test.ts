@@ -49,7 +49,9 @@ const hoisted = vi.hoisted(() => {
   // via ModelRuntime.getModel(provider, modelId) instead of inheriting pi's
   // ambient default. `findModelMock` lets a test say "this model resolves" (a
   // Model object) or "it doesn't" (undefined).
-  const findModelMock = vi.fn((provider: string, modelId: string) => ({
+  // The return type admits `undefined` ("not in the registry") and an optional
+  // `cost` (issue #112's expense comparison reads registry pricing).
+  const findModelMock = vi.fn<(provider: string, modelId: string) => { id: string; provider: string; name: string; cost?: { input: number; output: number } } | undefined>((provider: string, modelId: string) => ({
     id: modelId,
     provider,
     name: `${provider}/${modelId}`,
@@ -2104,6 +2106,199 @@ describe("dispatchRules with unpinned rules (design-review #6)", () => {
     expect(result.rulesFailed).toEqual([]);
     // The suffix must survive into the resolved per-rule model, not be dropped.
     expect(stub.prompts[0]).toContain('model: "anthropic/claude-opus-4-5:high"');
+  });
+
+  // Issue #112 (model discipline): an unpinned rule inherits by omission.
+  // The inheritance must be VISIBLE, and when the inherited default is the
+  // most expensive credentialed model on the machine, the operator should
+  // hear about it (with the turn-count caveat, not a silent re-route).
+  describe("issue #112: unpinned-rule model inheritance is visible", () => {
+    const withCosts = (models: { provider: string; id: string; cost?: { input: number; output: number } }[]): void => {
+      hoisted.findModelMock.mockImplementation((provider: string, modelId: string) => {
+        const match = models.find((m) => m.provider === provider && m.id === modelId);
+        return match === undefined ? undefined : { id: modelId, provider, name: `${provider}/${modelId}`, cost: match.cost };
+      });
+      hoisted.getAvailableMock.mockReturnValue(models);
+    };
+
+    it("names the inherited model, and warns when it is the most expensive credentialed one", async () => {
+      withCosts([
+        { provider: "anthropic", id: "claude-opus-4-5", cost: { input: 15, output: 75 } },
+        { provider: "openai", id: "gpt-5.6-mini", cost: { input: 1, output: 4 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session);
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        // The inheritance itself is always visible...
+        expect(warnings.some((w) => w.includes('1 rule(s) without a provider/model pin will run on "anthropic/claude-opus-4-5"'))).toBe(true);
+        // ...and the priciest default names the cheapest alternative, ranked
+        // under the documented review-shaped token mix.
+        const expensive = warnings.find((w) => w.includes("priciest credentialed model"));
+        expect(expensive).toBeDefined();
+        // The claim is scoped to priced models — an unpriced credentialed
+        // entry's cost is unknown, so the categorical version would be
+        // unfalsifiable (Codex review, round three).
+        expect(expensive).toContain("with published pricing");
+        expect(expensive).toContain('"openai/gpt-5.6-mini"');
+        expect(expensive).toContain("90% input / 10% output");
+        // Deliberately advisory: turn count beats token price.
+        expect(expensive).toContain("turn count beats token price");
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    it("stays quiet about expense when the default is not the priciest, but still names the inheritance", async () => {
+      withCosts([
+        { provider: "anthropic", id: "claude-opus-4-5", cost: { input: 1, output: 2 } },
+        { provider: "openai", id: "gpt-5.6-terra", cost: { input: 15, output: 75 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session);
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "anthropic/claude-opus-4-5"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    it("emits no expense comparison when the registry carries no pricing", async () => {
+      // The model resolves (so the inheritance happens) but carries no cost
+      // fields — nothing to compare, so the expense line must stay quiet.
+      withCosts([{ provider: "anthropic", id: "claude-opus-4-5" }]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session);
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "anthropic/claude-opus-4-5"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    it("does not misdescribe a mid-priced default as the most expensive", async () => {
+      // Codex review of PR #124: costs of 5, 10 (default), 20 — cheaper
+      // alternatives exist, but so does a pricier model, so the default is
+      // NOT the ceiling and the "most expensive" warning must stay quiet.
+      withCosts([
+        { provider: "openai", id: "gpt-5.6-terra", cost: { input: 15, output: 75 } },
+        { provider: "anthropic", id: "claude-opus-4-5", cost: { input: 2, output: 8 } },
+        { provider: "groq", id: "kimi-k2", cost: { input: 1, output: 2 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        // Pin the default explicitly so the mid-priced one is the inherited
+        // default (the snapshot's first entry would otherwise win).
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session, "anthropic/claude-opus-4-5");
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "anthropic/claude-opus-4-5"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    it("excludes an unpriced (zero-normalized) model from the comparison instead of calling it free", async () => {
+      // Codex review of PR #124: the SDK normalizes a custom models.json
+      // model's omitted pricing to zeros. A zero-cost entry must not be
+      // reported as the cheapest alternative at ~0% — and with only that
+      // entry priced alongside the default, there is nothing to compare.
+      withCosts([
+        { provider: "anthropic", id: "claude-opus-4-5", cost: { input: 15, output: 75 } },
+        { provider: "custom", id: "free-proxy", cost: { input: 0, output: 0 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session);
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "anthropic/claude-opus-4-5"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
+        expect(warnings.some((w) => w.includes("free-proxy"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    // Codex review of PR #124, second round: the per-class rates cannot be
+    // summed into a scalar — which model is pricier depends on the workload's
+    // input/output mix. The comparison uses a documented review-shaped profile
+    // (90% input / 10% output): under it, a high-output default loses to a
+    // high-input alternative even though the raw rate SUM would rank the
+    // default pricier (o3-pro 20+80 vs gpt-4 30+60).
+    it("ranks models by a review-shaped token mix, not a raw rate sum", async () => {
+      withCosts([
+        { provider: "openai", id: "o3-pro", cost: { input: 20, output: 80 } },
+        { provider: "openai", id: "gpt-4", cost: { input: 30, output: 60 } },
+      ]);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["unpinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules([unpinnedRule()], "diff", false, async () => stub.session, "openai/o3-pro");
+
+        const warnings = warnSpy.mock.calls.map((c) => c.join(" "));
+        expect(warnings.some((w) => w.includes('will run on "openai/o3-pro"'))).toBe(true);
+        expect(warnings.some((w) => w.includes("most expensive credentialed model"))).toBe(false);
+      } finally {
+        warnSpy.mockRestore();
+        hoisted.findModelMock.mockRestore();
+        hoisted.getAvailableMock.mockReturnValue([]);
+      }
+    });
+
+    it("says nothing at all when every rule is pinned", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const stub = createPiSessionStub(
+        JSON.stringify({ findings: [], rulesRun: ["pinned-rule"], rulesFailed: [] }),
+      );
+      try {
+        await dispatchRules(
+          [makeRule({ name: "pinned-rule", provider: "anthropic", model: "claude-opus-4-5" })],
+          "diff",
+          false,
+          async () => stub.session,
+        );
+
+        expect(warnSpy.mock.calls).toHaveLength(0);
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
   });
 
   it("falls back to the registry's first credentialed provider when no --model/settings default exists", async () => {
