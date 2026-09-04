@@ -443,11 +443,14 @@ export function suggestionProvenanceKeys(
         keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
       }
       // Issue #114: the reviewer's verbatim excerpt gets the same provenance
-      // rule as a suggestion, keyed on the excerpt ALONE — the orchestrator's
-      // file/line may be the miscount being corrected, and a quote is
-      // distinctive enough to key on its own content.
-      if (typeof finding.existingCode === "string") {
-        keys.add(finding.existingCode);
+      // rule as a suggestion, bound to the rule that emitted it — a bare
+      // excerpt key would let reviewer A's quote authenticate reviewer B's
+      // finding, relocating B's comment to A's code (PR #130 review). The
+      // file/line are deliberately NOT part of the key: they may be exactly
+      // the miscount the quote exists to correct. A failed task's output is
+      // not trustworthy and contributes no quote.
+      if (typeof finding.existingCode === "string" && c.exitCode === 0) {
+        keys.add(quoteProvenanceKey(rule.name, finding.existingCode));
       }
     }
   });
@@ -456,6 +459,10 @@ export function suggestionProvenanceKeys(
 
 function provenanceKey(file: string, line: number | undefined, suggestion: string): string {
   return JSON.stringify([file, line ?? null, suggestion]);
+}
+
+function quoteProvenanceKey(ruleName: string, excerpt: string): string {
+  return JSON.stringify([ruleName, excerpt]);
 }
 
 /** Strips any suggestion or quote the orchestrator cannot prove a subagent made. */
@@ -473,11 +480,12 @@ export function enforceSuggestionProvenance(result: DispatchResult, allowed: Set
       }
     }
     // Issue #114: the orchestrator relays the reviewer's excerpt under the
-    // legacy engine, and a reformatted or substituted quote would relocate
-    // the comment to unrelated code (or discard a valid anchor). An excerpt
-    // no dispatched reviewer emitted is dropped — the finding falls back to
-    // the model's line, exactly as if no quote had been returned.
-    if (typeof out.existingCode === "string" && !allowed.has(out.existingCode)) {
+    // legacy engine, and a reformatted, substituted, or cross-rule
+    // misattributed quote would relocate the comment to the wrong code (or
+    // discard a valid anchor). An excerpt the attributed rule did not emit is
+    // dropped — the finding falls back to the model's line, exactly as if no
+    // quote had been returned.
+    if (typeof out.existingCode === "string" && !allowed.has(quoteProvenanceKey(out.ruleName, out.existingCode))) {
       quotesDropped += 1;
       out = { ...out, existingCode: undefined };
     }

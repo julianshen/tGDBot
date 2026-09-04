@@ -2935,6 +2935,56 @@ describe("enforceSuggestionProvenance — existingCode (#114)", () => {
     expect(result.findings[0]?.existingCode).toBe(reviewerExcerpt);
   });
 
+  it("drops an excerpt attributed to the wrong rule (cross-rule misattribution)", async () => {
+    // Reviewer A emitted the excerpt; the orchestrator attached it to
+    // reviewer B's finding. B never said this, so the quote is dropped even
+    // though A's output contains it verbatim.
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: JSON.stringify([
+        { file: "src/a.ts", line: 11, severity: "warning", category: "c", message: "m", existingCode: reviewerExcerpt },
+      ]) },
+      { model: "openai-codex/gpt-5.6-terra:high", exitCode: 0, finalOutput: "[]" },
+    ];
+    const misattributed = JSON.stringify({
+      findings: [{ file: "src/b.ts", line: 5, severity: "warning", category: "c", message: "m", ruleName: "terra-review", existingCode: reviewerExcerpt }],
+      rulesRun: ["grok-review", "terra-review"], rulesFailed: [],
+    });
+    const session = makeSubscribableSession(details, misattributed);
+
+    const result = await dispatchRules(
+      [
+        makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" }),
+        makeRule({ name: "terra-review", provider: "openai-codex", model: "gpt-5.6-terra" }),
+      ],
+      "diff",
+      false,
+      async () => session,
+    );
+
+    expect(result.findings[0]?.existingCode).toBeUndefined();
+    expect(result.findings[0]?.line).toBe(5);
+  });
+
+  it("drops a quote sourced from a failed task's output", async () => {
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 1, finalOutput: rawFindings },
+    ];
+    const relayed = JSON.stringify({
+      findings: [{ file: "src/a.ts", line: 11, severity: "warning", category: "c", message: "m", ruleName: "grok-review", existingCode: reviewerExcerpt }],
+      rulesRun: [], rulesFailed: ["grok-review"],
+    });
+    const session = makeSubscribableSession(details, relayed);
+
+    const result = await dispatchRules(
+      [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })],
+      "diff",
+      false,
+      async () => session,
+    );
+
+    expect(result.findings[0]?.existingCode).toBeUndefined();
+  });
+
   it("drops an excerpt the orchestrator substituted, falling back to the model's line", async () => {
     const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: rawFindings }];
     const substituted = JSON.stringify({
