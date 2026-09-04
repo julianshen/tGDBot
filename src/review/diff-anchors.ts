@@ -180,7 +180,7 @@ export function isCommentable(
 
 // `+++ b/src/a.go` → `src/a.go`. git prefixes the new side with `b/` by default,
 // but `--no-prefix` (and some providers) omit it, so only strip when present.
-function stripDiffPathPrefix(target: string): string {
+export function stripDiffPathPrefix(target: string): string {
   return target.startsWith("b/") ? target.slice(2) : target;
 }
 

@@ -132,6 +132,21 @@ describe("resolveQuoteAnchor", () => {
     expect(resolveQuoteAnchor(diff, "src/a.ts", lines.join("\n"))).toBeUndefined();
   });
 
+  it("resolves the actual path from the +++ header when the git header is ambiguous", () => {
+    // A path containing " b/" makes the git header's operands ambiguous;
+    // git emits it unquoted and the +++ header carries the real path.
+    const diff = [
+      "diff --git a/foo b/bar.ts b/foo b/bar.ts",
+      "--- a/foo b/bar.ts",
+      "+++ b/foo b/bar.ts",
+      "@@ -10,1 +10,2 @@",
+      "+quoted in an odd path",
+      "",
+    ].join("\n");
+    const anchor = resolveQuoteAnchor(diff, "foo b/bar.ts", "quoted in an odd path");
+    expect(anchor).toEqual({ file: "foo b/bar.ts", line: 10 });
+  });
+
   it("declines an empty or whitespace-only quote", () => {
     expect(resolveQuoteAnchor(diffOf("src/a.ts", HUNK), "src/a.ts", "")).toBeUndefined();
     expect(resolveQuoteAnchor(diffOf("src/a.ts", HUNK), "src/a.ts", "  \n  ")).toBeUndefined();

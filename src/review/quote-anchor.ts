@@ -23,7 +23,7 @@
 // related files do sometimes quote the source file while filing against the
 // header, and a unique match re-files the whole finding.
 
-import { parseDiffGitHeader } from "./diff-anchors.js";
+import { parseDiffGitHeader, stripDiffPathPrefix } from "./diff-anchors.js";
 import type { Finding } from "./types.js";
 
 export interface QuoteAnchorResult {
@@ -58,6 +58,8 @@ export function newSideHunksByFile(diff: string): Map<string, NewSideLine[][]> {
   let currentFile: string | undefined;
   let currentHunk: NewSideLine[] = [];
   let newLine: number | undefined;
+  // True between a hunk header and its end — inside one, "+++ " is content.
+  let inHunkContent = false;
 
   const endHunk = (): void => {
     if (currentFile !== undefined && currentHunk.length > 0) {
@@ -73,7 +75,19 @@ export function newSideHunksByFile(diff: string): Map<string, NewSideLine[][]> {
     const header = parseDiffGitHeader(line);
     if (header !== undefined) {
       endHunk();
+      // The git header's operands cannot be split unambiguously when the path
+      // itself contains " b/" — corrected below from the +++ header, the way
+      // diff-anchors' own parsers do (PR #130 review).
       currentFile = header.b;
+      inHunkContent = false;
+      continue;
+    }
+    // The +++ header is file-scoped ONLY outside a hunk: inside one, an added
+    // line starting "++ " renders as "+++ " and is ordinary content.
+    if (!inHunkContent && line.startsWith("+++ ")) {
+      const path = line.slice(4).trim();
+      const resolved = path === "/dev/null" ? undefined : stripDiffPathPrefix(path);
+      if (resolved !== undefined) currentFile = resolved;
       continue;
     }
     if (currentFile === undefined) continue;
@@ -82,6 +96,7 @@ export function newSideHunksByFile(diff: string): Map<string, NewSideLine[][]> {
       endHunk();
       const match = /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
       newLine = match === null ? undefined : Number.parseInt(match[1] as string, 10);
+      inHunkContent = newLine !== undefined;
       continue;
     }
     if (newLine === undefined) continue;
@@ -90,8 +105,10 @@ export function newSideHunksByFile(diff: string): Map<string, NewSideLine[][]> {
     else if (line.startsWith("-") || line.startsWith("\\")) continue;
     else if (line.startsWith(" ")) text = line.slice(1);
     else {
-      // Anything else (empty trailing line, malformed row) ends the hunk.
+      // Anything else (empty trailing line, malformed row) ends the hunk and
+      // re-opens the header scope for a possible +++ correction.
       endHunk();
+      inHunkContent = false;
       continue;
     }
     // Blank lines are dropped: matching is per-line, and a blank source line
@@ -100,6 +117,7 @@ export function newSideHunksByFile(diff: string): Map<string, NewSideLine[][]> {
       newLine += 1;
       continue;
     }
+    inHunkContent = true;
     currentHunk.push({ newLine, text });
     newLine += 1;
   }
