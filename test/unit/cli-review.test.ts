@@ -1831,9 +1831,12 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
     expect(seenDir).toBeDefined();
 
     // The traversal target (two levels above the temp dir, then etc/passwd)
-    // must never have been written to.
+    // must never have been written to. Note the target resolves to the real
+    // /etc/passwd on any Unix system (tempRulesDir sits directly under /tmp,
+    // so ../.. lands at /), so existence can't discriminate here — assert the
+    // system file was never overwritten with the malicious payload instead.
     const escapedPath = path.resolve(seenDir as string, "../../etc/passwd");
-    expect(existsSync(escapedPath)).toBe(false);
+    expect(readFileSync(escapedPath, "utf-8")).not.toContain("malicious content");
 
     // A warning names the offending path — visible, not silently dropped.
     const warnedText = warnSpy.mock.calls.map((call) => call.join(" ")).join("\n");
