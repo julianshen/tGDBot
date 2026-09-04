@@ -3034,6 +3034,26 @@ describe("enforceSuggestionProvenance — existingCode (#114)", () => {
     expect(result.findings[1]?.existingCode).toBe("excerpt B");
   });
 
+  it("drops a quote sourced from a task that timed out despite exiting 0", async () => {
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, timedOut: true, finalOutput: rawFindings },
+    ];
+    const relayed = JSON.stringify({
+      findings: [{ file: "src/a.ts", line: 11, severity: "warning", category: "c", message: "m", ruleName: "grok-review", existingCode: reviewerExcerpt }],
+      rulesRun: [], rulesFailed: ["grok-review"],
+    });
+    const session = makeSubscribableSession(details, relayed);
+
+    const result = await dispatchRules(
+      [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })],
+      "diff",
+      false,
+      async () => session,
+    );
+
+    expect(result.findings[0]?.existingCode).toBeUndefined();
+  });
+
   it("drops a quote sourced from a failed task's output", async () => {
     const details = [
       { model: "xai/grok-4.5:high", exitCode: 1, finalOutput: rawFindings },

@@ -451,7 +451,11 @@ export function suggestionProvenanceKeys(
       // another finding's comment onto this one's code (PR #130 review,
       // three rounds). A failed task's output is not trustworthy and
       // contributes no quote.
-      if (typeof finding.existingCode === "string" && c.exitCode === 0) {
+      // The FULL success predicate, not the exit code alone: a task that
+      // errored, timed out or detached mid-run has output reconcile would
+      // never trust, and its quote must not authenticate anything
+      // (PR #130 review).
+      if (typeof finding.existingCode === "string" && taskSucceeded(c)) {
         keys.add(quoteProvenanceKey(rule.name, finding.file, finding, finding.existingCode));
       }
     }
