@@ -162,6 +162,28 @@ describe("conversation reply rendering", () => {
     expect([...text.matchAll(/<!-- tgd-child:/g)]).toHaveLength(1);
   });
 
+  // CodeRabbit review of PR #129: HTML's error tolerance accepts `--!>` as a
+  // comment end, so the conversation renderer's defang must cover BOTH
+  // spellings — a reply body quoting `<!-- ... --!>` must not be able to
+  // close a comment the reply thought was still open.
+  it("defangs the --!> comment-end spelling in explanation prose", () => {
+    const body = renderExplainReply({
+      explanation: "quotes a marker: <!-- x --!> and a plain one --> end",
+      author: hostileAuthor,
+      excerpt: hostileExcerpt,
+      sourceUrl: "https://github.com/acme/app/pull/42#discussion_r99",
+    }, marker, githubBinding);
+    const text = publicationBody(body);
+
+    expect(text).toContain("&lt;!-- x --!&gt;");
+    expect(text).toContain("--&gt; end");
+    // Neither spelling survives as a closable comment in the quoted prose —
+    // the ONLY remaining comment is the tool's own trailing child marker.
+    const withoutOwnMarker = text.slice(0, text.lastIndexOf(lastMarker(text)));
+    expect([...withoutOwnMarker.matchAll(/<!--/g)]).toHaveLength(0);
+    expect(withoutOwnMarker).not.toMatch(/--!?>/);
+  });
+
   it("renders reconsider and clarification outcomes without committable generated fences", () => {
     const reconsider = publicationBody(renderReconsiderReply({
       outcome: "confirmed",
