@@ -443,14 +443,16 @@ export function suggestionProvenanceKeys(
         keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
       }
       // Issue #114: the reviewer's verbatim excerpt gets the same provenance
-      // rule as a suggestion, bound to the rule AND the file it was emitted
-      // for — a bare excerpt key would let reviewer A's quote authenticate
-      // reviewer B's finding, relocating B's comment to A's code (PR #130
-      // review). The LINE is deliberately not part of the key: it may be
-      // exactly the miscount the quote exists to correct. A failed task's
-      // output is not trustworthy and contributes no quote.
+      // rule as a suggestion, bound to the full captured finding identity
+      // MINUS the location: rule, file, severity, category, message, title
+      // and the excerpt itself. The line/endLine are deliberately excluded —
+      // they may be exactly the miscount the quote exists to correct — while
+      // everything else must match, or a swapped excerpt would relocate
+      // another finding's comment onto this one's code (PR #130 review,
+      // three rounds). A failed task's output is not trustworthy and
+      // contributes no quote.
       if (typeof finding.existingCode === "string" && c.exitCode === 0) {
-        keys.add(quoteProvenanceKey(rule.name, finding.file, finding.existingCode));
+        keys.add(quoteProvenanceKey(rule.name, finding.file, finding, finding.existingCode));
       }
     }
   });
@@ -461,8 +463,21 @@ function provenanceKey(file: string, line: number | undefined, suggestion: strin
   return JSON.stringify([file, line ?? null, suggestion]);
 }
 
-function quoteProvenanceKey(ruleName: string, file: string, excerpt: string): string {
-  return JSON.stringify([ruleName, file, excerpt]);
+function quoteProvenanceKey(
+  ruleName: string,
+  file: string,
+  finding: Pick<Finding, "severity" | "category" | "message" | "title">,
+  excerpt: string,
+): string {
+  return JSON.stringify([
+    ruleName,
+    file,
+    finding.severity,
+    finding.category,
+    finding.message,
+    finding.title ?? null,
+    excerpt,
+  ]);
 }
 
 /** Strips any suggestion or quote the orchestrator cannot prove a subagent made. */
@@ -485,7 +500,7 @@ export function enforceSuggestionProvenance(result: DispatchResult, allowed: Set
     // discard a valid anchor). An excerpt the attributed rule did not emit is
     // dropped — the finding falls back to the model's line, exactly as if no
     // quote had been returned.
-    if (typeof out.existingCode === "string" && !allowed.has(quoteProvenanceKey(out.ruleName, out.file, out.existingCode))) {
+    if (typeof out.existingCode === "string" && !allowed.has(quoteProvenanceKey(out.ruleName, out.file, out, out.existingCode))) {
       quotesDropped += 1;
       out = { ...out, existingCode: undefined };
     }

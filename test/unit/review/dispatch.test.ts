@@ -2988,6 +2988,52 @@ describe("enforceSuggestionProvenance — existingCode (#114)", () => {
     expect(result.findings[0]?.line).toBe(3);
   });
 
+  it("drops an excerpt swapped between two findings of the same rule and file", async () => {
+    // Both findings are the reviewer's, in the same file — but the
+    // orchestrator swapped their excerpts, so each message would be anchored
+    // to the other one's code. The per-finding identity (severity, category,
+    // message) catches the swap: neither merged finding matches the captured
+    // finding its excerpt belongs to.
+    const findingA = { file: "src/a.ts", line: 11, severity: "warning", category: "c", message: "message A", existingCode: "excerpt A" };
+    const findingB = { file: "src/a.ts", line: 20, severity: "warning", category: "c", message: "message B", existingCode: "excerpt B" };
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: JSON.stringify([findingA, findingB]) }];
+    const swapped = JSON.stringify({
+      findings: [
+        { ...findingA, existingCode: "excerpt B", ruleName: "grok-review" },
+        { ...findingB, existingCode: "excerpt A", ruleName: "grok-review" },
+      ],
+      rulesRun: ["grok-review"], rulesFailed: [],
+    });
+    const session = makeSubscribableSession(details, swapped);
+
+    const result = await dispatchRules([makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })], "diff", false, async () => session);
+
+    expect(result.findings[0]?.existingCode).toBeUndefined();
+    expect(result.findings[1]?.existingCode).toBeUndefined();
+    // The findings themselves survive, at the model's lines.
+    expect(result.findings[0]?.message).toBe("message A");
+    expect(result.findings[1]?.message).toBe("message B");
+  });
+
+  it("keeps both excerpts when the orchestrator relays them faithfully", async () => {
+    const findingA = { file: "src/a.ts", line: 11, severity: "warning", category: "c", message: "message A", existingCode: "excerpt A" };
+    const findingB = { file: "src/a.ts", line: 20, severity: "warning", category: "c", message: "message B", existingCode: "excerpt B" };
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: JSON.stringify([findingA, findingB]) }];
+    const relayed = JSON.stringify({
+      findings: [
+        { ...findingA, ruleName: "grok-review" },
+        { ...findingB, ruleName: "grok-review" },
+      ],
+      rulesRun: ["grok-review"], rulesFailed: [],
+    });
+    const session = makeSubscribableSession(details, relayed);
+
+    const result = await dispatchRules([makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })], "diff", false, async () => session);
+
+    expect(result.findings[0]?.existingCode).toBe("excerpt A");
+    expect(result.findings[1]?.existingCode).toBe("excerpt B");
+  });
+
   it("drops a quote sourced from a failed task's output", async () => {
     const details = [
       { model: "xai/grok-4.5:high", exitCode: 1, finalOutput: rawFindings },
