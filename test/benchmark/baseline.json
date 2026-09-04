@@ -21,7 +21,7 @@
       "findingsPerRule": {
         "benchmark-correctness": 1
       },
-      "dispatchChars": 20735,
+      "dispatchChars": 21919,
       "diffChars": 219,
       "findingTextChars": 150,
       "renderedChars": 1661,
@@ -45,7 +45,7 @@
         "suggestion": 0
       },
       "findingsPerRule": {},
-      "dispatchChars": 18115,
+      "dispatchChars": 19299,
       "diffChars": 207,
       "findingTextChars": 0,
       "renderedChars": 354,
@@ -71,7 +71,7 @@
       "findingsPerRule": {
         "benchmark-correctness": 1
       },
-      "dispatchChars": 18025,
+      "dispatchChars": 19209,
       "diffChars": 216,
       "findingTextChars": 145,
       "renderedChars": 1655,
@@ -97,7 +97,7 @@
       "findingsPerRule": {
         "benchmark-correctness": 1
       },
-      "dispatchChars": 18087,
+      "dispatchChars": 19271,
       "diffChars": 271,
       "findingTextChars": 145,
       "renderedChars": 1648,
@@ -123,7 +123,7 @@
       "findingsPerRule": {
         "benchmark-correctness": 1
       },
-      "dispatchChars": 17635,
+      "dispatchChars": 18819,
       "diffChars": 169,
       "findingTextChars": 140,
       "renderedChars": 1782,
@@ -149,7 +149,7 @@
       "findingsPerRule": {
         "benchmark-correctness": 2
       },
-      "dispatchChars": 17945,
+      "dispatchChars": 19129,
       "diffChars": 289,
       "findingTextChars": 307,
       "renderedChars": 2337,
