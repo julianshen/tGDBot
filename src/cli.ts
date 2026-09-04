@@ -1377,7 +1377,14 @@ export async function review(
   // extraction ceiling applies — enough to stall a review or exhaust an API
   // quota, mostly on files with no relevant change (PR #67 review, round four).
   // What is skipped is reported, not silently dropped.
-  const allChangedManifests = changedManifests(diff);
+  // Nothing will consume a dependency pack when no rule is going to run, so
+  // none of the work below is done. Reaching the later context short-circuit
+  // was too late: by then the merge base is resolved, up to 25 manifests have
+  // been read at BOTH refs, and under `--dependency-facts on` the registry and
+  // advisory lookups have already gone out — real provider and network cost on
+  // the path #115 introduced as a cheap, legitimate outcome (Codex review of
+  // PR #126).
+  const allChangedManifests = rules.length === 0 ? [] : changedManifests(diff);
   const manifestsToRead = allChangedManifests.slice(0, MAX_MANIFESTS_READ);
   const skippedManifests = allChangedManifests
     .slice(MAX_MANIFESTS_READ)

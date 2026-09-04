@@ -1281,6 +1281,39 @@ describe("review", () => {
       vi.restoreAllMocks();
     });
 
+    it("does no dependency work when no rule applies", async () => {
+      // Reaching the context short-circuit was too late: by then the merge
+      // base is resolved, manifests are read at BOTH refs, and with
+      // `--dependency-facts on` the registry lookups have already gone out —
+      // real network cost for a pack nothing can consume, on the path this
+      // feature introduced as cheap (Codex review of PR #126).
+      const manifestDiff = [
+        "diff --git a/package.json b/package.json",
+        "--- a/package.json",
+        "+++ b/package.json",
+        "@@ -1,3 +1,3 @@",
+        " {",
+        "-  \"version\": \"1.0.0\"",
+        "+  \"version\": \"1.1.0\"",
+        " }",
+      ].join("\n");
+      const h = makeHarness({
+        args: makeArgs({ dependencyFacts: "on" }),
+        loadResult: { rules: [makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] })], errors: [] },
+        botComment: null,
+      });
+      h.vcsAdapter.getDiff.mockResolvedValue(manifestDiff);
+      const fetchJson = vi.fn();
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, { ...depsFrom(h), fetchJson })).resolves.toBe(0);
+
+      expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalled();
+      expect(fetchJson).not.toHaveBeenCalled();
+
+      vi.restoreAllMocks();
+    });
+
     it("still posts a review when no rule applies, rather than aborting", async () => {
       // "No rule applies to these files" is a legitimate outcome, distinct
       // from "no rules could be loaded" — which is fatal and stays fatal.
