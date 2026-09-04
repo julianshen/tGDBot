@@ -16,10 +16,12 @@
 //
 // Matching is whitespace-insensitive per line (leading/trailing whitespace
 // stripped, blank lines ignored on both sides) because models quote reliably
-// but count indentation unreliably; everything else is verbatim. The search
-// covers the finding's own file first and every other changed file after it —
-// reviewers reading related files do sometimes quote the source file while
-// filing against the header, and a unique match re-files the whole finding.
+// but count indentation unreliably; everything else is verbatim. Lines never
+// match ACROSS hunk boundaries — the last line of one hunk and the first of
+// the next are not contiguous in the source. The search covers the finding's
+// own file first and every other changed file after it — reviewers reading
+// related files do sometimes quote the source file while filing against the
+// header, and a unique match re-files the whole finding.
 
 import { parseDiffGitHeader } from "./diff-anchors.js";
 
@@ -29,74 +31,86 @@ export interface QuoteAnchorResult {
   readonly endLine?: number;
 }
 
-/** An added or context line on the new side of one file's diff. */
-interface NewSideLine {
+/** A non-blank added or context line on the new side of one file's diff. */
+export interface NewSideLine {
   readonly newLine: number;
   readonly text: string;
 }
 
-/** Cap on excerpt size — a quote longer than this is not a quote. */
+/**
+ * Cap on the normalized excerpt — a quote longer than this is not a quote.
+ * Over the cap DECLINES rather than truncates: accepting a prefix would
+ * verify a quote whose remaining lines occur nowhere in the diff (PR #130
+ * review).
+ */
 const MAX_EXCERPT_LINES = 50;
 
-function excerptLines(existingCode: string): string[] {
-  return existingCode
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .slice(0, MAX_EXCERPT_LINES);
-}
-
 /**
- * New-side lines (added and context) per file, in diff order. Reuses the
- * git-header and hunk-header handling of diff-anchors' parsers.
+ * New-side lines (added and context, blanks dropped) per file, grouped by
+ * HUNK. Grouping is load-bearing: the last recorded line of one hunk and the
+ * first of the next are not contiguous in the source, so a multi-line match
+ * must never span two hunks. Reuses the git-header and hunk-header handling
+ * of diff-anchors' parsers.
  */
-export function newSideLinesByFile(diff: string): Map<string, NewSideLine[]> {
-  const byFile = new Map<string, NewSideLine[]>();
+export function newSideHunksByFile(diff: string): Map<string, NewSideLine[][]> {
+  const byFile = new Map<string, NewSideLine[][]>();
   let currentFile: string | undefined;
+  let currentHunk: NewSideLine[] = [];
   let newLine: number | undefined;
+
+  const endHunk = (): void => {
+    if (currentFile !== undefined && currentHunk.length > 0) {
+      const hunks = byFile.get(currentFile) ?? [];
+      hunks.push(currentHunk);
+      byFile.set(currentFile, hunks);
+    }
+    currentHunk = [];
+    newLine = undefined;
+  };
+
   for (const line of diff.split("\n")) {
     const header = parseDiffGitHeader(line);
     if (header !== undefined) {
+      endHunk();
       currentFile = header.b;
-      newLine = undefined;
       continue;
     }
     if (currentFile === undefined) continue;
     if (line.startsWith("@@")) {
+      // A hunk boundary within the same file (multi-hunk diffs).
+      endHunk();
       const match = /@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
       newLine = match === null ? undefined : Number.parseInt(match[1] as string, 10);
       continue;
     }
     if (newLine === undefined) continue;
-    if (line.startsWith("+")) {
-      const entry = { newLine, text: line.slice(1) };
-      const lines = byFile.get(currentFile) ?? [];
-      lines.push(entry);
-      byFile.set(currentFile, lines);
+    let text: string | undefined;
+    if (line.startsWith("+")) text = line.slice(1);
+    else if (line.startsWith("-") || line.startsWith("\\")) continue;
+    else if (line.startsWith(" ")) text = line.slice(1);
+    else {
+      // Anything else (empty trailing line, malformed row) ends the hunk.
+      endHunk();
+      continue;
+    }
+    // Blank lines are dropped: matching is per-line, and a blank source line
+    // must not break a quote that spans it. Hunk boundaries are what remain.
+    if (text.trim().length === 0) {
       newLine += 1;
       continue;
     }
-    if (line.startsWith("-") || line.startsWith("\\")) continue;
-    if (line.startsWith(" ")) {
-      const entry = { newLine, text: line.slice(1) };
-      const lines = byFile.get(currentFile) ?? [];
-      lines.push(entry);
-      byFile.set(currentFile, lines);
-      newLine += 1;
-      continue;
-    }
-    // Anything else (empty trailing line, malformed row) ends the hunk.
-    newLine = undefined;
+    currentHunk.push({ newLine, text });
+    newLine += 1;
   }
+  endHunk();
   return byFile;
 }
 
 /**
- * Occurrences of the excerpt in one file's new-side lines, as
- * `{ line, endLine }` per match. Whitespace-insensitive per line, blank lines
- * ignored, contiguous runs required.
+ * Occurrences of the excerpt within ONE hunk's lines, as `{ line, endLine }`
+ * per match. Whitespace-insensitive per line, contiguous runs required.
  */
-function matchesInFile(lines: readonly NewSideLine[], excerpt: readonly string[]): Array<{ line: number; endLine?: number }> {
+function matchesInHunk(lines: readonly NewSideLine[], excerpt: readonly string[]): Array<{ line: number; endLine?: number }> {
   const normalized = lines.map((entry) => ({ newLine: entry.newLine, text: entry.text.trim() }));
   const matches: Array<{ line: number; endLine?: number }> = [];
   if (excerpt.length === 1) {
@@ -128,18 +142,25 @@ function matchesInFile(lines: readonly NewSideLine[], excerpt: readonly string[]
  *
  * Returns the unique match — searching the finding's own file first, then
  * every other changed file — or `undefined` when the excerpt matches zero or
- * multiple locations. `undefined` means "declined": the caller drops the
- * model-supplied line rather than publishing a location no quote supports.
+ * multiple locations, or is longer than the excerpt cap. `undefined` means
+ * "declined": the caller drops the model-supplied line rather than publishing
+ * a location no quote supports.
  */
 export function resolveQuoteAnchor(
   diff: string,
   findingFile: string,
   existingCode: string,
 ): QuoteAnchorResult | undefined {
-  const excerpt = excerptLines(existingCode);
-  if (excerpt.length === 0) return undefined;
+  const excerpt = existingCode
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  // Over the cap declines — WITHOUT truncating. A truncated prefix matching
+  // the diff would verify a quote whose remaining lines exist nowhere (PR
+  // #130 review).
+  if (excerpt.length === 0 || excerpt.length > MAX_EXCERPT_LINES) return undefined;
 
-  const byFile = newSideLinesByFile(diff);
+  const byFile = newSideHunksByFile(diff);
   // The finding's file first, then every other changed file, so the search
   // order is deterministic even though the uniqueness rule makes it matter
   // only for error messages.
@@ -151,18 +172,20 @@ export function resolveQuoteAnchor(
   let found: QuoteAnchorResult | undefined;
   let total = 0;
   for (const file of orderedFiles) {
-    for (const match of matchesInFile(byFile.get(file) as NewSideLine[], excerpt)) {
-      total += 1;
-      if (total === 1) {
-        found = {
-          file,
-          line: match.line,
-          ...(match.endLine === undefined ? {} : { endLine: match.endLine }),
-        };
-      } else {
-        // Second hit anywhere: ambiguous by the refusal rule. Still counted,
-        // so the caller cannot mistake "first hit so far" for "unique".
-        return undefined;
+    for (const hunk of byFile.get(file) as NewSideLine[][]) {
+      for (const match of matchesInHunk(hunk, excerpt)) {
+        total += 1;
+        if (total === 1) {
+          found = {
+            file,
+            line: match.line,
+            ...(match.endLine === undefined ? {} : { endLine: match.endLine }),
+          };
+        } else {
+          // Second hit anywhere: ambiguous by the refusal rule. Returning
+          // immediately also stops the search from continuing.
+          return undefined;
+        }
       }
     }
   }

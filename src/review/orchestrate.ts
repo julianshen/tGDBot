@@ -198,12 +198,28 @@ export function orchestrate(
       delete withoutLocation.endLine;
       return withoutLocation;
     }
-    return {
+    const relocated =
+      anchor.file !== finding.file || anchor.line !== finding.line;
+    if (!relocated) {
+      // The quote agrees with the model's line: the unverified location was
+      // verified, so everything the model authored (endLine, suggestion)
+      // stands as emitted.
+      return { ...finding, file: anchor.file, line: anchor.line };
+    }
+    // Relocated: the model's endLine and suggestion were authored against an
+    // UNVERIFIED range — a quote may carry context lines for uniqueness, so
+    // neither its start nor its span can be translated to the match with any
+    // confidence, and a committable suggestion that replaces unintended lines
+    // is worse than no suggestion (PR #130 review). The quote pins the anchor
+    // line; the suggestion is suppressed.
+    const relocatedFinding: Finding = {
       ...finding,
       file: anchor.file,
       line: anchor.line,
-      ...(anchor.endLine === undefined ? {} : { endLine: anchor.endLine }),
     };
+    delete relocatedFinding.endLine;
+    delete relocatedFinding.suggestion;
+    return relocatedFinding;
   });
   // The quote itself never reaches the published finding: it is positioning
   // evidence the host consumed, not content a reader needs.

@@ -4,7 +4,7 @@
 // line number no quote supports is never published as a location.
 import { describe, expect, it } from "vitest";
 import {
-  newSideLinesByFile,
+  newSideHunksByFile,
   resolveQuoteAnchor,
 } from "../../../src/review/quote-anchor.js";
 
@@ -20,10 +20,10 @@ const HUNK = [
   " const after = 4;",
 ].join("\n");
 
-describe("newSideLinesByFile", () => {
+describe("newSideHunksByFile", () => {
   it("collects added and context lines with their new-side numbers", () => {
-    const byFile = newSideLinesByFile(diffOf("src/a.ts", HUNK));
-    const lines = byFile.get("src/a.ts") ?? [];
+    const byFile = newSideHunksByFile(diffOf("src/a.ts", HUNK));
+    const lines = (byFile.get("src/a.ts") ?? []).flat();
     expect(lines.map((line) => line.newLine)).toEqual([10, 11, 12, 13]);
     expect(lines[1]?.text).toBe("const added = 2;");
   });
@@ -33,10 +33,10 @@ describe("newSideLinesByFile", () => {
       diffOf("src/a.ts", "@@ -1,2 +1,3 @@\n-a\n+a1\n context\n+b1"),
       diffOf("src/b.ts", "@@ -5,1 +5,2 @@\n-keep\n+keep2"),
     ].join("\n");
-    const byFile = newSideLinesByFile(diff);
+    const byFile = newSideHunksByFile(diff);
     expect([...byFile.keys()].sort()).toEqual(["src/a.ts", "src/b.ts"]);
-    expect(byFile.get("src/a.ts")?.map((line) => line.text)).toEqual(["a1", "context", "b1"]);
-    expect(byFile.get("src/b.ts")?.map((line) => line.text)).toEqual(["keep2"]);
+    expect((byFile.get("src/a.ts") ?? []).flat().map((line) => line.text)).toEqual(["a1", "context", "b1"]);
+    expect((byFile.get("src/b.ts") ?? []).flat().map((line) => line.text)).toEqual(["keep2"]);
   });
 });
 
@@ -97,6 +97,38 @@ describe("resolveQuoteAnchor", () => {
       diffOf("src/other.ts", "@@ -1,2 +1,3 @@\n const a = 1;\n+const added = 2;\n const b = 3;"),
     ].join("\n");
     expect(resolveQuoteAnchor(diff, "src/a.ts", "const added = 2;")).toBeUndefined();
+  });
+
+  it("groups lines by hunk so a match can never span two hunks", () => {
+    // The excerpt's lines exist, but in DIFFERENT hunks of the same file —
+    // they are not contiguous in the source and must decline.
+    const diff = diffOf(
+      "src/a.ts",
+      "@@ -10,1 +10,2 @@\n+added\n@@ -50,1 +50,2 @@\n+added2",
+    );
+    expect(resolveQuoteAnchor(diff, "src/a.ts", "added\nadded2")).toBeUndefined();
+    // Each line alone still matches uniquely within its own hunk.
+    expect(resolveQuoteAnchor(diff, "src/a.ts", "added")).toEqual({ file: "src/a.ts", line: 10 });
+  });
+
+  it("matches a quote spanning a blank source line (blanks ignored on both sides)", () => {
+    const diff = diffOf(
+      "src/a.ts",
+      "@@ -10,1 +10,4 @@\n+first\n+\n+second\n",
+    );
+    expect(resolveQuoteAnchor(diff, "src/a.ts", "first\nsecond")).toEqual({
+      file: "src/a.ts",
+      line: 10,
+      endLine: 12,
+    });
+  });
+
+  it("declines an excerpt over the line cap instead of truncating it", () => {
+    // 51 distinct lines: no prefix of the quote occurs in the diff, and the
+    // full quote must NOT be accepted via a truncated prefix either.
+    const lines = Array.from({ length: 51 }, (_, index) => `const v${index} = ${index};`);
+    const diff = diffOf("src/a.ts", `@@ -1,1 +1,2 @@\n+${lines[0]}\n`);
+    expect(resolveQuoteAnchor(diff, "src/a.ts", lines.join("\n"))).toBeUndefined();
   });
 
   it("declines an empty or whitespace-only quote", () => {

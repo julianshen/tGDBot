@@ -1331,6 +1331,56 @@ describe("quote-anchored findings (#114)", () => {
     expect(result.inlineComments[0]).toMatchObject({ path: "src/b.ts", line: 20 });
   });
 
+  // PR #130 review (P1): the suggestion and endLine were authored against the
+  // model's UNVERIFIED range — a quote may carry context lines for uniqueness,
+  // so neither can be translated to the match. A committable suggestion that
+  // replaces unintended lines is worse than no suggestion, so relocation
+  // suppresses both. When the quote agrees with the model's line, nothing is
+  // suppressed.
+  it("suppresses the suggestion and endLine when the quote relocates the finding", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 10,
+            endLine: 14,
+            severity: "blocking",
+            suggestion: "const added = 42;",
+            existingCode: "added2",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 12 });
+    // No model-authored range or suggestion survives the relocation.
+    expect(result.inlineComments[0].body).not.toContain("const added = 42;");
+  });
+
+  it("keeps the suggestion and endLine when the quote agrees with the model's line", () => {
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 12,
+            endLine: 12,
+            severity: "blocking",
+            suggestion: "const added2 = 42;",
+            existingCode: "added2",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0].body).toContain("const added2 = 42;");
+  });
+
   it("drops the model's line to the summary when the quote matches nothing", () => {
     const result = orchestrate(
       makeDispatchResult({
