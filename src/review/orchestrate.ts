@@ -198,20 +198,34 @@ export function orchestrate(
       delete withoutLocation.endLine;
       return withoutLocation;
     }
-    const relocated =
-      anchor.file !== finding.file || anchor.line !== finding.line;
-    if (!relocated) {
-      // The quote agrees with the model's line: the unverified location was
-      // verified, so everything the model authored (endLine, suggestion)
-      // stands as emitted.
-      return { ...finding, file: anchor.file, line: anchor.line };
+    // The model's line may sit INSIDE the verified match — a quote may carry
+    // leading context for uniqueness (PR #130 review, round two). In that
+    // case the model's line is not relocated, it is CONFIRMED: the host found
+    // the quoted code and the reported line falls within it.
+    const sameFile = anchor.file === finding.file;
+    // A single-line match has an implicit end equal to its start.
+    const matchEnd = anchor.endLine ?? anchor.line;
+    const lineInMatch = sameFile && finding.line !== undefined &&
+      finding.line >= anchor.line && finding.line <= matchEnd;
+    if (sameFile && lineInMatch) {
+      const endLineInMatch = finding.endLine !== undefined &&
+        finding.endLine >= anchor.line && finding.endLine <= matchEnd;
+      const confirmed: Finding = { ...finding, file: anchor.file, line: finding.line };
+      if (!endLineInMatch) delete confirmed.endLine;
+      // The suggestion replaces line..endLine; it survives only when that
+      // whole range is inside the verified match (or the finding had no
+      // endLine and the suggestion targets the confirmed line alone).
+      if (finding.endLine !== undefined && !endLineInMatch) delete confirmed.suggestion;
+      return confirmed;
     }
-    // Relocated: the model's endLine and suggestion were authored against an
-    // UNVERIFIED range — a quote may carry context lines for uniqueness, so
-    // neither its start nor its span can be translated to the match with any
-    // confidence, and a committable suggestion that replaces unintended lines
-    // is worse than no suggestion (PR #130 review). The quote pins the anchor
-    // line; the suggestion is suppressed.
+    // Otherwise the reported line is OUTSIDE the verified region (or the
+    // match is in another file): the model's endLine and suggestion were
+    // authored against an UNVERIFIED range — a quote may carry context lines
+    // for uniqueness, so neither its start nor its span can be translated to
+    // the match with any confidence, and a committable suggestion that
+    // replaces unintended lines is worse than no suggestion (PR #130 review).
+    // The quote pins the anchor to the excerpt's first line; the suggestion
+    // is suppressed.
     const relocatedFinding: Finding = {
       ...finding,
       file: anchor.file,

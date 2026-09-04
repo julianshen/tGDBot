@@ -1381,6 +1381,56 @@ describe("quote-anchored findings (#114)", () => {
     expect(result.inlineComments[0].body).toContain("const added2 = 42;");
   });
 
+  // PR #130 review, round two: a quote may carry leading context for
+  // uniqueness. When the model's reported line falls INSIDE the verified
+  // match, it is confirmed (not relocated), and its suggestion survives as
+  // long as the range it replaces stays inside the match.
+  it("confirms the model's line when it lies inside the verified match", () => {
+    // The quote covers lines 11-12; the model reported line 12.
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 12,
+            endLine: 12,
+            severity: "blocking",
+            suggestion: "const added2 = 42;",
+            existingCode: "added\nadded2",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 12 });
+    expect(result.inlineComments[0].body).toContain("const added2 = 42;");
+  });
+
+  it("drops a suggestion whose range escapes the verified match, keeping the confirmed line", () => {
+    // Quote covers lines 11-12; the model reported 12..14 — endLine escapes.
+    const result = orchestrate(
+      makeDispatchResult({
+        findings: [
+          makeFinding({
+            file: "src/a.ts",
+            line: 12,
+            endLine: 14,
+            severity: "blocking",
+            suggestion: "const added2 = 42;",
+            existingCode: "added\nadded2",
+          }),
+        ],
+      }),
+      DIFF,
+    );
+
+    expect(result.inlineComments).toHaveLength(1);
+    expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 12 });
+    expect(result.inlineComments[0].body).not.toContain("const added2 = 42;");
+  });
+
   it("drops the model's line to the summary when the quote matches nothing", () => {
     const result = orchestrate(
       makeDispatchResult({
