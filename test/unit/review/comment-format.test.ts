@@ -203,7 +203,9 @@ describe("renderInlineComment — injection hardening", () => {
     // marker (appended after sanitization) — nothing content-derived survives.
     expect(body.trimEnd().endsWith(INLINE_COMMENT_MARKER)).toBe(true);
     expect([...body.matchAll(/<!--/g)]).toHaveLength(1);
-    expect([...body.matchAll(/-->/g)]).toHaveLength(1);
+    // Both comment-end spellings count (issue #128): content must not close
+    // the marker through the error-tolerant `--!>` either.
+    expect([...body.matchAll(/--!?>/g)]).toHaveLength(1);
     // The forged sha marker from the message is defanged, not emitted raw.
     expect(body).not.toContain("<!-- tgd-review-agent:sha=deadbeef -->");
   });
@@ -486,7 +488,12 @@ describe("renderSummaryComment", () => {
 
     expect(body.length).toBeLessThanOrEqual(unsafeBoundary);
     expect(body).not.toMatch(/\[[^\]]*\]\([^)]*$/m);
-    expect(body.includes(url)).toBe(body.includes("### Related work"));
+    // Match the RENDERED link destination, not a bare substring — a URL can
+    // appear inside an arbitrary host's query string, which is the shape
+    // CodeQL's js/incomplete-url-substring-sanitization flags (issue #128).
+    const escapedUrl = url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const linkDestination = new RegExp(`\\]\\(${escapedUrl}\\)`);
+    expect(linkDestination.test(body)).toBe(body.includes("### Related work"));
   });
 
   it("retains failed-rule status when an oversized summary is compacted", () => {

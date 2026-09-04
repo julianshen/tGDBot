@@ -8,7 +8,7 @@
 // instead of dropping it. That safety property is what lets the similarity
 // threshold be tuned for recall rather than precision.
 import { describe, expect, it } from "vitest";
-import { clusterFindings, crossFileGroups } from "../../../src/review/finding-clusters.js";
+import { clusterFindings, crossFileGroups, identifierSymbols } from "../../../src/review/finding-clusters.js";
 import type { Finding } from "../../../src/review/types.js";
 
 function finding(overrides: Partial<Finding> & { message: string }): Finding {
@@ -568,5 +568,32 @@ describe("clusterFindings — a host check survives duplicate collapsing", () =>
     ]);
 
     expect(clusters[0]?.representative?.hostCheck).toEqual(own);
+  });
+});
+
+// Issue #128: the bare-identifier scan used to backtrack exponentially on
+// same-letter runs (CodeQL js/redos x2). These fixtures pin two things: the
+// adversarial inputs complete (and would time out under the old regex), and
+// the rewritten scan accepts/rejects the same ordinary identifiers.
+describe("issue #128: identifier scan is linear and parity-safe", () => {
+  it("completes quickly on adversarial same-letter and 0A_ runs", () => {
+    const adversarial = `${"A".repeat(4000)} and ${"0A_".repeat(2000)} end`;
+    const started = Date.now();
+    const symbols = identifierSymbols(finding({ title: "Hostile", message: adversarial }));
+    expect(Date.now() - started).toBeLessThan(2000);
+    expect(symbols).toBeDefined();
+  });
+
+  it("keeps the same accept/reject behavior on ordinary identifiers", () => {
+    const symbolsOf = (message: string): string[] =>
+      identifierSymbols(finding({ title: "T", message })).map((s) => s.name);
+    // Accepted: camelCase, snake_case, all-caps, mixed with underscore parts.
+    expect(symbolsOf("uses retryBudget and retry_budget and MAX_RETRIES and Ab_C here"))
+      .toEqual(expect.arrayContaining(["retrybudget", "retry_budget", "max_retries", "ab_c"]));
+    // Rejected: single-part lowercase words, a letter+hump-only word ("Ab"),
+    // trailing underscore, double underscore, digit-led tokens.
+    for (const word of ["plain", "Ab", "trailing_", "double__underscore"]) {
+      expect(symbolsOf(`mentions ${word} only`)).not.toContain(word.toLowerCase());
+    }
   });
 });

@@ -190,7 +190,7 @@ export function stripSignature(body: string): string {
   }
   if (index === -1) return body.trimEnd();
   const after = body.slice(index + length);
-  if (!ONLY_MARKERS_RE.test(after)) return body.trimEnd();
+  if (!isOnlyWholeLineMarkers(after)) return body.trimEnd();
   // Newlines are normalized only where the block was, so nothing else in the
   // body — a fenced block's own blank lines, say — is reflowed.
   const before = body.slice(0, index).replace(/\n+$/u, "");
@@ -198,8 +198,32 @@ export function stripSignature(body: string): string {
   return (tail.length === 0 ? before : `${before}\n\n${tail}`).trimEnd();
 }
 
-/** Whitespace and whole-line HTML comments only — the tool's trailing markers. */
-const ONLY_MARKERS_RE = /^\s*(?:<!--[^\n]*-->\s*)*$/u;
+/** Whitespace and whole-line HTML comments only — the tool's trailing markers.
+ *
+ * Checked LINE AT A TIME rather than with one regex over the whole region:
+ * `/^\s*(?:<!--[^\n]*-->\s*)*$/u` nested a quantifier inside a loop and
+ * backtracked exponentially on `--><!--` repetitions (CodeQL js/redos, issue
+ * #128), and its `-->` missed HTML's error-tolerant `--!>` end spelling
+ * (CodeQL js/bad-tag-filter). One comment per LINE — with several allowed on
+ * the same line, as before — and `--!>` accepted, is the same language without
+ * the backtracking: each scan is a single linear pass over the line.
+ */
+const COMMENT_END_RE = /--!?>/u;
+
+/** Exported for the issue #128 linear-parsing regression tests. */
+export function isOnlyWholeLineMarkers(region: string): boolean {
+  for (const line of region.split("\n")) {
+    if (line.trimEnd() === "") continue;
+    let rest = line.trimStart();
+    while (rest.length > 0) {
+      if (!rest.startsWith("<!--")) return false;
+      const end = COMMENT_END_RE.exec(rest);
+      if (end === null) return false; // an unclosed comment is CONTENT, not a marker
+      rest = rest.slice(end.index + end[0].length).trimStart();
+    }
+  }
+  return true;
+}
 
 function sameTerminalResult(
   actual: TerminalReviewResult | undefined,

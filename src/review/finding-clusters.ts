@@ -168,7 +168,8 @@ function sameSymbol(left: NamedSymbol, right: NamedSymbol): boolean {
  * "two independently named symbols" and not "two mentions". A bare mention
  * absorbs its qualified form; two different receivers stay separate.
  */
-function identifierSymbols(finding: Finding): NamedSymbol[] {
+/** Exported for the issue #128 linear-scan regression tests. */
+export function identifierSymbols(finding: Finding): NamedSymbol[] {
   const text = `${finding.title ?? ""} ${finding.message}`;
   const found: NamedSymbol[] = [];
   const add = (parts: readonly string[]): void => {
@@ -192,10 +193,60 @@ function identifierSymbols(finding: Finding): NamedSymbol[] {
   // Quoted spans are removed before the bare scan, or a camelCase name INSIDE
   // one would be counted a second time.
   const unquoted = text.replace(/`[^`\n]{1,200}`/gu, " ");
-  for (const match of unquoted.matchAll(/\b[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+\b/gu)) {
-    add([match[0]]);
+  // Candidate words are extracted with a LINEAR token regex and then filtered
+  // by a linear scan (see isMultiPartIdentifier): the previous single regex
+  // nested an ambiguous alternation inside a `+` loop and backtracked
+  // exponentially on same-letter runs (CodeQL js/redos x2, issue #128).
+  for (const match of unquoted.matchAll(/\b[A-Za-z][A-Za-z0-9_]*\b/gu)) {
+    if (isMultiPartIdentifier(match[0])) add([match[0]]);
   }
   return found;
+}
+
+const isAlphanumeric = (ch: string): boolean =>
+  (ch >= "0" && ch <= "9") || (ch >= "A" && ch <= "Z") || (ch >= "a" && ch <= "z");
+
+// No real identifier approaches this; the cap keeps the part-scanner's
+// worst case (re-scanning the tail per split point) trivially bounded even
+// on adversarial single-token inputs.
+const MAX_IDENTIFIER_TOKEN_LENGTH = 200;
+
+/**
+ * Whether an extracted word is a MULTI-PART identifier — camelCase humps or
+ * internal underscores — the words the clusterer deduplicates on. Mirrors the
+ * part grammar of the regex it replaced
+ * (`[A-Za-z][A-Za-z0-9]*(?:[A-Z][A-Za-z0-9]*|_[A-Za-z0-9]+)+`): a letter-led
+ * alnum prefix, then one or more parts, each an uppercase-led or
+ * underscore-led alnum run, consuming the word to its end. The prefix split
+ * point is tried from shortest to longest because the original regex's
+ * backtracking could stop the prefix early to let an uppercase start a part.
+ */
+function isMultiPartIdentifier(word: string): boolean {
+  if (word.length > MAX_IDENTIFIER_TOKEN_LENGTH) return false;
+  let runEnd = 1; // extraction guarantees word[0] is a letter
+  while (runEnd < word.length && isAlphanumeric(word[runEnd]!)) runEnd += 1;
+  for (let split = 1; split <= runEnd; split += 1) {
+    let i = split;
+    let parts = 0;
+    let failed = false;
+    while (i < word.length) {
+      const ch = word[i]!;
+      if (ch === "_") {
+        i += 1;
+        const runStart = i;
+        while (i < word.length && isAlphanumeric(word[i]!)) i += 1;
+        if (i === runStart) { failed = true; break; } // `_[A-Za-z0-9]+` needs at least one
+      } else if (ch >= "A" && ch <= "Z") {
+        i += 1;
+        while (i < word.length && isAlphanumeric(word[i]!)) i += 1;
+      } else {
+        failed = true; break;
+      }
+      parts += 1;
+    }
+    if (!failed && i === word.length && parts >= 1) return true;
+  }
+  return false;
 }
 
 /**
