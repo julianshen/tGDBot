@@ -24,6 +24,7 @@
 // header, and a unique match re-files the whole finding.
 
 import { parseDiffGitHeader } from "./diff-anchors.js";
+import type { Finding } from "./types.js";
 
 export interface QuoteAnchorResult {
   readonly file: string;
@@ -190,4 +191,75 @@ export function resolveQuoteAnchor(
     }
   }
   return total === 1 ? found : undefined;
+}
+
+/**
+ * The per-finding relocation issue #114 specifies, as a pass over a findings
+ * list: a verbatim quote pins the location (confirmed when the model's line
+ * falls inside the match, relocated to the excerpt start otherwise), and a
+ * quote that matches zero or multiple locations declines — the model's line
+ * is dropped so the finding falls to the summary. The quote itself is
+ * stripped from the result: it is positioning evidence the host consumed,
+ * not content a reader needs.
+ *
+ * Exported (rather than living only inside orchestrate) because consumers
+ * that run BEFORE orchestrate — structural checks and clarification
+ * persistence — must see the relocated location too (PR #130 review). The
+ * pass is idempotent: it strips the quote, so a second application is a
+ * no-op.
+ */
+export function relocateFindingsByQuote(
+  findings: readonly Finding[],
+  diff: string,
+): Finding[] {
+  return findings.map((finding): Finding => {
+    if (finding.existingCode === undefined) return finding;
+    const anchor = resolveQuoteAnchor(diff, finding.file, finding.existingCode);
+    if (anchor === undefined) {
+      // Declined: drop the unverified location entirely. Omitting the keys
+      // (not just setting undefined) keeps `line` optional-shaped exactly as
+      // older reviewer output looks.
+      const withoutLocation: Finding = { ...finding };
+      delete withoutLocation.line;
+      delete withoutLocation.endLine;
+      return withoutQuote(withoutLocation);
+    }
+    const sameFile = anchor.file === finding.file;
+    // A single-line match has an implicit end equal to its start.
+    const matchEnd = anchor.endLine ?? anchor.line;
+    const lineInMatch = sameFile && finding.line !== undefined &&
+      finding.line >= anchor.line && finding.line <= matchEnd;
+    if (sameFile && lineInMatch) {
+      // The model's line sits INSIDE the verified match — a quote may carry
+      // leading context for uniqueness — so it is confirmed, not relocated.
+      // endLine and the suggestion survive only when the range they replace
+      // stays inside the match.
+      const endLineInMatch = finding.endLine !== undefined &&
+        finding.endLine >= anchor.line && finding.endLine <= matchEnd;
+      const confirmed: Finding = { ...finding, file: anchor.file, line: finding.line };
+      if (!endLineInMatch) delete confirmed.endLine;
+      if (finding.endLine !== undefined && !endLineInMatch) delete confirmed.suggestion;
+      return withoutQuote(confirmed);
+    }
+    // Otherwise the reported line is OUTSIDE the verified region (or the
+    // match is in another file): the model's endLine and suggestion were
+    // authored against an UNVERIFIED range, and a committable suggestion
+    // that replaces unintended lines is worse than no suggestion. The quote
+    // pins the anchor to the excerpt's first line; the suggestion is
+    // suppressed.
+    const relocated: Finding = {
+      ...finding,
+      file: anchor.file,
+      line: anchor.line,
+    };
+    delete relocated.endLine;
+    delete relocated.suggestion;
+    return withoutQuote(relocated);
+  });
+}
+
+function withoutQuote(finding: Finding): Finding {
+  const withoutQuote: Finding = { ...finding };
+  delete withoutQuote.existingCode;
+  return withoutQuote;
 }

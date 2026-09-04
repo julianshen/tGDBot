@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import {
   newSideHunksByFile,
+  relocateFindingsByQuote,
   resolveQuoteAnchor,
 } from "../../../src/review/quote-anchor.js";
 
@@ -134,5 +135,34 @@ describe("resolveQuoteAnchor", () => {
   it("declines an empty or whitespace-only quote", () => {
     expect(resolveQuoteAnchor(diffOf("src/a.ts", HUNK), "src/a.ts", "")).toBeUndefined();
     expect(resolveQuoteAnchor(diffOf("src/a.ts", HUNK), "src/a.ts", "  \n  ")).toBeUndefined();
+  });
+});
+
+// PR #130 review: quote relocation must run BEFORE the consumers that read a
+// finding's location — structural checks and clarification persistence — so
+// the pass is exported for the composition root and must be idempotent (the
+// quote is stripped on relocation, so a second application is a no-op).
+describe("relocateFindingsByQuote — shared preprocessing (#114)", () => {
+  const DIFF = diffOf("src/a.ts", HUNK);
+
+  it("relocates, strips the quote, and is idempotent", () => {
+    const findings = [
+      { file: "src/a.ts", line: 10, severity: "blocking" as const, category: "c", message: "m", ruleName: "r", existingCode: "const added = 2;" },
+    ];
+    const first = relocateFindingsByQuote(findings, DIFF);
+    expect(first[0]).toMatchObject({ file: "src/a.ts", line: 11 });
+    expect(first[0].existingCode).toBeUndefined();
+
+    const second = relocateFindingsByQuote(first, DIFF);
+    expect(second).toEqual(first);
+  });
+
+  it("drops the model's line when the quote declines", () => {
+    const findings = [
+      { file: "src/a.ts", line: 10, severity: "blocking" as const, category: "c", message: "m", ruleName: "r", existingCode: "not in the diff" },
+    ];
+    const relocated = relocateFindingsByQuote(findings, DIFF);
+    expect(relocated[0]?.line).toBeUndefined();
+    expect(relocated[0]?.endLine).toBeUndefined();
   });
 });

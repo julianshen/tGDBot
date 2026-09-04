@@ -19,7 +19,7 @@ import {
   rangeIsCommentable,
 } from "./diff-anchors.js";
 import { clusterFindings } from "./finding-clusters.js";
-import { resolveQuoteAnchor } from "./quote-anchor.js";
+import { relocateFindingsByQuote } from "./quote-anchor.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
 import { acceptanceKey } from "../conversation/disposition.js";
@@ -176,72 +176,12 @@ export function orchestrate(
   diff = "",
   options: OrchestrateOptions = {},
 ): OrchestrationResult {
-  // Issue #114: a reviewer's verbatim excerpt is host-verified evidence of
-  // where the finding actually lives. Relocate BEFORE anything else consumes
-  // a location — addressed-key suppression, clarification selection,
-  // clustering, anchoring — so every downstream surface sees the
-  // quote-derived position, not the model's possibly-miscounted one.
-  // Strictness (resolveQuoteAnchor): a quote with zero or multiple matches
-  // DECLINES — the model's line is dropped and the finding falls to the
-  // summary, because a line number no quote supports is never published as a
-  // location. Findings without a quote keep the model's line (the additive
-  // fallback the issue specifies).
-  const locatedFindings: Finding[] = dispatchResult.findings.map((finding): Finding => {
-    if (finding.existingCode === undefined) return finding;
-    const anchor = resolveQuoteAnchor(diff, finding.file, finding.existingCode);
-    if (anchor === undefined) {
-      // Declined: drop the unverified location entirely. Omitting the keys
-      // (not just setting undefined) keeps `line` optional-shaped exactly as
-      // older reviewer output looks.
-      const withoutLocation: Finding = { ...finding };
-      delete withoutLocation.line;
-      delete withoutLocation.endLine;
-      return withoutLocation;
-    }
-    // The model's line may sit INSIDE the verified match — a quote may carry
-    // leading context for uniqueness (PR #130 review, round two). In that
-    // case the model's line is not relocated, it is CONFIRMED: the host found
-    // the quoted code and the reported line falls within it.
-    const sameFile = anchor.file === finding.file;
-    // A single-line match has an implicit end equal to its start.
-    const matchEnd = anchor.endLine ?? anchor.line;
-    const lineInMatch = sameFile && finding.line !== undefined &&
-      finding.line >= anchor.line && finding.line <= matchEnd;
-    if (sameFile && lineInMatch) {
-      const endLineInMatch = finding.endLine !== undefined &&
-        finding.endLine >= anchor.line && finding.endLine <= matchEnd;
-      const confirmed: Finding = { ...finding, file: anchor.file, line: finding.line };
-      if (!endLineInMatch) delete confirmed.endLine;
-      // The suggestion replaces line..endLine; it survives only when that
-      // whole range is inside the verified match (or the finding had no
-      // endLine and the suggestion targets the confirmed line alone).
-      if (finding.endLine !== undefined && !endLineInMatch) delete confirmed.suggestion;
-      return confirmed;
-    }
-    // Otherwise the reported line is OUTSIDE the verified region (or the
-    // match is in another file): the model's endLine and suggestion were
-    // authored against an UNVERIFIED range — a quote may carry context lines
-    // for uniqueness, so neither its start nor its span can be translated to
-    // the match with any confidence, and a committable suggestion that
-    // replaces unintended lines is worse than no suggestion (PR #130 review).
-    // The quote pins the anchor to the excerpt's first line; the suggestion
-    // is suppressed.
-    const relocatedFinding: Finding = {
-      ...finding,
-      file: anchor.file,
-      line: anchor.line,
-    };
-    delete relocatedFinding.endLine;
-    delete relocatedFinding.suggestion;
-    return relocatedFinding;
-  });
-  // The quote itself never reaches the published finding: it is positioning
-  // evidence the host consumed, not content a reader needs.
-  const findingsWithQuoteStripped: Finding[] = locatedFindings.map((finding) => {
-    const withoutQuote: Finding = { ...finding };
-    delete withoutQuote.existingCode;
-    return withoutQuote;
-  });
+  // Issue #114: quote relocation runs HERE and, for consumers that run
+  // earlier (structural checks, clarification persistence), in review() at
+  // the composition root — the pass is idempotent, so whichever runs first
+  // wins and the second is a no-op (the quote is stripped on relocation).
+  const locatedFindings = relocateFindingsByQuote(dispatchResult.findings, diff);
+  const findingsWithQuoteStripped = locatedFindings;
 
   // Addressed findings are removed before ordinary dedup, and their keys
   // suppress a repeated new/still-valid copy of the same issue.
