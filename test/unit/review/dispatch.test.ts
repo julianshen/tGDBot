@@ -2965,6 +2965,29 @@ describe("enforceSuggestionProvenance — existingCode (#114)", () => {
     expect(result.findings[0]?.line).toBe(5);
   });
 
+  it("drops an excerpt attached to a finding in a different file than the reviewer emitted", async () => {
+    // Reviewer A emitted the excerpt for src/a.ts; the orchestrator attached
+    // it to a finding in src/other.ts — relocating that comment to A's code.
+    const details = [
+      { model: "xai/grok-4.5:high", exitCode: 0, finalOutput: rawFindings },
+    ];
+    const swapped = JSON.stringify({
+      findings: [{ file: "src/other.ts", line: 3, severity: "warning", category: "c", message: "m", ruleName: "grok-review", existingCode: reviewerExcerpt }],
+      rulesRun: ["grok-review"], rulesFailed: [],
+    });
+    const session = makeSubscribableSession(details, swapped);
+
+    const result = await dispatchRules(
+      [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })],
+      "diff",
+      false,
+      async () => session,
+    );
+
+    expect(result.findings[0]?.existingCode).toBeUndefined();
+    expect(result.findings[0]?.line).toBe(3);
+  });
+
   it("drops a quote sourced from a failed task's output", async () => {
     const details = [
       { model: "xai/grok-4.5:high", exitCode: 1, finalOutput: rawFindings },
