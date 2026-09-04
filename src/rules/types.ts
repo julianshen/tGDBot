@@ -16,6 +16,16 @@ export interface RuleDefinition {
    */
   provider?: string;
   model?: string;
+  /**
+   * Issue #115: the paths this rule reviews, as globs. Absent means EVERY
+   * path, so a rule that does not declare one behaves exactly as before and
+   * no existing repository changes meaning on upgrade.
+   *
+   * A rule whose globs match nothing in the diff is not dispatched — and is
+   * reported as skipped rather than as having found nothing, because a rule
+   * that did not run is not a rule with no findings.
+   */
+  appliesTo?: readonly string[];
   dependsOn: readonly string[];
   parallelGroup?: string;
   body: string;

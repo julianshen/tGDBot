@@ -80,7 +80,65 @@ describe("loadRules", () => {
     }
   });
 
+  // Issue #115: the scope a rule declares over the paths it reviews.
+  it("loads applies_to from a scalar or a list", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-applies-to-"));
+    await writeFile(
+      path.join(dir, "scalar.md"),
+      "---\nname: scalar-rule\napplies_to: \"**/*.ts\"\n---\n\nReview.\n",
+      "utf-8",
+    );
+    await writeFile(
+      path.join(dir, "list.md"),
+      [
+        "---",
+        "name: list-rule",
+        "applies_to:",
+        "  - \"**/package.json\"",
+        "  - \"**/Cargo.toml\"",
+        "---",
+        "",
+        "Review.",
+      ].join("\n"),
+      "utf-8",
+    );
+
+    try {
+      const result = await loadRules(dir, false);
+
+      expect(result.errors).toEqual([]);
+      const byName = new Map(result.rules.map((rule) => [rule.name, rule]));
+      // One glob is the common case; demanding a single-element array for it
+      // would be ceremony, so a scalar is accepted and normalized.
+      expect(byName.get("scalar-rule")?.appliesTo).toEqual(["**/*.ts"]);
+      expect(byName.get("list-rule")?.appliesTo).toEqual(["**/package.json", "**/Cargo.toml"]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves applies_to absent when the rule does not declare one", async () => {
+    // The compatibility guarantee, pinned: an existing rule file keeps its
+    // exact shape, so nothing about an existing repository changes on upgrade.
+    const dir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-no-applies-to-"));
+    await writeFile(path.join(dir, "plain.md"), "---\nname: plain-rule\n---\n\nReview.\n", "utf-8");
+    try {
+      const result = await loadRules(dir, false);
+      expect(result.rules[0]).not.toHaveProperty("appliesTo");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each([
+    ["a blank scope", "applies_to: \"\"", "applies_to"],
+    ["an empty scope list", "applies_to: []", "applies_to"],
+    // Rejected at LOAD, naming the file. A pattern this matcher does not
+    // implement would otherwise match nothing, and the rule would stop running
+    // with no explanation at all.
+    ["a character class", "applies_to: \"src/[a-z].ts\"", "character classes"],
+    ["a negation", "applies_to: \"!src/a.ts\"", "negated"],
+    ["an unbalanced brace", "applies_to: \"src/{a.ts\"", "unbalanced brace"],
     ["a scalar dependency", "depends_on: prerequisite", "depends_on"],
     ["a blank dependency", "depends_on:\n  - \"\"", "depends_on"],
     ["duplicate dependencies", "depends_on:\n  - prerequisite\n  - prerequisite", "duplicate"],

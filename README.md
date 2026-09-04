@@ -970,6 +970,38 @@ log/comment) rather than failing the whole run. Everything after the closing
 dispatched subagent's task prompt (with a fixed JSON-output contract appended
 automatically — you don't need to ask for JSON yourself).
 
+`applies_to` is an optional path scope: a glob, or an array of them. A rule
+that declares one is **not dispatched** when the pull request changes no
+matching file — a rule about SQL migrations should not be prompted with a
+CSS-only change, and dispatching it anyway pays the full per-rule diff cost
+and then asks it to answer anyway. Absent means every path, so a rule without
+`applies_to` behaves exactly as it always has.
+
+Rules that did not run this way are listed in the summary under *"Rules not
+applicable to the changed paths"* and on the `TGD_REVIEW_RESULT` line as
+`rulesSkipped`. A rule that did not run is not a rule that found nothing, and
+a review that reported only what ran would imply coverage it did not have.
+
+The supported glob syntax is deliberately small: `*` (within one path
+segment), `**` (across segments, and `**/` also matches zero of them, so
+`**/*.ts` matches a root-level file), `?` (one character, never `/`), and
+`{a,b}` alternation. Character classes, negation and nesting are rejected at
+load, naming the file — a pattern that silently matched nothing would stop a
+rule running with no explanation. Rename sources count as changed paths, so a
+rule scoped to `**/*.go` still sees a pull request that renamed a Go file
+away.
+
+```markdown
+---
+name: migration-safety
+applies_to:
+  - "**/migrations/**/*.sql"
+  - "**/*.migration.ts"
+---
+
+Review these migrations for destructive or non-reversible operations.
+```
+
 `depends_on` is an optional unique array of rule names and defaults to `[]`.
 `parallel_group` is an optional lowercase slug
 (`[a-z0-9][a-z0-9._-]{0,63}`). The loader validates and snapshots this

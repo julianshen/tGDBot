@@ -1183,6 +1183,156 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+  // Issue #115: a rule declares the paths it reviews, and is not dispatched
+  // when the pull request touches none of them.
+  describe("path-scoped rules", () => {
+    const tsDiff = [
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -1,1 +1,2 @@",
+      " keep",
+      "+added",
+    ].join("\n");
+
+    function scopedHarness(rules: RuleDefinition[]) {
+      const h = makeHarness({ loadResult: { rules, errors: [] }, botComment: null });
+      h.vcsAdapter.getDiff.mockResolvedValue(tsDiff);
+      return h;
+    }
+
+    it("dispatches only the rules whose declared paths the diff touches", async () => {
+      const h = scopedHarness([
+        makeRule({ name: "ts-rule", appliesTo: ["**/*.ts"] }),
+        makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] }),
+        makeRule({ name: "unscoped-rule" }),
+      ]);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      expect(h.dispatchRules).toHaveBeenCalledTimes(1);
+      const dispatched = (h.dispatchRules.mock.calls[0]?.[0].rules ?? []).map((rule) => rule.name);
+      // A rule with no declared scope still runs: that is what keeps every
+      // existing rule set behaving exactly as it did.
+      expect(dispatched).toEqual(["ts-rule", "unscoped-rule"]);
+
+      vi.restoreAllMocks();
+    });
+
+    it("reports the rules it did not dispatch rather than implying they found nothing", async () => {
+      const h = scopedHarness([
+        makeRule({ name: "ts-rule", appliesTo: ["**/*.ts"] }),
+        makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] }),
+      ]);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      // Into the summary, so a reader learns which coverage the review had...
+      expect(h.orchestrate).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ rulesSkipped: ["sql-rule"] }),
+      );
+      // ...and onto the machine-readable line, for anyone counting across runs.
+      const statuses = log.mock.calls.flat().join("\n")
+        .split("\n").filter((line) => line.startsWith("TGD_REVIEW_RESULT: "));
+      expect(JSON.parse(statuses.at(-1)!.slice("TGD_REVIEW_RESULT: ".length)).rulesSkipped).toEqual(["sql-rule"]);
+
+      vi.restoreAllMocks();
+    });
+
+    it("keeps the status line unchanged when every rule applies", async () => {
+      // Omitted rather than empty, so a run without scoped rules produces the
+      // exact line anyone already parsing it has always seen.
+      const h = scopedHarness([makeRule({ name: "ts-rule", appliesTo: ["**/*.ts"] })]);
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      const statuses = log.mock.calls.flat().join("\n")
+        .split("\n").filter((line) => line.startsWith("TGD_REVIEW_RESULT: "));
+      expect(JSON.parse(statuses.at(-1)!.slice("TGD_REVIEW_RESULT: ".length))).not.toHaveProperty("rulesSkipped");
+
+      vi.restoreAllMocks();
+    });
+
+    it("does not fail a --context require run when no rule applies", async () => {
+      // The "no rule applies is not fatal" promise held only under some
+      // context settings: with nothing to build context FOR, the mapper
+      // reported "no rules to build context for", and under `require` that is
+      // fatal — so an empty applicable set aborted (Codex review of PR #126).
+      const h = makeHarness({
+        args: makeArgs({ context: "require" }),
+        loadResult: { rules: [makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] })], errors: [] },
+        botComment: null,
+      });
+      h.vcsAdapter.getDiff.mockResolvedValue(tsDiff);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      // Context preparation is short-circuited rather than asked about an
+      // empty rule set: a pack keyed by rule name means nothing without them.
+      expect(h.prepareContext).not.toHaveBeenCalled();
+      expect(h.dispatchRules).not.toHaveBeenCalled();
+
+      vi.restoreAllMocks();
+    });
+
+    it("does no dependency work when no rule applies", async () => {
+      // Reaching the context short-circuit was too late: by then the merge
+      // base is resolved, manifests are read at BOTH refs, and with
+      // `--dependency-facts on` the registry lookups have already gone out —
+      // real network cost for a pack nothing can consume, on the path this
+      // feature introduced as cheap (Codex review of PR #126).
+      const manifestDiff = [
+        "diff --git a/package.json b/package.json",
+        "--- a/package.json",
+        "+++ b/package.json",
+        "@@ -1,3 +1,3 @@",
+        " {",
+        "-  \"version\": \"1.0.0\"",
+        "+  \"version\": \"1.1.0\"",
+        " }",
+      ].join("\n");
+      const h = makeHarness({
+        args: makeArgs({ dependencyFacts: "on" }),
+        loadResult: { rules: [makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] })], errors: [] },
+        botComment: null,
+      });
+      h.vcsAdapter.getDiff.mockResolvedValue(manifestDiff);
+      const fetchJson = vi.fn();
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, { ...depsFrom(h), fetchJson })).resolves.toBe(0);
+
+      expect(h.vcsAdapter.getFileAtRef).not.toHaveBeenCalled();
+      expect(fetchJson).not.toHaveBeenCalled();
+
+      vi.restoreAllMocks();
+    });
+
+    it("still posts a review when no rule applies, rather than aborting", async () => {
+      // "No rule applies to these files" is a legitimate outcome, distinct
+      // from "no rules could be loaded" — which is fatal and stays fatal.
+      const h = scopedHarness([makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] })]);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      expect(h.dispatchRules).not.toHaveBeenCalled();
+      expect(h.orchestrate).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        expect.objectContaining({ rulesSkipped: ["sql-rule"] }),
+      );
+
+      vi.restoreAllMocks();
+    });
+  });
+
   it("design-review #13: a diff exactly at (not over) --max-diff-chars still reviews normally", async () => {
     const h = makeHarness({
       args: makeArgs({ maxDiffChars: 18 }), // getDiff stub returns exactly 18 chars
