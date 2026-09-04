@@ -6,7 +6,7 @@
 // `gh` CLI, real network, or a real pi SDK/LLM session — same
 // dependency-injection spirit as Task 5's `dispatchRules` (which itself
 // takes an injectable `createSession`).
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
@@ -1968,6 +1968,33 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
     vi.spyOn(console, "log").mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
+    // The escape target is OWNED BY THE TEST, not inferred from the host.
+    //
+    // Production creates its rules directory under `os.tmpdir()`, so where
+    // `../../etc/passwd` lands depends entirely on how deep that is. Directly
+    // under `/tmp` it resolves to the machine's real `/etc/passwd`; under
+    // macOS's `/var/folders/<...>/T` it resolves to a path that does not
+    // exist. An assertion written against either one is really an assertion
+    // about the host, and fails on the other platform (Codex review of PR
+    // #131 — the previous attempt swapped a Linux failure for a macOS one).
+    //
+    // Worse, an assertion aimed at the real `/etc/passwd` means that if the
+    // guard ever regressed, running this suite as root would OVERWRITE it. A
+    // test must not be able to do that, whatever the production code does.
+    //
+    // So `TMPDIR` is pointed at a directory this test made, two levels below
+    // its own root, and a sentinel is planted exactly where the traversal
+    // would land. Deterministic on every platform, and the blast radius of a
+    // regression is a temp directory.
+    const traversalRoot = mkdtempSync(path.join(os.tmpdir(), "tgd-traversal-"));
+    const tmpRoot = path.join(traversalRoot, "escape-guard", "tmp");
+    const sentinelPath = path.join(traversalRoot, "escape-guard", "etc", "passwd");
+    mkdirSync(tmpRoot, { recursive: true });
+    mkdirSync(path.dirname(sentinelPath), { recursive: true });
+    writeFileSync(sentinelPath, "sentinel", "utf-8");
+    const previousTmpDir = process.env.TMPDIR;
+    process.env.TMPDIR = tmpRoot;
+
     let seenDir: string | undefined;
     h.loadRules.mockImplementation(async (dir: string) => {
       seenDir = dir;
@@ -1975,20 +2002,28 @@ describe("review — base-branch rule sourcing (ADR-002 CLI-native fix)", () => 
       return { rules: [makeRule()], errors: [] };
     });
 
-    const exitCode = await review(h.args, depsFrom(h));
+    let exitCode: number;
+    try {
+      exitCode = await review(h.args, depsFrom(h));
+    } finally {
+      if (previousTmpDir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpDir;
+    }
 
     expect(exitCode).toBe(0);
     expect(seenDir).toBeDefined();
+    // The rules directory really was created under the redirected root, so the
+    // arithmetic below is about this test's tree and not the host's.
+    expect(path.resolve(seenDir as string, "../..")).toBe(path.resolve(traversalRoot, "escape-guard"));
 
-    // The traversal target (two levels above the temp dir, then etc/passwd)
-    // must never have been written to.
-    const escapedPath = path.resolve(seenDir as string, "../../etc/passwd");
-    expect(existsSync(escapedPath)).toBe(false);
+    // Untouched: neither overwritten with the payload nor replaced.
+    expect(readFileSync(sentinelPath, "utf-8")).toBe("sentinel");
 
     // A warning names the offending path — visible, not silently dropped.
     const warnedText = warnSpy.mock.calls.map((call) => call.join(" ")).join("\n");
     expect(warnedText).toContain("../../etc/passwd");
 
+    rmSync(traversalRoot, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
 
