@@ -495,6 +495,42 @@ reviewed), `1` fatal (e.g. every rule failed to load), `2` partial (at least
 one rule ran, but something also failed — the comment is still posted and
 the failure is noted in it).
 
+#### The `TGD_REVIEW_RESULT` line
+
+The last line the process writes to stdout is a machine-readable summary,
+prefixed `TGD_REVIEW_RESULT: `. It always carries `status`, `findingsCount`,
+`rulesRun` and `rulesFailed`, and optionally `reason`, `loadErrors`,
+`rulesSkipped` and `metrics`.
+
+**`metrics` is present if and only if this process dispatched rules.** That is
+the field to key on when aggregating cost across runs — `dispatchChars`,
+`durationMs` and the rest live there, and a line without it is not a run that
+cost nothing, it is a run that did no work to cost anything.
+
+A line arrives without `metrics` in these cases, identified by `reason`:
+
+| `reason` | What happened |
+|---|---|
+| *(absent)* | The head SHA was already reviewed under this config; nothing ran. |
+| `diff-too-large` | The diff exceeded `--max-diff-chars`. |
+| `diff-incomplete` | The provider could not hand over the whole diff (#33). |
+| `context-required` | `--context require` and the context could not be built. |
+| `recovered-pending-review` | A previous process published and died before reporting; this one finalized its marker. |
+| `recovered-pending-review-dry-run` | The same, under `--dry-run`. |
+| `recovered-ambiguous-inline-review` | A previous process's inline write was ambiguous and has now been reconciled. |
+| `inline-publication-awaiting-consistency` | The provider has not yet made an accepted inline write visible. |
+| `inline-publication-still-ambiguous` | It stayed ambiguous past the retry budget. |
+
+The three `recovered-*` cases are worth understanding if you aggregate. The
+process that *did* the work crashed before it could report; the process that
+recovers it dispatched nothing and so has nothing to report. Its telemetry is
+not lost in transit — it was never produced by the process you are reading.
+An aggregator should treat these runs as absent rather than as zero, or the
+average cost per review drifts down every time a run crashes.
+
+`test/unit/cli/status-telemetry.test.ts` pins this table against the source,
+so a new emitter cannot join the list without the documentation moving too.
+
 ### Repository context
 
 By default (`--context auto`) each dispatched rule is given a **trusted-base
