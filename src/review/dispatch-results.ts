@@ -442,6 +442,13 @@ export function suggestionProvenanceKeys(
       if (typeof finding.suggestion === "string") {
         keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
       }
+      // Issue #114: the reviewer's verbatim excerpt gets the same provenance
+      // rule as a suggestion, keyed on the excerpt ALONE — the orchestrator's
+      // file/line may be the miscount being corrected, and a quote is
+      // distinctive enough to key on its own content.
+      if (typeof finding.existingCode === "string") {
+        keys.add(finding.existingCode);
+      }
     }
   });
   return keys;
@@ -451,19 +458,41 @@ function provenanceKey(file: string, line: number | undefined, suggestion: strin
   return JSON.stringify([file, line ?? null, suggestion]);
 }
 
-/** Strips any suggestion the orchestrator cannot prove a subagent actually made. */
+/** Strips any suggestion or quote the orchestrator cannot prove a subagent made. */
 export function enforceSuggestionProvenance(result: DispatchResult, allowed: Set<string>): DispatchResult {
   let dropped = 0;
+  let quotesDropped = 0;
   const findings = result.findings.map((f) => {
-    if (typeof f.suggestion !== "string") return f;
-    if (allowed.has(provenanceKey(f.file, f.line, f.suggestion))) return f;
-    dropped += 1;
-    return { ...f, suggestion: undefined, endLine: undefined };
+    let out = f;
+    if (typeof out.suggestion === "string") {
+      if (allowed.has(provenanceKey(out.file, out.line, out.suggestion))) {
+        // Kept.
+      } else {
+        dropped += 1;
+        out = { ...out, suggestion: undefined, endLine: undefined };
+      }
+    }
+    // Issue #114: the orchestrator relays the reviewer's excerpt under the
+    // legacy engine, and a reformatted or substituted quote would relocate
+    // the comment to unrelated code (or discard a valid anchor). An excerpt
+    // no dispatched reviewer emitted is dropped — the finding falls back to
+    // the model's line, exactly as if no quote had been returned.
+    if (typeof out.existingCode === "string" && !allowed.has(out.existingCode)) {
+      quotesDropped += 1;
+      out = { ...out, existingCode: undefined };
+    }
+    return out;
   });
   if (dropped > 0) {
     console.warn(
       `dispatchRules: dropped ${dropped} committable suggestion(s) that no dispatched reviewer ` +
         `actually produced for that file/line (orchestrator provenance check)`,
+    );
+  }
+  if (quotesDropped > 0) {
+    console.warn(
+      `dispatchRules: dropped ${quotesDropped} verbatim excerpt(s) that no dispatched reviewer ` +
+        `actually produced (orchestrator provenance check, #114)`,
     );
   }
   return { ...result, findings };

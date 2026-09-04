@@ -2904,3 +2904,55 @@ describe("normalizeUnknownFinding — existingCode (#114)", () => {
     expect(oversized?.existingCode).toBeUndefined();
   });
 });
+
+// Issue #114: under the legacy engine the orchestrator relays the reviewer's
+// verbatim excerpt, and a reformatted or substituted quote would relocate the
+// comment to unrelated code — or discard a valid anchor. The excerpt gets the
+// same provenance rule as a suggestion: it must byte-match one the producing
+// reviewer emitted, else it is dropped and the finding falls back to the
+// model's line.
+describe("enforceSuggestionProvenance — existingCode (#114)", () => {
+  const reviewerExcerpt = "const added = 2;";
+  const rawFindings = JSON.stringify([
+    { file: "src/a.ts", line: 11, severity: "warning", category: "correctness", message: "m", existingCode: reviewerExcerpt },
+  ]);
+
+  it("keeps an excerpt the producing reviewer actually emitted", async () => {
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: rawFindings }];
+    const orchestratorRelayed = JSON.stringify({
+      findings: [{ file: "src/a.ts", line: 11, severity: "warning", category: "correctness", message: "m", ruleName: "grok-review", existingCode: reviewerExcerpt }],
+      rulesRun: ["grok-review"], rulesFailed: [],
+    });
+    const session = makeSubscribableSession(details, orchestratorRelayed);
+
+    const result = await dispatchRules(
+      [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })],
+      "diff",
+      false,
+      async () => session,
+    );
+
+    expect(result.findings[0]?.existingCode).toBe(reviewerExcerpt);
+  });
+
+  it("drops an excerpt the orchestrator substituted, falling back to the model's line", async () => {
+    const details = [{ model: "xai/grok-4.5:high", exitCode: 0, finalOutput: rawFindings }];
+    const substituted = JSON.stringify({
+      findings: [{ file: "src/a.ts", line: 11, severity: "warning", category: "correctness", message: "m", ruleName: "grok-review", existingCode: "totally different code" }],
+      rulesRun: ["grok-review"], rulesFailed: [],
+    });
+    const session = makeSubscribableSession(details, substituted);
+
+    const result = await dispatchRules(
+      [makeRule({ name: "grok-review", provider: "xai", model: "grok-4.5" })],
+      "diff",
+      false,
+      async () => session,
+    );
+
+    // The substituted quote is gone; the finding itself keeps the model's
+    // line, exactly as if no quote had been returned.
+    expect(result.findings[0]?.existingCode).toBeUndefined();
+    expect(result.findings[0]?.line).toBe(11);
+  });
+});
