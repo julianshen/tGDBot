@@ -516,7 +516,9 @@ describe("inline anchoring", () => {
     // Can't terminate an HTML comment we open: the ONLY `-->` in the body is
     // the tool's own trailing inline marker (appended after sanitization) —
     // nothing content-derived survives.
-    expect([...body.matchAll(/-->/g)]).toHaveLength(1);
+    // Both comment-end spellings count — content must not be able to close
+    // the marker through HTML's error-tolerant `--!>` either (issue #128).
+    expect([...body.matchAll(/--!?>/g)]).toHaveLength(1);
     expect(body.trimEnd().endsWith("<!-- tgd-review-agent:inline -->")).toBe(true);
   });
 });
