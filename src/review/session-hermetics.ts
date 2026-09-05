@@ -4,10 +4,10 @@
 // plus the intercom-off subagent config. Split out of dispatch.ts
 // (design-review #8); dispatchRules still owns WHEN these are created,
 // pointed at via PI_CODING_AGENT_DIR, and removed.
-import { mkdir, mkdtemp, copyFile, symlink, writeFile, access } from "node:fs/promises";
+import { mkdir, mkdtemp, symlink, writeFile, access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { vendoredAssetContents, vendoredAssetPath } from "../vendored-assets.js";
 
 // Files symlinked into the hermetic agent dir (see createIsolatedAgentDir).
 // Exported because orchestrator-model.ts reads the same files through the
@@ -26,9 +26,7 @@ const HERMETIC_AGENT_LINK_FILES = [AUTH_FILE, MODELS_FILE, SETTINGS_FILE];
 // `npm run build` — the build script copies this .md file alongside the
 // compiled dispatch.js at dist/review/builtin-agents/reviewer.md (same
 // pattern as src/rules/loader.ts's BUILTIN_RULE_PATH).
-export const VENDORED_REVIEWER_AGENT_PATH = fileURLToPath(
-  new URL("./builtin-agents/reviewer.md", import.meta.url),
-);
+export const VENDORED_REVIEWER_AGENT_PATH = vendoredAssetPath("reviewer-agent");
 
 // ADR-003 "restrict dispatched subagent tools via project-scoped agent
 // override": pi-subagents' agent discovery priority is Builtin < Installed
@@ -70,7 +68,11 @@ export async function createIsolatedSessionCwd(): Promise<string> {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-session-"));
   const agentsDir = path.join(tempDir, ".pi", "agents");
   await mkdir(agentsDir, { recursive: true });
-  await copyFile(VENDORED_REVIEWER_AGENT_PATH, path.join(agentsDir, "reviewer.md"));
+  // WRITTEN from the vendored contents rather than copied from a path: inside
+  // a single-file binary there is no source file to copy, and a review whose
+  // subagent silently kept its bash/edit/write tools is the one failure this
+  // seeding exists to prevent (ADR-003).
+  await writeFile(path.join(agentsDir, "reviewer.md"), vendoredAssetContents("reviewer-agent"), "utf-8");
   return tempDir;
 }
 

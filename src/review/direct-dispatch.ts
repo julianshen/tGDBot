@@ -34,7 +34,6 @@
 //
 // `--dispatch legacy` keeps the old path selectable for one release as the
 // escape hatch while this one gets live mileage.
-import { readFileSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -62,7 +61,7 @@ import {
   resolveOrchestratorModel,
   resolveRuleSessionModel,
 } from "./orchestrator-model.js";
-import { VENDORED_REVIEWER_AGENT_PATH } from "./session-hermetics.js";
+import { vendoredAssetContents } from "../vendored-assets.js";
 import type { DispatchResult, Finding } from "./types.js";
 import type { ReviewDispatchInput } from "./types.js";
 import { validateDispatchContext } from "./dispatch-context.js";
@@ -116,8 +115,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string)
 let cachedReviewerSystemPrompt: string | undefined;
 function reviewerSystemPrompt(): string {
   if (cachedReviewerSystemPrompt === undefined) {
-    cachedReviewerSystemPrompt = matter(readFileSync(VENDORED_REVIEWER_AGENT_PATH, "utf-8"))
-      .content.trim();
+    cachedReviewerSystemPrompt = matter(vendoredAssetContents("reviewer-agent")).content.trim();
   }
   return cachedReviewerSystemPrompt;
 }
