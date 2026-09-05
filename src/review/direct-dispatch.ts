@@ -39,7 +39,6 @@ import os from "node:os";
 import path from "node:path";
 import {
   createAgentSession,
-  createReadOnlyTools,
   DefaultResourceLoader,
   getAgentDir,
   SessionManager,
@@ -48,6 +47,7 @@ import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent"
 import matter from "gray-matter";
 import type { EffectiveRule } from "../rules/types.js";
 import { buildTaskText } from "./dispatch-prompt.js";
+import { createSubmitFindingsTool, readSubmittedFindings, ruleDirName } from "./findings-file.js";
 import {
   classifyTaskFailure,
   extractFindingsArray,
@@ -69,7 +69,12 @@ import { planReviewWorkflow } from "./workflow.js";
 import { redactSecrets } from "../conversation/redact.js";
 
 /** Creates one rule's review session. Tests inject stubs; the real factory below is the only SDK toucher. */
-export type DirectSessionFactory = (rule: EffectiveRule, cwd: string) => Promise<DispatchSession>;
+export type DirectSessionFactory = (
+  rule: EffectiveRule,
+  cwd: string,
+  /** Issue #138: where this rule's submitted findings.json is written. */
+  outputDir: string,
+) => Promise<DispatchSession>;
 
 /** Creates the (single) advisor session for the --advisor pass. */
 export type AdvisorSessionFactory = (cwd: string) => Promise<DispatchSession>;
@@ -120,7 +125,7 @@ function reviewerSystemPrompt(): string {
   return cachedReviewerSystemPrompt;
 }
 
-async function createRealDirectSession(rule: EffectiveRule, cwd: string): Promise<DispatchSession> {
+async function createRealDirectSession(rule: EffectiveRule, cwd: string, outputDir: string): Promise<DispatchSession> {
   // Credential gate BEFORE any session exists: a rule pinned to a provider
   // this machine can't authenticate must fail with the classified reason,
   // not burn a session-construction round trip to discover it. The error
@@ -152,7 +157,17 @@ async function createRealDirectSession(rule: EffectiveRule, cwd: string): Promis
     resourceLoader: loader,
     cwd,
     tools: ["read", "grep", "find", "ls"],
-    customTools: createReadOnlyTools(cwd),
+    customTools: [
+      // Issue #138 phase 1: the findings file contract. A single host-mediated
+      // tool whose write path is baked into the closure; the model supplies
+      // arguments only. Read-only enforcement over the REPOSITORY is intact —
+      // the write lands in host-created staging, never in the reviewed tree.
+      createSubmitFindingsTool({
+        outputDir,
+        ruleName: rule.name,
+        allowedReferences: referencesDeclaredBy(rule.body),
+      }),
+    ],
     model: resolved.model,
     ...(resolved.thinkingLevel
       ? { thinkingLevel: resolved.thinkingLevel as CreateAgentSessionOptions["thinkingLevel"] }
@@ -270,6 +285,7 @@ export async function dispatchRulesDirect(
   const workflow = planReviewWorkflow(rules);
 
   let cwd: string | undefined;
+  let findingsDir: string | undefined;
   try {
     // Model resolution reads ambient registry/settings state and can fail for
     // operational reasons (for example an unreadable agent configuration).
@@ -283,6 +299,9 @@ export async function dispatchRulesDirect(
     // stance as the legacy path's createIsolatedSessionCwd, without the agent
     // seeding (direct sessions do no agent discovery at all).
     cwd = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-direct-"));
+    // Issue #138 phase 1: per-run staging for submitted findings, OUTSIDE the
+    // sessions' cwd so one rule cannot read another rule's submissions.
+    findingsDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-findings-"));
 
     const unresolvedNames = Object.keys(unresolved);
     for (const name of unresolvedNames) {
@@ -314,7 +333,7 @@ interface RuleOutcome {
       let session: DispatchSession | undefined;
       try {
         session = await withTimeout(
-          createSession(rule, cwd as string),
+          createSession(rule, cwd as string, path.join(findingsDir as string, ruleDirName(rule.name))),
           ruleTimeoutMs,
           `rule "${rule.name}" session creation timed out after ${ruleTimeoutMs}ms`,
         );
@@ -325,6 +344,20 @@ interface RuleOutcome {
           ruleTimeoutMs,
           `rule "${rule.name}" timed out after ${ruleTimeoutMs}ms`,
         );
+        // Issue #138 phase 1: the file contract is the PRIMARY channel — the
+        // submit_findings tool wrote the validated findings durably. The
+        // assistant text remains the fallback for a reviewer that never called
+        // the tool; when both exist, the file wins (the text is the same
+        // array by contract, relayed by a lossier channel).
+        const submitted = await readSubmittedFindings({
+          outputDir: path.join(findingsDir as string, ruleDirName(rule.name)),
+          ruleName: rule.name,
+          allowedReferences: referencesDeclaredBy(rule.body),
+        });
+        console.log(`DBG-DIRECT: submitted for "${rule.name}": ${submitted === undefined ? "undefined" : JSON.stringify(submitted)}`);
+        if (submitted !== undefined) {
+          return { ruleName: rule.name, succeeded: true, findings: submitted };
+        }
         const text = session.getLastAssistantText();
         // extractFindingsArray distinguishes "no parseable findings array"
         // (undefined — the rule FAILED to follow its output contract) from
@@ -486,6 +519,9 @@ interface RuleOutcome {
     };
   } finally {
     if (cwd) {
+      if (findingsDir !== undefined) {
+        await rm(findingsDir, { recursive: true, force: true }).catch(() => undefined);
+      }
       await rm(cwd, { recursive: true, force: true }).catch((err: unknown) => {
         console.warn(
           `dispatchRulesDirect: failed to remove temp directory ${cwd} (${(err as Error).message})`,

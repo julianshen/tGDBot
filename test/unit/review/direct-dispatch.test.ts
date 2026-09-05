@@ -4,7 +4,10 @@
 // the only SDK toucher exercised live, not here. The real ADVISOR-session
 // factory's hermeticity (below) IS unit tested against a mocked SDK, the same
 // stance dispatch.test.ts takes for the legacy engine's real factory.
-import { describe, expect, it, vi } from "vitest";
+import { rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   dispatchRulesDirect as dispatchRulesDirectObject,
   parseAdvisorDropList,
@@ -15,7 +18,7 @@ import type {
   DirectSessionFactory,
 } from "../../../src/review/direct-dispatch.js";
 import { DispatchInputError } from "../../../src/review/dispatch-context.js";
-import type { DispatchSession } from "../../../src/review/dispatch.js";
+import type { DispatchResult, DispatchSession } from "../../../src/review/dispatch.js";
 import { resolveRpivAdvisorExtensionPath } from "../../../src/review/extensions.js";
 import { ReviewWorkflowError } from "../../../src/review/workflow.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
@@ -560,8 +563,8 @@ describe("dispatchRulesDirect", () => {
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
       try {
         const { factory } = makeFactory({ "rule-b": "[]" });
-        const createSession: DirectSessionFactory = (rule, cwd) =>
-          rule.name === "rule-a" ? new Promise(() => {}) : factory(rule, cwd);
+        const createSession: DirectSessionFactory = (rule, cwd, outputDir) =>
+          rule.name === "rule-a" ? new Promise(() => {}) : factory(rule, cwd, outputDir);
 
         const result = await dispatchRulesDirect(
           [
@@ -593,9 +596,9 @@ describe("dispatchRulesDirect", () => {
           },
         };
         const { factory } = makeFactory({ "rule-b": JSON.stringify([finding("b.ts", "ok")]) });
-        const combinedFactory: DirectSessionFactory = async (rule, cwd) => {
+        const combinedFactory: DirectSessionFactory = async (rule, cwd, outputDir) => {
           if (rule.name === "rule-a") return hangingSession;
-          const session = await factory(rule, cwd);
+          const session = await factory(rule, cwd, outputDir);
           return {
             ...session,
             async prompt(text: string) {
@@ -931,5 +934,58 @@ describe("dispatchRulesDirect — the advisor gate (issue #111)", () => {
     expect(result.findings).toEqual([]);
     expect(result.rulesFailed).toEqual(["rule-broken"]);
     expect(createAdvisorSession).not.toHaveBeenCalled();
+  });
+});
+
+// Issue #138 phase 1: the file contract. A reviewer session calls
+// submit_findings, which writes findings.json to the task's output directory;
+// the host reads the FILE as the primary channel. The assistant text remains
+// the fallback for a reviewer that never called the tool.
+describe("dispatchRulesDirect — the findings file contract (#138 phase 1)", () => {
+  const findingInFile = { file: "src/a.ts", line: 11, severity: "warning", category: "c", message: "from the file" };
+
+  const leftovers: string[] = [];
+  afterAll(async () => {
+    await Promise.all(leftovers.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  async function runWithSessionWritingFile(submitFile: boolean): Promise<DispatchResult> {
+    const { mkdtemp } = await import("node:fs/promises");
+    const findingsRoot = await mkdtemp(path.join(os.tmpdir(), "tgd-file-contract-"));
+    leftovers.push(findingsRoot);
+    const { mkdir, writeFile: wf } = await import("node:fs/promises");
+    const createSession: DirectSessionFactory = async (rule, _cwd, outputDir) => {
+      await mkdir(outputDir, { recursive: true });
+        if (submitFile) {
+        await wf(
+          path.join(outputDir, "findings.json"),
+          JSON.stringify([{ ...findingInFile, ruleName: rule.name }]),
+          "utf8",
+        );
+      }
+      return {
+        async prompt() {},
+        // Divergent text: the file contract must WIN over the assistant text
+        // when both exist (the text is the lossier relay).
+        getLastAssistantText: () =>
+          JSON.stringify([{ file: "src/a.ts", line: 99, severity: "blocking", category: "c", message: "from the text" }]),
+      };
+    };
+
+    return dispatchRulesDirect([makeRule({ name: "rule-a" })], "diff", false, { createSession });
+  }
+
+  it("prefers the submitted findings file over the assistant text", async () => {
+    const result = await runWithSessionWritingFile(true);
+    expect(result.findings).toEqual([{ ...findingInFile, ruleName: "rule-a", decision: "new" }]);
+    expect(result.findings[0]?.line).toBe(11);
+  });
+
+  it("falls back to the assistant text when the tool was never called", async () => {
+    const result = await runWithSessionWritingFile(false);
+    expect(result.findings).toEqual([
+      { file: "src/a.ts", line: 99, severity: "blocking", category: "c", message: "from the text", ruleName: "rule-a", decision: "new" },
+    ]);
+    expect(result.rulesRun).toEqual(["rule-a"]);
   });
 });
