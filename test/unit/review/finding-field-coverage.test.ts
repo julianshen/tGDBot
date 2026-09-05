@@ -80,6 +80,7 @@ const COMPLETE: Required<Finding> = {
   file: "src/subauthcache.go",
   line: 120,
   endLine: 124,
+  existingCode: "if cache.age > revocationTTL { invalidate(); }",
   severity: "blocking",
   category: "consistency",
   message: "The cached authorization outlives its revocation.",
@@ -319,6 +320,7 @@ describe("every Finding field reaches the reader", () => {
     file: "the comment is anchored to the file; repeating the path would be noise",
     line: "likewise — the anchor IS the line",
     endLine: "structural: it bounds a suggestion rather than being shown",
+    existingCode: "consumed by the host to derive the anchor (#114); printing the excerpt would duplicate the diff context already shown beside the comment",
     decision: "routes the finding between sections; never printed in the body",
     question: "surfaced by the clarification flow, not by an inline finding",
   };

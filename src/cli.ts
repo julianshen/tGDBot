@@ -95,6 +95,7 @@ import {
 } from "./context/prepare.js";
 import { contextRoots, selectContextRoot } from "./context/root.js";
 import { GraphifyMapper, GRAPHIFY_MAPPER_VERSION } from "./context/graphify-mapper.js";
+import { relocateFindingsByQuote } from "./review/quote-anchor.js";
 import { CONTEXT_MAPPER_VERSION } from "./context/prepare.js";
 
 /**
@@ -1691,6 +1692,14 @@ export async function review(
       };
     }
   }
+
+  // Issue #114: quote relocation must run BEFORE every consumer of a
+  // finding's location — structural checks verify claims at file/line, and
+  // clarification persistence anchors an inline question there. Running the
+  // shared pass at the composition root (rather than only inside orchestrate)
+  // means a miscounted line never reaches either consumer. Idempotent:
+  // orchestrate re-applies it harmlessly.
+  dispatchResult.findings = relocateFindingsByQuote(dispatchResult.findings, diff);
 
   // Issue #75: check the structural claims the reviewer chose to make, against
   // the trusted BASE tree. Best-effort throughout — a check that cannot run

@@ -180,6 +180,9 @@ export function referencesDeclaredBy(ruleBody: string): Set<string> {
   return declared;
 }
 
+/** Cap on a reviewer's verbatim excerpt — a quote longer than this is not a quote. */
+const MAX_EXISTING_CODE_CHARS = 2000;
+
 export function normalizeUnknownFinding(
   value: unknown,
   ruleName?: string,
@@ -238,6 +241,16 @@ export function normalizeUnknownFinding(
   const suggestion = stateSafeSuggestion(candidate.suggestion);
   if (suggestion !== undefined) finding.suggestion = suggestion;
   if (Number.isInteger(candidate.endLine)) finding.endLine = candidate.endLine as number;
+  // Issue #114: the verbatim excerpt the host locates to derive the finding's
+  // real position. Trimmed at the outer edges only — the match is
+  // whitespace-insensitive per line — and bounded, because a quote longer
+  // than this is not a quote.
+  if (typeof candidate.existingCode === "string") {
+    const excerpt = candidate.existingCode.trim();
+    if (excerpt.length > 0 && excerpt.length <= MAX_EXISTING_CODE_CHARS) {
+      finding.existingCode = excerpt;
+    }
+  }
   if (contract.question !== undefined) finding.question = contract.question;
   return finding;
 }
@@ -429,6 +442,22 @@ export function suggestionProvenanceKeys(
       if (typeof finding.suggestion === "string") {
         keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
       }
+      // Issue #114: the reviewer's verbatim excerpt gets the same provenance
+      // rule as a suggestion, bound to the full captured finding identity
+      // MINUS the location: rule, file, severity, category, message, title
+      // and the excerpt itself. The line/endLine are deliberately excluded —
+      // they may be exactly the miscount the quote exists to correct — while
+      // everything else must match, or a swapped excerpt would relocate
+      // another finding's comment onto this one's code (PR #130 review,
+      // three rounds). A failed task's output is not trustworthy and
+      // contributes no quote.
+      // The FULL success predicate, not the exit code alone: a task that
+      // errored, timed out or detached mid-run has output reconcile would
+      // never trust, and its quote must not authenticate anything
+      // (PR #130 review).
+      if (typeof finding.existingCode === "string" && taskSucceeded(c)) {
+        keys.add(quoteProvenanceKey(rule.name, finding.file, finding, finding.existingCode));
+      }
     }
   });
   return keys;
@@ -438,19 +467,59 @@ function provenanceKey(file: string, line: number | undefined, suggestion: strin
   return JSON.stringify([file, line ?? null, suggestion]);
 }
 
-/** Strips any suggestion the orchestrator cannot prove a subagent actually made. */
+function quoteProvenanceKey(
+  ruleName: string,
+  file: string,
+  finding: Pick<Finding, "severity" | "category" | "message" | "title">,
+  excerpt: string,
+): string {
+  return JSON.stringify([
+    ruleName,
+    file,
+    finding.severity,
+    finding.category,
+    finding.message,
+    finding.title ?? null,
+    excerpt,
+  ]);
+}
+
+/** Strips any suggestion or quote the orchestrator cannot prove a subagent made. */
 export function enforceSuggestionProvenance(result: DispatchResult, allowed: Set<string>): DispatchResult {
   let dropped = 0;
+  let quotesDropped = 0;
   const findings = result.findings.map((f) => {
-    if (typeof f.suggestion !== "string") return f;
-    if (allowed.has(provenanceKey(f.file, f.line, f.suggestion))) return f;
-    dropped += 1;
-    return { ...f, suggestion: undefined, endLine: undefined };
+    let out = f;
+    if (typeof out.suggestion === "string") {
+      if (allowed.has(provenanceKey(out.file, out.line, out.suggestion))) {
+        // Kept.
+      } else {
+        dropped += 1;
+        out = { ...out, suggestion: undefined, endLine: undefined };
+      }
+    }
+    // Issue #114: the orchestrator relays the reviewer's excerpt under the
+    // legacy engine, and a reformatted, substituted, or cross-rule
+    // misattributed quote would relocate the comment to the wrong code (or
+    // discard a valid anchor). An excerpt the attributed rule did not emit is
+    // dropped — the finding falls back to the model's line, exactly as if no
+    // quote had been returned.
+    if (typeof out.existingCode === "string" && !allowed.has(quoteProvenanceKey(out.ruleName, out.file, out, out.existingCode))) {
+      quotesDropped += 1;
+      out = { ...out, existingCode: undefined };
+    }
+    return out;
   });
   if (dropped > 0) {
     console.warn(
       `dispatchRules: dropped ${dropped} committable suggestion(s) that no dispatched reviewer ` +
         `actually produced for that file/line (orchestrator provenance check)`,
+    );
+  }
+  if (quotesDropped > 0) {
+    console.warn(
+      `dispatchRules: dropped ${quotesDropped} verbatim excerpt(s) that no dispatched reviewer ` +
+        `actually produced (orchestrator provenance check, #114)`,
     );
   }
   return { ...result, findings };

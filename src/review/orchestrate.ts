@@ -19,6 +19,7 @@ import {
   rangeIsCommentable,
 } from "./diff-anchors.js";
 import { clusterFindings } from "./finding-clusters.js";
+import { relocateFindingsByQuote } from "./quote-anchor.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
 import { acceptanceKey } from "../conversation/disposition.js";
@@ -181,13 +182,20 @@ export function orchestrate(
   diff = "",
   options: OrchestrateOptions = {},
 ): OrchestrationResult {
+  // Issue #114: quote relocation runs HERE and, for consumers that run
+  // earlier (structural checks, clarification persistence), in review() at
+  // the composition root — the pass is idempotent, so whichever runs first
+  // wins and the second is a no-op (the quote is stripped on relocation).
+  const locatedFindings = relocateFindingsByQuote(dispatchResult.findings, diff);
+  const findingsWithQuoteStripped = locatedFindings;
+
   // Addressed findings are removed before ordinary dedup, and their keys
   // suppress a repeated new/still-valid copy of the same issue.
   const addressedKeys = new Set(
-    dispatchResult.findings.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
+    findingsWithQuoteStripped.filter((finding) => decisionOf(finding) === "addressed").map(dedupeKey),
   );
   const waivedKeys = options.waivedKeys ?? new Set<string>();
-  const remaining = dispatchResult.findings.filter((finding) => !waivedKeys.has(acceptanceKey(finding)));
+  const remaining = findingsWithQuoteStripped.filter((finding) => !waivedKeys.has(acceptanceKey(finding)));
   const actionable = remaining.filter(
     (finding) => isActionableDecision(decisionOf(finding)) && !addressedKeys.has(dedupeKey(finding)),
   );

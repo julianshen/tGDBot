@@ -28,6 +28,7 @@ const finding: FindingSnapshot = {
   message: "Tokens must not be logged.",
   ruleName: "no-token-logs",
   title: "Do not log tokens",
+  existingCode: "console.log(token);",
 };
 const reviewOptions: FindingReviewOptions = {
   advisor: "on",

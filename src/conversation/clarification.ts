@@ -160,6 +160,7 @@ export function toClarificationFindingSnapshot(finding: Finding | FindingSnapsho
     ruleName: finding.ruleName,
     ...(finding.line === undefined ? {} : { line: finding.line }),
     ...(finding.endLine === undefined ? {} : { endLine: finding.endLine }),
+    ...(finding.existingCode === undefined ? {} : { existingCode: finding.existingCode }),
     ...(finding.decision === undefined ? {} : { decision: finding.decision }),
     ...(finding.question === undefined ? {} : { question: finding.question }),
     ...(finding.title === undefined ? {} : { title: finding.title }),

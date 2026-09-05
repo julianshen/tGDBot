@@ -18,6 +18,7 @@ import {
   type PublicationWriter,
 } from "../conversation/publication-manifest.js";
 import { computeContentDigest, computeRepositoryDigest, formatChildMarker, parseChildMarker } from "../conversation/markers.js";
+import { relocateFindingsByQuote } from "./quote-anchor.js";
 import { publicationBody, renderFocusReply } from "../conversation/render.js";
 import type { ConversationStateStore } from "../conversation/state-store.js";
 import type { RepositoryBinding, ReviewIdentity } from "../conversation/types.js";
@@ -251,6 +252,7 @@ export function toFindingSnapshot(finding: Finding): FindingSnapshot {
     ruleName: finding.ruleName,
     ...(finding.line === undefined ? {} : { line: finding.line }),
     ...(finding.endLine === undefined ? {} : { endLine: finding.endLine }),
+    ...(finding.existingCode === undefined ? {} : { existingCode: finding.existingCode }),
     ...(finding.decision === undefined ? {} : { decision: finding.decision }),
     ...(finding.question === undefined ? {} : { question: finding.question }),
     ...(finding.title === undefined ? {} : { title: finding.title }),
@@ -982,8 +984,15 @@ export async function publishConfirmedClarificationFinding(options: {
   const actionable = actionableClarificationFinding(options.finding);
   // AFTER `actionableClarificationFinding`, so the check sees the finding as it
   // will be published — its decision settled and its question dropped — rather
-  // than the reassessment's intermediate form.
-  const finding = options.checkClaim === undefined ? actionable : await options.checkClaim(actionable);
+  // than the reassessment's intermediate form. And AFTER quote relocation
+  // (#114): the check verifies a claim at file/line, so a miscounted line
+  // would check the wrong declaration. The reassessment contract
+  // (FINDING_OBJECT_CONTRACT) lets a model return `existingCode`, and the
+  // pass is idempotent — orchestrate re-applies it harmlessly.
+  const [actionableRelocated] = relocateFindingsByQuote([actionable], options.diff);
+  const finding = options.checkClaim === undefined
+    ? actionableRelocated
+    : await options.checkClaim(actionableRelocated);
   const orchestration = orchestrate({
     findings: [finding],
     rulesRun: [finding.ruleName],
