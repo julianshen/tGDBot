@@ -1183,6 +1183,80 @@ describe("review", () => {
     vi.restoreAllMocks();
   });
 
+  // Issue #132: `metrics` describes work THIS process did. A consumer keys on
+  // its presence to decide whether a run's numbers are real, so the boundary
+  // has to hold on the paths it actually meets.
+  describe("terminal telemetry", () => {
+    function statusOf(log: { readonly mock: { readonly calls: readonly unknown[][] } }): Record<string, unknown> {
+      const lines = log.mock.calls.flat().map(String).join("\n").split("\n")
+        .filter((line: string) => line.startsWith("TGD_REVIEW_RESULT: "));
+      return JSON.parse(lines.at(-1)!.slice("TGD_REVIEW_RESULT: ".length)) as Record<string, unknown>;
+    }
+
+    it("carries metrics when this process ran the review", async () => {
+      const h = makeHarness({ botComment: null });
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      expect(statusOf(log)).toHaveProperty("metrics");
+      vi.restoreAllMocks();
+    });
+
+    it("carries metrics reporting zero dispatch when every rule was scoped out", async () => {
+      // Codex review of PR #133: I had documented `metrics` as proof that rules
+      // dispatched. This path skips `dispatchRules` entirely and still emits,
+      // so that claim was false. It is not a bug — a review where no rule
+      // applies really did cost nothing to dispatch, and reporting zero is a
+      // measurement rather than an absence — but the contract had to say so.
+      const h = makeHarness({
+        loadResult: { rules: [makeRule({ name: "sql-rule", appliesTo: ["**/*.sql"] })], errors: [] },
+        botComment: null,
+      });
+      h.vcsAdapter.getDiff.mockResolvedValue(
+        "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1,1 +1,2 @@\n keep\n+added",
+      );
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      expect(h.dispatchRules).not.toHaveBeenCalled();
+      // `metrics` IS there — this process ran the review — even though nothing
+      // dispatched. Which is exactly why "metrics proves rules dispatched" was
+      // the wrong contract: the honest one is that metrics describes work THIS
+      // process did, and `rulesSkipped` says what it chose not to do.
+      const status = statusOf(log);
+      expect(status).toHaveProperty("metrics");
+      expect(status.rulesSkipped).toEqual(["sql-rule"]);
+      vi.restoreAllMocks();
+    });
+
+    it("omits metrics when the run skipped before dispatching", async () => {
+      // The head SHA was already reviewed under this config: nothing ran, so
+      // there is nothing to report — and a consumer must not read that as a
+      // review that cost zero.
+      const pr = makePr({ headSha: "cafef00d" });
+      const cfg = expectedConfigHash(makeArgs());
+      const h = makeHarness({
+        pr,
+        botComment: {
+          id: "999",
+          body: `<!-- tgd-review-agent:sha=cafef00d cfg=${cfg} -->`,
+          lastReviewedSha: "cafef00d",
+          reviewedConfig: cfg,
+        },
+      });
+      const log = vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(0);
+
+      const status = statusOf(log);
+      expect(status.status).toBe("skipped");
+      expect(status).not.toHaveProperty("metrics");
+      vi.restoreAllMocks();
+    });
+  });
+
   // Issue #115: a rule declares the paths it reviews, and is not dispatched
   // when the pull request touches none of them.
   describe("path-scoped rules", () => {
