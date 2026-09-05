@@ -21,4 +21,11 @@ import { provideVendoredAsset } from "../src/vendored-assets.js";
 provideVendoredAsset("builtin-rule", builtinRule);
 provideVendoredAsset("reviewer-agent", reviewerAgent);
 
-await import("../src/cli.js");
+// `main()` is called EXPLICITLY rather than relying on `cli.ts`'s direct-run
+// guard. That guard compares `import.meta.url` to `file://${process.argv[1]}`,
+// which holds by luck on macOS and Linux inside a binary and is false on
+// Windows, where argv[1] is a filesystem path and the module URL is a
+// normalized, percent-encoded file URL — so the advertised windows-x64 binary
+// would start and exit without reviewing anything (Codex review of PR #137).
+const { main } = await import("../src/cli.js");
+process.exitCode = await main(process.argv.slice(2));

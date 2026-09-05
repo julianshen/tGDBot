@@ -37,10 +37,22 @@ const provided = new Map<VendoredAsset, string>();
  * for a failed read: a missing file in the Node build is a broken install, and
  * quietly substituting an embedded copy would hide that while shipping a rule
  * the operator's `dist/` does not actually contain.
+ *
+ * Returns a function that withdraws the entry. The binary calls this once at
+ * startup and ignores the result; a caller that provides an asset temporarily
+ * — a test — restores the previous state with it. Without that, this registry
+ * is process-global with no way out, and providing an asset in one test
+ * silently changes every test after it (which it promptly did, Codex review of
+ * PR #137).
  */
-export function provideVendoredAsset(asset: VendoredAsset, contents: string): void {
+export function provideVendoredAsset(asset: VendoredAsset, contents: string): () => void {
   if (contents.length === 0) throw new Error(`vendored asset "${asset}" was provided empty`);
+  const previous = provided.get(asset);
   provided.set(asset, contents);
+  return () => {
+    if (previous === undefined) provided.delete(asset);
+    else provided.set(asset, previous);
+  };
 }
 
 /** The asset's text: whatever was provided, else the file on disk. */

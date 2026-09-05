@@ -40,14 +40,32 @@ describe("vendored assets", () => {
     expect(() => provideVendoredAsset("builtin-rule", "")).toThrow(/provided empty/);
   });
 
-  // LAST in the file, deliberately: the registry is process-global and there is
-  // no way to withdraw an entry — which is correct for its real use, where the
-  // binary populates it once before anything runs. Any test needing the disk
-  // path must come above this one.
   it("prefers provided contents over the file on disk", () => {
-    provideVendoredAsset("builtin-rule", "---\nname: embedded\n---\n\nbody\n");
-    expect(vendoredAssetContents("builtin-rule")).toContain("name: embedded");
-    // The other asset is untouched: providing one does not shadow the rest.
-    expect(vendoredAssetContents("reviewer-agent")).toBe(onDisk("review/builtin-agents/reviewer.md"));
+    const restore = provideVendoredAsset("builtin-rule", "---\nname: embedded\n---\n\nbody\n");
+    try {
+      expect(vendoredAssetContents("builtin-rule")).toContain("name: embedded");
+      // The other asset is untouched: providing one does not shadow the rest.
+      expect(vendoredAssetContents("reviewer-agent")).toBe(onDisk("review/builtin-agents/reviewer.md"));
+    } finally {
+      restore();
+    }
+  });
+
+  it("withdraws a provided asset, restoring the disk read", () => {
+    // The registry is process-global. Before it returned a disposer, providing
+    // an asset in one test silently changed every test after it — which is
+    // exactly what happened when a loader test provided an empty builtin.
+    provideVendoredAsset("builtin-rule", "---\nname: temporary\n---\n\nbody\n")();
+    expect(vendoredAssetContents("builtin-rule")).toBe(onDisk("rules/builtin/tgd-review.md"));
+  });
+
+  it("restores the previous value, not merely the disk", () => {
+    const outer = provideVendoredAsset("builtin-rule", "---\nname: outer\n---\n\nbody\n");
+    try {
+      provideVendoredAsset("builtin-rule", "---\nname: inner\n---\n\nbody\n")();
+      expect(vendoredAssetContents("builtin-rule")).toContain("name: outer");
+    } finally {
+      outer();
+    }
   });
 });

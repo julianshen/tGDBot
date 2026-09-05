@@ -236,15 +236,19 @@ export async function loadRules(rulesDir: string, includeBuiltin: boolean): Prom
     // ships with the tool, and a build that cannot ship a directory supplies
     // its text instead. A user rule file is still read from the filesystem,
     // because that is where the user put it.
-    let raw: string;
+    // A read failure and a successful read of an empty file are different
+    // facts, and only the first is a missing file. Collapsing them let a
+    // zero-byte builtin rule be skipped with no error recorded — so a review
+    // with user rules would proceed silently without the builtin, where
+    // before it reported the missing `name` (Codex review of PR #137).
+    let raw: string | undefined;
     try {
       raw = vendoredAssetContents("builtin-rule");
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       errors.push({ sourcePath: BUILTIN_RULE_PATH, message: `could not read rule file: ${message}` });
-      raw = "";
     }
-    if (raw.length > 0) {
+    if (raw !== undefined) {
       const { rule, error } = parseRuleFile(BUILTIN_RULE_PATH, raw);
       if (rule) candidates.push(rule);
       if (error) errors.push({ sourcePath: BUILTIN_RULE_PATH, message: error });

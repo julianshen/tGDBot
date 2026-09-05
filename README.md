@@ -955,8 +955,8 @@ inline-comment preview without creating notes or discussions.
 
 ## Single-file binary
 
-`bun build --compile` produces a standalone executable with no Node, no
-`node_modules`, and nothing to install:
+`bun build --compile` produces a standalone executable needing no Node and
+nothing to install — with two feature caveats below:
 
 ```bash
 npm run build:binary          # this platform  -> dist/tgd-review-agent
@@ -973,6 +973,23 @@ into Bun's virtual filesystem — so `scripts/bun-entry.ts` imports both as text
 and hands them to `src/vendored-assets.ts` before anything else runs. Without
 that the binary starts, loads **zero rules**, and aborts every review; and the
 subagent seeding that denies it `bash`/`edit`/`write` has nothing to seed.
+
+**Two features need packages the binary cannot embed.** pi loads its
+extensions from a real filesystem path at runtime, so `@juicesharp/rpiv-advisor`
+(the `--advisor` pass) and `pi-subagents` (`--dispatch legacy`) must be
+resolvable on disk. Inside a binary they are not:
+
+| | In a binary |
+|---|---|
+| `--dispatch direct` (default) | works — rule sessions load no extension |
+| `--advisor on` (default) | **degrades**: the pass fails, a warning is printed, and every finding is kept |
+| `--dispatch legacy` | fails — the session cannot be created |
+
+The advisor degradation is not silent — it warns — but it does mean a binary
+review keeps findings a full run would have dropped. Pass `--advisor off` for
+behaviour a binary can actually deliver, or install those packages next to the
+binary, or use the Node build. The error names the situation rather than
+reporting a bare missing module.
 
 **Cross-compilation has one real caveat.** `@ast-grep/napi` is a native module,
 and `bun build --target` embeds the build present in `node_modules` — this

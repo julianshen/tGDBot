@@ -81,6 +81,28 @@ describe("loadRules", () => {
   });
 
   // Issue #115: the scope a rule declares over the paths it reviews.
+  // Codex review of PR #137: routing the builtin through the vendored-asset
+  // seam collapsed "could not read" and "read, and it was empty" into one
+  // branch, so a zero-byte builtin was skipped with no error recorded — a
+  // review with user rules would then proceed silently without it.
+  it("reports an empty builtin rule as a validation error, not silence", async () => {
+    const { provideVendoredAsset } = await import("../../../src/vendored-assets.js");
+    // Withdrawn in the finally: the registry is process-global, and leaving an
+    // empty builtin in it changes every test that runs after this one.
+    const restore = provideVendoredAsset("builtin-rule", "   \n");
+    const dir = await mkdtemp(path.join(os.tmpdir(), "tgd-empty-builtin-"));
+    await writeFile(path.join(dir, "user.md"), "---\nname: user-rule\n---\n\nReview.\n", "utf-8");
+    try {
+      const result = await loadRules(dir, true);
+      expect(result.rules.map((rule) => rule.name)).toEqual(["user-rule"]);
+      expect(result.errors).toHaveLength(1);
+      expect(result.errors[0]?.message).toContain("name");
+    } finally {
+      restore();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("loads applies_to from a scalar or a list", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-applies-to-"));
     await writeFile(
