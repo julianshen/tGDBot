@@ -256,7 +256,7 @@ memories are kept and shown as-is rather than silently reconciled; use
 A repository holds at most **200** active memories, and each is capped at 2,000
 characters. At the limit, `remember` declines and tells you to free a slot.
 
-### Ceilings, dry-run, and exit codes
+## Ceilings, dry-run, and exit codes
 
 Each invocation processes at most 200 event revisions and then exits reporting
 that more remains; the next invocation resumes where it stopped.
@@ -277,7 +277,7 @@ the result was partial. Provider rate limits and auth failures are treated as
 transient: the command stays unanswered, nothing is posted, and the next
 invocation retries it.
 
-### GitLab targets and authentication
+## GitLab targets and authentication
 
 Install `glab` before reviewing GitLab merge requests. The ordinary interactive
 login for GitLab.com or a self-managed host is:
@@ -371,7 +371,7 @@ below) — no special setup required. Do **not** pass `--trust-local-rules`
 when reviewing untrusted PRs; that flag reopens the exact hole this design
 closes by reading `--rules-dir` off the PR's own checkout.
 
-### CLI flags
+## CLI flags
 
 The real flags, as parsed by `src/cli.ts`:
 
@@ -543,7 +543,7 @@ use are `diff-too-large`, `diff-incomplete`, `context-required`,
 `inline-publication-still-ambiguous`; the head-SHA dedup skip carries none, so
 that line keeps the exact shape it had before `reason` existed.
 
-### Repository context
+## Repository context
 
 By default (`--context auto`) each dispatched rule is given a **trusted-base
 context pack** alongside the diff: the part of the repository map that is
@@ -680,7 +680,7 @@ of dependency facts cannot be cut mid-claim. The repository map keeps a floor of
 4000 characters, so a very large dependency section is the one case where the
 combined text exceeds the ceiling.
 
-### Checking a finding's structural claim
+## Checking a finding's structural claim
 
 The confident false positive this exists for is *"this function is never
 called"* — written about code the reviewer cannot see, because the only caller
@@ -776,7 +776,22 @@ to check configuration.
 reference is available in this manifest" until `--context` learns to publish
 them.
 
-### What the review looks like
+### A clarified finding is checked again, not remembered
+
+A `needs-clarification` finding publishes only its question, so there is nothing
+to check yet. When you answer, the reviewer re-runs against the *current* diff
+and returns a freshly written finding — which may carry a claim it did not make
+the first time.
+
+That claim is checked at the moment it is published, against the base as it is
+then. The earlier check is never reused: a verification computed against one
+base and attached to a finding regenerated against another is a stale answer
+presented as a current one, which is the failure this whole feature exists to
+prevent. If the check cannot run — an unreadable worktree, a language the
+checker has no parser for, a review whose base commit is unavailable — the
+finding still publishes, saying `Host check: not performed` and why.
+
+## What the review looks like
 
 Findings are posted as **inline review comments, anchored to the line of the diff
 they are about** — the model CodeRabbit and Cursor Bugbot use, because a finding
@@ -848,7 +863,7 @@ finding. GitLab inline partial failure falls back only the failed findings to
 the summary while successful discussions remain inline. A finding is only ever
 relocated, never dropped.
 
-### Which model runs what?
+## Which model runs what?
 
 A rule file MAY pin its own `provider`/`model`; a rule without a pin runs on
 the **default model** — `--model` if passed, else pi's settings default
@@ -934,7 +949,36 @@ For GitLab, use the same flag with either a complete MR URL or
 `--vcs gitlab --repo ... --pr 42`; the output includes the summary and every
 inline-comment preview without creating notes or discussions.
 
-### Zero-config smoke test (AC-9.2)
+## Working on this repository
+
+```bash
+npm ci
+npm run lint          # eslint over src and test
+npm test              # unit tests, then tsc over src AND test
+npm run benchmark     # review quality and cost against fixed fixtures
+npm run test:smoke    # builds, and runs the smoke tests below
+```
+
+`npm test` runs `tsc -p tsconfig.type-tests.json` after the unit tests, which
+type-checks the **test tree** as well as `src`. A test file that compiles only
+because its mocks are `any` is a test that can stop testing anything without
+failing, so the suite is type-checked on the same terms as the code.
+
+`npm run benchmark` runs six pinned pull requests through the real review flow
+and diffs the result against a committed baseline, so a change to a prompt, a
+rule, or the dispatch path can be argued from numbers rather than intuition. It
+spends nothing by default — no network, no model — because it replays recorded
+dispatch results. `test/benchmark/README.md` explains what those numbers do and
+do not mean, how to read a baseline diff, and how to add a fixture. **Read it
+before quoting a figure from it**: in recorded mode the quality numbers are a
+property of the recording, not of the reviewer.
+
+The same comparison runs inside `npm test`, so a change that moves a benchmark
+number fails there too rather than waiting for someone to remember the command.
+When it fails, the failure *is* the measurement — read which metric moved before
+reaching for `--update`.
+
+## Zero-config smoke test (AC-9.2)
 
 Proves the "works with zero user configuration" claim: no `.review/rules/`
 directory, only the vendored built-in `tgd-review` rule.
@@ -983,7 +1027,7 @@ request, provider credentials, and authenticated network access.
    note and inline discussions appear, then push a commit and confirm stale bot
    discussions are resolved on the next run.
 
-### Authoring a rule file
+## Authoring a rule file
 
 Rule files live under `.review/rules/*.md` (configurable via
 `--rules-dir`) and supplement (not replace) the built-in `tgd-review` rule
@@ -1153,7 +1197,7 @@ mislead the subagent's own analysis/output. See "⚠️ Security
 Considerations" at the top of this document and "Read-only enforcement"
 below for the full picture.
 
-### Provider API keys
+## Provider API keys
 
 Each dispatched rule runs as a pi SDK agent session; API keys are resolved
 by the SDK's `AuthStorage`, which (absent a stored `auth.json`) falls back
@@ -1320,7 +1364,7 @@ does not need substituting into the JSON itself; pi reads the environment
 variable at request time. Provide `OPENROUTER_API_KEY` (or whichever provider
 you're using) in the environment the same way as `ANTHROPIC_API_KEY` above.
 
-### Read-only enforcement
+## Read-only enforcement
 
 See also: "⚠️ Security Considerations" at the top of this document for the
 prominent version of this section, and

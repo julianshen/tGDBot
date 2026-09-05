@@ -23,11 +23,11 @@ const readme = readFileSync(path.join(repoRoot, "README.md"), "utf8");
 // or guts the walkthrough while leaving the heading behind.
 describe("AC-9.2: README documents the zero-config smoke test procedure", () => {
   it("AC-9.2: README has a 'Zero-config smoke test' section", () => {
-    expect(readme).toMatch(/^### Zero-config smoke test/m);
+    expect(readme).toMatch(/^## Zero-config smoke test/m);
   });
 
   it("AC-9.2: the smoke-test section walks through the fresh-clone, zero-config procedure", () => {
-    const startMatch = readme.match(/^### Zero-config smoke test.*$/m);
+    const startMatch = readme.match(/^## Zero-config smoke test.*$/m);
     expect(startMatch).not.toBeNull();
     const startIndex = readme.indexOf(startMatch![0]);
 
@@ -59,7 +59,7 @@ describe("direct workflow scheduling documentation", () => {
 });
 
 describe("GitLab review documentation", () => {
-  const gitLabHeading = /^### GitLab targets and authentication.*$/m;
+  const gitLabHeading = /^## GitLab targets and authentication.*$/m;
   const gitLabStart = readme.match(gitLabHeading);
   const gitLabSection = (() => {
     if (gitLabStart === null) return "";
@@ -161,7 +161,13 @@ describe("conversational review and local memory documentation", () => {
     expect(pollSection).toMatch(/never cross(?:es)? repositor|per repository|repository-local/i);
     // Two state roots for one repository cannot coordinate, so replies duplicate.
     expect(pollSection).toMatch(/duplicate/i);
-    expect(pollSection).toMatch(/back ?up|delete/i);
+    // Widened to the prose the README actually uses ("Back it up…",
+    // "Deleting it loses…"). The old pattern matched neither, and passed only
+    // because the section extractor ran to the end of the file — the README
+    // had no further level-2 heading, so this "section" was everything after
+    // it, and the match came from an unrelated paragraph about deleted callers.
+    expect(pollSection).toMatch(/back(?: it)? ?up/i);
+    expect(pollSection).toMatch(/delet(?:e|ing)/i);
   });
 
   it("documents memory trust, ceilings, and exit codes", () => {
