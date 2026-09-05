@@ -256,7 +256,7 @@ memories are kept and shown as-is rather than silently reconciled; use
 A repository holds at most **200** active memories, and each is capped at 2,000
 characters. At the limit, `remember` declines and tells you to free a slot.
 
-## Ceilings, dry-run, and exit codes
+### Ceilings, dry-run, and exit codes
 
 Each invocation processes at most 200 event revisions and then exits reporting
 that more remains; the next invocation resumes where it stopped.
@@ -495,7 +495,7 @@ reviewed), `1` fatal (e.g. every rule failed to load), `2` partial (at least
 one rule ran, but something also failed — the comment is still posted and
 the failure is noted in it).
 
-#### The `TGD_REVIEW_RESULT` line
+### The `TGD_REVIEW_RESULT` line
 
 When the review reaches a terminal state it writes a machine-readable summary
 to stdout, prefixed `TGD_REVIEW_RESULT: `, carrying `status`, `findingsCount`,
@@ -779,9 +779,13 @@ them.
 ### A clarified finding is checked again, not remembered
 
 A `needs-clarification` finding publishes only its question, so there is nothing
-to check yet. When you answer, the reviewer re-runs against the *current* diff
-and returns a freshly written finding — which may carry a claim it did not make
-the first time.
+to check yet. When you answer **while the head the question was asked about is
+still current**, the reviewer re-runs against that diff and returns a freshly
+written finding — which may carry a claim it did not make the first time.
+
+If a commit landed first, the answer is recorded as stale: the reviewer is not
+re-run and the question does not become a finding, because an answer about code
+that has since changed cannot be turned into a current claim.
 
 That claim is checked at the moment it is published, against the base as it is
 then. The earlier check is never reused: a verification computed against one
@@ -905,7 +909,7 @@ authenticated candidate is used instead — rather than failing the whole review
 A model id may carry a thinking suffix (`claude-opus-4-5:high`); it is stripped
 before lookup, so it resolves the same way it does for the rule's own subagent.
 
-#### Model tiers: what the absence of a pin chooses for you
+### Model tiers: what the absence of a pin chooses for you
 
 When rules run unpinned, the review logs what they inherited:
 
@@ -1000,7 +1004,7 @@ directory, only the vendored built-in `tgd-review` rule.
    against the same unchanged head SHA is skipped instead, per the dedup
    behavior described above).
 
-### Opt-in GitLab smoke test
+## Opt-in GitLab smoke test
 
 This live procedure is intentionally not part of the default test suite. It
 requires a user-provided GitLab.com or self-managed project, a real open merge

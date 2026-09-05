@@ -170,6 +170,27 @@ describe("conversational review and local memory documentation", () => {
     expect(pollSection).toMatch(/delet(?:e|ing)/i);
   });
 
+  // The ceilings prose is asserted against ITS OWN section, not against the
+  // whole conversational chapter. Reading the chapter meant `200`, `--dry-run`
+  // and "exits" could be satisfied by unrelated text elsewhere in it — the same
+  // accidental coverage that let a local-state assertion pass against a
+  // paragraph 500 lines away (CodeRabbit and Codex on PR #135).
+  const ceilingsSection = (() => {
+    const start = readme.match(/^### Ceilings, dry-run, and exit codes.*$/m);
+    if (start === null) return "";
+    const from = readme.indexOf(start[0]) + start[0].length;
+    const rest = readme.slice(from);
+    const next = rest.match(/^#{1,3} .*$/m);
+    return next === null ? rest : rest.slice(0, next.index);
+  })();
+
+  it("documents the poll ceilings and exit codes in their own section", () => {
+    expect(ceilingsSection, "the ceilings section was not found").not.toBe("");
+    expect(ceilingsSection).toContain("200");
+    expect(ceilingsSection).toMatch(/--dry-run/);
+    expect(ceilingsSection).toMatch(/exit/i);
+  });
+
   it("documents memory trust, ceilings, and exit codes", () => {
     expect(pollSection).toMatch(/any(?:one|\s+commenter)/i);
     expect(pollSection).toMatch(/advisory/i);
