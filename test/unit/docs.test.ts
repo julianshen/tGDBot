@@ -23,11 +23,11 @@ const readme = readFileSync(path.join(repoRoot, "README.md"), "utf8");
 // or guts the walkthrough while leaving the heading behind.
 describe("AC-9.2: README documents the zero-config smoke test procedure", () => {
   it("AC-9.2: README has a 'Zero-config smoke test' section", () => {
-    expect(readme).toMatch(/^### Zero-config smoke test/m);
+    expect(readme).toMatch(/^## Zero-config smoke test/m);
   });
 
   it("AC-9.2: the smoke-test section walks through the fresh-clone, zero-config procedure", () => {
-    const startMatch = readme.match(/^### Zero-config smoke test.*$/m);
+    const startMatch = readme.match(/^## Zero-config smoke test.*$/m);
     expect(startMatch).not.toBeNull();
     const startIndex = readme.indexOf(startMatch![0]);
 
@@ -59,7 +59,7 @@ describe("direct workflow scheduling documentation", () => {
 });
 
 describe("GitLab review documentation", () => {
-  const gitLabHeading = /^### GitLab targets and authentication.*$/m;
+  const gitLabHeading = /^## GitLab targets and authentication.*$/m;
   const gitLabStart = readme.match(gitLabHeading);
   const gitLabSection = (() => {
     if (gitLabStart === null) return "";
@@ -161,7 +161,34 @@ describe("conversational review and local memory documentation", () => {
     expect(pollSection).toMatch(/never cross(?:es)? repositor|per repository|repository-local/i);
     // Two state roots for one repository cannot coordinate, so replies duplicate.
     expect(pollSection).toMatch(/duplicate/i);
-    expect(pollSection).toMatch(/back ?up|delete/i);
+    // Widened to the prose the README actually uses ("Back it up…",
+    // "Deleting it loses…"). The old pattern matched neither, and passed only
+    // because the section extractor ran to the end of the file — the README
+    // had no further level-2 heading, so this "section" was everything after
+    // it, and the match came from an unrelated paragraph about deleted callers.
+    expect(pollSection).toMatch(/back(?: it)? ?up/i);
+    expect(pollSection).toMatch(/delet(?:e|ing)/i);
+  });
+
+  // The ceilings prose is asserted against ITS OWN section, not against the
+  // whole conversational chapter. Reading the chapter meant `200`, `--dry-run`
+  // and "exits" could be satisfied by unrelated text elsewhere in it — the same
+  // accidental coverage that let a local-state assertion pass against a
+  // paragraph 500 lines away (CodeRabbit and Codex on PR #135).
+  const ceilingsSection = (() => {
+    const start = readme.match(/^### Ceilings, dry-run, and exit codes.*$/m);
+    if (start === null) return "";
+    const from = readme.indexOf(start[0]) + start[0].length;
+    const rest = readme.slice(from);
+    const next = rest.match(/^#{1,3} .*$/m);
+    return next === null ? rest : rest.slice(0, next.index);
+  })();
+
+  it("documents the poll ceilings and exit codes in their own section", () => {
+    expect(ceilingsSection, "the ceilings section was not found").not.toBe("");
+    expect(ceilingsSection).toContain("200");
+    expect(ceilingsSection).toMatch(/--dry-run/);
+    expect(ceilingsSection).toMatch(/exit/i);
   });
 
   it("documents memory trust, ceilings, and exit codes", () => {
