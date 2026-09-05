@@ -1,35 +1,34 @@
-// Issue #132: `metrics` is present on the TGD_REVIEW_RESULT line if and only
-// if the process dispatched rules.
+// Issue #132: what `metrics` on the TGD_REVIEW_RESULT line actually promises.
 //
-// That is the invariant an aggregator keys on, and it is only useful if the
-// set of telemetry-free emitters is knowable. It is documented in the README
-// as a table of `reason` values; this pins the table against the source, so a
-// new emitter cannot join the list silently and leave the documentation
-// describing a contract the code no longer keeps.
+// The first version of this test pinned a table of `reason` values and claimed
+// that a reason identified a telemetry-free line. Codex showed both halves
+// wrong (PR #133): `inline-publication-ambiguous` is emitted WITH metrics by a
+// run that dispatched and WITHOUT them by a recovery replaying a manifest, so
+// a reason cannot classify anything; and the scan read only `src/cli.ts`,
+// missing every emitter in the publication module.
 //
-// A SOURCE-SHAPE test, which is unusual here and deliberate. The alternative
-// is nine end-to-end tests driving paths that mostly have coverage already,
-// and none of them would notice a TENTH emitter being added — which is the
-// thing that actually goes wrong.
+// So the contract is stated on `metrics` itself — it describes work THIS
+// process did — and checked two ways: behaviourally, on the paths a consumer
+// actually meets, and structurally, so a new emitter cannot join without the
+// documented reason list moving with it.
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const cliPath = fileURLToPath(new URL("../../../src/cli.ts", import.meta.url));
+const sources = ["src/cli.ts", "src/review/review-publication.ts"] as const;
 
 /**
- * The reasons a status line carries when the run dispatched nothing.
+ * Every `reason` a status line currently carries.
  *
- * Kept in step with the table under "The `TGD_REVIEW_RESULT` line" in the
- * README. `null` is the head-SHA dedup skip, which carries no `reason` at all
- * — it predates the field and keeps its original shape so anyone already
- * parsing that line sees no change.
+ * NOT a telemetry classifier — see the file header. It exists so that adding a
+ * reason without documenting it fails, and so that deleting one without
+ * removing it from the README fails too.
  */
-const TELEMETRY_FREE_REASONS: readonly (string | null)[] = [
-  null,
+const KNOWN_REASONS: readonly string[] = [
   "context-required",
   "diff-incomplete",
   "diff-too-large",
+  "inline-publication-ambiguous",
   "inline-publication-awaiting-consistency",
   "inline-publication-still-ambiguous",
   "recovered-ambiguous-inline-review",
@@ -37,100 +36,66 @@ const TELEMETRY_FREE_REASONS: readonly (string | null)[] = [
   "recovered-pending-review-dry-run",
 ];
 
-/** Every `logStatus({ … })` argument in the file, as source text. */
-function statusCalls(source: string): string[] {
-  const calls: string[] = [];
-  const marker = "logStatus({";
-  let from = 0;
-  for (;;) {
-    const start = source.indexOf(marker, from);
-    if (start === -1) return calls;
-    // Balanced-brace scan from the opening `{`. The arguments here are plain
-    // object literals — no template literals spanning braces — so counting is
-    // enough, and a malformed count would surface as a failing parse rather
-    // than a quietly wrong answer.
-    let depth = 0;
-    let index = start + marker.length - 1;
-    for (; index < source.length; index += 1) {
-      if (source[index] === "{") depth += 1;
-      else if (source[index] === "}") {
-        depth -= 1;
-        if (depth === 0) break;
+/**
+ * The `reason:` literals across every status emitter in the production sources.
+ *
+ * Three call shapes emit one: `logStatus({`, the publication module's
+ * `emitStatus({`, and its direct `options.logStatus?.({`. Reading only the
+ * first missed two thirds of them.
+ *
+ * A literal preceded by an equality operator is a comparison operand rather
+ * than a reason — one emitter picks between two with `status === "none" ? …`,
+ * and counting that operand reported `"none"` as an undocumented reason.
+ */
+async function emittedReasons(): Promise<Set<string>> {
+  const found = new Set<string>();
+  for (const relative of sources) {
+    const source = await readFile(
+      fileURLToPath(new URL(`../../../${relative}`, import.meta.url)),
+      "utf8",
+    );
+    for (const match of source.matchAll(/reason:\s*([^\n]*)/gu)) {
+      for (const literal of match[1]!.matchAll(/(===|!==|==|!=)?\s*["']([^"']+)["']/gu)) {
+        if (literal[1] === undefined) found.add(literal[2]!);
       }
     }
-    calls.push(source.slice(start, index + 1));
-    from = index + 1;
   }
+  return found;
 }
 
-/**
- * The `reason:` string literals in one call, or `null` when it sets none.
- *
- * One emitter picks its reason with a ternary, so the expression contains a
- * literal that is a COMPARISON OPERAND rather than a reason — taking every
- * literal after `reason:` reported `"none"` from `status === "none" ? …` as an
- * undocumented reason. Literals preceded by an equality operator are dropped
- * for that reason, which is narrow enough to state and wrong in no case this
- * file contains.
- */
-function reasonsOf(call: string): (string | null)[] {
-  const start = call.indexOf("reason:");
-  // A ternary yields two; a plain assignment one; absence means the dedup skip.
-  if (start === -1) return [null];
-  const expression = call.slice(start, endOfProperty(call, start));
-  const found = [...expression.matchAll(/(===|!==|==|!=)?\s*["']([^"']+)["']/gu)]
-    .filter((match) => match[1] === undefined)
-    .map((match) => match[2]!);
-  return found.length === 0 ? [null] : found;
-}
+describe("TGD_REVIEW_RESULT reasons", () => {
+  it("documents every reason the code emits, and emits every reason it documents", async () => {
+    const emitted = await emittedReasons();
 
-/** Where the `reason:` property ends: the next comma or brace at its own depth. */
-function endOfProperty(call: string, from: number): number {
-  let depth = 0;
-  for (let index = from; index < call.length; index += 1) {
-    const char = call[index]!;
-    if (char === "{" || char === "(") depth += 1;
-    else if (char === "}" || char === ")") {
-      if (depth === 0) return index;
-      depth -= 1;
-    } else if (char === "," && depth === 0) return index;
-  }
-  return call.length;
-}
+    // A guard on the guard: a scan that matches nothing would pass everything.
+    expect(emitted.size, "no reasons found; the scanner needs updating").toBeGreaterThan(5);
 
-describe("TGD_REVIEW_RESULT telemetry contract", () => {
-  it("emits metrics if and only if the run dispatched, and every other reason is documented", async () => {
-    const source = await readFile(cliPath, "utf8");
-    const calls = statusCalls(source);
-
-    // A guard on the guard: if the scan stops finding call sites — renamed
-    // helper, reformatted arguments — this test would pass by examining
-    // nothing at all.
-    expect(calls.length, "no logStatus call sites found; the scanner needs updating").toBeGreaterThan(5);
-
-    const undocumented = calls
-      .filter((call) => !call.includes("metrics:"))
-      .flatMap(reasonsOf)
-      .filter((reason) => !TELEMETRY_FREE_REASONS.includes(reason));
-
-    expect(
-      undocumented,
-      "a status line without `metrics` carries a reason the README's table does not list — " +
-        "add it there and here, or give the emitter its run's metrics",
-    ).toEqual([]);
+    // Both directions, for real this time. The previous version only checked
+    // that each hard-coded constant appeared somewhere in the README, so a
+    // reason deleted from the source left the table stale and both tests green.
+    expect([...emitted].sort()).toEqual([...KNOWN_REASONS].sort());
   });
 
-  it("keeps the documented reasons in step with the README", async () => {
-    // The table is the contract a consumer reads. A reason retired from the
-    // code but left in the table is as misleading as one added and not
-    // documented, so both directions are checked.
+  it("lists those reasons in the README", async () => {
     const readme = await readFile(
       fileURLToPath(new URL("../../../README.md", import.meta.url)),
       "utf8",
     );
-    for (const reason of TELEMETRY_FREE_REASONS) {
-      if (reason === null) continue;
-      expect(readme, `the README table does not mention "${reason}"`).toContain(`\`${reason}\``);
+    for (const reason of KNOWN_REASONS) {
+      expect(readme, `the README does not mention "${reason}"`).toContain(`\`${reason}\``);
     }
+  });
+
+  it("does not claim a reason identifies a telemetry-free line", async () => {
+    // The correction this file exists to record. `inline-publication-ambiguous`
+    // is emitted by a dispatching run that owes its telemetry AND by a recovery
+    // that has none, so any documentation keying telemetry off `reason` is
+    // wrong however carefully its table is maintained.
+    const publication = await readFile(
+      fileURLToPath(new URL("../../../src/review/review-publication.ts", import.meta.url)),
+      "utf8",
+    );
+    const ambiguous = publication.slice(publication.indexOf('reason: "inline-publication-ambiguous"'));
+    expect(ambiguous.slice(0, 400)).toContain("options.metrics");
   });
 });

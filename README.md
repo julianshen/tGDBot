@@ -497,39 +497,51 @@ the failure is noted in it).
 
 #### The `TGD_REVIEW_RESULT` line
 
-The last line the process writes to stdout is a machine-readable summary,
-prefixed `TGD_REVIEW_RESULT: `. It always carries `status`, `findingsCount`,
-`rulesRun` and `rulesFailed`, and optionally `reason`, `loadErrors`,
+When the review reaches a terminal state it writes a machine-readable summary
+to stdout, prefixed `TGD_REVIEW_RESULT: `, carrying `status`, `findingsCount`,
+`rulesRun` and `rulesFailed`, plus optionally `reason`, `loadErrors`,
 `rulesSkipped` and `metrics`.
 
-**`metrics` is present if and only if this process dispatched rules.** That is
-the field to key on when aggregating cost across runs — `dispatchChars`,
-`durationMs` and the rest live there, and a line without it is not a run that
-cost nothing, it is a run that did no work to cost anything.
+**Some exits emit no line at all.** A run that aborts before it can report —
+every rule failing to load (exit `1`), an argument parse failure, or an
+unhandled provider error — exits with a message on stderr and nothing on
+stdout. A consumer must treat a missing line as a failed run, not as a run
+still in progress.
 
-A line arrives without `metrics` in these cases, identified by `reason`:
+**`metrics` describes work *this process* did.** It is present when this
+process ran the review itself, and absent when it skipped before dispatching,
+recovered another process's published work, or gave up early. That is the
+field to key on when aggregating cost:
 
-| `reason` | What happened |
-|---|---|
-| *(absent)* | The head SHA was already reviewed under this config; nothing ran. |
-| `diff-too-large` | The diff exceeded `--max-diff-chars`. |
-| `diff-incomplete` | The provider could not hand over the whole diff (#33). |
-| `context-required` | `--context require` and the context could not be built. |
-| `recovered-pending-review` | A previous process published and died before reporting; this one finalized its marker. |
-| `recovered-pending-review-dry-run` | The same, under `--dry-run`. |
-| `recovered-ambiguous-inline-review` | A previous process's inline write was ambiguous and has now been reconciled. |
-| `inline-publication-awaiting-consistency` | The provider has not yet made an accepted inline write visible. |
-| `inline-publication-still-ambiguous` | It stayed ambiguous past the retry budget. |
+```
+metrics present  ->  this run's numbers are real; count it
+metrics absent   ->  this process did no reviewing; exclude it, do not count zero
+```
 
-The three `recovered-*` cases are worth understanding if you aggregate. The
-process that *did* the work crashed before it could report; the process that
-recovers it dispatched nothing and so has nothing to report. Its telemetry is
-not lost in transit — it was never produced by the process you are reading.
-An aggregator should treat these runs as absent rather than as zero, or the
-average cost per review drifts down every time a run crashes.
+Excluding matters more than it sounds. A recovering process finalizes a marker
+left by one that crashed after publishing; it dispatches nothing, so it has
+nothing to report, and the run that *did* the work never got to report either.
+Counting those as zero-cost runs drifts an average down every time something
+crashes — and crashes are not distributed randomly with respect to cost.
 
-`test/unit/cli/status-telemetry.test.ts` pins this table against the source,
-so a new emitter cannot join the list without the documentation moving too.
+**`metrics` is not proof that rules dispatched.** A run where every rule
+declares an `applies_to` this pull request does not match reaches its terminal
+result normally and reports `metrics` with `rulesSkipped` naming what it
+declined to run — a review that legitimately cost nothing to dispatch is still
+a review this process performed. Individual fields inside `metrics` appear only
+when there was something to measure, so read a missing one as "not measured"
+rather than as zero.
+
+**Do not key on `reason` for this.** It explains *what happened*, and the same
+reason can appear with and without telemetry: `inline-publication-ambiguous` is
+emitted by a run that dispatched and paid its full prompt cost, and also by a
+recovery replaying a persisted manifest, which did not. Reasons currently in
+use are `diff-too-large`, `diff-incomplete`, `context-required`,
+`recovered-pending-review`, `recovered-pending-review-dry-run`,
+`recovered-ambiguous-inline-review`, `inline-publication-ambiguous`,
+`inline-publication-awaiting-consistency` and
+`inline-publication-still-ambiguous`; the head-SHA dedup skip carries none, so
+that line keeps the exact shape it had before `reason` existed.
 
 ### Repository context
 
