@@ -53,11 +53,32 @@ export function extractPiExtensionEntry(
 // node_modules packages that declare their pi extension entry point in
 // their own package.json, so the same require.resolve + "pi.extensions[0]"
 // read applies to either.
+/**
+ * True when this code is running from a single-file binary.
+ *
+ * Bun compiles the module graph into a virtual filesystem rooted at `/$bunfs`,
+ * and `createRequire` from a path inside it cannot see a real `node_modules`.
+ * Worth naming in the error, because the bare module-not-found it produces
+ * otherwise sends a reader looking for a broken install (Codex review of
+ * PR #137).
+ */
+function runningFromBundle(): boolean {
+  return import.meta.url.includes("/$bunfs/") || import.meta.url.includes("/B:/~BUN/");
+}
+
 function resolvePiExtensionEntryPath(packageName: string): string {
   let packageJsonPath: string;
   try {
     packageJsonPath = require.resolve(`${packageName}/package.json`);
   } catch (error) {
+    if (runningFromBundle()) {
+      throw new Error(
+        `${packageName} cannot be resolved from a single-file binary: pi loads extensions ` +
+          `from a real path at runtime, and this build embeds no node_modules. ` +
+          `Install ${packageName} beside the binary, or run the Node build.`,
+        { cause: error },
+      );
+    }
     // Newer extension packages may export their entry point while deliberately
     // hiding package.json. Resolve the public entry and walk upward to the
     // package root instead; this retains compatibility with older packages

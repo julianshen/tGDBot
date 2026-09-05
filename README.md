@@ -953,6 +953,55 @@ For GitLab, use the same flag with either a complete MR URL or
 `--vcs gitlab --repo ... --pr 42`; the output includes the summary and every
 inline-comment preview without creating notes or discussions.
 
+## Single-file binary
+
+`bun build --compile` produces a standalone executable needing no Node and
+nothing to install — with two feature caveats below:
+
+```bash
+npm run build:binary          # this platform  -> dist/tgd-review-agent
+npm run build:binary:all      # every target   -> dist/binaries/
+./dist/tgd-review-agent review --pr 42
+```
+
+Requires [Bun](https://bun.sh) to build. Running the result does not.
+
+**Two files are embedded rather than read.** The builtin review rule and the
+restricted `reviewer` agent definition are normally read from disk next to the
+compiled output. A binary has no such directory — `import.meta.url` resolves
+into Bun's virtual filesystem — so `scripts/bun-entry.ts` imports both as text
+and hands them to `src/vendored-assets.ts` before anything else runs. Without
+that the binary starts, loads **zero rules**, and aborts every review; and the
+subagent seeding that denies it `bash`/`edit`/`write` has nothing to seed.
+
+**Two features need packages the binary cannot embed.** pi loads its
+extensions from a real filesystem path at runtime, so `@juicesharp/rpiv-advisor`
+(the `--advisor` pass) and `pi-subagents` (`--dispatch legacy`) must be
+resolvable on disk. Inside a binary they are not:
+
+| | In a binary |
+|---|---|
+| `--dispatch direct` (default) | works — rule sessions load no extension |
+| `--advisor on` (default) | **degrades**: the pass fails, a warning is printed, and every finding is kept |
+| `--dispatch legacy` | fails — the session cannot be created |
+
+The advisor degradation is not silent — it warns — but it does mean a binary
+review keeps findings a full run would have dropped. Pass `--advisor off` for
+behaviour a binary can actually deliver, or install those packages next to the
+binary, or use the Node build. The error names the situation rather than
+reporting a bare missing module.
+
+**Cross-compilation has one real caveat.** `@ast-grep/napi` is a native module,
+and `bun build --target` embeds the build present in `node_modules` — this
+machine's. A Linux binary cross-built on a Mac runs fine until a rule attaches
+a structural claim, and then fails inside `--structural-checks on`. Build each
+target on its own platform, or in a matching container, when that feature
+matters. `build:binary:all` prints this warning every time rather than relying
+on you having read it here.
+
+The binary is about 90 MB, most of it the TypeScript compiler that
+`--structural-checks` uses to resolve symbols, and the Bun runtime itself.
+
 ## Working on this repository
 
 ```bash
@@ -961,6 +1010,7 @@ npm run lint          # eslint over src and test
 npm test              # unit tests, then tsc over src AND test
 npm run benchmark     # review quality and cost against fixed fixtures
 npm run test:smoke    # builds, and runs the smoke tests below
+npm run build:binary  # single-file executable (needs bun); see below
 ```
 
 `npm test` runs `tsc -p tsconfig.type-tests.json` after the unit tests, which

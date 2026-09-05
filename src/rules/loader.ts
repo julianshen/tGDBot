@@ -8,8 +8,8 @@
 // `errors` and excluded from `rules`.
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import matter from "gray-matter";
+import { vendoredAssetContents, vendoredAssetPath } from "../vendored-assets.js";
 import { globToRegExp } from "./glob.js";
 import type { RuleDefinition } from "./types.js";
 
@@ -18,11 +18,11 @@ export interface LoadResult {
   errors: { sourcePath: string; message: string }[];
 }
 
-// Resolved relative to this module's own location (not process.cwd()) so it
-// works correctly whether running from src/ in dev (tsx/vitest) or from
-// dist/ after `npm run build` — the build script copies this .md file
-// alongside the compiled loader.js at dist/rules/builtin/tgd-review.md.
-const BUILTIN_RULE_PATH = fileURLToPath(new URL("./builtin/tgd-review.md", import.meta.url));
+// The builtin rule's location, kept only so a parse error can name the file a
+// reader would go and look at. Its CONTENTS come from `vendored-assets`, which
+// reads that path on Node and hands back embedded text inside a single-file
+// binary, where the directory the build copies into does not exist.
+const BUILTIN_RULE_PATH = vendoredAssetPath("builtin-rule");
 
 interface ParsedRuleFile {
   rule?: RuleDefinition;
@@ -232,9 +232,27 @@ export async function loadRules(rulesDir: string, includeBuiltin: boolean): Prom
   }
 
   if (includeBuiltin) {
-    const { rule, loadError } = await loadOneRuleFile(BUILTIN_RULE_PATH);
-    if (rule) candidates.push(rule);
-    if (loadError) errors.push(loadError);
+    // Read through the vendored-asset seam rather than off disk: this one file
+    // ships with the tool, and a build that cannot ship a directory supplies
+    // its text instead. A user rule file is still read from the filesystem,
+    // because that is where the user put it.
+    // A read failure and a successful read of an empty file are different
+    // facts, and only the first is a missing file. Collapsing them let a
+    // zero-byte builtin rule be skipped with no error recorded — so a review
+    // with user rules would proceed silently without the builtin, where
+    // before it reported the missing `name` (Codex review of PR #137).
+    let raw: string | undefined;
+    try {
+      raw = vendoredAssetContents("builtin-rule");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      errors.push({ sourcePath: BUILTIN_RULE_PATH, message: `could not read rule file: ${message}` });
+    }
+    if (raw !== undefined) {
+      const { rule, error } = parseRuleFile(BUILTIN_RULE_PATH, raw);
+      if (rule) candidates.push(rule);
+      if (error) errors.push({ sourcePath: BUILTIN_RULE_PATH, message: error });
+    }
   }
 
   const deduped = dedupeByName(candidates);

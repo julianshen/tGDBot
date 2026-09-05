@@ -13,7 +13,9 @@
     "test:smoke": "vitest run test/smoke",
     "test:all": "vitest run",
     "lint": "eslint src test",
-    "benchmark": "npm run build && node dist/benchmark/cli.js"
+    "benchmark": "npm run build && node dist/benchmark/cli.js",
+    "build:binary": "bun build --compile --minify --sourcemap scripts/bun-entry.ts --outfile dist/tgd-review-agent",
+    "build:binary:all": "bun run scripts/build-binaries.ts"
   },
   "engines": {
     "node": ">=22.19.0"
