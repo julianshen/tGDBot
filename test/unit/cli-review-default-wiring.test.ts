@@ -105,6 +105,8 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     suggestions: "on",
     dependencyFacts: "off",
     structuralChecks: "off",
+    // Issue #139: off by default, like structural checks.
+    securityPass: "off",
     dryRun: false,
     trustLocalRules: false,
     dispatch: "direct",

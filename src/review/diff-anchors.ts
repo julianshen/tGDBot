@@ -418,6 +418,86 @@ export interface RemovedLines {
   readonly positioned: boolean;
 }
 
+/**
+ * Head-side line number -> the text added at it, per file.
+ *
+ * Deliberately NOT a parameterisation of `removedLinesByFile`. The two differ
+ * in more than a sign: a removed line belongs to the file at the BASE, so that
+ * function aliases a rename's removals onto the source path, while an added
+ * line only ever belongs to the head path — recording it under a pre-rename
+ * name would report a secret as introduced in a file the head does not have.
+ * Sharing one body would mean a flag deciding which of those two meanings
+ * applied, in a parser whose edge cases took several review rounds to settle.
+ *
+ * Unparseable hunk headers drop that file's positions rather than guessing,
+ * because a caller uses these numbers to point at a line.
+ */
+export function addedLinesByFile(diff: string): Map<string, Map<number, string>> {
+  const added = new Map<string, Map<number, string>>();
+  let key = "";
+  let newLine: number | undefined;
+  let inHunk = false;
+  let plus: string | undefined;
+
+  const entry = (): Map<number, string> => {
+    let found = added.get(key);
+    if (found === undefined) {
+      found = new Map();
+      added.set(key, found);
+    }
+    return found;
+  };
+
+  for (const line of diff.split("\n")) {
+    const header = parseDiffGitHeader(line);
+    if (header !== undefined) {
+      key = header.b || header.a;
+      newLine = undefined;
+      inHunk = false;
+      plus = undefined;
+      continue;
+    }
+    if (key === "") continue;
+
+    if (line.startsWith("@@")) {
+      inHunk = true;
+      const hunk = HUNK_RE.exec(line);
+      // Group 3 is the new-side start; an unparseable header means every later
+      // line in this file is unpositioned, so nothing is recorded for it.
+      newLine = hunk === null ? undefined : Number(hunk[3]);
+      continue;
+    }
+    // Before the first hunk these are file headers; inside one they are
+    // content, and an added line reading `+++x` is a real addition. Same
+    // distinction `removedLinesByFile` documents.
+    if (!inHunk && (line.startsWith("--- ") || line.startsWith("+++ "))) {
+      if (line.startsWith("+++ ")) {
+        const value = line.slice(4).split("\t")[0] ?? "";
+        if (value !== "/dev/null" && !value.startsWith('"')) {
+          const bare = value.startsWith("b/") ? value.slice(2) : value;
+          if (bare !== "") plus = bare;
+        }
+      }
+      if (plus !== undefined) key = plus;
+      continue;
+    }
+    if (!inHunk && (line.startsWith("---") || line.startsWith("+++"))) continue;
+    if (line.startsWith("\\")) continue;
+
+    if (line.startsWith("+")) {
+      if (newLine !== undefined) {
+        entry().set(newLine, line.slice(1));
+        newLine += 1;
+      }
+      continue;
+    }
+    if (line.startsWith("-")) continue;
+    if (newLine !== undefined) newLine += 1;
+  }
+
+  return added;
+}
+
 export function removedLinesByFile(diff: string): Map<string, RemovedLines> {
   interface Accumulator {
     readonly byLine: Map<number, string>;

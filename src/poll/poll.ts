@@ -118,6 +118,7 @@ import type {
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
 import { CODEX_SECURITY_POLICY } from "../review/codex-security-results.js";
+import { SECRETS_POLICY, SECRETS_RULE_NAME } from "../review/security/secrets.js";
 import type {
   ConversationAdapter,
   ReviewActivityEvent,
@@ -923,6 +924,10 @@ function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): Review
     // different one (PR #54 review).
     dependencyFacts: config.dependencyFacts,
     structuralChecks: config.structuralChecks,
+    // A polled review runs the host security detectors under the poll's own
+    // setting, for the same reason it runs under the poll's dependency-facts
+    // setting: an operator asked for one configuration, not another.
+    securityPass: config.securityPass,
     prIntent: config.prIntent,
     suggestions: config.suggestions,
     dryRun: config.dryRun,
@@ -1137,7 +1142,14 @@ async function planConversationReply(input: {
   const importedScanFinding = resolution.ledger.reviewOptions.codexScanResults === true &&
     resolution.ledger.finding.ruleName === "codex-security";
   let currentRule: RuleDefinition | undefined;
-  if (importedScanFinding) {
+  // Issue #139: resolved by RESERVED NAME, unconditionally — not gated on the
+  // review option the way the imported-scan branch is. A host detector's
+  // finding stays explainable on a later poll whose `--security-pass` is off:
+  // the finding exists, the host computed it, and the policy that describes
+  // that computation does not stop being true because a flag changed.
+  if (resolution.ledger.finding.ruleName === SECRETS_RULE_NAME) {
+    currentRule = SECRETS_POLICY;
+  } else if (importedScanFinding) {
     currentRule = CODEX_SECURITY_POLICY;
   } else {
     const rules = await loadActiveRules(item.event.reviewNumber, metadata, options);

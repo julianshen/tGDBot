@@ -235,6 +235,8 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     // its own declared return type — invisibly, because this file is not in
     // the type-test program (CodeRabbit review).
     structuralChecks: "off",
+    // Issue #139: off by default, like structural checks.
+    securityPass: "off",
     // Off by default in this harness: mapping is the one review step that
     // needs a real git mirror and a model session, and no test here is about
     // that. `contextFingerprint` returns undefined for "off", so every config

@@ -7,7 +7,7 @@
 // not-checked with the process alive. It lives in its own file because the
 // registration attempt is once-per-process (a per-file vitest worker), and the
 // environment is set before the first check runs.
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
