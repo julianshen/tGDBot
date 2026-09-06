@@ -2272,9 +2272,10 @@ describe("clarification answer lifecycle", () => {
         createSession: sessionFor(JSON.stringify({
           outcome: "confirmed",
           rationale: "The logger still prints the token.",
-          // A language the check has no parser for, so `hasCheckableClaim`
-          // refuses it before any workspace is touched.
-          finding: { ...claimingFinding, file: "src/auth.go", line: undefined },
+          // A language the check has no parser for (Rust — issue #142 made Go
+          // checkable), so `hasCheckableClaim` refuses it before any workspace
+          // is touched.
+          finding: { ...claimingFinding, file: "src/auth.rs", line: undefined },
         })),
       }),
       prepareStructuralWorkspace,

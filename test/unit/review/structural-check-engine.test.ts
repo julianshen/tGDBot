@@ -6,11 +6,12 @@
 // `STRUCTURAL_CHECK_ENGINE` is a constant rather than a runtime read of
 // package.json, which buys a simpler build and costs the risk of drift. This
 // file is what makes that trade safe.
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import { describe, expect, it } from "vitest";
-import { STRUCTURAL_CHECK_ENGINE } from "../../../src/review/structural-check.js";
+import { STRUCTURAL_CHECK_ENGINE, TREE_SITTER_GRAMMAR_VERSIONS } from "../../../src/review/structural-check.js";
 import { computeReviewConfigHash } from "../../../src/review/dedup.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -38,7 +39,16 @@ describe("structural-check engine identity", () => {
     expect(typescript).toMatch(/^\d+\.\d+\.\d+$/u);
     // Resolution (issue #77) is part of the engine: a typescript upgrade can
     // change which occurrences resolve, so it belongs in the identity too.
-    expect(STRUCTURAL_CHECK_ENGINE).toBe(`ast-grep@${astGrep}+typescript@${typescript}`);
+    // Issue #142: the dynamic tree-sitter grammars are part of it as well —
+    // their kind tables were measured against specific versions, and a
+    // grammar upgrade can change what a reference IS.
+    // The grammar versions come from the source table (they are compiled from
+    // pinned grammar repos, not npm), so the identity is asserted against it.
+    expect(STRUCTURAL_CHECK_ENGINE).toBe(
+      `ast-grep@${astGrep}+typescript@${typescript}` +
+      `+tree-sitter-python@${TREE_SITTER_GRAMMAR_VERSIONS.python}` +
+      `+tree-sitter-go@${TREE_SITTER_GRAMMAR_VERSIONS.go}`,
+    );
   });
 
   it("re-triggers a review when the parser version changes", () => {
@@ -54,6 +64,37 @@ describe("structural-check engine identity", () => {
     });
 
     expect(before).not.toBe(after);
+  });
+
+  // Issue #142 / Codex review of PR #143 round two: AVAILABILITY changes what
+  // a review produces (a Python finding is not-checked without the library,
+  // checked with it), so installing a grammar must change the config hash and
+  // re-check existing heads instead of matching a stale marker.
+  it("re-triggers a review when a dynamic grammar is installed", () => {
+    const before = computeReviewConfigHash({
+      ...base,
+      structuralChecks: "on",
+      // An explicit engine pins the identity — the production default is what
+      // this test varies, via the environment the identity function reads.
+      structuralCheckEngine: undefined,
+    });
+    process.env.TGD_TREE_SITTER_LIB_DIR = "/tmp/does-not-exist";
+    const emptyDir = computeReviewConfigHash({ ...base, structuralChecks: "on" });
+    delete process.env.TGD_TREE_SITTER_LIB_DIR;
+    // A directory with no libraries: same identity as no env at all.
+    expect(emptyDir).toBe(computeReviewConfigHash({ ...base, structuralChecks: "on" }));
+
+    // An installed grammar changes the identity.
+    const libDir = mkdtempSync(path.join(os.tmpdir(), "tgd-grammars-"));
+    writeFileSync(path.join(libDir, "tree_sitter_python.so"), "not a real library — availability is a file check");
+    try {
+      process.env.TGD_TREE_SITTER_LIB_DIR = libDir;
+      const after = computeReviewConfigHash({ ...base, structuralChecks: "on" });
+      expect(after).not.toBe(before);
+    } finally {
+      delete process.env.TGD_TREE_SITTER_LIB_DIR;
+      rmSync(libDir, { recursive: true, force: true });
+    }
   });
 
   // The cost of this feature has to land only on repositories that opted in.

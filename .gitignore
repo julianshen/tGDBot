@@ -6,3 +6,5 @@ coverage/
 .codegraph
 .understand-anything
 .worktrees/
+.tree-sitter-grammars/
+.tree-sitter-grammars/

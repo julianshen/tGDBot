@@ -5725,7 +5725,9 @@ describe("review — structural checks", () => {
   // largest single cost. Each case below resolves to nothing today, so the
   // clone would buy nothing.
   it.each([
-    ["every claim is on an unsupported language", [{ ...claimed, file: "src/retry.go" }]],
+    // Rust (not .go): issue #142 made Go findings checkable — the worktree is
+    // worth preparing for them even before their grammar is installed.
+    ["every claim is on an unsupported language", [{ ...claimed, file: "src/retry.rs" }]],
     ["every claimed finding is addressed", [{ ...claimed, decision: "addressed" as const }]],
     ["every claimed finding needs clarification", [{ ...claimed, decision: "needs-clarification" as const }]],
     ["every claimed finding is suppressed by an addressed duplicate",

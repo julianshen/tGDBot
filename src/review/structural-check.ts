@@ -19,6 +19,7 @@
 // finding so a human can weigh both; silently dropping a finding because a
 // mechanical check disagreed would trade one confident wrong answer for
 // another.
+import { existsSync, readFileSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Lang, parseAsync } from "@ast-grep/napi";
@@ -186,6 +187,22 @@ const REFERENCE_KINDS: ReadonlyMap<string, readonly string[]> = new Map([
   ["tsx", ["identifier", "property_identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern", "type_identifier"]],
   ["js", ["identifier", "property_identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"]],
   ["jsx", ["identifier", "property_identifier", "shorthand_property_identifier", "shorthand_property_identifier_pattern"]],
+  // Measured, not assumed — same discipline as the TypeScript row above. Built
+  // by compiling the grammars (see scripts/build-tree-sitter-grammars.sh),
+  // parsing a sample that exercises every reference form, and recording which
+  // node kinds carry the name (issue #142):
+  // - Python: attribute names (obj.budget) ARE `identifier` nodes inside
+  //   `attribute` nodes — 22 of 24 name occurrences in the sample. EXCLUDED:
+  //   `dotted_name` (import path segments — a module path, not a reference to
+  //   the claimed symbol) and `string_content` (dict keys are strings).
+  // - Go: calls are `identifier`; struct field declarations and selector
+  //   fields (w.budget) are `field_identifier`. Composite-literal names —
+  //   keys (Wallet{budget: 1}) and values ([]int{budget}) — are
+  //   `identifier` nodes WRAPPED in a `literal_element`, so the wrapper kind
+  //   must NOT be in the table: both spellings are already counted through
+  //   `identifier`, and including the wrapper double-counts the key.
+  ["python", ["identifier"]],
+  ["go", ["identifier", "field_identifier"]],
 ]);
 
 const LANG_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
@@ -193,6 +210,8 @@ const LANG_BY_EXTENSION: ReadonlyMap<string, string> = new Map([
   [".tsx", "tsx"],
   [".js", "js"], [".mjs", "js"], [".cjs", "js"],
   [".jsx", "jsx"],
+  [".py", "python"], [".pyi", "python"],
+  [".go", "go"],
 ]);
 
 /**
@@ -212,11 +231,180 @@ const AST_LANG: ReadonlyMap<string, "TypeScript" | "Tsx" | "JavaScript"> = new M
   ["jsx", "JavaScript"],
 ]);
 
+/**
+ * Languages parsed by DYNAMIC tree-sitter grammars (issue #142): not compiled
+ * into `@ast-grep/napi`, registered at parser-load time from shared libraries
+ * found in `TGD_TREE_SITTER_LIB_DIR`. Absent libraries mean these languages
+ * are simply not covered — TS/JS behavior is byte-identical, and findings in
+ * these languages degrade to `not-checked` with a reason naming the env var.
+ *
+ * The kind tables above were measured against these grammar versions; a
+ * grammar upgrade re-opens the measurement, and `STRUCTURAL_CHECK_ENGINE`
+ * carries the versions so open PRs re-review once on upgrade.
+ */
+interface DynamicGrammar {
+  /** The registered language name — passed to parseAsync verbatim. */
+  readonly name: "python" | "go";
+  readonly extensions: readonly string[];
+  readonly libFileName: string;
+  readonly symbol: string;
+  readonly grammarVersion: string;
+}
+
+/** The grammar versions the measured kind tables above were built against. */
+export const TREE_SITTER_GRAMMAR_VERSIONS = { python: "0.25.0", go: "0.25.0" } as const;
+
+const DYNAMIC_GRAMMARS: readonly DynamicGrammar[] = [
+  { name: "python", extensions: [".py", ".pyi"], libFileName: "tree_sitter_python.so", symbol: "tree_sitter_python", grammarVersion: TREE_SITTER_GRAMMAR_VERSIONS.python },
+  { name: "go", extensions: [".go"], libFileName: "tree_sitter_go.so", symbol: "tree_sitter_go", grammarVersion: TREE_SITTER_GRAMMAR_VERSIONS.go },
+];
+
+/** The env var naming the directory that holds the compiled grammar libraries. */
+export const TREE_SITTER_LIB_DIR_ENV = "TGD_TREE_SITTER_LIB_DIR";
+
+/**
+ * Dynamic languages whose grammar library was found and registered — empty
+ * until the parser loads, and stable for the process lifetime
+ * (`registerDynamicLanguage` may only be called once).
+ */
+const registeredDynamicLangs = new Set<string>();
+let dynamicRegistrationAttempted = false;
+
+/**
+ * The dynamic grammars whose library exists in the configured directory RIGHT
+ * NOW — a pure filesystem check, no parser import (the identity below is read
+ * while computing the config hash, which must not load napi eagerly).
+ */
+export function installedDynamicGrammars(): Array<"python" | "go"> {
+  const libDir = process.env[TREE_SITTER_LIB_DIR_ENV];
+  if (libDir === undefined || libDir === "" || libDir.includes("\u0000")) return [];
+  try {
+    return DYNAMIC_GRAMMARS
+      .filter((grammar) => existsSync(path.join(libDir, grammar.libFileName)))
+      .map((grammar) => grammar.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The engine identity the config hash uses (issue #142, Codex review of
+ * PR #143 round two): the pinned parser versions PLUS the dynamic grammars
+ * actually installed. Availability changes what a review produces — a Python
+ * finding is `not-checked` without the library and checked with it — so
+ * installing one must re-check existing heads instead of matching a stale
+ * marker.
+ */
+export function structuralEngineIdentity(): string {
+  const installed = installedDynamicGrammars();
+  if (installed.length === 0) return STRUCTURAL_CHECK_ENGINE;
+  return `${STRUCTURAL_CHECK_ENGINE}+grammars:${installed.sort().join(",")}`;
+}
+
+/**
+ * Registers every dynamic grammar whose library exists in the configured
+ * directory. Called ONCE per process, lazily, from the parser-load path — a
+ * directory with none (or no directory at all) registers nothing and leaves
+ * the dynamic languages uncovered, which is the honest default.
+ */
+/**
+ * Whether a file is plausibly a shared library — ELF or Mach-O magic.
+ *
+ * Measured (issue #142, Codex review of PR #143 round three): napi does NOT
+ * throw on a bad grammar path — `register_dynamic_language` PANICS in Rust
+ * (`napi_lang.rs:169`, GetLibPath NotFound) and the abort takes the whole
+ * review process down. The magic check keeps garbage files (a README saved as
+ * tree_sitter_python.so, a truncated download) from ever reaching napi; a
+ * magic-valid but unloadable file remains a residual risk, documented here
+ * rather than hidden behind a catch that cannot fire.
+ */
+function looksLikeSharedLibrary(libPath: string): boolean {
+  try {
+    const header = readFileSync(libPath).subarray(0, 4);
+    const elf = header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46;
+    const machO = (header[0] === 0xcf && header[1] === 0xfa && header[2] === 0xed && header[3] === 0xfe) ||
+      (header[0] === 0xca && header[1] === 0xfe && header[2] === 0xba && header[3] === 0xbe) ||
+      (header[0] === 0xfe && header[1] === 0xed && header[2] === 0xfa && header[3] === 0xce) ||
+      (header[0] === 0xce && header[1] === 0xfa && header[2] === 0xed && header[3] === 0xfe);
+    return elf || machO;
+  } catch {
+    return false;
+  }
+}
+
+function registerDynamicGrammarsOnce(parser: { registerDynamicLanguage?: (langs: Parameters<typeof import("@ast-grep/napi").registerDynamicLanguage>[0]) => void }): void {
+  if (dynamicRegistrationAttempted) return;
+  dynamicRegistrationAttempted = true;
+  const libDir = process.env[TREE_SITTER_LIB_DIR_ENV];
+  if (libDir === undefined || libDir === "" || libDir.includes("\u0000")) return;
+  const registrable: Record<string, { libraryPath: string; extensions: string[]; languageSymbol: string }> = {};
+  try {
+    for (const grammar of DYNAMIC_GRAMMARS) {
+      const libPath = path.join(libDir, grammar.libFileName);
+      if (existsSync(libPath) && looksLikeSharedLibrary(libPath)) {
+        registrable[grammar.name] = { libraryPath: libPath, extensions: [...grammar.extensions], languageSymbol: grammar.symbol };
+      }
+    }
+  } catch {
+    return; // unreadable directory: leave the dynamic languages uncovered
+  }
+  if (Object.keys(registrable).length === 0) return;
+  // ONE call, always. Measured: registering languages in SEPARATE calls does
+  // not accumulate — a language registered in a second call parses as "go is
+  // not supported in napi" while the first call's language keeps working. The
+  // batch is the only shape napi honors, so per-language isolation happens in
+  // the validation above, not here.
+  try {
+    parser.registerDynamicLanguage?.(registrable);
+    for (const name of Object.keys(registrable)) registeredDynamicLangs.add(name);
+  } catch {
+    // A catchable registration failure (napi can also abort on a malformed
+    // library — hence the magic check above) leaves the languages uncovered
+    // and findings in them degrade to not-checked.
+  }
+}
+
 /** The native parser, loaded on first use and remembered — including a failure. */
-let parserModule: Promise<{ Lang: typeof Lang; parseAsync: typeof parseAsync }> | undefined;
-function loadParser(): Promise<{ Lang: typeof Lang; parseAsync: typeof parseAsync }> {
-  parserModule ??= import("@ast-grep/napi");
+let parserModule: Promise<
+  { Lang: typeof Lang; parseAsync: typeof parseAsync; registerDynamicLanguage?: (langs: Parameters<typeof import("@ast-grep/napi").registerDynamicLanguage>[0]) => void }
+> | undefined;
+function loadParser(): Promise<
+  { Lang: typeof Lang; parseAsync: typeof parseAsync; registerDynamicLanguage?: (langs: Parameters<typeof import("@ast-grep/napi").registerDynamicLanguage>[0]) => void }
+> {
+  parserModule ??= import("@ast-grep/napi").then((module) => {
+    registerDynamicGrammarsOnce(module);
+    return module;
+  });
   return parserModule;
+}
+
+/**
+ * The ast-grep language to parse `language`'s files with, or undefined when
+ * this process cannot: native languages resolve through the `Lang` enum,
+ * dynamic ones only when their grammar library was registered. The dynamic
+ * name is passed to parseAsync verbatim — `NapiLang` accepts it.
+ */
+/**
+ * The language a file extension belongs to, or undefined. Dynamic languages
+ * count only when their grammar library was registered — an unregistered
+ * Python/Go file must not enter a TS claim's search set (it would silently
+ * change the TS check's coverage), which is why the maps above are filtered
+ * here rather than merged statically.
+ */
+function langForExtension(extension: string): string | undefined {
+  const language = LANG_BY_EXTENSION.get(extension);
+  if (language === undefined) return undefined;
+  if (AST_LANG.has(language)) return language;
+  return registeredDynamicLangs.has(language) ? language : undefined;
+}
+
+function astLangFor(language: string): string | undefined {
+  const native = AST_LANG.get(language);
+  if (native !== undefined) return native;
+  if (registeredDynamicLangs.has(language)) {
+    return DYNAMIC_GRAMMARS.find((grammar) => grammar.name === language)?.name;
+  }
+  return undefined;
 }
 
 /** Directories never worth walking, and expensive to walk by mistake. */
@@ -346,7 +534,7 @@ async function collectSourceFiles(
         continue;
       }
       if (!entry.isFile()) continue;
-      if (LANG_BY_EXTENSION.has(path.extname(entry.name).toLowerCase())) found.push(full);
+      if (langForExtension(path.extname(entry.name).toLowerCase()) !== undefined) found.push(full);
     }
   }
   return found;
@@ -404,18 +592,9 @@ export async function checkStructuralClaim(
     return { status: "not-checked", reason: "the base worktree is unavailable" };
   }
 
-  // The finding's OWN language decides whether this search is even about the
-  // right thing. A claim on a Go file in a mixed repository would otherwise
-  // walk the TypeScript files, find nothing, and report on a language where
-  // neither the symbol nor its callers live (Codex review, round 3).
-  if (!LANG_BY_EXTENSION.has(path.extname(input.findingFile).toLowerCase())) {
-    return {
-      status: "not-checked",
-      reason: `this check reads TypeScript and JavaScript only, and the finding is in ${path.extname(input.findingFile) || "a file with no extension"}`,
-    };
-  }
-
-  // Loaded HERE rather than at module scope: see `AST_LANG`. A platform with no
+  // Loaded HERE rather than at module scope, and BEFORE the language gate
+  // below: loading the parser is also what registers the dynamic grammars
+  // (issue #142), and the gate must see the registration. A platform with no
   // prebuilt binary degrades to an unperformed check instead of taking the CLI
   // down with it.
   let parser;
@@ -425,6 +604,29 @@ export async function checkStructuralClaim(
     return {
       status: "not-checked",
       reason: "the structural parser is not available on this platform",
+    };
+  }
+
+  // The finding's OWN language decides whether this search is even about the
+  // right thing. A claim on a Go file in a mixed repository would otherwise
+  // walk the TypeScript files, find nothing, and report on a language where
+  // neither the symbol nor its callers live (Codex review, round 3).
+  const findingLanguage = langForExtension(path.extname(input.findingFile).toLowerCase());
+  if (findingLanguage === undefined) {
+    const extension = path.extname(input.findingFile) || "a file with no extension";
+    // An unknown extension and a known-but-uncovered dynamic language get
+    // DIFFERENT reasons: the first is a language this check has no table for;
+    // the second is fixable on this machine by installing the grammar.
+    if (!LANG_BY_EXTENSION.has(path.extname(input.findingFile).toLowerCase())) {
+      return {
+        status: "not-checked",
+        reason: `this check reads TypeScript and JavaScript only, and the finding is in ${extension}`,
+      };
+    }
+    const grammar = DYNAMIC_GRAMMARS.find((entry) => entry.name === LANG_BY_EXTENSION.get(path.extname(input.findingFile).toLowerCase()));
+    return {
+      status: "not-checked",
+      reason: `reading ${grammar?.name ?? "this language"} needs its tree-sitter grammar, which is not installed on this machine — set ${TREE_SITTER_LIB_DIR_ENV} to a directory containing ${grammar?.libFileName ?? "the compiled grammar"} (see scripts/build-tree-sitter-grammars.sh)`,
     };
   }
 
@@ -468,10 +670,9 @@ export async function checkStructuralClaim(
       walkExpired = true;
       break;
     }
-    const language = LANG_BY_EXTENSION.get(path.extname(file).toLowerCase());
+    const language = langForExtension(path.extname(file).toLowerCase());
     const kinds = language === undefined ? undefined : REFERENCE_KINDS.get(language);
-    const astLangName = language === undefined ? undefined : AST_LANG.get(language);
-    const astLang = astLangName === undefined ? undefined : parser.Lang[astLangName];
+    const astLang = language === undefined ? undefined : astLangFor(language);
     if (kinds === undefined || astLang === undefined) continue;
 
     let source: string;
@@ -774,7 +975,10 @@ export function describeCheck(
  * for a value that changes once a year. `structural-check-engine.test.ts`
  * asserts it matches the dependency pin, so the two cannot drift silently.
  */
-export const STRUCTURAL_CHECK_ENGINE = "ast-grep@0.45.2+typescript@5.9.3";
+export const STRUCTURAL_CHECK_ENGINE =
+  `ast-grep@0.45.2+typescript@5.9.3` +
+  `+tree-sitter-python@${TREE_SITTER_GRAMMAR_VERSIONS.python}` +
+  `+tree-sitter-go@${TREE_SITTER_GRAMMAR_VERSIONS.go}`;
 
 export const DEFAULT_CLAIM_BUDGET = 10;
 
