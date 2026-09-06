@@ -656,6 +656,23 @@ is ever executed, and only the base worktree is read):
   > that share the spelling.
 ```
 
+#### Languages
+
+TypeScript, TSX, JavaScript and JSX are covered out of the box. **Python and
+Go** are covered when their dynamic tree-sitter grammars are installed: the
+grammars are NOT npm dependencies — compile them once with
+`scripts/build-tree-sitter-grammars.sh [dir]` (needs git + a C compiler, about
+a minute) and point `TGD_TREE_SITTER_LIB_DIR` at the directory. Each language's
+reference kinds were measured against its pinned grammar version
+(`tree-sitter-python@0.25.0`, `tree-sitter-go@0.25.0` — both ride in the
+engine identity, so a grammar upgrade re-reviews open PRs once). Without the
+grammars, Python/Go findings degrade to `not-checked` with a reason naming the
+env var, and TypeScript/JS behavior is byte-identical to before.
+
+Symbol RESOLUTION stays TypeScript-only: a Python or Go finding always gets
+the LEXICAL answer — the type checker's program does not contain their files,
+so a claim's own declaration cannot be attributed there.
+
 The lexical answer is the floor, not a relic. A repository without a root
 `tsconfig.json`, files the program does not cover (plain-JS directories, other
 languages' neighbours), a finding whose file does not declare the symbol, or a

@@ -10,7 +10,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { STRUCTURAL_CHECK_ENGINE } from "../../../src/review/structural-check.js";
+import { STRUCTURAL_CHECK_ENGINE, TREE_SITTER_GRAMMAR_VERSIONS } from "../../../src/review/structural-check.js";
 import { computeReviewConfigHash } from "../../../src/review/dedup.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -38,7 +38,16 @@ describe("structural-check engine identity", () => {
     expect(typescript).toMatch(/^\d+\.\d+\.\d+$/u);
     // Resolution (issue #77) is part of the engine: a typescript upgrade can
     // change which occurrences resolve, so it belongs in the identity too.
-    expect(STRUCTURAL_CHECK_ENGINE).toBe(`ast-grep@${astGrep}+typescript@${typescript}`);
+    // Issue #142: the dynamic tree-sitter grammars are part of it as well —
+    // their kind tables were measured against specific versions, and a
+    // grammar upgrade can change what a reference IS.
+    // The grammar versions come from the source table (they are compiled from
+    // pinned grammar repos, not npm), so the identity is asserted against it.
+    expect(STRUCTURAL_CHECK_ENGINE).toBe(
+      `ast-grep@${astGrep}+typescript@${typescript}` +
+      `+tree-sitter-python@${TREE_SITTER_GRAMMAR_VERSIONS.python}` +
+      `+tree-sitter-go@${TREE_SITTER_GRAMMAR_VERSIONS.go}`,
+    );
   });
 
   it("re-triggers a review when the parser version changes", () => {

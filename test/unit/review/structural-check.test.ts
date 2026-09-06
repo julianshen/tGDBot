@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -10,6 +11,7 @@ import {
   runStructuralChecks,
   type StructuralCheck,
 } from "../../../src/review/structural-check.js";
+import { createSymbolResolver } from "../../../src/review/symbol-resolution.js";
 import type { Finding } from "../../../src/review/types.js";
 
 const roots: string[] = [];
@@ -64,6 +66,98 @@ describe("parseStructuralClaim", () => {
     ["an empty symbol", { kind: "no-other-references", symbol: "" }],
   ])("rejects %s", (_label, value) => {
     expect(parseStructuralClaim(value)).toBeUndefined();
+  });
+});
+
+// Issue #142: dynamic grammars (Python, Go) load from shared libraries found
+// in TGD_TREE_SITTER_LIB_DIR. Building them is a documented script, not an npm
+// dependency, so the suite stays hermetic: when the libraries are absent these
+// tests SKIP, and the no-grammars behavior is pinned by the dedicated
+// not-checked tests above.
+const grammarLibDir = process.env.TGD_TREE_SITTER_LIB_DIR;
+const grammarsAvailable = grammarLibDir !== undefined &&
+  existsSync(path.join(grammarLibDir ?? "", "tree_sitter_python.so")) &&
+  existsSync(path.join(grammarLibDir ?? "", "tree_sitter_go.so"));
+
+describe("checkStructuralClaim — dynamic languages (issue #142)", () => {
+  describe.skipIf(!grammarsAvailable)("with grammar libraries installed", () => {
+    it("checks a Python finding against python files with the measured kinds", async () => {
+      const root = await tree({
+        "src/wallet.py": "def budget(amount):\n    return amount\n",
+        "src/caller.py": "from wallet import budget\n\ntotal = budget(21)\n",
+        "src/attr.py": "import wallet\n\nresult = wallet.budget(3)\n",
+        "src/keeper.go": "package main\n\nfunc budget() {}\n",
+      });
+
+      const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/wallet.py" });
+
+      expect(result.status).toBe("lexical-matches");
+      if (result.status !== "lexical-matches") throw new Error("unreachable");
+      const files = new Set(result.references.map((reference) => reference.file));
+      // The import, the call, and the ATTRIBUTE access (an `identifier` inside
+      // an `attribute` node — the measured Python table). The .go file is
+      // searched too (registered grammars join the same search set).
+      expect(files).toContain("src/caller.py");
+      expect(files).toContain("src/attr.py");
+      expect(result.occurrences).toBeGreaterThanOrEqual(3);
+    });
+
+    it("checks a Go finding including selector fields and literal keys", async () => {
+      const root = await tree({
+        // The struct DECLARATION stays in the finding's own file: a same-named
+        // field in ANOTHER struct is the known lexical limitation (the Go
+        // analogue of the TS unrelated-member test), and this fixture keeps it
+        // out of the count so the assertion is exact.
+        "wallet.go": "package main\n\nfunc budget() int { return 0 }\n\ntype Wallet struct { budget int }\n",
+        "caller.go": "package main\n\nfunc main() {\n    w := Wallet{budget: 1}\n    _ = w.budget\n    _ = budget()\n}\n",
+      });
+
+      const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "wallet.go" });
+
+      expect(result.status).toBe("lexical-matches");
+      if (result.status !== "lexical-matches") throw new Error("unreachable");
+      // Literal key (identifier inside the wrapper) + selector field + call.
+      // The wrapper `literal_element` must NOT double-count the key.
+      expect(result.references.filter((reference) => reference.file === "caller.go")).toHaveLength(3);
+    });
+
+    it("never resolves a non-TypeScript finding, even in a repo with a root tsconfig", async () => {
+      const root = await tree({
+        "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, noEmit: true, module: "commonjs", target: "es2022", include: ["src/**/*.ts"] } }),
+        "src/wallet.ts": "export function budget(n: number) { return n; }\n",
+        "src/caller.py": "from wallet import budget\n\ntotal = budget(21)\n",
+      });
+
+      const resolver = await createSymbolResolver(root);
+      const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/caller.py" }, { resolver });
+
+      // The TS program does not contain the .py file, so the claim's own
+      // declaration cannot be attributed — the honest answer is lexical, and
+      // the same-name occurrences in the TS files are the lexical fallback,
+      // never a resolved accusation.
+      expect(result.status).toBe("lexical-matches");
+      if (result.status !== "lexical-matches") throw new Error("unreachable");
+      expect(result).not.toHaveProperty("partial");
+      resolver.dispose();
+    });
+  });
+
+  it("degrades a Python finding to not-checked when the grammar is absent", async () => {
+    // With libraries: a caller exists, so the claim is checked (never the
+    // grammar reason). Without: the grammar reason names the fix. This test is
+    // meaningful in BOTH environments.
+    const root = await tree({
+      "src/wallet.py": "def budget(amount):\n    return amount\n",
+      "src/caller.py": "from wallet import budget\n\ntotal = budget(21)\n",
+    });
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/wallet.py" });
+    if (grammarsAvailable) {
+      expect(result.status).toBe("lexical-matches");
+    } else {
+      expect(result.status).toBe("not-checked");
+      if (result.status !== "not-checked") throw new Error("unreachable");
+      expect(result.reason).toContain("TGD_TREE_SITTER_LIB_DIR");
+    }
   });
 });
 
@@ -488,6 +582,24 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
   it("refuses a claim whose own file is in an unsupported language", async () => {
     const root = await tree({
       "src/retry.ts": "export function budget(n: number) { return n; }\n",
+      "main.rs": "fn budget() {}\n",
+    });
+
+    const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "main.rs" });
+
+    expect(result.status).toBe("not-checked");
+    if (result.status !== "not-checked") throw new Error("unreachable");
+    expect(result.reason).toMatch(/TypeScript and JavaScript only/);
+  });
+
+  // Issue #142: a DYNAMIC language (Python, Go) is supported in principle but
+  // needs its grammar library on the machine. Without it the claim degrades to
+  // not-checked with a reason that names the fix, rather than silently
+  // searching the wrong languages. (Meaningful only without the libraries —
+  // with them the go finding is checked, which the tests above pin.)
+  it.skipIf(grammarsAvailable)("tells the operator how to cover a dynamic language whose grammar is missing", async () => {
+    const root = await tree({
+      "src/retry.ts": "export function budget(n: number) { return n; }\n",
       "main.go": "package main\nfunc budget() {}\n",
     });
 
@@ -495,7 +607,9 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
 
     expect(result.status).toBe("not-checked");
     if (result.status !== "not-checked") throw new Error("unreachable");
-    expect(result.reason).toMatch(/TypeScript and JavaScript only/);
+    expect(result.reason).toMatch(/tree-sitter grammar, which is not installed/);
+    expect(result.reason).toContain("TGD_TREE_SITTER_LIB_DIR");
+    expect(result.reason).toContain("tree_sitter_go.so");
   });
 });
 
@@ -987,7 +1101,12 @@ describe("hasCheckableClaim — the eligibility predicate the CLI gate shares (i
   it.each([
     ["a claim on a supported language with a reader", {}, true],
     ["no claim", { claim: undefined }, false],
-    ["an unsupported language", { file: "src/retry.go" }, false],
+    // Issue #142: Go/Python findings ARE checkable (their grammars load from
+    // TGD_TREE_SITTER_LIB_DIR; without one the claim degrades to not-checked
+    // with a fixable reason, but the worktree is still worth preparing).
+    ["a go file", { file: "src/retry.go" }, true],
+    ["a python file", { file: "src/retry.py" }, true],
+    ["an unsupported language", { file: "src/retry.rs" }, false],
     ["an extension-less file", { file: "retry" }, false],
     ["a decision no reader sees", { decision: "needs-clarification" as const }, false],
     ["an addressed finding", { decision: "addressed" as const }, false],
