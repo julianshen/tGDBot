@@ -47,6 +47,18 @@ The last is the one I had flagged as unexamined when the decision was made, and
 it was a real hole rather than a theoretical one: two of the four advertised
 security surfaces would have reported nothing, silently.
 
+A third round found four more:
+
+| Claim | What was wrong |
+|---|---|
+| unmatched routing keeps the reviewer's `vector`/`authScope` | contradicted the paragraph directly below it, and with the pattern list starting empty would have let model text drive severity on every review |
+| `unlikely` preconditions mean not exploitable | `unlikely` still describes a **reachable** path; grouping it with the non-exploitable cases sent a remote, public, cross-boundary failure to `suggestion`, a level this project reserves for code that is correct as written |
+| synthesized findings are "addressable in conversation" | `poll.ts` resolves a rule by `ruleName` among active rules and reports `inactive` otherwise; `codex-security` works only because #120 defined a host-owned policy object, and these two names had none |
+| "two model calls per review" | stage 3 runs **per candidate**, so the real figure is `2 + N` — an understatement of the cost of the feature the document asks operators to enable |
+
+Across three rounds, twenty findings. Most were the document asserting a
+property it did not deliver.
+
 ## Why this is not the thing that was rejected
 
 `2026-09-01-codex-security-scan-design.md` records a feasibility study that
@@ -211,8 +223,25 @@ positive evidence**, and `unknown` otherwise:
 | Situation | `source` | Value |
 |---|---|---|
 | a supported router registration resolves to the finding's symbol, with the mounting evidence read | `host` | established |
-| the language parses (tier 1 or 2) but no supported pattern matches | `reviewer` | whatever the reviewer asserted |
-| no grammar for the language, or no ast-grep binding | `reviewer` | asserted, or `unknown` |
+| the language parses (tier 1 or 2) but no supported pattern matches | — | `unknown` |
+| no grammar for the language, or no ast-grep binding | — | `unknown` |
+
+An earlier draft of this table said an unmatched pattern retained *whatever the
+reviewer asserted*, which contradicted the paragraph below it and — because the
+supported-pattern list starts empty — would have let model text drive severity
+on every review until the first framework landed. Unmatched is `unknown`.
+
+That splits the schema in two, which is worth stating plainly:
+
+| Field | Who can establish it |
+|---|---|
+| `vector`, `authScope` | the **host**, under a supported pattern. Unmatched is `unknown`; a reviewer assertion never substitutes, because these two drive severity. |
+| `attackerControl`, `preconditions`, `crossesBoundary`, `impactSurface` | the **reviewer**. No host check establishes whether an attacker controls a value in general, so these are judgements, labelled as such, and always `source: "reviewer"`. |
+
+Both halves still carry evidence and can be `unknown`. The difference is that a
+`vector` the host could not establish is `unknown` rather than a guess wearing
+the reviewer's name — the reviewer's prose about it is still rendered as
+context, it simply does not reach `rateSeverity`.
 
 Tiers are defined under "The rule pack". **Discovery is not tiered** — every
 language is reviewed. Only the evidence behind a fact is, and a language without
@@ -273,11 +302,18 @@ function rateSeverity(discovered, facts) {
   // 2. Exploitability first, so a non-exploitable path can never be raised by
   //    a later branch. This ordering is the fix for a localhost path with
   //    `attackerControl: no` being rated `warning` before it could be reduced.
-  const exploitable =
+  const reachable =
     (facts.attackerControl.value === "yes" || facts.attackerControl.value === "plausible") &&
-    (facts.preconditions.value === "none" || facts.preconditions.value === "plausible") &&
+    facts.preconditions.value !== "unachievable" &&
     facts.vector.value !== "none";
-  if (!exploitable) return "suggestion";
+  if (!reachable) return "suggestion";
+
+  // 2b. `unlikely` preconditions still describe a REACHABLE path. Grouping
+  //     them with the non-exploitable cases sent a remote, public,
+  //     cross-boundary failure to `suggestion` — a level this project reserves
+  //     for code that is correct as written (builtin-agents/reviewer.md). Low
+  //     confidence caps the result; it does not deny the path.
+  const lowConfidence = facts.preconditions.value === "unlikely";
 
   // 3. Reachable but bounded to one user or tenant. Capped, never raised: a
   //    self-only issue the reviewer called `suggestion` stays there.
@@ -287,7 +323,7 @@ function rateSeverity(discovered, facts) {
   if (
     (facts.vector.value === "remote" || facts.vector.value === "local-network") &&
     (facts.authScope.value === "public" || facts.authScope.value === "user")
-  ) return "blocking";
+  ) return lowConfidence ? "warning" : "blocking";
 
   // 5. Crosses a boundary, but from localhost, or behind internal/admin auth.
   return "warning";
@@ -301,6 +337,12 @@ so an implementation following it returned `undefined` against a declared
 `Finding["severity"]`. Here it reaches branch 4 and returns `blocking`.
 
 `min` compares on the published ordering `blocking > warning > suggestion`.
+
+`suggestion` is reached only by branch 2 — a path that is genuinely not
+reachable: the attacker controls nothing, the preconditions are unachievable,
+or there is no vector. That matters because this project's own reviewer
+contract reserves `suggestion` for code that is **correct as written**, so
+sending a reachable vulnerability there would state something false about it.
 
 ### Unknown lowers confidence, never severity
 
@@ -376,8 +418,16 @@ The pack is therefore:
 | `secrets-and-crypto` | committed credentials, weak or misused primitives, unverified signatures and tokens, unsafe randomness | **host check** | none |
 | `supply-chain-and-ci` | mutable action refs, `pull_request_target` misuse, over-broad workflow permissions, unpinned or substituted dependencies | **host check** | none |
 
-Two model calls per review with candidates, down from seven. `applies_to`
-(#115) scopes each so a manifest-only change pays for neither.
+**Two discovery calls, plus one attack-path call per eligible candidate.** An
+earlier draft said "two model calls per review", which understated the cost of
+the feature it was asking operators to enable: stage 3 runs per candidate, so a
+review with `N` eligible candidates costs `2 + N` calls, bounded by the
+candidate budget.
+
+The two host checks add none, which is most of the argument for making them host
+checks. `applies_to` (#115) scopes the two rules, so a manifest-only change pays
+for neither discovery call and reaches stage 3 only through the host detectors,
+which do not use it.
 
 ### Host detectors must synthesize findings, not annotate them
 
@@ -402,6 +452,20 @@ So host detectors **create** findings, before orchestration:
   countable in `metrics` (#109)
 - a detector that fails pushes its name to `rulesFailed` with a reason, rather
   than being absent
+
+Each name also needs a **host-owned policy object**, or the conversation
+commands do not work on its findings. `poll.ts` resolves a finding's rule by
+looking up `ruleName` among the active rules and reports `inactive` when none
+matches; `codex-security` works only because #120 defined
+`CODEX_SECURITY_POLICY` — a `RuleDefinition` the host owns and never dispatches.
+`security:secrets` and `security:supply-chain` need the same, or `explain` and
+`reconsider` return "the trusted rule is no longer active" on a finding the host
+produced moments earlier.
+
+Their policy text differs from a rule's in an instructive way: it describes what
+the host computed and forbids inventing evidence, exactly as
+`CODEX_SECURITY_POLICY` does, because there is no reviewer reasoning to recover
+— the finding is a computation, and an explanation must not imply otherwise.
 
 Because these findings never pass through a model, their `hostCheck`-equivalent
 provenance is inherent: the host computed the whole finding, so there is nothing
@@ -466,6 +530,10 @@ rendered with its source and evidence when present.
 - gated on there being eligible candidates, as #80 gates the structural clone
 - bounded per review by a candidate budget, as `structural-check.ts` bounds
   claims; overflow becomes `not-analyzed` with a budget reason, never silence
+- the total is `2 + min(candidates, budget)` model calls, not two: the two
+  discovery rules, plus one attack-path pass per eligible candidate. That
+  number is what #113's benchmark should record, and what an operator deciding
+  whether to enable this is entitled to see before they do
 - `metrics` (#109) gains the counts, so #113's benchmark can measure the cost
   before anyone is asked to turn it on
 
