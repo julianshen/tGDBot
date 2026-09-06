@@ -19,7 +19,7 @@
 // finding so a human can weigh both; silently dropping a finding because a
 // mechanical check disagreed would trade one confident wrong answer for
 // another.
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { Lang, parseAsync } from "@ast-grep/napi";
@@ -307,17 +307,41 @@ export function structuralEngineIdentity(): string {
  * directory with none (or no directory at all) registers nothing and leaves
  * the dynamic languages uncovered, which is the honest default.
  */
+/**
+ * Whether a file is plausibly a shared library — ELF or Mach-O magic.
+ *
+ * Measured (issue #142, Codex review of PR #143 round three): napi does NOT
+ * throw on a bad grammar path — `register_dynamic_language` PANICS in Rust
+ * (`napi_lang.rs:169`, GetLibPath NotFound) and the abort takes the whole
+ * review process down. The magic check keeps garbage files (a README saved as
+ * tree_sitter_python.so, a truncated download) from ever reaching napi; a
+ * magic-valid but unloadable file remains a residual risk, documented here
+ * rather than hidden behind a catch that cannot fire.
+ */
+function looksLikeSharedLibrary(libPath: string): boolean {
+  try {
+    const header = readFileSync(libPath).subarray(0, 4);
+    const elf = header[0] === 0x7f && header[1] === 0x45 && header[2] === 0x4c && header[3] === 0x46;
+    const machO = (header[0] === 0xcf && header[1] === 0xfa && header[2] === 0xed && header[3] === 0xfe) ||
+      (header[0] === 0xca && header[1] === 0xfe && header[2] === 0xba && header[3] === 0xbe) ||
+      (header[0] === 0xfe && header[1] === 0xed && header[2] === 0xfa && header[3] === 0xce) ||
+      (header[0] === 0xce && header[1] === 0xfa && header[2] === 0xed && header[3] === 0xfe);
+    return elf || machO;
+  } catch {
+    return false;
+  }
+}
+
 function registerDynamicGrammarsOnce(parser: { registerDynamicLanguage?: (langs: Parameters<typeof import("@ast-grep/napi").registerDynamicLanguage>[0]) => void }): void {
   if (dynamicRegistrationAttempted) return;
   dynamicRegistrationAttempted = true;
   const libDir = process.env[TREE_SITTER_LIB_DIR_ENV];
-  if (libDir === undefined || libDir === "") return;
+  if (libDir === undefined || libDir === "" || libDir.includes("\u0000")) return;
   const registrable: Record<string, { libraryPath: string; extensions: string[]; languageSymbol: string }> = {};
   try {
     for (const grammar of DYNAMIC_GRAMMARS) {
-      if (libDir.includes("\u0000")) return;
       const libPath = path.join(libDir, grammar.libFileName);
-      if (existsSync(libPath)) {
+      if (existsSync(libPath) && looksLikeSharedLibrary(libPath)) {
         registrable[grammar.name] = { libraryPath: libPath, extensions: [...grammar.extensions], languageSymbol: grammar.symbol };
       }
     }
@@ -325,12 +349,18 @@ function registerDynamicGrammarsOnce(parser: { registerDynamicLanguage?: (langs:
     return; // unreadable directory: leave the dynamic languages uncovered
   }
   if (Object.keys(registrable).length === 0) return;
+  // ONE call, always. Measured: registering languages in SEPARATE calls does
+  // not accumulate — a language registered in a second call parses as "go is
+  // not supported in napi" while the first call's language keeps working. The
+  // batch is the only shape napi honors, so per-language isolation happens in
+  // the validation above, not here.
   try {
     parser.registerDynamicLanguage?.(registrable);
     for (const name of Object.keys(registrable)) registeredDynamicLangs.add(name);
   } catch {
-    // A malformed library must never take the check down: the languages stay
-    // uncovered and findings in them degrade to not-checked.
+    // A catchable registration failure (napi can also abort on a malformed
+    // library — hence the magic check above) leaves the languages uncovered
+    // and findings in them degrade to not-checked.
   }
 }
 
