@@ -56,8 +56,17 @@ A third round found four more:
 | synthesized findings are "addressable in conversation" | `poll.ts` resolves a rule by `ruleName` among active rules and reports `inactive` otherwise; `codex-security` works only because #120 defined a host-owned policy object, and these two names had none |
 | "two model calls per review" | stage 3 runs **per candidate**, so the real figure is `2 + N` — an understatement of the cost of the feature the document asks operators to enable |
 
-Across three rounds, twenty findings. Most were the document asserting a
-property it did not deliver.
+A fourth round found three more:
+
+| Claim | What was wrong |
+|---|---|
+| the pass covers security findings | a `needs-clarification` finding is excluded by the gate, regenerated at answer time, and published **unrated** — #79's gap in a new place, and `needs-clarification` was therefore a route around the whole feature |
+| host detectors synthesize findings | `Finding.severity` is mandatory and nothing said what theirs is; every implementation would have invented its own ordering |
+| the cost is `2 + N` | `applies_to` can scope out either discovery rule, which this document says two paragraphs later; a manifest-only change costs neither |
+
+Across four rounds, twenty-three findings. Most were the document asserting a
+property it did not deliver, and several were it contradicting itself a few
+paragraphs apart.
 
 ## Why this is not the thing that was rejected
 
@@ -418,11 +427,18 @@ The pack is therefore:
 | `secrets-and-crypto` | committed credentials, weak or misused primitives, unverified signatures and tokens, unsafe randomness | **host check** | none |
 | `supply-chain-and-ci` | mutable action refs, `pull_request_target` misuse, over-broad workflow permissions, unpinned or substituted dependencies | **host check** | none |
 
-**Two discovery calls, plus one attack-path call per eligible candidate.** An
-earlier draft said "two model calls per review", which understated the cost of
-the feature it was asking operators to enable: stage 3 runs per candidate, so a
-review with `N` eligible candidates costs `2 + N` calls, bounded by the
-candidate budget.
+**The security discovery rules that actually dispatch, plus one attack-path call
+per eligible candidate.** Two earlier drafts got this wrong in the same
+direction: first "two model calls per review", which ignored stage 3 entirely,
+then `2 + N`, which assumed both discovery rules always run. They do not —
+`applies_to` scopes them, and this document says two paragraphs later that a
+manifest-only change pays for neither. The figure is
+
+```
+dispatched security rules  +  min(eligible candidates, budget)
+```
+
+which is 0 for a change that touches nothing either rule claims.
 
 The two host checks add none, which is most of the argument for making them host
 checks. `applies_to` (#115) scopes the two rules, so a manifest-only change pays
@@ -452,6 +468,28 @@ So host detectors **create** findings, before orchestration:
   countable in `metrics` (#109)
 - a detector that fails pushes its name to `rulesFailed` with a reason, rather
   than being absent
+
+Their severity is **fixed per detector rule**, not derived from attack-path
+facts — those findings never enter stage 3, and `Finding.severity` is mandatory,
+so leaving it undefined would make every implementation invent its own ordering:
+
+| Detector rule | Severity | Why fixed |
+|---|---|---|
+| a credential matching a known live-secret format (`sk_live_`, an AWS key id, a PEM private key) | `blocking` | reachability is irrelevant; the secret is already disclosed to everyone who can read the repository |
+| a credential-shaped literal with no recognised provider format | not reported | too weak to publish; a detector that guesses here produces the noise this pass exists to avoid |
+| `pull_request_target` combined with a mutable action ref or an untrusted checkout | `blocking` | the documented path to arbitrary code execution with repository secrets |
+| a mutable action ref (`@main`, a moving tag) outside that combination | `warning` | a real supply-chain exposure, not an immediate compromise |
+| a dependency resolved from a branch or a mutable ref | `warning` | same reasoning |
+| a weak or misused primitive matching an explicit rule (an MD5 password hash, a disabled certificate check) | `warning` | decidable from the text; impact depends on context the host cannot see |
+
+Two properties of this table matter more than the individual rows. **Nothing
+lands at `suggestion`** — that level asserts the code is correct as written, and
+a detector that fires has by construction found something that is not.
+And **uncertainty is expressed by not reporting**, never by reporting at a lower
+severity: a detector that cannot decide has found nothing, and says nothing.
+That is the opposite of the attack-path stage, where uncertainty is reported as
+`unknown` — because there a finding already exists and the question is how to
+rate it, while here the question is whether there is a finding at all.
 
 Each name also needs a **host-owned policy object**, or the conversation
 commands do not work on its findings. `poll.ts` resolves a finding's rule by
@@ -523,6 +561,33 @@ never persisted in `FindingSnapshot` (a verification computed against one tree
 must not be reattached to a finding regenerated against another — #79), and
 rendered with its source and evidence when present.
 
+### The clarification path needs its own hook
+
+A security finding that starts as `needs-clarification` is excluded by the
+eligibility gate — correctly, since it publishes only a question. When the user
+answers, `reassessClarification` regenerates the finding and publishes it, and
+without a hook there that finding arrives with **no attack-path facts and no
+host severity re-rating**: `attackPath` is deliberately absent from
+`FindingSnapshot`, and the pass above runs only on the main pipeline.
+
+This is #79 in a new place. That issue existed because exactly the same gap let
+a clarification-confirmed finding publish a structural claim nobody had checked,
+and the fix was a `checkClaim` callback invoked at publication time, below the
+replay-from-manifest return so a re-publication pays nothing.
+
+The security pass needs the same shape, with the same three properties:
+
+- computed at **publication time against the head as it is then**, never
+  reusing a rating from the review that first raised the question
+- not persisted — a severity derived from facts about one tree must not be
+  reattached to a finding regenerated against another
+- degrading to `not-analyzed` with a host-authored reason, so a clarified
+  finding that could not be re-rated says so rather than silently publishing
+  discovery's severity as though the pass had run
+
+Without it, `needs-clarification` becomes a route around the feature: ask a
+question, answer it, and the finding publishes unrated.
+
 ## Cost
 
 - gated on `--security-pass on`, and gated **before dispatch**, so an off review
@@ -530,8 +595,8 @@ rendered with its source and evidence when present.
 - gated on there being eligible candidates, as #80 gates the structural clone
 - bounded per review by a candidate budget, as `structural-check.ts` bounds
   claims; overflow becomes `not-analyzed` with a budget reason, never silence
-- the total is `2 + min(candidates, budget)` model calls, not two: the two
-  discovery rules, plus one attack-path pass per eligible candidate. That
+- the total is `dispatched security rules + min(candidates, budget)` — not two,
+  and not `2 + N`, since `applies_to` can scope out either discovery rule. That
   number is what #113's benchmark should record, and what an operator deciding
   whether to enable this is entitled to see before they do
 - `metrics` (#109) gains the counts, so #113's benchmark can measure the cost
