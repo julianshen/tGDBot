@@ -20,6 +20,20 @@ OUT="$(mkdir -p "$OUT" && cd "$OUT" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# The documented requirement is "a C compiler (gcc/clang)" - honor it: \$CC
+# first, then whatever is on PATH (Codex review of PR #143, round four).
+COMPILER="${CC:-}"
+if [ -z "$COMPILER" ]; then
+  for candidate in cc gcc clang; do
+    if command -v "$candidate" >/dev/null 2>&1; then COMPILER="$candidate"; break; fi
+  done
+fi
+if [ -z "$COMPILER" ]; then
+  echo "no C compiler found (tried \$CC, cc, gcc, clang)" >&2
+  exit 1
+fi
+echo "compiling with $COMPILER"
+
 build() {
   repo="$1"; tag="$2"; lib="$3"
   # The TAG the kind tables were measured against, not remote HEAD: the engine
@@ -31,7 +45,7 @@ build() {
   # The scanner is optional (python has one, go does not).
   SOURCES="src/parser.c"
   [ -f "$TMP/$repo/src/scanner.c" ] && SOURCES="$SOURCES src/scanner.c"
-  (cd "$TMP/$repo" && gcc -shared -fPIC -I src $SOURCES -o "$OUT/$lib")
+  (cd "$TMP/$repo" && "$COMPILER" -shared -fPIC -I src $SOURCES -o "$OUT/$lib")
   echo "built $OUT/$lib at tag $tag"
 }
 
