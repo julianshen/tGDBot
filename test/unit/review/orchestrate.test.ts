@@ -1517,3 +1517,56 @@ describe("quote-anchored findings (#114)", () => {
     expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 11 });
   });
 });
+
+// Issue #139 / Codex review of PR #147: a rejected inline write falls back to
+// the managed summary, which renders each finding's diff excerpt IN FULL. A
+// secrets finding omits the credential from its own message, so without this
+// the fallback republished it into a world-readable comment — strictly more
+// public than the repository it already leaked to.
+describe("redactSource keeps a finding's source line out of the summary", () => {
+  const diff = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1,1 +1,2 @@",
+    " keep",
+    '+const key = "AKIAIOSFODNN7EXAMPLE";',
+  ].join("\n");
+
+  const finding = {
+    file: "src/a.ts",
+    line: 2,
+    severity: "blocking" as const,
+    category: "security",
+    ruleName: "security:secrets",
+    title: "This change commits an AWS access key id",
+    message: "A line added here matches the format of an AWS access key id.",
+  };
+
+  // Asserted on the excerpt orchestrate STORES, which is what `renderSummary`
+  // prints on the fallback path. An earlier version of these tests ran with
+  // `inline: false`, where no excerpt is built for any finding — so the
+  // redaction test passed while testing nothing, and only its control failing
+  // revealed that.
+  const excerptFor = (extra: Partial<typeof finding> & { redactSource?: boolean }) => {
+    const input = { ...finding, ...extra };
+    const result = orchestrate(
+      { findings: [input], rulesRun: [input.ruleName], rulesFailed: [] },
+      diff,
+      { inline: true },
+    );
+    const [stored] = [...(result.summaryInput.context?.values() ?? [])];
+    // `snippet` is the excerpt's LINES; joined here so the assertion is about
+    // whether the credential is present at all, not about its line shape.
+    return stored?.snippet === undefined ? undefined : JSON.stringify(stored.snippet);
+  };
+
+  it("stores no excerpt when the finding is redacted", () => {
+    expect(excerptFor({ redactSource: true })).toBeUndefined();
+  });
+
+  it("still stores one for an ordinary finding", () => {
+    // The guard has to be the flag, not the absence of excerpts everywhere.
+    expect(excerptFor({ ruleName: "ordinary" })).toContain("AKIAIOSFODNN7EXAMPLE");
+  });
+});

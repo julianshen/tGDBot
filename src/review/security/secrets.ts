@@ -62,18 +62,25 @@ interface SecretPattern {
 
 const PATTERNS: readonly SecretPattern[] = [
   // Distinctive four-character prefix and a fixed sixteen-character body.
-  { label: "an AWS access key id", pattern: /\bAKIA[0-9A-Z]{16}\b/u },
+  // ASIA is the STS/session form. Recognising only AKIA advertised an "AWS
+  // access key" check that silently passed temporary credentials.
+  { label: "an AWS access key id", pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/u },
   // Stripe's own live prefix. The test-mode `sk_test_` twin is deliberately
   // absent: it is not a credential worth waking anyone for.
   { label: "a Stripe live secret key", pattern: /\bsk_live_[A-Za-z0-9]{16,}\b/u },
   { label: "a GitHub personal access token", pattern: /\bghp_[A-Za-z0-9]{36}\b/u },
   { label: "a GitHub fine-grained token", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/u },
-  { label: "a Google API key", pattern: /\bAIza[0-9A-Za-z_-]{35}\b/u },
+  // A trailing `-` is legal in the suffix, and `\b` needs a word/non-word
+  // transition — so a key ending in `-` inside quotes matched nothing at all.
+  { label: "a Google API key", pattern: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/u },
   { label: "a Slack token", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/u },
   // The header alone is decisive: nothing else writes this line.
   {
     label: "a private key",
-    pattern: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----/u,
+    // ENCRYPTED is the standard PKCS#8 header and was not among the
+    // alternatives, so an encrypted private key read as clean — its base64
+    // body carries no other recognisable prefix.
+    pattern: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----/u,
   },
 ];
 
@@ -112,6 +119,10 @@ export function detectCommittedSecrets(diff: string): Finding[] {
             `does not contain. Removing the line in a later commit does not undo the ` +
             `disclosure, because the value stays in the history.`,
           decision: "new",
+          // Keeps the credential out of the diff excerpt the summary fallback
+          // renders, and out of the hunk the conversation path would send to a
+          // model. The message omitting it is not sufficient on its own.
+          redactSource: true,
         });
         // One finding per line: a line matching two formats is one mistake, and
         // reporting it twice would make the count say otherwise.

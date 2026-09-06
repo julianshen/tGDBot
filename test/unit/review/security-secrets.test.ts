@@ -107,6 +107,27 @@ describe("detectCommittedSecrets", () => {
     expect(finding?.title).toContain(label);
   });
 
+  it.each([
+    ["a temporary AWS access key id (ASIA)", 'const k = "ASIAIOSFODNN7EXAMPLE";'],
+    ["a Google API key ending in a hyphen", `const k = "AIza${"B".repeat(34)}-";`],
+    ["an encrypted PKCS#8 private key", "-----BEGIN ENCRYPTED PRIVATE KEY-----"],
+  ])("recognises %s", (_label, line) => {
+    // Each of these read as CLEAN before review: an STS key the advertised
+    // "AWS access key" check silently passed, a legal suffix that `\b` could
+    // not terminate, and the standard encrypted header missing from the
+    // alternatives. A pattern gap in a secrets detector fails silently and
+    // looks like a clean review (Codex review of PR #147).
+    expect(detectCommittedSecrets(diffAdding("src/a.ts", line))).toHaveLength(1);
+  });
+
+  it("marks its findings so no published surface quotes the source line", () => {
+    // The message omitting the credential is not enough. `orchestrate` attaches
+    // a hunk snippet the summary fallback renders in full, and the
+    // conversation path sends the hunk to a model that may quote it back.
+    const [finding] = detectCommittedSecrets(diffAdding("src/a.ts", `const k = "${AWS_KEY}";`));
+    expect(finding?.redactSource).toBe(true);
+  });
+
   it("does not report a Stripe TEST key", () => {
     // Not a credential worth waking anyone for, and reporting it would train
     // readers that this detector cries wolf.

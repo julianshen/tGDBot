@@ -1340,7 +1340,14 @@ export async function review(
   }
 
   // AC-8.5: every rule failed to load -> exit 1 before any VCS write.
-  if (loadedRuleSet.length === 0 && config.codexScanResults === undefined) {
+  // A host detector needs no model rules to produce findings, so an enabled
+  // security pass is a reason to continue — the same exception the scan ingest
+  // already has. Without this, `--security-pass on --disable-builtin-rule` with
+  // no user rules aborted before the detector ran, making a host-only review
+  // impossible to configure (Codex review of PR #147).
+  const hostFindingSourceEnabled =
+    config.codexScanResults !== undefined || config.securityPass === "on";
+  if (loadedRuleSet.length === 0 && !hostFindingSourceEnabled) {
     console.error("tgd-review-agent: no rules could be loaded; aborting before posting a comment");
     return EXIT_FATAL;
   }

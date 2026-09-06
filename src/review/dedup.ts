@@ -43,6 +43,8 @@ export interface ReviewConfigForDedup {
    * older callers and their pinned hashes still typecheck.
    */
   structuralChecks?: "on" | "off";
+  /** Issue #139: the host security detectors. */
+  securityPass?: "on" | "off";
   /**
    * Issue #59: whether the PR's stated intent reaches the reviewer. Read by
    * the CLI caller to decide whether the intent digest joins the fingerprint
@@ -152,6 +154,13 @@ export function computeReviewConfigHash(
       // engine (tests) pin the identity themselves.
       ? ["structural-checks", config.structuralCheckEngine ?? structuralEngineIdentity()]
       : []),
+    // #139. Inside an `=== "on"` guard for the same reason: a repository that
+    // never enables it keeps its hash and pays nothing. Without this, turning
+    // the pass ON for an already-reviewed head produced the SAME hash, so
+    // dedup skipped the run and committed credentials stayed unscanned until
+    // an unrelated change moved the hash — enabling the feature appeared to do
+    // nothing (Codex review of PR #147).
+    ...(config.securityPass === "on" ? ["security-pass"] : []),
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,

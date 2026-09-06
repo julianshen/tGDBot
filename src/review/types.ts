@@ -139,6 +139,23 @@ export interface Finding {
    * `suggestion` a validated field rather than free text in `message`.
    */
   hostCheck?: StructuralCheck;
+
+  /**
+   * Issue #139: never quote this finding's source line anywhere published.
+   *
+   * Set by a HOST detector and, like `hostCheck`, never parsed from reviewer
+   * output — `normalizeUnknownFinding` builds a finding from an allowlist, so a
+   * reviewer emitting this key has it dropped.
+   *
+   * The secrets detector keeps the credential out of its own `message`, but a
+   * `Finding` travels further than its own fields: `orchestrate` attaches a
+   * `hunkSnippet` that the summary fallback renders in full, and the
+   * conversation path sends the surrounding hunk to a model that may quote it
+   * back. Either route republishes the credential into a world-readable
+   * comment — strictly more public than the repository it already leaked to
+   * (Codex review of PR #147). The flag is what those paths check.
+   */
+  redactSource?: boolean;
 }
 
 /**

@@ -371,7 +371,12 @@ export function orchestrate(
       finding,
       {
         ...(inlineEnabled
-          ? { snippet: hunkSnippet(diff, finding.file, finding.line, finding.endLine) }
+          ? (finding.redactSource === true
+            // #139: the summary fallback renders this snippet in full, so a
+            // rejected inline write would publish the credential the finding
+            // deliberately omits.
+            ? {}
+            : { snippet: hunkSnippet(diff, finding.file, finding.line, finding.endLine) })
           : {}),
         ...(() => {
           const rules = contributingRules.get(finding);
