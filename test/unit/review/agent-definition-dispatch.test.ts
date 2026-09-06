@@ -103,4 +103,25 @@ describe("dispatchRulesDirect — agent definitions (#138 phase 2)", () => {
     expect(capturedDefinition?.provider).toBe("openai");
     expect(capturedDefinition?.model).toBe("gpt-4.1-mini");
   });
+
+  it("resolves definitions from ReviewDispatchInput when deps omit them", async () => {
+    const captured: { definition?: AgentDefinition }[] = [];
+    const createSession: DirectSessionFactory = async (_rule, _cwd, _outputDir, definition) => {
+      captured.push({ definition });
+      return { async prompt() {}, getLastAssistantText: () => "[]" };
+    };
+
+    const result = await dispatchRulesDirect(
+      {
+        rules: [makeRule({ name: "rule-a", agent: "docs-reviewer" })],
+        diff: "diff",
+        useAdvisor: false,
+        agentDefinitions: baseDefs,
+      },
+      { createSession },
+    );
+
+    expect(result.rulesRun).toEqual(["rule-a"]);
+    expect(captured[0]?.definition?.tools).toEqual(["read"]);
+  });
 });

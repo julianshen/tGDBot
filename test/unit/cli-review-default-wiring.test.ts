@@ -74,7 +74,7 @@ vi.mock("../../src/review/orchestrate.js", async (importOriginal) => {
   return { ...actual, orchestrate: vi.fn() };
 });
 
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { review } from "../../src/cli.js";
@@ -300,5 +300,41 @@ describe("review — default dependency wiring", () => {
     );
     expect(dispatchRulesDirect).not.toHaveBeenCalled();
     logSpy.mockRestore();
+  });
+
+  it("passes loaded agent definitions on the object input, never in the direct deps argument", async () => {
+    const agentsDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), "tgd-wiring-agents-")));
+    stateRoots.push(agentsDir);
+    writeFileSync(
+      path.join(agentsDir, "docs.agent.md"),
+      "---\nname: docs-reviewer\ntools: read\n---\nFocus on documentation.\n",
+      "utf8",
+    );
+
+    vi.mocked(dispatchRulesDirect).mockClear();
+    vi.mocked(dispatchRulesDirect).mockResolvedValue({
+      findings: [],
+      rulesRun: ["rule-a"],
+      rulesFailed: [],
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await review(makeArgs({ agentsDir }));
+
+    expect(dispatchRulesDirect).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentDefinitions: [
+          expect.objectContaining({
+            name: "docs-reviewer",
+            tools: ["read"],
+            body: "Focus on documentation.",
+          }),
+        ],
+      }),
+      {},
+    );
+    logSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 });

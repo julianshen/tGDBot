@@ -359,7 +359,7 @@ interface RuleOutcome {
       readonly failureReason?: string;
     }
 
-    const agentDefinitions = deps.agentDefinitions ?? [];
+    const agentDefinitions = deps.agentDefinitions ?? input.agentDefinitions ?? [];
     const runRule = async (rule: EffectiveRule): Promise<RuleOutcome> => {
       let session: DispatchSession | undefined;
       try {
