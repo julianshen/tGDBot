@@ -118,6 +118,11 @@ export function computeReviewConfigHash(
    */
   contextFingerprint?: string,
   scanFingerprint?: string,
+  /**
+   * Fingerprint of loaded agent definitions (body/tools/provider/model).
+   * Omitted when `--agents-dir` is unset so existing hashes stay put.
+   */
+  agentFingerprint?: string,
 ): string {
   // A positional array (not an object) so the serialization can't drift on key
   // ordering; every field that affects review output is included explicitly.
@@ -158,6 +163,7 @@ export function computeReviewConfigHash(
     ...(conversationFingerprint === undefined ? [] : [conversationFingerprint]),
     ...(contextFingerprint === undefined ? [] : [{ context: contextFingerprint }]),
     ...(scanFingerprint === undefined ? [] : [{ codexScan: scanFingerprint }]),
+    ...(agentFingerprint === undefined ? [] : [{ agents: agentFingerprint }]),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 12);
 }

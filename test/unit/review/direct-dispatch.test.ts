@@ -23,6 +23,7 @@ import { resolveRpivAdvisorExtensionPath } from "../../../src/review/extensions.
 import { ReviewWorkflowError } from "../../../src/review/workflow.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 import type { RuleContextPacks } from "../../../src/review/types.js";
+import type { AgentDefinition } from "../../../src/review/agent-definition.js";
 
 // Hoisted so the SDK mock below can reference it before direct-dispatch.ts is
 // imported (vi.mock is hoisted to the top of the module by vitest).
@@ -718,6 +719,96 @@ describe("dispatchRulesDirect", () => {
       };
       expect(callArgs.thinkingLevel).toBe("off");
     }
+  });
+
+  describe("agent definitions on the real session factory", () => {
+    const docsDef: AgentDefinition = {
+      name: "docs-reviewer",
+      tools: ["read"],
+      body: "Focus on documentation.",
+      sourcePath: "/agents/docs.agent.md",
+    };
+
+    function mockRuleSession(): void {
+      hoisted.resourceLoaderInstances.length = 0;
+      hoisted.createAgentSessionMock.mockReset();
+      hoisted.createAgentSessionMock.mockResolvedValueOnce({
+        session: {
+          async prompt() {},
+          getLastAssistantText: () => "[]",
+        },
+      });
+    }
+
+    it("prepends the definition body and uses its tool list", async () => {
+      mockRuleSession();
+
+      await dispatchRulesDirect(
+        [makeRule({ agent: "docs-reviewer" })],
+        "diff",
+        false,
+        { agentDefinitions: [docsDef] },
+      );
+
+      const prompt = hoisted.resourceLoaderInstances[0]?.options.systemPrompt;
+      expect(typeof prompt).toBe("string");
+      expect(prompt as string).toMatch(/^Focus on documentation\.\n\n/);
+      const callArgs = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as { tools?: string[] };
+      expect(callArgs.tools).toEqual(["read"]);
+    });
+
+    it("keeps an explicit rule model pin over the definition pin", async () => {
+      mockRuleSession();
+      const cheap: AgentDefinition = {
+        ...docsDef,
+        name: "cheap-reviewer",
+        provider: "openai",
+        model: "gpt-4.1-mini",
+      };
+
+      const result = await dispatchRulesDirect(
+        [makeRule({ agent: "cheap-reviewer" })],
+        "diff",
+        false,
+        { agentDefinitions: [cheap] },
+      );
+
+      const callArgs = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as {
+        model?: { provider?: string; id?: string };
+      };
+      expect(callArgs.model).toMatchObject({ provider: "anthropic", id: "claude-opus-4-5" });
+      expect(result.modelsUsed).toEqual(["anthropic/claude-opus-4-5"]);
+    });
+
+    it("applies the definition model pin when the rule is unpinned", async () => {
+      mockRuleSession();
+      const cheap: AgentDefinition = {
+        ...docsDef,
+        name: "cheap-reviewer",
+        provider: "openai",
+        model: "gpt-4.1-mini",
+      };
+
+      const result = await dispatchRulesDirectObject(
+        {
+          rules: [makeRule({
+            provider: undefined,
+            model: undefined,
+            agent: "cheap-reviewer",
+          })],
+          diff: "diff",
+          useAdvisor: false,
+          orchestratorModel: "anthropic/claude-opus-4-5",
+        },
+        { agentDefinitions: [cheap] },
+      );
+
+      const callArgs = hoisted.createAgentSessionMock.mock.calls[0]?.[0] as {
+        model?: { provider?: string; id?: string };
+      };
+      expect(callArgs.model).toMatchObject({ provider: "openai", id: "gpt-4.1-mini" });
+      expect(result.modelsUsed).toEqual(["openai/gpt-4.1-mini"]);
+    });
   });
 });
 

@@ -2,6 +2,7 @@ import type { ContextPackResult } from "../context/context-pack.js";
 import type { PrIntent } from "./pr-intent.js";
 import type { StructuralCheck, StructuralClaim } from "./structural-check.js";
 import type { RuleDefinition } from "../rules/types.js";
+import type { AgentDefinition } from "./agent-definition.js";
 
 // Finding/DispatchResult: the shape produced by dispatching every loaded rule
 // through the orchestrating AgentSession's `subagent` tool call and parsing
@@ -261,4 +262,11 @@ export interface ReviewDispatchInput {
    * task text byte-identical to the pre-#59 output.
    */
   prIntent?: PrIntent;
+  /**
+   * Issue #138 phase 2: loaded agent definitions for this run. The CLI
+   * attaches them to the shared input; the direct engine resolves each
+   * rule's `agent:` reference from this list. Absent when `--agents-dir`
+   * is unset or loads nothing.
+   */
+  agentDefinitions?: readonly AgentDefinition[];
 }

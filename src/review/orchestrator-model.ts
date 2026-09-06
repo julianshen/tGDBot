@@ -412,7 +412,7 @@ export async function resolveEffectiveRules(
     effective: rules.map((r) =>
       r.provider !== undefined && r.model !== undefined
         ? (r as EffectiveRule)
-        : { ...r, provider: defaultProvider, model: defaultModel },
+        : { ...r, provider: defaultProvider, model: defaultModel, modelFromDefault: true as const },
     ),
     unresolved: {},
   };

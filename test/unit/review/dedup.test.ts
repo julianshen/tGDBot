@@ -159,6 +159,17 @@ describe("computeReviewConfigHash", () => {
     expect(first).not.toBe(legacy);
     expect(replaced).not.toBe(first);
   });
+
+  it("keeps hashes unchanged without an agent fingerprint and changes when one is supplied", () => {
+    const legacy = computeReviewConfigHash(makeConfig());
+    expect(computeReviewConfigHash(makeConfig(), undefined, undefined, undefined, undefined, undefined)).toBe(legacy);
+    const first = computeReviewConfigHash(makeConfig(), undefined, undefined, undefined, undefined, "agents-a");
+    const replaced = computeReviewConfigHash(makeConfig(), undefined, undefined, undefined, undefined, "agents-b");
+    expect(first).not.toBe(legacy);
+    expect(replaced).not.toBe(first);
+    expect(computeReviewConfigHash(makeConfig(), undefined, undefined, undefined, "/scan:a", "agents-a"))
+      .not.toBe(first);
+  });
 });
 
 describe("conversationDedupFingerprint", () => {

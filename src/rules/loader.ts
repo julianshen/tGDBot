@@ -110,6 +110,15 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
     appliesTo = [...(candidates as string[])];
   }
 
+  // Issue #138 phase 2: an optional reference to an agent definition by
+  // name. The definition supplies the tool allowlist, optional model pin,
+  // and additional system-prompt instructions for this persona.
+  const agentValue = data.agent;
+  if (agentValue !== undefined && !isNonEmptyString(agentValue)) {
+    return { error: `frontmatter field "agent" must be a non-empty string` };
+  }
+  const agent = agentValue as string | undefined;
+
   const parallelGroupValue = data.parallel_group;
   if (
     parallelGroupValue !== undefined &&
@@ -131,6 +140,7 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
       ...(parallelGroupValue === undefined
         ? {}
         : { parallelGroup: parallelGroupValue as string }),
+      ...(agent === undefined ? {} : { agent }),
       body: parsed.content.trim(),
       sourcePath,
     },

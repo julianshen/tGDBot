@@ -28,6 +28,13 @@ export interface RuleDefinition {
   appliesTo?: readonly string[];
   dependsOn: readonly string[];
   parallelGroup?: string;
+  /**
+   * Issue #138 phase 2: references an agent definition by name. The
+   * definition's tool allowlist and model override the rule's defaults;
+   * its body is prepended to the reviewer system prompt. Absent means the
+   * standard reviewer persona.
+   */
+  agent?: string;
   body: string;
   sourcePath: string;
 }
@@ -39,4 +46,13 @@ export interface RuleDefinition {
  * shape so it never has to re-handle "no model" — that case fails, with a
  * clear reason, before dispatch.
  */
-export type EffectiveRule = RuleDefinition & { provider: string; model: string };
+export type EffectiveRule = RuleDefinition & {
+  provider: string;
+  model: string;
+  /**
+   * Set when provider/model were filled from the runtime default rather than
+   * the rule file. Agent-definition model pins apply only in that case —
+   * an explicit rule pin stays authoritative.
+   */
+  readonly modelFromDefault?: true;
+};
