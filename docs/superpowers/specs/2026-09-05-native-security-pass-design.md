@@ -34,6 +34,19 @@ folded in, because several invalidate claims the draft made confidently:
 Two of those — the tree, and the trusted label — were the specific things the
 draft claimed as its strongest evidence.
 
+A second round, after the revision, found four more:
+
+| Claim in the revision | What was wrong |
+|---|---|
+| `Fact.source` parsed from reviewer output | the model could select `source: "host"` and have its guess rendered as host-established evidence; stage 4 leaves reviewer facts alone where no pattern matches, so nothing downstream would catch it |
+| the rewritten severity table is total | it was not: an all-known `attackerControl: plausible` + remote + `crossesBoundary: yes` + `public` path matched no row, so an implementation returns `undefined` |
+| the localhost row | matched on vector and boundary alone, rating a path with `attackerControl: no` as `warning` before the non-exploitable branch could reduce it |
+| host checks for secrets and supply chain | they had **no way to reach a reader**: `structural-check.ts` annotates existing findings, and a PR whose only defect is a committed credential produces none to annotate |
+
+The last is the one I had flagged as unexamined when the decision was made, and
+it was a real hole rather than a theoretical one: two of the four advertised
+security surfaces would have reported nothing, silently.
+
 ## Why this is not the thing that was rejected
 
 `2026-09-01-codex-security-scan-design.md` records a feasibility study that
@@ -123,6 +136,7 @@ export interface Fact<T> {
    * rejected at parse: an unevidenced fact drives severity on nothing.
    */
   readonly evidence: string;
+  /** Set by the HOST, never parsed. See below. */
   readonly source: FactSource;
 }
 
@@ -145,6 +159,19 @@ export type AttackPathResult =
   | { readonly status: "analyzed"; readonly facts: AttackPathFacts }
   | { readonly status: "not-analyzed"; readonly reason: string };
 ```
+
+**`source` is not a parsed field.** Stage 3's parser stamps every incoming fact
+`reviewer`, unconditionally; only stage 4 may construct one with `source:
+"host"`. Reviewer output is model text produced over an attacker-controlled
+diff, and if the contract let it select its own provenance, a mistaken or
+injected response would render as host-established evidence — with nothing
+downstream to catch it, because stage 4 leaves reviewer facts in place wherever
+no supported pattern matches.
+
+This is the guarantee `hostCheck` already holds, for the reason its own comment
+gives: a forged verification is the most damaging thing a finding can carry,
+being the one part a reader is meant to trust without re-deriving. Unforgeable
+by construction, not by the model behaving.
 
 `not-analyzed` is not optional decoration. Without it, a finding whose analysis
 timed out, failed to parse, or fell outside the candidate budget renders exactly
@@ -234,33 +261,46 @@ export function rateSeverity(
 ): Finding["severity"];
 ```
 
-The rules, applied in order, first match wins:
+Expressed as control flow rather than a table, because two rounds of review
+found combinations a table did not cover. Every branch returns, so the function
+is total by construction rather than by enumeration:
 
-| # | Condition | Result |
-|---|---|---|
-| 1 | any field required by rules 2–5 is `unknown` | **`discovered`**, unchanged |
-| 2 | `attackerControl: yes` ∧ `vector: remote\|local-network` ∧ `preconditions: none\|plausible` ∧ `crossesBoundary: yes` ∧ `authScope: public\|user` | `blocking` |
-| 3 | as 2 but `authScope: internal\|admin`, **or** `vector: localhost` with `crossesBoundary: yes` | `warning` |
-| 4 | reachable, but `crossesBoundary: no` — same-user, same-tenant, self-only | `warning`, capped: never above `discovered` |
-| 5 | `attackerControl: no` ∨ `preconditions: unachievable` ∨ `vector: none` | `suggestion` |
+```ts
+function rateSeverity(discovered, facts) {
+  // 1. Any field the decision needs is unknown -> preserve what discovery said.
+  if (anyRequiredUnknown(facts)) return discovered;
 
-Rule 1 is what makes "unknown lowers confidence, never severity" implementable.
-The draft asserted that rule and could not deliver it: with no baseline, an
-all-`unknown` input had nothing to preserve, and the function had to invent a
-default. Passing `discovered` in gives it something to preserve.
+  // 2. Exploitability first, so a non-exploitable path can never be raised by
+  //    a later branch. This ordering is the fix for a localhost path with
+  //    `attackerControl: no` being rated `warning` before it could be reduced.
+  const exploitable =
+    (facts.attackerControl.value === "yes" || facts.attackerControl.value === "plausible") &&
+    (facts.preconditions.value === "none" || facts.preconditions.value === "plausible") &&
+    facts.vector.value !== "none";
+  if (!exploitable) return "suggestion";
 
-Rule 3 exists because the draft had no row at all for a known `localhost` path
-that crosses a boundary — another local tenant, or a browser reaching a local
-service. The function was not total and would have thrown or silently defaulted
-on a genuinely serious case.
+  // 3. Reachable but bounded to one user or tenant. Capped, never raised: a
+  //    self-only issue the reviewer called `suggestion` stays there.
+  if (facts.crossesBoundary.value === "no") return min(discovered, "warning");
 
-Rule 2 requires `crossesBoundary: yes` explicitly. Without it the draft promoted
-a bounded self-only defect to `blocking` on nothing more than "remote and no
-prerequisites", and rows 2 and 4 both matched the same finding.
+  // 4. Crosses a boundary, from a network surface, on a caller anyone can be.
+  if (
+    (facts.vector.value === "remote" || facts.vector.value === "local-network") &&
+    (facts.authScope.value === "public" || facts.authScope.value === "user")
+  ) return "blocking";
 
-Rule 4 caps rather than sets: an authenticated same-user issue the reviewer
-called `suggestion` should not be *raised* to `warning` by a policy whose job
-here is to hold severity down.
+  // 5. Crosses a boundary, but from localhost, or behind internal/admin auth.
+  return "warning";
+}
+```
+
+The counterexample that forced this shape: `attackerControl: plausible`,
+`vector: remote`, `preconditions: plausible`, `crossesBoundary: yes`,
+`authScope: public` — all known, and matching **no row** of the previous table,
+so an implementation following it returned `undefined` against a declared
+`Finding["severity"]`. Here it reaches branch 4 and returns `blocking`.
+
+`min` compares on the published ordering `blocking > warning > suggestion`.
 
 ### Unknown lowers confidence, never severity
 
@@ -338,6 +378,35 @@ The pack is therefore:
 
 Two model calls per review with candidates, down from seven. `applies_to`
 (#115) scopes each so a manifest-only change pays for neither.
+
+### Host detectors must synthesize findings, not annotate them
+
+A gap the second review found, and the one I had flagged as unexamined: making
+secrets and supply-chain **host checks** left them with no way to reach a
+reader at all. `structural-check.ts` is the wrong precedent for this half —
+it *annotates* findings that already exist. A pull request whose only defect is
+a committed credential produces no reviewer finding to annotate, so two of the
+four advertised surfaces would have reported nothing, silently.
+
+So host detectors **create** findings, before orchestration:
+
+- they run after dispatch and before `orchestrateFn`, appending to
+  `dispatchResult.findings`
+- each carries a **host-owned `ruleName`** — `security:secrets`,
+  `security:supply-chain` — reserved the way `codex-security` already is, so a
+  user rule cannot claim the name and reviewer output cannot forge one
+- those names are pushed to `rulesRun`, exactly as the Codex ingest pushes
+  `codex-security`, so the summary's "Rules run" reflects what actually ran
+- their findings then flow through dedup, clustering, anchoring and publication
+  like any other, which is what makes them addressable in conversation and
+  countable in `metrics` (#109)
+- a detector that fails pushes its name to `rulesFailed` with a reason, rather
+  than being absent
+
+Because these findings never pass through a model, their `hostCheck`-equivalent
+provenance is inherent: the host computed the whole finding, so there is nothing
+for a reviewer to have asserted. That is a stronger position than the reachability
+facts are in, and worth keeping distinct in the rendering.
 
 ### Deliberately excluded
 
@@ -424,20 +493,32 @@ that the total is unknown.
 ## Testing
 
 - **`rateSeverity` is pure and total**, so the rubric is table-driven unit
-  tests. Required cases, each from a defect the review found in the draft:
+  tests. Required cases, each from a defect a review round found:
   - every field `unknown` returns `discovered` exactly — the case that had no
     baseline before
   - a known `localhost` + `crossesBoundary: yes` path returns a defined result —
     the combination that matched no row
   - a remote, no-precondition, **self-only** finding does **not** reach
     `blocking` — the overlap between rows 2 and 4
-  - a property test that the function is total: no input throws or returns
-    `undefined`
+  - `attackerControl: plausible` + remote + plausible preconditions +
+    `crossesBoundary: yes` + `authScope: public` returns `blocking` — the
+    all-known combination that matched no row in either earlier table
+  - a known `localhost` path with `attackerControl: no` returns `suggestion`,
+    not `warning` — exploitability is decided before the localhost branch
+  - an **exhaustive** test over the full enum cross-product asserting every
+    input returns one of the three severities. The function is small enough
+    that totality can be proven by enumeration rather than asserted
 - **Parsing** rejects a non-`unknown` fact with no evidence, and drops enum
   values outside the contract rather than coercing them, through
   `normalizeUnknownFinding`'s allowlist discipline.
 - **Provenance** renders differently: a test asserting a `host` fact and a
-  `reviewer` fact with identical values do not produce identical text.
+  `reviewer` fact with identical values do not produce identical text — and a
+  test that reviewer output claiming `source: "host"` is stamped `reviewer`
+  anyway, because that field is not parsed.
+- **Host detectors produce findings**: a fixture whose only defect is a
+  committed credential yields a finding, with its host-owned rule name in
+  `rulesRun`, reaching the summary — the case where annotating rather than
+  creating would have reported nothing.
 - **`not-analyzed`** renders a reason, and a test pins that a budget-deferred
   finding is distinguishable from a finding reviewed with the pass off.
 - **Gating**: a `--security-pass off` review dispatches no security rule and
