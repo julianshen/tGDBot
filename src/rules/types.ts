@@ -46,4 +46,13 @@ export interface RuleDefinition {
  * shape so it never has to re-handle "no model" — that case fails, with a
  * clear reason, before dispatch.
  */
-export type EffectiveRule = RuleDefinition & { provider: string; model: string };
+export type EffectiveRule = RuleDefinition & {
+  provider: string;
+  model: string;
+  /**
+   * Set when provider/model were filled from the runtime default rather than
+   * the rule file. Agent-definition model pins apply only in that case —
+   * an explicit rule pin stays authoritative.
+   */
+  readonly modelFromDefault?: true;
+};

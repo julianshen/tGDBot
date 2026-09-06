@@ -75,6 +75,8 @@ export type DirectSessionFactory = (
   cwd: string,
   /** Issue #138: where this rule's submitted findings.json is written. */
   outputDir: string,
+  /** Issue #138 phase 2: resolved persona, if the rule named one. */
+  definition?: AgentDefinition,
 ) => Promise<DispatchSession>;
 
 /** Creates the (single) advisor session for the --advisor pass. */
@@ -104,6 +106,23 @@ const ADVISOR_PROMPT_TIMEOUT_MS = 5 * 60 * 1000;
 // generic error.
 class PromptTimeoutError extends Error {
   readonly timedOut = true as const;
+}
+
+function sessionModelFor(
+  rule: EffectiveRule,
+  definition: AgentDefinition | undefined,
+): { provider: string; model: string } {
+  // An explicit rule pin is the more specific dispatch unit. A definition
+  // pin applies only when the rule inherited the runtime default — a
+  // persona designed for a cheaper model keeps that pin on unpinned rules.
+  if (
+    definition?.provider !== undefined &&
+    definition.model !== undefined &&
+    rule.modelFromDefault === true
+  ) {
+    return { provider: definition.provider, model: definition.model };
+  }
+  return { provider: rule.provider, model: rule.model };
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string): Promise<T> {
@@ -139,13 +158,8 @@ async function createRealDirectSession(
   // not burn a session-construction round trip to discover it. The error
   // strings deliberately match PROVIDER_AUTH_ERROR_RE's vocabulary so
   // classifyTaskFailure names the cause in the PR comment.
-  // Issue #138 phase 2: a definition's model pin is MORE specific than
-  // the rule's (a persona designed for a cheaper model keeps it even
-  // when the rule is unpinned). The rule's pin still wins when both
-  // are set, because the rule is the more specific dispatch unit.
-  const resolvedProvider = definition?.provider ?? rule.provider;
-  const resolvedModelSpec = definition?.model ?? rule.model;
-  const resolved = await resolveRuleSessionModel(resolvedProvider, resolvedModelSpec);
+  const sessionModel = sessionModelFor(rule, definition);
+  const resolved = await resolveRuleSessionModel(sessionModel.provider, sessionModel.model);
   if (!resolved.model) {
     throw new Error(resolved.error ?? `could not resolve model for rule "${rule.name}"`);
   }
@@ -163,14 +177,16 @@ async function createRealDirectSession(
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPrompt: reviewerSystemPrompt(),
+    systemPrompt: definition?.body
+      ? `${definition.body}\n\n${reviewerSystemPrompt()}`
+      : reviewerSystemPrompt(),
   });
   await loader.reload();
 
   const { session } = await createAgentSession({
     resourceLoader: loader,
     cwd,
-    tools: ["read", "grep", "find", "ls", "submit_findings"],
+    tools: [...(definition?.tools ?? ["read", "grep", "find", "ls", "submit_findings"])],
     customTools: [
       // Issue #138 phase 1: the findings file contract. A single host-mediated
       // tool whose write path is baked into the closure; the model supplies
@@ -348,6 +364,12 @@ interface RuleOutcome {
       let session: DispatchSession | undefined;
       try {
         const definition = resolveAgentDefinition(rule.agent, agentDefinitions);
+        if (rule.agent !== undefined && definition === undefined) {
+          console.warn(
+            `dispatchRulesDirect: rule "${rule.name}" references unknown agent definition "${rule.agent}"; ` +
+              `running with the standard persona`,
+          );
+        }
         session = await withTimeout(
           createSession(rule, cwd as string, path.join(findingsDir as string, ruleDirName(rule.name)), definition),
           ruleTimeoutMs,
@@ -501,7 +523,10 @@ interface RuleOutcome {
     // Derived from what was DISPATCHED, not from `rulesRun`: a rule whose
     // output failed to parse still reached the model and still consumed it, so
     // filtering on success understated what ran (PR #72 review).
-    const modelsUsed = [...new Set(effective.map((rule) => `${rule.provider}/${rule.model}`))];
+    const modelsUsed = [...new Set(effective.map((rule) => {
+      const resolved = sessionModelFor(rule, resolveAgentDefinition(rule.agent, agentDefinitions));
+      return `${resolved.provider}/${resolved.model}`;
+    }))];
 
     return {
       findings,

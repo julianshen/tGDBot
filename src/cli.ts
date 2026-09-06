@@ -96,9 +96,12 @@ import {
 import { contextRoots, selectContextRoot } from "./context/root.js";
 import { GraphifyMapper, GRAPHIFY_MAPPER_VERSION } from "./context/graphify-mapper.js";
 import { relocateFindingsByQuote } from "./review/quote-anchor.js";
-import { loadAgentDefinitions } from "./review/agent-definition.js";
+import {
+  fingerprintAgentDefinitions,
+  loadAgentDefinitions,
+  type AgentDefinition,
+} from "./review/agent-definition.js";
 import { CONTEXT_MAPPER_VERSION } from "./context/prepare.js";
-import type { AgentDefinition } from "./review/agent-definition.js";
 
 /**
  * The mapper identity that goes into the context cache key and the review
@@ -1133,6 +1136,20 @@ export async function review(
       console.warn(`tgd-review-agent: Codex Security ingest failed: ${redactedMessage(error)}`);
     }
   }
+  // Issue #138 phase 2: load agent definitions before the dedup hash so a
+  // persona change retriggers on an unchanged head. Local filesystem only —
+  // this does not fetch rule files from the PR (the documented "skipped
+  // review fetches nothing" optimization still holds for rules).
+  let agentDefinitions: AgentDefinition[] | undefined;
+  let agentFingerprint: string | undefined;
+  if (config.agentsDir !== undefined) {
+    const agentLoad = await loadAgentDefinitions(config.agentsDir);
+    for (const error of agentLoad.errors) {
+      console.warn(`tgd-review-agent: agent definition: ${error.message}`);
+    }
+    agentDefinitions = agentLoad.definitions;
+    agentFingerprint = fingerprintAgentDefinitions(agentLoad.definitions);
+  }
   const configHash = computeReviewConfigHash(
     config,
     // Issue #59: when intent is enabled, the normalized title + description
@@ -1142,10 +1159,11 @@ export async function review(
     // and the hash is what it always was.
     relatedWorkFingerprintWithIntent(config, extracted, pr.title, pr.description),
     loadedContext.fingerprint,
-    ...(contextIdentity === undefined ? [undefined] : [contextIdentity]),
-    ...(config.codexScanResults === undefined
-      ? []
-      : [`${path.resolve(config.codexScanResults)}:${scanIngest?.digest ?? codexScanArtifactDigest(scanIngestError) ?? "unreadable"}`]),
+    contextIdentity,
+    config.codexScanResults === undefined
+      ? undefined
+      : `${path.resolve(config.codexScanResults)}:${scanIngest?.digest ?? codexScanArtifactDigest(scanIngestError) ?? "unreadable"}`,
+    agentFingerprint,
   );
   const storeBinding = storeBindingOf(stateStore, repository);
   const publicationIdentity = reviewPublicationIdentity({
@@ -1302,18 +1320,6 @@ export async function review(
   }
 
   const loadedRules = await loadRulesForReview(config, pr, loadRulesFn);
-  // Issue #138 phase 2: load agent definitions from the operator's
-  // --agents-dir (when set). Best-effort: load errors go to stderr, the
-  // review proceeds with rules that reference missing definitions running
-  // on the standard persona.
-  let agentDefinitions: AgentDefinition[] | undefined;
-  if (config.agentsDir !== undefined) {
-    const agentLoad = await loadAgentDefinitions(config.agentsDir);
-    for (const error of agentLoad.errors) {
-      console.warn(`tgd-review-agent: agent definition: ${error.message}`);
-    }
-    agentDefinitions = agentLoad.definitions;
-  }
   const loadedRuleSet = config.codexScanResults === undefined
     ? loadedRules.rules
     : loadedRules.rules.filter((rule) => rule.name !== "codex-security");

@@ -9,8 +9,10 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   loadAgentDefinitions,
   resolveAgentDefinition,
+  fingerprintAgentDefinitions,
   ALLOWED_DEFINITION_TOOLS,
 } from "../../../src/review/agent-definition.js";
+import type { AgentDefinition } from "../../../src/review/agent-definition.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -48,6 +50,20 @@ describe("loadAgentDefinitions", () => {
     expect(errors).toEqual([]);
   });
 
+  it("returns a load error when the path is not a directory", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "agent-def-"));
+    roots.push(dir);
+    const filePath = path.join(dir, "not-a-dir");
+    await writeFile(filePath, "not a directory", "utf8");
+
+    const { definitions, errors } = await loadAgentDefinitions(filePath);
+
+    expect(definitions).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].sourcePath).toBe(filePath);
+    expect(errors[0].message).toMatch(/could not read agent definitions directory/);
+  });
+
   it("rejects an unknown tool with a load error naming the tool", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "agent-def-"));
     roots.push(dir);
@@ -80,6 +96,17 @@ describe("loadAgentDefinitions", () => {
     const { errors } = await loadAgentDefinitions(dir);
     expect(errors).toHaveLength(1);
     expect(errors[0].message).toMatch(/"model" without "provider"/);
+  });
+
+  it("rejects a present provider or model that is not a non-empty string", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "agent-def-"));
+    roots.push(dir);
+    await writeDefinition(dir, "numeric-pin.agent.md", "name: numeric\nprovider: 123\nmodel: 456");
+
+    const { definitions, errors } = await loadAgentDefinitions(dir);
+    expect(definitions).toEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toMatch(/"provider" must be a non-empty string/);
   });
 
   it("keeps the first definition when names collide", async () => {
@@ -132,5 +159,30 @@ describe("resolveAgentDefinition", () => {
 
   it("returns undefined for an undefined reference (the standard persona)", () => {
     expect(resolveAgentDefinition(undefined, definitions)).toBeUndefined();
+  });
+});
+
+describe("fingerprintAgentDefinitions", () => {
+  const base: AgentDefinition = {
+    name: "docs-reviewer",
+    tools: ["read"],
+    body: "Focus on documentation.",
+    sourcePath: "/agents/docs.agent.md",
+  };
+
+  it("is stable for the same definitions regardless of input order or sourcePath", () => {
+    const a = fingerprintAgentDefinitions([base, { ...base, name: "core", sourcePath: "/a.md" }]);
+    const b = fingerprintAgentDefinitions([
+      { ...base, name: "core", sourcePath: "/other.md" },
+      { ...base, sourcePath: "/moved.md" },
+    ]);
+    expect(a).toBe(b);
+  });
+
+  it("changes when body, tools, provider, or model change", () => {
+    const original = fingerprintAgentDefinitions([base]);
+    expect(fingerprintAgentDefinitions([{ ...base, body: "Different." }])).not.toBe(original);
+    expect(fingerprintAgentDefinitions([{ ...base, tools: ["read", "grep"] }])).not.toBe(original);
+    expect(fingerprintAgentDefinitions([{ ...base, provider: "openai", model: "gpt-4.1-mini" }])).not.toBe(original);
   });
 });

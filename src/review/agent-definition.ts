@@ -25,6 +25,7 @@
 // the defaults (additive, never a cliff), consistent with every optional
 // feature in this codebase.
 
+import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import matter from "gray-matter";
@@ -99,6 +100,15 @@ function parseAgentDefinitionFile(
   }
 
   // Model: same pair rule as rules files (provider + model, or neither).
+  // A present non-string (or empty) value is a load error — otherwise
+  // `provider: 123` / `model: 456` would both fail isNonEmptyString, skip
+  // the pair check, and silently drop the pin.
+  if (data.provider !== undefined && !isNonEmptyString(data.provider)) {
+    return { error: `frontmatter field "provider" must be a non-empty string` };
+  }
+  if (data.model !== undefined && !isNonEmptyString(data.model)) {
+    return { error: `frontmatter field "model" must be a non-empty string` };
+  }
   const hasProvider = isNonEmptyString(data.provider);
   const hasModel = isNonEmptyString(data.model);
   if (hasProvider !== hasModel) {
@@ -159,7 +169,11 @@ export async function loadAgentDefinitions(
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return { definitions, errors };
     }
-    throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      definitions,
+      errors: [{ sourcePath: agentsDir, message: `could not read agent definitions directory: ${message}` }],
+    };
   }
 
   const mdFiles = entries
@@ -205,4 +219,21 @@ export function resolveAgentDefinition(
 ): AgentDefinition | undefined {
   if (agentName === undefined) return undefined;
   return definitions.find((d) => d.name === agentName);
+}
+
+/**
+ * Stable fingerprint of the fields that change a review's output. Excludes
+ * filesystem paths so a moved-but-identical definition does not retrigger.
+ */
+export function fingerprintAgentDefinitions(definitions: readonly AgentDefinition[]): string {
+  const canonical = [...definitions]
+    .map((definition) => ({
+      name: definition.name,
+      tools: [...definition.tools],
+      provider: definition.provider ?? null,
+      model: definition.model ?? null,
+      body: definition.body,
+    }))
+    .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
 }
