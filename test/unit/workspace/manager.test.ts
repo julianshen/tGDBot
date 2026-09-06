@@ -246,6 +246,36 @@ describe("withPreparedWorkspaces", () => {
     )).rejects.toThrow(/No managed worktree was prepared/);
   });
 
+  it("refuses to adopt a symlink planted at the SECOND commit's path", async () => {
+    // The shared setup validates paths derived from the FIRST requested SHA.
+    // Its ancestors — `worktreesRoot`, `.owners` — are shared, so that check
+    // covers them for every SHA; the second tree's OWN directory is not, and
+    // is guarded instead by the ownership marker refusing to adopt a path it
+    // did not create (CodeRabbit review of PR #146).
+    //
+    // Asserted on the specific rejection, because an earlier version of this
+    // test passed with the symlink-ancestor guard deleted — it was catching
+    // the ownership check while claiming to cover the other one, which is a
+    // test that would not notice its own subject being removed.
+    const root = await tempRoot();
+    const outside = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    const headPaths = deriveWorkspacePaths({ root, repo, baseSha: headSha });
+    await mkdir(path.dirname(headPaths.baseWorktreePath), { recursive: true });
+    await symlink(outside, headPaths.baseWorktreePath);
+
+    const exec = multiExec(paths);
+    await expect(withPreparedWorkspaces(
+      { root, repo },
+      [baseSha, headSha],
+      async () => "unreachable",
+      { exec },
+    )).rejects.toThrow(/Refusing unmanaged worktree collision/);
+
+    // And nothing was written through the link.
+    await expect(readFile(path.join(outside, ".git"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("refuses an empty request rather than locking for nothing", async () => {
     const root = await tempRoot();
     await expect(withPreparedWorkspaces(
