@@ -83,6 +83,10 @@ export function createSubmitFindingsTool(options: {
           dropped += 1;
           continue;
         }
+        // Stamp the attributed rule: normalizeUnknownFinding prefers a
+        // model-supplied ruleName, and a submitted finding with a different
+        // one would be misattributed (PR #141 review).
+        finding.ruleName = options.ruleName;
         findings.push(finding);
         accepted += 1;
       }
@@ -125,7 +129,10 @@ export async function readSubmittedFindings(options: {
   const findings: Finding[] = [];
   for (const raw of parsed) {
     const finding = normalizeUnknownFinding(raw, options.ruleName, options.allowedReferences);
-    if (finding !== undefined) findings.push(finding);
+    if (finding !== undefined) {
+      finding.ruleName = options.ruleName;
+      findings.push(finding);
+    }
   }
   return findings;
 }

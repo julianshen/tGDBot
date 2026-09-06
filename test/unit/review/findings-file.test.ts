@@ -55,6 +55,17 @@ describe("createSubmitFindingsTool", () => {
     expect(written[0]).toMatchObject({ file: "src/a.ts", message: "real" });
   });
 
+  it("stamps the attributed rule over a model-supplied ruleName (PR #141 review)", async () => {
+    const outputDir = await tempDir("stamp-");
+    const tool = createSubmitFindingsTool({ outputDir, ruleName, allowedReferences: refs });
+    await tool.execute("call-1", {
+      findings: [{ file: "a.ts", severity: "warning", category: "c", message: "ok", ruleName: "wrong-rule" }],
+    }, undefined, undefined, {} as never);
+
+    const read = await readSubmittedFindings({ outputDir, ruleName, allowedReferences: refs });
+    expect(read?.[0]?.ruleName).toBe(ruleName);
+  });
+
   it("replaces the recorded set when called again (last submission wins)", async () => {
     const outputDir = await tempDir("submit-replace-");
     const tool = createSubmitFindingsTool({ outputDir, ruleName, allowedReferences: refs });

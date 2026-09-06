@@ -158,7 +158,7 @@ async function createRealDirectSession(rule: EffectiveRule, cwd: string, outputD
   const { session } = await createAgentSession({
     resourceLoader: loader,
     cwd,
-    tools: ["read", "grep", "find", "ls"],
+    tools: ["read", "grep", "find", "ls", "submit_findings"],
     customTools: [
       // Issue #138 phase 1: the findings file contract. A single host-mediated
       // tool whose write path is baked into the closure; the model supplies
@@ -356,7 +356,6 @@ interface RuleOutcome {
           ruleName: rule.name,
           allowedReferences: referencesDeclaredBy(rule.body),
         });
-        console.log(`DBG-DIRECT: submitted for "${rule.name}": ${submitted === undefined ? "undefined" : JSON.stringify(submitted)}`);
         if (submitted !== undefined) {
           return { ruleName: rule.name, succeeded: true, findings: submitted };
         }
