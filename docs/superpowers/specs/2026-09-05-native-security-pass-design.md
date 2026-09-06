@@ -164,11 +164,19 @@ Evidence strings are bounded (#110) and sanitized on the same terms as
 ## Stage 4: reachability, and its much narrower limit
 
 The first draft claimed host-established `vector` and `authScope` across the
-whole TS/JS family. That is wrong, and the correction matters more than the
-capability: **resolving a call chain proves neither.** The same handler is
+whole TS/JS family. That is wrong twice over, and the corrections matter more
+than the capability.
+
+**Resolving a call chain proves neither.** The same handler is
 public or authenticated depending on Express or Fastify middleware, a decorator,
 generated routing, or a project's own wrapper — none of which a caller-edge walk
 observes.
+
+**And the TS/JS limit was the package's, not the design's.** `@ast-grep/napi`'s
+built-in `Lang` enum is `Html, JavaScript, Tsx, Css, TypeScript`; Java, Go, Rust
+and Python are reachable through `registerDynamicLanguage` and a per-language
+grammar. That is tier 2, and "The rule pack" states what it costs — this section
+should not be read as saying those languages are out of reach.
 
 So a host fact is produced **only under an explicitly supported pattern with
 positive evidence**, and `unknown` otherwise:
@@ -176,8 +184,12 @@ positive evidence**, and `unknown` otherwise:
 | Situation | `source` | Value |
 |---|---|---|
 | a supported router registration resolves to the finding's symbol, with the mounting evidence read | `host` | established |
-| TS/JS resolves, no supported pattern matches | `reviewer` | whatever the reviewer asserted |
-| non-TS/JS, or no ast-grep binding | `reviewer` | asserted, or `unknown` |
+| the language parses (tier 1 or 2) but no supported pattern matches | `reviewer` | whatever the reviewer asserted |
+| no grammar for the language, or no ast-grep binding | `reviewer` | asserted, or `unknown` |
+
+Tiers are defined under "The rule pack". **Discovery is not tiered** — every
+language is reviewed. Only the evidence behind a fact is, and a language without
+a grammar reaches `unknown`, never "no attack path".
 
 The supported-pattern list starts empty and grows one framework at a time, each
 with fixtures. An unrecognised routing style yields `unknown` — a coverage gap
@@ -205,8 +217,9 @@ mapper emits no edges at all.
 
 `@ast-grep/napi` ships no prebuilt binary for some platforms, and
 `structural-check.ts` already avoids evaluating the binding at module load for
-that reason. This stage degrades the same way: no binding, no host fact,
-`unknown`, review continues.
+that reason. This stage degrades the same way, and so must every grammar added
+for tier 2: no binding, no grammar, no host fact — `unknown`, review continues.
+**A missing grammar must never read as an absent attack path.**
 
 ## Stage 5: severity policy
 
@@ -256,6 +269,93 @@ renders the unknowns explicitly. On a Go or Rust repository most reachability
 fields will legitimately be `unknown`, and that must read as *"we could not
 establish the path"*, never as *"there is no path"* — the failure
 `dependency-facts.ts` and `hostCheck: not-checked` were both written to avoid.
+
+## The rule pack
+
+### Discovery is language-agnostic; only host verification is not
+
+Worth separating, because the first draft conflated them. A rule is a prompt: a
+reviewer reads Java, Go, Rust or Python as readily as TypeScript, and discovery
+works in all of them **today, with no new dependency**. What is language-limited
+is the *host-verified* tier — the evidence the host establishes rather than
+accepts.
+
+| Tier | How | Languages | Cost |
+|---|---|---|---|
+| 1 — resolved | ast-grep + the in-process TypeScript compiler (#77) | TS/JS family | none; already installed |
+| 2 — structural | ast-grep with a registered grammar | Java, Go, Rust, Python, … | a native `@ast-grep/lang-*` per language |
+| 3 — asserted | the reviewer says so, labelled as such | everything | none |
+
+Tier 2 is what makes the scan real for Java/Go/Rust/Python, and it is not free:
+
+- `@ast-grep/napi`'s built-in `Lang` is only `Html, JavaScript, Tsx, Css,
+  TypeScript`. Anything else needs `registerDynamicLanguage`, which takes **a
+  path to a compiled tree-sitter library**.
+- Those ship as `@ast-grep/lang-python`, `-java`, `-go`, `-rust` — roughly 6 MB
+  unpacked each, all at `0.0.x`.
+- They are loaded **by library path**, which is exactly what broke the pi
+  extensions inside the single-file binary (#137): a `.dylib` cannot be read
+  from `/$bunfs`. Supporting them there means extracting grammars to a temp
+  directory at startup, per platform.
+
+Tier 2 is therefore **its own decision**, not a detail of this one. The pass
+should ship with tiers 1 and 3 — full discovery everywhere, host verification
+where it is free — and tier 2 added per language, each with fixtures, once the
+dependency and binary questions are answered.
+
+What must not happen is tier 2's absence being read as an answer. A Go finding
+without a grammar is `unknown` reachability, not safe.
+
+### One reachability rule, not four
+
+Injection, deserialization, path handling and the web sinks are the same
+question — *does an attacker-controlled value reach a dangerous sink* — and
+splitting them into four rules buys four model calls for one analysis. They
+collapse into a single rule carrying a **sink table**, with the family recorded
+on the finding so the summary can still group by class.
+
+### Deterministic checks are not rules
+
+Secrets, crypto misuse, and the supply-chain and CI checks are largely decidable
+from the text. A committed `sk_live_…`, a workflow with `pull_request_target`
+plus a mutable action ref, a dependency pinned to a branch — none of these needs
+a model to have an opinion, and a model asked for one will sometimes disagree
+with the evidence in front of it.
+
+They become **host checks**, in the shape `structural-check.ts` already
+establishes: computed by the host, rendered as host facts, unforgeable by
+reviewer output, and free. That also removes them from the per-review model
+budget entirely.
+
+The pack is therefore:
+
+| | What | Kind | Cost |
+|---|---|---|---|
+| `sink-reachability` | attacker-controlled value reaching a dangerous sink: SQL/NoSQL/command/LDAP/XPath/template injection, deserialization and unsafe parsing, path traversal and file handling, XSS, SSRF, open redirect | **rule** | one model call, then the attack-path stage |
+| `authz-boundary` | missing or incorrect authorization, IDOR, tenant-boundary breaks, privilege escalation, auth bypass | **rule** | one model call, then the attack-path stage |
+| `secrets-and-crypto` | committed credentials, weak or misused primitives, unverified signatures and tokens, unsafe randomness | **host check** | none |
+| `supply-chain-and-ci` | mutable action refs, `pull_request_target` misuse, over-broad workflow permissions, unpinned or substituted dependencies | **host check** | none |
+
+Two model calls per review with candidates, down from seven. `applies_to`
+(#115) scopes each so a manifest-only change pays for neither.
+
+### Deliberately excluded
+
+- **DoS and resource exhaustion** — every unbounded loop looks like one at diff
+  scope, and the false-positive surface would swamp the rest.
+- **Memory corruption** — meaningful only where we have the least evidence.
+- **Known-CVE dependency matching** — that is #50's dependency facts and the
+  advisory endpoint, already built. A rule duplicating it would publish two
+  findings for one fact.
+- **Secrets in git history** — the diff is the wrong input; that is a different
+  tool with a different scope.
+
+### Sequencing this suggests
+
+The two host checks need neither a head worktree nor a supported-pattern table
+nor a grammar. They could ship first and be useful while the reachability work
+lands — which is worth stating, because the alternative is a feature that does
+nothing until three prerequisites are done.
 
 ## Where it hooks in
 
@@ -380,11 +480,16 @@ What remains genuinely open:
 2. **Should the head worktree be this issue's work or its own?** Stage 4 cannot
    be honest without it, and `withPreparedWorkspace` prepares only a base. My
    assumption is a separate issue, blocking this one.
-3. **Should the rule pack ship enabled?** Off by default is safe and means most
+3. **Is tier 2 worth four native dependencies?** Java, Go, Rust and Python need
+   `@ast-grep/lang-*` grammars — roughly 6 MB each, all `0.0.x`, loaded by
+   library path and therefore needing extraction inside the single-file binary.
+   Discovery in those languages works without them; only host-verified evidence
+   does not. That trade should be decided deliberately, per language.
+4. **Should the rule pack ship enabled?** Off by default is safe and means most
    users never see it. There is a case that a security rule pack nobody enables
    is a security rule pack that does nothing — and it is a stronger case now
    that the off path is gated before dispatch and genuinely free.
-4. **Is the supported-pattern list a trap?** Starting empty and growing one
+5. **Is the supported-pattern list a trap?** Starting empty and growing one
    framework at a time is honest, but it means the feature ships with every
    reachability answer `unknown` until someone adds Express. Whether that is a
    principled floor or a feature that does nothing on day one is worth arguing.
