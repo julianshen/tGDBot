@@ -6,9 +6,10 @@
 // `STRUCTURAL_CHECK_ENGINE` is a constant rather than a runtime read of
 // package.json, which buys a simpler build and costs the risk of drift. This
 // file is what makes that trade safe.
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import { describe, expect, it } from "vitest";
 import { STRUCTURAL_CHECK_ENGINE, TREE_SITTER_GRAMMAR_VERSIONS } from "../../../src/review/structural-check.js";
 import { computeReviewConfigHash } from "../../../src/review/dedup.js";
@@ -63,6 +64,37 @@ describe("structural-check engine identity", () => {
     });
 
     expect(before).not.toBe(after);
+  });
+
+  // Issue #142 / Codex review of PR #143 round two: AVAILABILITY changes what
+  // a review produces (a Python finding is not-checked without the library,
+  // checked with it), so installing a grammar must change the config hash and
+  // re-check existing heads instead of matching a stale marker.
+  it("re-triggers a review when a dynamic grammar is installed", () => {
+    const before = computeReviewConfigHash({
+      ...base,
+      structuralChecks: "on",
+      // An explicit engine pins the identity — the production default is what
+      // this test varies, via the environment the identity function reads.
+      structuralCheckEngine: undefined,
+    });
+    process.env.TGD_TREE_SITTER_LIB_DIR = "/tmp/does-not-exist";
+    const emptyDir = computeReviewConfigHash({ ...base, structuralChecks: "on" });
+    delete process.env.TGD_TREE_SITTER_LIB_DIR;
+    // A directory with no libraries: same identity as no env at all.
+    expect(emptyDir).toBe(computeReviewConfigHash({ ...base, structuralChecks: "on" }));
+
+    // An installed grammar changes the identity.
+    const libDir = mkdtempSync(path.join(os.tmpdir(), "tgd-grammars-"));
+    writeFileSync(path.join(libDir, "tree_sitter_python.so"), "not a real library — availability is a file check");
+    try {
+      process.env.TGD_TREE_SITTER_LIB_DIR = libDir;
+      const after = computeReviewConfigHash({ ...base, structuralChecks: "on" });
+      expect(after).not.toBe(before);
+    } finally {
+      delete process.env.TGD_TREE_SITTER_LIB_DIR;
+      rmSync(libDir, { recursive: true, force: true });
+    }
   });
 
   // The cost of this feature has to land only on repositories that opted in.

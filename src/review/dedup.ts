@@ -4,7 +4,7 @@
 // "Always" bullet: a missing or malformed marker is always treated as "no prior
 // review" (safe default — re-review, never silently skip).
 import { createHash } from "node:crypto";
-import { STRUCTURAL_CHECK_ENGINE } from "./structural-check.js";
+import { structuralEngineIdentity } from "./structural-check.js";
 import type { BotComment, PullRequestInfo } from "../vcs/adapter.js";
 
 export type DedupDecision = "skip-no-new-commits" | "review";
@@ -53,9 +53,12 @@ export interface ReviewConfigForDedup {
    */
   prIntent?: "on" | "off";
   /**
-   * The structural-check parser identity. Defaults to `STRUCTURAL_CHECK_ENGINE`
-   * and exists as a field only so a test can vary it; production callers should
-   * leave it unset so there is one source of truth.
+   * The structural-check parser identity. Defaults to
+   * `structuralEngineIdentity()` — the pinned parser versions PLUS the dynamic
+   * grammars installed on this machine (issue #142), because availability
+   * changes what a review produces — and exists as a field only so a test can
+   * vary it; production callers should leave it unset so there is one source
+   * of truth.
    */
   structuralCheckEngine?: string;
 }
@@ -143,7 +146,11 @@ export function computeReviewConfigHash(
     // `=== "on"` guard, so a repository that never enables the flag keeps its
     // hash across ast-grep upgrades and pays nothing.
     ...(config.structuralChecks === "on"
-      ? ["structural-checks", config.structuralCheckEngine ?? STRUCTURAL_CHECK_ENGINE]
+      // The DEFAULT identity is environment-aware (issue #142): the dynamic
+      // grammars installed on this machine change what a review produces, so
+      // installing one re-checks existing heads. Callers that pass an explicit
+      // engine (tests) pin the identity themselves.
+      ? ["structural-checks", config.structuralCheckEngine ?? structuralEngineIdentity()]
       : []),
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.

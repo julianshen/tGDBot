@@ -271,6 +271,37 @@ const registeredDynamicLangs = new Set<string>();
 let dynamicRegistrationAttempted = false;
 
 /**
+ * The dynamic grammars whose library exists in the configured directory RIGHT
+ * NOW — a pure filesystem check, no parser import (the identity below is read
+ * while computing the config hash, which must not load napi eagerly).
+ */
+export function installedDynamicGrammars(): Array<"python" | "go"> {
+  const libDir = process.env[TREE_SITTER_LIB_DIR_ENV];
+  if (libDir === undefined || libDir === "" || libDir.includes("\u0000")) return [];
+  try {
+    return DYNAMIC_GRAMMARS
+      .filter((grammar) => existsSync(path.join(libDir, grammar.libFileName)))
+      .map((grammar) => grammar.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The engine identity the config hash uses (issue #142, Codex review of
+ * PR #143 round two): the pinned parser versions PLUS the dynamic grammars
+ * actually installed. Availability changes what a review produces — a Python
+ * finding is `not-checked` without the library and checked with it — so
+ * installing one must re-check existing heads instead of matching a stale
+ * marker.
+ */
+export function structuralEngineIdentity(): string {
+  const installed = installedDynamicGrammars();
+  if (installed.length === 0) return STRUCTURAL_CHECK_ENGINE;
+  return `${STRUCTURAL_CHECK_ENGINE}+grammars:${installed.sort().join(",")}`;
+}
+
+/**
  * Registers every dynamic grammar whose library exists in the configured
  * directory. Called ONCE per process, lazily, from the parser-load path — a
  * directory with none (or no directory at all) registers nothing and leaves
