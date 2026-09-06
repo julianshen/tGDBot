@@ -48,6 +48,7 @@ import matter from "gray-matter";
 import type { EffectiveRule } from "../rules/types.js";
 import { buildTaskText } from "./dispatch-prompt.js";
 import { createSubmitFindingsTool, readSubmittedFindings, ruleDirName } from "./findings-file.js";
+import { resolveAgentDefinition, type AgentDefinition } from "./agent-definition.js";
 import {
   classifyTaskFailure,
   extractFindingsArray,
@@ -86,6 +87,8 @@ export interface DirectDispatchDeps {
   ruleTimeoutMs?: number;
   /** Override for tests. Default ADVISOR_PROMPT_TIMEOUT_MS. */
   advisorTimeoutMs?: number;
+  /** Issue #138 phase 2: loaded agent definitions, resolved per rule. */
+  readonly agentDefinitions?: readonly AgentDefinition[];
 }
 
 // CodeRabbit review (PR #7): a hung provider call must not block Promise.all
@@ -125,13 +128,24 @@ function reviewerSystemPrompt(): string {
   return cachedReviewerSystemPrompt;
 }
 
-async function createRealDirectSession(rule: EffectiveRule, cwd: string, outputDir: string): Promise<DispatchSession> {
+async function createRealDirectSession(
+  rule: EffectiveRule,
+  cwd: string,
+  outputDir: string,
+  definition?: AgentDefinition,
+): Promise<DispatchSession> {
   // Credential gate BEFORE any session exists: a rule pinned to a provider
   // this machine can't authenticate must fail with the classified reason,
   // not burn a session-construction round trip to discover it. The error
   // strings deliberately match PROVIDER_AUTH_ERROR_RE's vocabulary so
   // classifyTaskFailure names the cause in the PR comment.
-  const resolved = await resolveRuleSessionModel(rule.provider, rule.model);
+  // Issue #138 phase 2: a definition's model pin is MORE specific than
+  // the rule's (a persona designed for a cheaper model keeps it even
+  // when the rule is unpinned). The rule's pin still wins when both
+  // are set, because the rule is the more specific dispatch unit.
+  const resolvedProvider = definition?.provider ?? rule.provider;
+  const resolvedModelSpec = definition?.model ?? rule.model;
+  const resolved = await resolveRuleSessionModel(resolvedProvider, resolvedModelSpec);
   if (!resolved.model) {
     throw new Error(resolved.error ?? `could not resolve model for rule "${rule.name}"`);
   }
@@ -329,11 +343,13 @@ interface RuleOutcome {
       readonly failureReason?: string;
     }
 
+    const agentDefinitions = deps.agentDefinitions ?? [];
     const runRule = async (rule: EffectiveRule): Promise<RuleOutcome> => {
       let session: DispatchSession | undefined;
       try {
+        const definition = resolveAgentDefinition(rule.agent, agentDefinitions);
         session = await withTimeout(
-          createSession(rule, cwd as string, path.join(findingsDir as string, ruleDirName(rule.name))),
+          createSession(rule, cwd as string, path.join(findingsDir as string, ruleDirName(rule.name)), definition),
           ruleTimeoutMs,
           `rule "${rule.name}" session creation timed out after ${ruleTimeoutMs}ms`,
         );

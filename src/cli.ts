@@ -96,7 +96,9 @@ import {
 import { contextRoots, selectContextRoot } from "./context/root.js";
 import { GraphifyMapper, GRAPHIFY_MAPPER_VERSION } from "./context/graphify-mapper.js";
 import { relocateFindingsByQuote } from "./review/quote-anchor.js";
+import { loadAgentDefinitions } from "./review/agent-definition.js";
 import { CONTEXT_MAPPER_VERSION } from "./context/prepare.js";
+import type { AgentDefinition } from "./review/agent-definition.js";
 
 /**
  * The mapper identity that goes into the context cache key and the review
@@ -1300,6 +1302,18 @@ export async function review(
   }
 
   const loadedRules = await loadRulesForReview(config, pr, loadRulesFn);
+  // Issue #138 phase 2: load agent definitions from the operator's
+  // --agents-dir (when set). Best-effort: load errors go to stderr, the
+  // review proceeds with rules that reference missing definitions running
+  // on the standard persona.
+  let agentDefinitions: AgentDefinition[] | undefined;
+  if (config.agentsDir !== undefined) {
+    const agentLoad = await loadAgentDefinitions(config.agentsDir);
+    for (const error of agentLoad.errors) {
+      console.warn(`tgd-review-agent: agent definition: ${error.message}`);
+    }
+    agentDefinitions = agentLoad.definitions;
+  }
   const loadedRuleSet = config.codexScanResults === undefined
     ? loadedRules.rules
     : loadedRules.rules.filter((rule) => rule.name !== "codex-security");
@@ -1678,6 +1692,9 @@ export async function review(
           ? {}
           : { conversationContext: loadedContext.conversationContext }),
         ...(prIntent === undefined ? {} : { prIntent }),
+        ...(agentDefinitions === undefined || agentDefinitions.length === 0
+          ? {}
+          : { agentDefinitions }),
       });
   if (config.codexScanResults !== undefined) {
     if (scanIngest !== undefined) {

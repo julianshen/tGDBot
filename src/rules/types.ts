@@ -28,6 +28,13 @@ export interface RuleDefinition {
   appliesTo?: readonly string[];
   dependsOn: readonly string[];
   parallelGroup?: string;
+  /**
+   * Issue #138 phase 2: references an agent definition by name. The
+   * definition's tool allowlist and model override the rule's defaults;
+   * its body is prepended to the reviewer system prompt. Absent means the
+   * standard reviewer persona.
+   */
+  agent?: string;
   body: string;
   sourcePath: string;
 }

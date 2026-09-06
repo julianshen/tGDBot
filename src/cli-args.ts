@@ -57,6 +57,8 @@ export interface SharedReviewOptions {
   allowDegradedContext: boolean;
   /** Absolute root for the managed base worktree and the context cache. */
   contextDir?: string;
+  /** Issue #138 phase 2: absolute path to agent definition files (.agent.md). */
+  agentsDir?: string;
   stateDir?: string;
   /** Codex Security artifact produced by a separate, sandboxed job. */
   codexScanResults?: string;
@@ -126,6 +128,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "context-max-chars": { type: "string" },
       "allow-degraded-context": { type: "boolean" },
       "context-dir": { type: "string" },
+      "agents-dir": { type: "string" },
       "state-dir": { type: "string" },
       "codex-scan-results": { type: "string" },
     },
@@ -258,6 +261,14 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     throw new Error(`Invalid --context-dir value: "${contextDir}" (expected an absolute path)`);
   }
 
+  // Issue #138 phase 2: where agent definition files (.agent.md) live.
+  // Absent means no agent definitions are loaded — rules run with the
+  // standard reviewer persona. When present, must be an absolute path.
+  const agentsDir = values["agents-dir"] as string | undefined;
+  if (agentsDir !== undefined && (agentsDir.length === 0 || !path.isAbsolute(agentsDir))) {
+    throw new Error(`Invalid --agents-dir value: "${agentsDir}" (expected an absolute path)`);
+  }
+
   const stateDir = values["state-dir"] as string | undefined;
   if (stateDir !== undefined && (stateDir.length === 0 || !path.isAbsolute(stateDir))) {
     throw new Error(`Invalid --state-dir value: "${stateDir}" (expected an absolute path)`);
@@ -280,6 +291,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     allowDegradedContext:
       (values["allow-degraded-context"] as boolean | undefined) ?? DEFAULTS.allowDegradedContext,
     contextDir,
+    agentsDir,
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,
