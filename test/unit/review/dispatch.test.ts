@@ -1175,7 +1175,13 @@ describe("vendored reviewer agent output contract", () => {
   });
 
   it("still declares exactly the restricted read-only tool set (regression guard alongside the output-format change)", () => {
+    // Issue #138: the prose must acknowledge submit_findings as the single
+    // host-mediated exception. The FRONTMATTER stays read-only — the legacy
+    // orchestrator's agent discovery validates tool names against its registry
+    // and does not know submit_findings; the direct engine adds the tool
+    // programmatically, not via the frontmatter.
     expect(reviewerMd).toMatch(/^tools:\s*read,\s*grep,\s*find,\s*ls\s*$/m);
+    expect(reviewerMd).toContain("submit_findings");
     expect(reviewerMd).not.toMatch(/^tools:.*\b(bash|edit|write|intercom)\b/m);
   });
 });
