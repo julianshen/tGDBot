@@ -75,13 +75,17 @@ describe("parseStructuralClaim", () => {
 // tests SKIP, and the no-grammars behavior is pinned by the dedicated
 // not-checked tests above.
 const grammarLibDir = process.env.TGD_TREE_SITTER_LIB_DIR;
-const grammarsAvailable = grammarLibDir !== undefined &&
-  existsSync(path.join(grammarLibDir ?? "", "tree_sitter_python.so")) &&
-  existsSync(path.join(grammarLibDir ?? "", "tree_sitter_go.so"));
+// Per-language availability (Codex review of PR #143): a PARTIAL install —
+// python.so without go.so, say — must skip only that language's fixtures and
+// must not make the degradation tests expect the wrong branch.
+const pythonAvailable = grammarLibDir !== undefined &&
+  existsSync(path.join(grammarLibDir, "tree_sitter_python.so"));
+const goAvailable = grammarLibDir !== undefined &&
+  existsSync(path.join(grammarLibDir, "tree_sitter_go.so"));
 
 describe("checkStructuralClaim — dynamic languages (issue #142)", () => {
-  describe.skipIf(!grammarsAvailable)("with grammar libraries installed", () => {
-    it("checks a Python finding against python files with the measured kinds", async () => {
+  describe.skipIf(!pythonAvailable && !goAvailable)("with grammar libraries installed", () => {
+    it.skipIf(!pythonAvailable)("checks a Python finding against python files with the measured kinds", async () => {
       const root = await tree({
         "src/wallet.py": "def budget(amount):\n    return amount\n",
         "src/caller.py": "from wallet import budget\n\ntotal = budget(21)\n",
@@ -102,7 +106,7 @@ describe("checkStructuralClaim — dynamic languages (issue #142)", () => {
       expect(result.occurrences).toBeGreaterThanOrEqual(3);
     });
 
-    it("checks a Go finding including selector fields and literal keys", async () => {
+    it.skipIf(!goAvailable)("checks a Go finding including selector fields and literal keys", async () => {
       const root = await tree({
         // The struct DECLARATION stays in the finding's own file: a same-named
         // field in ANOTHER struct is the known lexical limitation (the Go
@@ -121,7 +125,7 @@ describe("checkStructuralClaim — dynamic languages (issue #142)", () => {
       expect(result.references.filter((reference) => reference.file === "caller.go")).toHaveLength(3);
     });
 
-    it("never resolves a non-TypeScript finding, even in a repo with a root tsconfig", async () => {
+    it.skipIf(!pythonAvailable)("never resolves a non-TypeScript finding, even in a repo with a root tsconfig", async () => {
       const root = await tree({
         "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, noEmit: true, module: "commonjs", target: "es2022", include: ["src/**/*.ts"] } }),
         "src/wallet.ts": "export function budget(n: number) { return n; }\n",
@@ -151,7 +155,7 @@ describe("checkStructuralClaim — dynamic languages (issue #142)", () => {
       "src/caller.py": "from wallet import budget\n\ntotal = budget(21)\n",
     });
     const result = await checkStructuralClaim(claim, { baseRoot: root, findingFile: "src/wallet.py" });
-    if (grammarsAvailable) {
+    if (pythonAvailable) {
       expect(result.status).toBe("lexical-matches");
     } else {
       expect(result.status).toBe("not-checked");
@@ -597,7 +601,7 @@ describe("checkStructuralClaim — refusing rather than guessing", () => {
   // not-checked with a reason that names the fix, rather than silently
   // searching the wrong languages. (Meaningful only without the libraries —
   // with them the go finding is checked, which the tests above pin.)
-  it.skipIf(grammarsAvailable)("tells the operator how to cover a dynamic language whose grammar is missing", async () => {
+  it.skipIf(goAvailable)("tells the operator how to cover a dynamic language whose grammar is missing", async () => {
     const root = await tree({
       "src/retry.ts": "export function budget(n: number) { return n; }\n",
       "main.go": "package main\nfunc budget() {}\n",

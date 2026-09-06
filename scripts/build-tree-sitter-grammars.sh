@@ -13,20 +13,28 @@
 
 set -eu
 OUT="${1:-.tree-sitter-grammars}"
-mkdir -p "$OUT"
+# ABSOLUTE before any cd: the build subshell runs inside the cloned repo, and
+# a relative output path would resolve against the clone, not the caller
+# (Codex review of PR #143).
+OUT="$(mkdir -p "$OUT" && cd "$OUT" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 build() {
-  repo="$1"; lib="$2"
-  git clone -q --depth 1 "https://github.com/tree-sitter/${repo}.git" "$TMP/$repo"
+  repo="$1"; tag="$2"; lib="$3"
+  # The TAG the kind tables were measured against, not remote HEAD: the engine
+  # identity claims tree-sitter-<lang>@<version>, so an unmeasured HEAD would
+  # silently change what a reference IS without changing the review hash
+  # (Codex review of PR #143).
+  git clone -q --depth 1 --branch "$tag" -c advice.detachedHead=false \
+    "https://github.com/tree-sitter/${repo}.git" "$TMP/$repo"
   # The scanner is optional (python has one, go does not).
   SOURCES="src/parser.c"
   [ -f "$TMP/$repo/src/scanner.c" ] && SOURCES="$SOURCES src/scanner.c"
   (cd "$TMP/$repo" && gcc -shared -fPIC -I src $SOURCES -o "$OUT/$lib")
-  echo "built $OUT/$lib"
+  echo "built $OUT/$lib at tag $tag"
 }
 
-build tree-sitter-python tree_sitter_python.so
-build tree-sitter-go tree_sitter_go.so
-echo "done - run reviews and tests with TGD_TREE_SITTER_LIB_DIR=$PWD/$OUT"
+build tree-sitter-python v0.25.0 tree_sitter_python.so
+build tree-sitter-go v0.25.0 tree_sitter_go.so
+echo "done - run reviews and tests with TGD_TREE_SITTER_LIB_DIR=$OUT"
