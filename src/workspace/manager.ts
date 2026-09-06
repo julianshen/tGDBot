@@ -12,7 +12,10 @@ import {
 import type {
   ExecWorkspaceCommand,
   PreparedWorkspace,
+  PreparedWorkspaces,
+  PreparedWorktree,
   WorkspaceDependencies,
+  WorkspacePaths,
   WorkspaceRequest,
   WorkspaceTool,
 } from "./types.js";
@@ -419,10 +422,97 @@ export async function prepareWorkspace(
   return prepareWorkspaceLocked(request, dependencies, async (prepared) => prepared);
 }
 
+/**
+ * Prepares several trees of one repository under ONE lock acquisition.
+ *
+ * Issue #144. A security review asking "is this reachable" must read the tree
+ * the pull request produces, not the one it started from: a change that adds a
+ * handler creates a path the base does not contain. Answering "was this called
+ * before" as well needs both trees at once.
+ *
+ * One acquisition is not an optimisation. `withRepositoryLock` takes an
+ * exclusive create on a repository-wide path, so a second call nested inside
+ * the first cannot acquire — and because the holder is this very process, the
+ * liveness check sees an owner that is alive and RENEWS the deadline. A nested
+ * acquisition therefore does not deadlock quickly and visibly; it waits out
+ * `lockMaxWaitMs`, which is four hours by default, looking like a hang.
+ *
+ * Trees are prepared in the order requested and deduplicated: a caller asking
+ * for base and head on a pull request with no new commits asks for one SHA
+ * twice, and preparing it twice would be a wasted checkout of an identical
+ * tree, not two views of it.
+ */
+export async function withPreparedWorkspaces<T>(
+  request: Omit<WorkspaceRequest, "baseSha">,
+  shas: readonly string[],
+  use: (prepared: PreparedWorkspaces) => Promise<T>,
+  dependencies: WorkspaceDependencies = { exec: realExecWorkspaceCommand },
+): Promise<T> {
+  if (shas.length === 0) throw new Error("Managed workspace requires at least one commit to prepare");
+  const requested = [...new Set(shas.map((sha) => sha.toLowerCase()))];
+
+  return withWorkspaceLock(
+    { ...request, baseSha: requested[0]! },
+    { lockTimeoutMs: SCOPED_LOCK_TIMEOUT_MS, lockMaxWaitMs: SCOPED_LOCK_MAX_WAIT_MS, ...dependencies },
+    async (paths, normalizedRequest, deps) => {
+      const worktrees: PreparedWorktree[] = [];
+      for (const sha of requested) {
+        // Each SHA goes through the SAME preparation the single-tree path
+        // uses, including its ownership-marker and mirror-registration
+        // checks. A second tree must not be held to a weaker standard than
+        // the first just because it arrived in the same call.
+        const prepared = await prepareWorkspaceUnlocked({ ...normalizedRequest, baseSha: sha }, deps);
+        worktrees.push({ sha, path: prepared.baseWorktreePath });
+      }
+      const byShaEntries = new Map(worktrees.map((tree) => [tree.sha, tree.path]));
+      return use({
+        root: paths.root,
+        repositoryRoot: paths.repositoryRoot,
+        mirrorPath: paths.mirrorPath,
+        worktreesRoot: paths.worktreesRoot,
+        worktrees,
+        at: (sha: string): string => {
+          const found = byShaEntries.get(sha.toLowerCase());
+          // Throws rather than returning undefined: every caller of `at` goes
+          // on to READ that path, and a silent undefined becomes a read of
+          // "undefined/src/..." that fails somewhere far from the mistake.
+          if (found === undefined) {
+            throw new Error(`No managed worktree was prepared for ${sha}`);
+          }
+          return found;
+        },
+      });
+    },
+  );
+}
+
 async function prepareWorkspaceLocked<T>(
   request: WorkspaceRequest,
   dependencies: WorkspaceDependencies,
   use: (prepared: PreparedWorkspace) => Promise<T>,
+): Promise<T> {
+  return withWorkspaceLock(request, dependencies, async (_paths, normalizedRequest, deps) =>
+    // The consumer runs INSIDE the lock, so what it reads is what preparation
+    // just guaranteed.
+    use(await prepareWorkspaceUnlocked(normalizedRequest, deps)));
+}
+
+/**
+ * Root protection, path validation and the repository lock — the part every
+ * preparation shares.
+ *
+ * Extracted so the single-tree and multi-tree entry points cannot drift: the
+ * checks here are the ones that make a prepared tree safe to read, and a second
+ * copy of them would be a second place to forget one.
+ */
+async function withWorkspaceLock<T>(
+  request: WorkspaceRequest,
+  dependencies: WorkspaceDependencies,
+  work: (
+    paths: WorkspacePaths,
+    normalizedRequest: WorkspaceRequest,
+    dependencies: WorkspaceDependencies,
+  ) => Promise<T>,
 ): Promise<T> {
   const paths = deriveWorkspacePaths({ ...request, root: await physicalWorkspaceRoot(request.root) });
   const normalizedRequest = { ...request, root: paths.root };
@@ -453,8 +543,6 @@ async function prepareWorkspaceLocked<T>(
       paths.root,
       [paths.repositoryRoot, paths.mirrorPath, paths.baseWorktreePath, paths.ownerMarkerPath],
     );
-    // The consumer runs INSIDE the lock, so what it reads is what preparation
-    // just guaranteed.
-    return use(await prepareWorkspaceUnlocked(normalizedRequest, dependencies));
+    return work(paths, normalizedRequest, dependencies);
   });
 }
