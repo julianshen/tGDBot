@@ -9,6 +9,7 @@ import {
   prepareWorkspace,
   realExecWorkspaceCommand,
   withPreparedWorkspace,
+  withPreparedWorkspaces,
 } from "../../../src/workspace/manager.js";
 import { deriveWorkspacePaths, encodeWorkspaceAuthority } from "../../../src/workspace/paths.js";
 
@@ -137,6 +138,122 @@ describe("withPreparedWorkspace", () => {
   // A constant check, stated as one: the wait has to outlast the work.
   it("waits longer than the mapping it now has to wait for", () => {
     expect(SCOPED_LOCK_TIMEOUT_MS).toBeGreaterThanOrEqual(30 * 60 * 1000);
+  });
+});
+
+// #144: a review that asks "is this reachable" must read the tree the pull
+// request PRODUCES. A change that adds a handler creates a path the base does
+// not contain, so a base-only answer misses exactly the new attack surface.
+describe("withPreparedWorkspaces", () => {
+  const headSha = "abc1234567abc1234567abc1234567abc1234567";
+
+  function multiExec(paths: { mirrorPath: string }) {
+    return vi.fn<ExecWorkspaceCommand>(async (tool, args) => {
+      if (tool !== "git" && tool !== "gh") unexpectedWorkspaceTool(tool);
+      if (args.includes("get-url")) return "https://github.com/octo-org/octo-repo\n";
+      if (args.includes("--git-common-dir")) return `${paths.mirrorPath}\n`;
+      if (tool === "git" && args.includes("worktree") && args.includes("add")) {
+        await mkdir(args.at(-2)!, { recursive: true });
+      }
+      return "";
+    });
+  }
+
+  it("prepares every requested commit, each in its own tree", async () => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+
+    const seen = await withPreparedWorkspaces(
+      { root, repo },
+      [baseSha, headSha],
+      async (prepared) => prepared.worktrees.map((tree) => tree.sha),
+      { exec: multiExec(paths) },
+    );
+
+    expect(seen).toEqual([baseSha, headSha]);
+  });
+
+  it("holds ONE lock across all of them", async () => {
+    // Not an optimisation. `withRepositoryLock` takes an exclusive create on a
+    // repository-wide path, and a nested acquisition would see a holder that
+    // is this very process — alive — so the liveness check RENEWS the
+    // deadline. It would wait out lockMaxWaitMs rather than failing fast.
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    const lockPath = path.join(root, ".locks", "github.com", "octo-org", "octo-repo.lock");
+    let lockedDuringUse = false;
+
+    await withPreparedWorkspaces(
+      { root, repo },
+      [baseSha, headSha],
+      async () => {
+        lockedDuringUse = await stat(lockPath).then((s) => s.isFile(), () => false);
+      },
+      { exec: multiExec(paths) },
+    );
+
+    expect(lockedDuringUse).toBe(true);
+    // Released once, when the consumer is done with BOTH trees.
+    expect(await stat(lockPath).then(() => true, () => false)).toBe(false);
+  });
+
+  it("gives each commit a distinct directory", async () => {
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+
+    const trees = await withPreparedWorkspaces(
+      { root, repo },
+      [baseSha, headSha],
+      async (prepared) => [prepared.at(baseSha), prepared.at(headSha)],
+      { exec: multiExec(paths) },
+    );
+
+    expect(trees[0]).not.toBe(trees[1]);
+    expect(trees[0]).toContain(baseSha.toLowerCase());
+    expect(trees[1]).toContain(headSha.toLowerCase());
+  });
+
+  it("prepares a repeated commit once", async () => {
+    // A pull request with no new commits asks for one SHA twice. Two checkouts
+    // of an identical tree is wasted work, not two views of it.
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+    const exec = multiExec(paths);
+
+    const count = await withPreparedWorkspaces(
+      { root, repo },
+      [baseSha, baseSha.toUpperCase()],
+      async (prepared) => prepared.worktrees.length,
+      { exec },
+    );
+
+    expect(count).toBe(1);
+    const added = exec.mock.calls.filter(([tool, args]) => tool === "git" && args.includes("add"));
+    expect(added).toHaveLength(1);
+  });
+
+  it("refuses a commit it was not asked to prepare", async () => {
+    // `at` feeds a path straight into a read. Returning undefined would surface
+    // as a read of "undefined/src/..." far from the mistake.
+    const root = await tempRoot();
+    const paths = deriveWorkspacePaths({ root, repo, baseSha });
+
+    await expect(withPreparedWorkspaces(
+      { root, repo },
+      [baseSha],
+      async (prepared) => prepared.at(headSha),
+      { exec: multiExec(paths) },
+    )).rejects.toThrow(/No managed worktree was prepared/);
+  });
+
+  it("refuses an empty request rather than locking for nothing", async () => {
+    const root = await tempRoot();
+    await expect(withPreparedWorkspaces(
+      { root, repo },
+      [],
+      async () => "unreachable",
+      { exec: vi.fn<ExecWorkspaceCommand>(async () => "") },
+    )).rejects.toThrow(/at least one commit/);
   });
 });
 
