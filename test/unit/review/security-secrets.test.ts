@@ -111,6 +111,13 @@ describe("detectCommittedSecrets", () => {
     ["a temporary AWS access key id (ASIA)", 'const k = "ASIAIOSFODNN7EXAMPLE";'],
     ["a Google API key ending in a hyphen", `const k = "AIza${"B".repeat(34)}-";`],
     ["an encrypted PKCS#8 private key", "-----BEGIN ENCRYPTED PRIVATE KEY-----"],
+    ["a GitHub OAuth token (gho_)", `const k = "gho_${"a".repeat(36)}";`],
+    ["a GitHub user-to-server token (ghu_)", `const k = "ghu_${"a".repeat(36)}";`],
+    ["a GitHub server-to-server token (ghs_)", `const k = "ghs_${"a".repeat(36)}";`],
+    // Refresh tokens run well past thirty-six characters, so a fixed-length
+    // body followed by `\b` could not match one however many prefixes it listed.
+    ["a GitHub refresh token (ghr_, long)", `const k = "ghr_${"a".repeat(76)}";`],
+    ["an OpenPGP secret key block", "-----BEGIN PGP PRIVATE KEY BLOCK-----"],
   ])("recognises %s", (_label, line) => {
     // Each of these read as CLEAN before review: an STS key the advertised
     // "AWS access key" check silently passed, a legal suffix that `\b` could

@@ -247,6 +247,13 @@ export function orchestrate(
   // had — members often disagree about which line of a construct to blame.
   // Prefer an anchorable member, keeping the severity ordering among those.
   const representativeOf = (cluster: (typeof clusters)[number]): Finding =>
+    // A redacted member REPRESENTS its cluster, ahead of anchorability. Choosing
+    // among the others is a presentation question; this one decides whether a
+    // credential is published. The representative's snippet is what the summary
+    // fallback renders, and its rule name is what the conversation path keys the
+    // withheld hunk on — so a model finding promoted over the host's secrets
+    // finding carries neither protection (#139, Codex review of PR #147).
+    cluster.members.find((member) => member.redactSource === true) ??
     cluster.members.find((member) => isCommentable(anchors, member.file, member.line)) ??
     cluster.representative;
 
@@ -255,8 +262,16 @@ export function orchestrate(
   // or a similarity heuristic silently deletes a finding (Codex review of
   // PR #23, P1). Every surface that shows a representative shows these too.
   const mergedMembers = new Map<Finding, readonly Finding[]>();
+  // Representatives whose cluster contains a redacted member. Selection above
+  // already promotes such a member, so this is normally the same answer stated
+  // twice — deliberately, because the two are independent: reordering the
+  // preference must not silently reattach the excerpt.
+  const redactedClusters = new Set<Finding>();
   for (const cluster of clusters) {
     const representative = representativeOf(cluster);
+    if (cluster.members.some((member) => member.redactSource === true)) {
+      redactedClusters.add(representative);
+    }
     contributingRules.set(representative, cluster.rules);
     mergedMembers.set(representative, cluster.members.filter((member) => member !== representative));
   }
@@ -371,7 +386,7 @@ export function orchestrate(
       finding,
       {
         ...(inlineEnabled
-          ? (finding.redactSource === true
+          ? (finding.redactSource === true || redactedClusters.has(finding)
             // #139: the summary fallback renders this snippet in full, so a
             // rejected inline write would publish the credential the finding
             // deliberately omits.

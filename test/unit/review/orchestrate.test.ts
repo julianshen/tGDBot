@@ -1569,4 +1569,63 @@ describe("redactSource keeps a finding's source line out of the summary", () => 
     // The guard has to be the flag, not the absence of excerpts everywhere.
     expect(excerptFor({ ruleName: "ordinary" })).toContain("AKIAIOSFODNN7EXAMPLE");
   });
+
+  // A model rule reporting the same credential in its own, longer words
+  // clusters with the host finding, and clustering runs BEFORE the excerpt is
+  // attached. The model member is the more detailed one, so it won the
+  // representative slot — and that representative carries neither
+  // `redactSource` nor the reserved rule name, which are exactly the two things
+  // the excerpt guard and the conversation path key on (Codex review of #147).
+  describe("when a model rule reports the same credential", () => {
+    const modelFinding = {
+      file: "src/a.ts",
+      line: 2,
+      severity: "blocking" as const,
+      category: "security",
+      ruleName: "model-rule",
+      title: "Hardcoded AWS access key",
+      message:
+        "A line added here matches the format of an AWS access key id, and the key " +
+        "should be revoked because anyone reading the repository can use it.",
+    };
+
+    const clustered = () =>
+      orchestrate(
+        {
+          // The model finding is FIRST, so member ordering alone would promote
+          // it. With the host finding first, the anchorable-member preference
+          // already happened to pick the redacted one and the test passed
+          // without the guard it exists to check.
+          findings: [modelFinding, { ...finding, redactSource: true }],
+          rulesRun: ["security:secrets", "model-rule"],
+          rulesFailed: [],
+        },
+        diff,
+        { inline: true },
+      );
+
+    it("clusters the two, so the guard is actually under test", () => {
+      // Without this the rest of the block passes for the wrong reason: two
+      // unclustered findings each keep their own excerpt, and the redacted one
+      // is never at risk of losing its flag.
+      expect(clustered().summaryInput.uniqueIssueCount).toBe(1);
+    });
+
+    it("stores no excerpt for the cluster", () => {
+      const stored = [...(clustered().summaryInput.context?.values() ?? [])];
+      expect(JSON.stringify(stored)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    });
+
+    it("represents the cluster with the redacted finding", () => {
+      // Not cosmetic: the conversation path withholds the hunk by matching the
+      // reserved rule name, and only the representative reaches the ledger.
+      //
+      // Asserted on the context KEY, which is the representative itself. The
+      // rendered comment body was the obvious probe and a useless one — it
+      // lists every CONTRIBUTING rule, so it named `security:secrets` whichever
+      // member was promoted, and passed with the preference deleted.
+      const [representative] = [...(clustered().summaryInput.context?.keys() ?? [])];
+      expect(representative?.ruleName).toBe("security:secrets");
+    });
+  });
 });

@@ -69,6 +69,13 @@ const PATTERNS: readonly SecretPattern[] = [
   // absent: it is not a credential worth waking anyone for.
   { label: "a Stripe live secret key", pattern: /\bsk_live_[A-Za-z0-9]{16,}\b/u },
   { label: "a GitHub personal access token", pattern: /\bghp_[A-Za-z0-9]{36}\b/u },
+  // `gho_` (OAuth), `ghu_`/`ghs_` (user- and server-to-server app tokens) and
+  // `ghr_` (refresh) are the same credential class and grant the same access.
+  // Recognising only `ghp_` reported a CLEAN result for a live GitHub token,
+  // under a check the README advertises as covering GitHub tokens. Open-ended
+  // length because a refresh token runs far past thirty-six characters, and a
+  // `{36}` body followed by `\b` cannot match one.
+  { label: "a GitHub OAuth or app token", pattern: /\bgh[ousr]_[A-Za-z0-9]{36,}\b/u },
   { label: "a GitHub fine-grained token", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/u },
   // A trailing `-` is legal in the suffix, and `\b` needs a word/non-word
   // transition — so a key ending in `-` inside quotes matched nothing at all.
@@ -80,7 +87,12 @@ const PATTERNS: readonly SecretPattern[] = [
     // ENCRYPTED is the standard PKCS#8 header and was not among the
     // alternatives, so an encrypted private key read as clean — its base64
     // body carries no other recognisable prefix.
-    pattern: /-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----/u,
+    // Two shapes, not one prefix list. OpenPGP writes
+    // `PGP PRIVATE KEY BLOCK`, so folding `PGP ` into the prefix alternation
+    // demanded `PRIVATE KEY-----` immediately after it and matched nothing an
+    // OpenPGP export actually contains.
+    pattern:
+      /-----BEGIN (?:(?:RSA |EC |DSA |OPENSSH |ENCRYPTED )?PRIVATE KEY|PGP PRIVATE KEY BLOCK)-----/u,
   },
 ];
 
