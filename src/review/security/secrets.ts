@@ -81,6 +81,9 @@ const PATTERNS: readonly SecretPattern[] = [
   // transition — so a key ending in `-` inside quotes matched nothing at all.
   { label: "a Google API key", pattern: /\bAIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])/u },
   { label: "a Slack token", pattern: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/u },
+  // App-level tokens are a separate family with its own prefix, not another
+  // `xox` letter — a check advertised as covering Slack tokens passed them.
+  { label: "a Slack app-level token", pattern: /\bxapp-\d-[A-Za-z0-9-]{10,}\b/u },
   // The header alone is decisive: nothing else writes this line.
   {
     label: "a private key",

@@ -1616,6 +1616,50 @@ describe("redactSource keeps a finding's source line out of the summary", () => 
       expect(JSON.stringify(stored)).not.toContain("AKIAIOSFODNN7EXAMPLE");
     });
 
+    // The member itself may QUOTE the credential — its rule was never told not
+    // to. `renderAlsoReported` prints a merged member's message and suggestion,
+    // and `renderCrossFileGroupsSection` prints `claimOf` for members that were
+    // never merged into anything, so the member's own text has to be withheld
+    // rather than merely un-promoted (Codex review of PR #147, round 3).
+    describe("and quotes the credential in its own words", () => {
+      const quoting = {
+        ...modelFinding,
+        message:
+          "A line added here matches the format of an AWS access key id: the value " +
+          'AKIAIOSFODNN7EXAMPLE should be revoked because anyone reading the repository can use it.',
+        suggestion: 'const key = process.env.AWS_ACCESS_KEY_ID; // was AKIAIOSFODNN7EXAMPLE',
+      };
+
+      const withQuote = () =>
+        orchestrate(
+          {
+            findings: [quoting, { ...finding, redactSource: true }],
+            rulesRun: ["security:secrets", "model-rule"],
+            rulesFailed: [],
+          },
+          diff,
+          { inline: true },
+        );
+
+      it("keeps the member's wording out of the published comment", () => {
+        expect(JSON.stringify(withQuote().inlineComments)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+      });
+
+      it("keeps it out of the summary's own view of every finding", () => {
+        // A separate route: this list is not the merged-member list, and the
+        // cross-file section re-clusters it and prints each member's claim.
+        expect(JSON.stringify(withQuote().summaryInput.allFindings))
+          .not.toContain("AKIAIOSFODNN7EXAMPLE");
+      });
+
+      it("still says the rule corroborated the finding", () => {
+        // Withholding the wording must not delete the member: losing it would
+        // hide the corroboration that made the cluster worth forming.
+        const published = JSON.stringify(withQuote().inlineComments);
+        expect(published).toContain("model-rule");
+      });
+    });
+
     it("represents the cluster with the redacted finding", () => {
       // Not cosmetic: the conversation path withholds the hunk by matching the
       // reserved rule name, and only the representative reaches the ledger.

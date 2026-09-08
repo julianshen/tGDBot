@@ -118,6 +118,7 @@ describe("detectCommittedSecrets", () => {
     // body followed by `\b` could not match one however many prefixes it listed.
     ["a GitHub refresh token (ghr_, long)", `const k = "ghr_${"a".repeat(76)}";`],
     ["an OpenPGP secret key block", "-----BEGIN PGP PRIVATE KEY BLOCK-----"],
+    ["a Slack app-level token", 'const k = "xapp-1-A012345678-1234567890123-abcdef0123";'],
   ])("recognises %s", (_label, line) => {
     // Each of these read as CLEAN before review: an STS key the advertised
     // "AWS access key" check silently passed, a legal suffix that `\b` could
