@@ -1517,3 +1517,159 @@ describe("quote-anchored findings (#114)", () => {
     expect(result.inlineComments[0]).toMatchObject({ path: "src/a.ts", line: 11 });
   });
 });
+
+// Issue #139 / Codex review of PR #147: a rejected inline write falls back to
+// the managed summary, which renders each finding's diff excerpt IN FULL. A
+// secrets finding omits the credential from its own message, so without this
+// the fallback republished it into a world-readable comment — strictly more
+// public than the repository it already leaked to.
+describe("redactSource keeps a finding's source line out of the summary", () => {
+  const diff = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1,1 +1,2 @@",
+    " keep",
+    '+const key = "AKIAIOSFODNN7EXAMPLE";',
+  ].join("\n");
+
+  const finding = {
+    file: "src/a.ts",
+    line: 2,
+    severity: "blocking" as const,
+    category: "security",
+    ruleName: "security:secrets",
+    title: "This change commits an AWS access key id",
+    message: "A line added here matches the format of an AWS access key id.",
+  };
+
+  // Asserted on the excerpt orchestrate STORES, which is what `renderSummary`
+  // prints on the fallback path. An earlier version of these tests ran with
+  // `inline: false`, where no excerpt is built for any finding — so the
+  // redaction test passed while testing nothing, and only its control failing
+  // revealed that.
+  const excerptFor = (extra: Partial<typeof finding> & { redactSource?: boolean }) => {
+    const input = { ...finding, ...extra };
+    const result = orchestrate(
+      { findings: [input], rulesRun: [input.ruleName], rulesFailed: [] },
+      diff,
+      { inline: true },
+    );
+    const [stored] = [...(result.summaryInput.context?.values() ?? [])];
+    // `snippet` is the excerpt's LINES; joined here so the assertion is about
+    // whether the credential is present at all, not about its line shape.
+    return stored?.snippet === undefined ? undefined : JSON.stringify(stored.snippet);
+  };
+
+  it("stores no excerpt when the finding is redacted", () => {
+    expect(excerptFor({ redactSource: true })).toBeUndefined();
+  });
+
+  it("still stores one for an ordinary finding", () => {
+    // The guard has to be the flag, not the absence of excerpts everywhere.
+    expect(excerptFor({ ruleName: "ordinary" })).toContain("AKIAIOSFODNN7EXAMPLE");
+  });
+
+  // A model rule reporting the same credential in its own, longer words
+  // clusters with the host finding, and clustering runs BEFORE the excerpt is
+  // attached. The model member is the more detailed one, so it won the
+  // representative slot — and that representative carries neither
+  // `redactSource` nor the reserved rule name, which are exactly the two things
+  // the excerpt guard and the conversation path key on (Codex review of #147).
+  describe("when a model rule reports the same credential", () => {
+    const modelFinding = {
+      file: "src/a.ts",
+      line: 2,
+      severity: "blocking" as const,
+      category: "security",
+      ruleName: "model-rule",
+      title: "Hardcoded AWS access key",
+      message:
+        "A line added here matches the format of an AWS access key id, and the key " +
+        "should be revoked because anyone reading the repository can use it.",
+    };
+
+    const clustered = () =>
+      orchestrate(
+        {
+          // The model finding is FIRST, so member ordering alone would promote
+          // it. With the host finding first, the anchorable-member preference
+          // already happened to pick the redacted one and the test passed
+          // without the guard it exists to check.
+          findings: [modelFinding, { ...finding, redactSource: true }],
+          rulesRun: ["security:secrets", "model-rule"],
+          rulesFailed: [],
+        },
+        diff,
+        { inline: true },
+      );
+
+    it("clusters the two, so the guard is actually under test", () => {
+      // Without this the rest of the block passes for the wrong reason: two
+      // unclustered findings each keep their own excerpt, and the redacted one
+      // is never at risk of losing its flag.
+      expect(clustered().summaryInput.uniqueIssueCount).toBe(1);
+    });
+
+    it("stores no excerpt for the cluster", () => {
+      const stored = [...(clustered().summaryInput.context?.values() ?? [])];
+      expect(JSON.stringify(stored)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+    });
+
+    // The member itself may QUOTE the credential — its rule was never told not
+    // to. `renderAlsoReported` prints a merged member's message and suggestion,
+    // and `renderCrossFileGroupsSection` prints `claimOf` for members that were
+    // never merged into anything, so the member's own text has to be withheld
+    // rather than merely un-promoted (Codex review of PR #147, round 3).
+    describe("and quotes the credential in its own words", () => {
+      const quoting = {
+        ...modelFinding,
+        message:
+          "A line added here matches the format of an AWS access key id: the value " +
+          'AKIAIOSFODNN7EXAMPLE should be revoked because anyone reading the repository can use it.',
+        suggestion: 'const key = process.env.AWS_ACCESS_KEY_ID; // was AKIAIOSFODNN7EXAMPLE',
+      };
+
+      const withQuote = () =>
+        orchestrate(
+          {
+            findings: [quoting, { ...finding, redactSource: true }],
+            rulesRun: ["security:secrets", "model-rule"],
+            rulesFailed: [],
+          },
+          diff,
+          { inline: true },
+        );
+
+      it("keeps the member's wording out of the published comment", () => {
+        expect(JSON.stringify(withQuote().inlineComments)).not.toContain("AKIAIOSFODNN7EXAMPLE");
+      });
+
+      it("keeps it out of the summary's own view of every finding", () => {
+        // A separate route: this list is not the merged-member list, and the
+        // cross-file section re-clusters it and prints each member's claim.
+        expect(JSON.stringify(withQuote().summaryInput.allFindings))
+          .not.toContain("AKIAIOSFODNN7EXAMPLE");
+      });
+
+      it("still says the rule corroborated the finding", () => {
+        // Withholding the wording must not delete the member: losing it would
+        // hide the corroboration that made the cluster worth forming.
+        const published = JSON.stringify(withQuote().inlineComments);
+        expect(published).toContain("model-rule");
+      });
+    });
+
+    it("represents the cluster with the redacted finding", () => {
+      // Not cosmetic: the conversation path withholds the hunk by matching the
+      // reserved rule name, and only the representative reaches the ledger.
+      //
+      // Asserted on the context KEY, which is the representative itself. The
+      // rendered comment body was the obvious probe and a useless one — it
+      // lists every CONTRIBUTING rule, so it named `security:secrets` whichever
+      // member was promoted, and passed with the preference deleted.
+      const [representative] = [...(clustered().summaryInput.context?.keys() ?? [])];
+      expect(representative?.ruleName).toBe("security:secrets");
+    });
+  });
+});

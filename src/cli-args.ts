@@ -23,6 +23,8 @@ export interface SharedReviewOptions {
   dependencyFacts: "on" | "off";
   /** Issue #75: check a finding's structural claim against the base tree. */
   structuralChecks: "on" | "off";
+  /** Issue #139: the host security detectors. Off by default, like structural checks. */
+  securityPass: "on" | "off";
   /**
    * Issue #59: give the dispatched reviewer the PR's stated intent (title,
    * description, linked-reference titles/states) as untrusted evidence. Off
@@ -85,6 +87,7 @@ const DEFAULTS = {
   // Off for v1: it needs a base worktree, which on a cold managed workspace
   // means a clone. Opt in until that cost is measured rather than assumed.
   structuralChecks: "off" as const,
+  securityPass: "off" as const,
   // On by default: intent is bounded, boundary-tokened untrusted evidence,
   // and a reviewer that cannot read what the PR says it is doing reports
   // deliberate behaviour changes as regressions (issue #59).
@@ -116,6 +119,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       advisor: { type: "string" },
       "dependency-facts": { type: "string" },
       "structural-checks": { type: "string" },
+      "security-pass": { type: "string" },
       "pr-intent": { type: "string" },
       suggestions: { type: "string" },
       model: { type: "string" },
@@ -180,6 +184,10 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     );
   }
 
+  const securityPass = (values["security-pass"] as string | undefined) ?? DEFAULTS.securityPass;
+  if (securityPass !== "on" && securityPass !== "off") {
+    throw new Error(`Invalid --security-pass value: "${securityPass}" (expected "on" or "off")`);
+  }
   const structuralChecks =
     (values["structural-checks"] as string | undefined) ?? DEFAULTS.structuralChecks;
   if (structuralChecks !== "on" && structuralChecks !== "off") {
@@ -297,6 +305,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     advisor,
     dependencyFacts,
     structuralChecks,
+    securityPass,
     prIntent,
     suggestions,
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,

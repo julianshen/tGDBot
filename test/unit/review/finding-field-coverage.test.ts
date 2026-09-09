@@ -77,6 +77,10 @@ const schemaLine = (text: string, marker: string): string => {
  * `needs-clarification`) so the value is one a real reviewer could emit.
  */
 const COMPLETE: Required<Finding> = {
+  // Host-set, so a real reviewer never emits it — but `Required<Finding>` is
+  // the point of this fixture: a new field must be classified below rather
+  // than defaulting to silence.
+  redactSource: false,
   file: "src/subauthcache.go",
   line: 120,
   endLine: 124,
@@ -105,6 +109,7 @@ const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
 
 /** Fields a REVIEWING rule is deliberately never asked to produce. */
 const NOT_IN_RULE_CONTRACT: Partial<Record<keyof Finding, string>> = {
+  redactSource: "host-set; the contract must not invite a reviewer to control whether its own source line is quoted",
   ruleName: "stamped by the dispatcher from the rule that actually ran — a rule naming itself would be unverifiable",
   hostCheck: "computed by the host from the base tree (#75); a rule able to emit it could forge its own verification, which is the one part of a finding a reader is invited to trust without re-deriving",
 };
@@ -118,6 +123,7 @@ const NOT_IN_RULE_CONTRACT: Partial<Record<keyof Finding, string>> = {
  */
 const NOT_FROM_REVIEWER: Partial<Record<keyof Finding, string>> = {
   hostCheck: "host-computed; accepting it from reviewer output would let a finding fabricate its own verification",
+  redactSource: "host-set; a reviewer that could set it would suppress its own excerpt, and one that could clear it would expose a redacted finding's source line",
 };
 
 /**
@@ -133,6 +139,7 @@ const NOT_FROM_REVIEWER: Partial<Record<keyof Finding, string>> = {
 const NOT_PERSISTED: Partial<Record<keyof Finding, string>> = {
   claim: "recomputed per review; meaningless without the check that answers it",
   hostCheck: "derived from one base commit; a persisted verification would go stale silently",
+  redactSource: "a rendering decision of the run that produced the finding, recomputed with it; persisting it would let a stale flag decide whether a later review quotes a line",
 };
 
 /**
@@ -145,6 +152,7 @@ const NOT_PERSISTED: Partial<Record<keyof Finding, string>> = {
  * question rather than defaulting to silence.
  */
 const NOT_COPIED_THROUGH: Partial<Record<keyof Finding, string>> = {
+  redactSource: "never present in reviewer output, so there is nothing to copy through",
   hostCheck: "never emitted by a task in the first place — see NOT_IN_RULE_CONTRACT",
   file: "structural; the aggregator carries it, not the prose of it",
   line: "structural, as above",
@@ -155,6 +163,7 @@ const NOT_COPIED_THROUGH: Partial<Record<keyof Finding, string>> = {
 
 /** Fields the builtin reviewer agent is deliberately never asked to produce. */
 const NOT_IN_REVIEWER_AGENT: Partial<Record<keyof Finding, string>> = {
+  redactSource: "host-set; the agent must not be told it can control whether its source line is quoted",
   hostCheck: "host-computed, as above",
   ruleName: "stamped by the dispatcher, as above",
   decision: "requires prior-discussion context the builtin agent is not given",
@@ -316,6 +325,7 @@ describe("every Finding field reaches the reader", () => {
 
   /** Fields an inline comment deliberately does not print. */
   const NOT_IN_INLINE_BODY: Partial<Record<keyof Finding, string>> = {
+  redactSource: "a rendering DECISION, not content: it suppresses the excerpt rather than appearing in one",
     claim: "shown through the host check that answers it (#75) — printing the raw assertion as well would present the reviewer's word alongside the host's, which is the confusion the split avoids",
     file: "the comment is anchored to the file; repeating the path would be noise",
     line: "likewise — the anchor IS the line",

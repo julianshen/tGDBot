@@ -290,3 +290,23 @@ describe("structural checks in the config hash", () => {
       .toBe(computeReviewConfigHash(base));
   });
 });
+
+// Issue #139: enabling the pass on an already-reviewed head must re-review it.
+describe("security pass in the config hash", () => {
+  it("changes the hash when the pass is turned on", () => {
+    // Without this, `decideDedup` skipped the run, the detector never executed,
+    // and committed credentials stayed unscanned until an unrelated change
+    // moved the hash — so enabling the feature appeared to do nothing at all
+    // (Codex review of PR #147).
+    const off = computeReviewConfigHash(makeConfig({ securityPass: "off" }));
+    const on = computeReviewConfigHash(makeConfig({ securityPass: "on" }));
+    expect(on).not.toBe(off);
+  });
+
+  it("leaves the hash alone for a repository that never enables it", () => {
+    // Same discipline the structural-check entry follows: an unused feature
+    // must not re-review every open head on upgrade.
+    expect(computeReviewConfigHash(makeConfig({ securityPass: "off" })))
+      .toBe(computeReviewConfigHash(makeConfig()));
+  });
+});

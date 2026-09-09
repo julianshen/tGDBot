@@ -118,6 +118,7 @@ import type {
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
 import { CODEX_SECURITY_POLICY } from "../review/codex-security-results.js";
+import { SECRETS_POLICY, SECRETS_RULE_NAME } from "../review/security/secrets.js";
 import type {
   ConversationAdapter,
   ReviewActivityEvent,
@@ -923,6 +924,10 @@ function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): Review
     // different one (PR #54 review).
     dependencyFacts: config.dependencyFacts,
     structuralChecks: config.structuralChecks,
+    // A polled review runs the host security detectors under the poll's own
+    // setting, for the same reason it runs under the poll's dependency-facts
+    // setting: an operator asked for one configuration, not another.
+    securityPass: config.securityPass,
     prIntent: config.prIntent,
     suggestions: config.suggestions,
     dryRun: config.dryRun,
@@ -1137,7 +1142,19 @@ async function planConversationReply(input: {
   const importedScanFinding = resolution.ledger.reviewOptions.codexScanResults === true &&
     resolution.ledger.finding.ruleName === "codex-security";
   let currentRule: RuleDefinition | undefined;
-  if (importedScanFinding) {
+  // Issue #139: resolved by RESERVED NAME, unconditionally — not gated on the
+  // review option the way the imported-scan branch is. A host detector's
+  // finding stays explainable on a later poll whose `--security-pass` is off:
+  // the finding exists, the host computed it, and the policy that describes
+  // that computation does not stop being true because a flag changed.
+  // #139: also decides whether the code hunk may be sent to a model. Keyed on
+  // the RESERVED NAME rather than on `redactSource`, because `FindingSnapshot`
+  // does not carry that field — and the name is host-owned, so it cannot be
+  // claimed by a rule or forged in reviewer output.
+  const hostComputedFinding = resolution.ledger.finding.ruleName === SECRETS_RULE_NAME;
+  if (hostComputedFinding) {
+    currentRule = SECRETS_POLICY;
+  } else if (importedScanFinding) {
     currentRule = CODEX_SECURITY_POLICY;
   } else {
     const rules = await loadActiveRules(item.event.reviewNumber, metadata, options);
@@ -1161,7 +1178,14 @@ async function planConversationReply(input: {
     const actionInput = {
       ledger: resolution.ledger,
       currentRule,
-      currentCodeHunk: extractFileHunk(diff, resolution.ledger.finding.file),
+      // A host-computed finding's hunk contains the credential the finding
+      // deliberately does not quote. Sending it lets the model repeat it into
+      // a reply that only Markdown-sanitizes on the way out, so the prompt's
+      // "do not quote" becomes the only thing standing between a secret and a
+      // world-readable comment (Codex review of PR #147). Withheld instead:
+      // the explanation is about the FORMAT and why committing one matters,
+      // which the ledger finding and the policy already carry.
+      currentCodeHunk: hostComputedFinding ? "" : extractFileHunk(diff, resolution.ledger.finding.file),
       model,
       createSession: options.deps.createSession,
     };

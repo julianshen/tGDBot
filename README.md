@@ -680,6 +680,39 @@ of dependency facts cannot be cut mid-claim. The repository map keeps a floor of
 4000 characters, so a very large dependency section is the one case where the
 combined text exceeds the ceiling.
 
+## Host security detectors
+
+`--security-pass on` runs detectors the **host** computes, rather than rules a
+model answers. Off by default.
+
+Today that is one detector, `security:secrets`: a line **added** by this pull
+request matching a known credential format — an AWS access key id, a Stripe
+live key, a GitHub token, a Google API key, a Slack token, a private-key header.
+
+Three properties are worth knowing before you turn it on.
+
+**It never publishes the credential.** The finding names the format, the file
+and the line; the matched text is not in the comment. A review comment is
+world-readable on a public repository, so echoing the value would take a secret
+exposed to everyone with repository access and expose it to everyone at all.
+
+**It reports only what it can decide.** Every pattern is a provider's own
+distinctive prefix at that provider's own length. A credential-shaped literal
+with no recognised format is not reported at all — uncertainty is expressed by
+saying nothing, never by reporting at a lower severity, because `suggestion`
+asserts the code is correct as written and a detector that fires has found
+something that is not. `sk_test_` keys are ignored for the same reason.
+
+**Added lines only.** A secret already present at the base was not introduced
+here. Reporting it on every unrelated change that touches the file is alarm
+fatigue, and it is a real problem that is not this review's finding to make.
+
+Findings carry the reserved rule name `security:secrets`, appear under "Rules
+run", and are addressable by the conversation commands like any other. A user
+rule may not claim that name: the loader reports it as a load error and does not
+dispatch it, because the host publishes under it and owns the policy that
+`explain` answers from.
+
 ## Checking a finding's structural claim
 
 The confident false positive this exists for is *"this function is never

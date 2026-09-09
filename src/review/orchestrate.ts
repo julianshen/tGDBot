@@ -19,6 +19,7 @@ import {
   rangeIsCommentable,
 } from "./diff-anchors.js";
 import { clusterFindings } from "./finding-clusters.js";
+import type { FindingCluster } from "./finding-clusters.js";
 import { relocateFindingsByQuote } from "./quote-anchor.js";
 import type { DispatchResult, Finding, FindingDecision } from "./types.js";
 import type { RelatedWorkItem } from "./related-work.js";
@@ -177,6 +178,69 @@ export function isSuggestionAllowedForPath(file: string): boolean {
   return !NO_SUGGESTION_PATHS.some((re) => re.test(file));
 }
 
+/**
+ * What a merged member says when it sits beside a REDACTED finding.
+ *
+ * Named rather than empty: the corroboration is the useful part — another rule
+ * saw the same line — and a member silently reduced to its rule name reads like
+ * a rendering bug.
+ */
+const WITHHELD_MESSAGE =
+  "Reported the same location. This rule's own wording is withheld here because " +
+  "it may quote the credential; the finding above says what to do about it.";
+
+/**
+ * A cluster member reduced to what is safe to publish beside a redacted one.
+ *
+ * An ALLOWLIST rather than a spread with deletions, for the same reason
+ * `normalizeUnknownFinding` is one: a field added to `Finding` later must
+ * default to withheld, and a spread would default it to published. Everything
+ * omitted here is prose or code the member chose — `message`, `title`,
+ * `suggestion`, `existingCode`, `references`, `question` — any of which a model
+ * rule reporting the same credential would naturally quote it into.
+ */
+function withheldMember(member: Finding): Finding {
+  return {
+    file: member.file,
+    ...(typeof member.line === "number" ? { line: member.line } : {}),
+    severity: member.severity,
+    category: member.category,
+    ruleName: member.ruleName,
+    message: WITHHELD_MESSAGE,
+    redactSource: true,
+  };
+}
+
+/**
+ * Withholds every member of a cluster that contains a redacted finding.
+ *
+ * Applied to the CLUSTER, before `allFindings`, the representative, or
+ * `mergedMembers` derive from it, because each of those is a separate publish
+ * route and they do not agree on what they render: `renderAlsoReported` emits a
+ * member's message and suggestion, while `renderCrossFileGroupsSection`
+ * re-clusters `allFindings` and prints `claimOf` for members that were never
+ * merged into anything. Sanitizing at the choke point covers both, and covers
+ * the next one without needing to find it first (Codex review of PR #147).
+ */
+function withholdBesideRedacted(cluster: FindingCluster): FindingCluster {
+  if (!cluster.members.some((member) => member.redactSource === true)) return cluster;
+  const members = cluster.members.map(
+    (member) => (member.redactSource === true ? member : withheldMember(member)),
+  );
+  // The REDACTED member represents the cluster, and it is promoted here rather
+  // than downstream because here is the last point at which it can be told
+  // apart: every withheld copy above also carries `redactSource`, so a later
+  // "find the redacted member" would happily return one of the copies.
+  //
+  // Promotion is ahead of anchorability, which is what decides the ordinary
+  // case. Choosing among the rest is a presentation question; this one decides
+  // whether a credential is published, because the representative's snippet is
+  // what the summary fallback renders and its rule name is what the
+  // conversation path keys the withheld hunk on.
+  const original = cluster.members.find((member) => member.redactSource === true);
+  return { ...cluster, members, representative: original ?? members[0] as Finding };
+}
+
 export function orchestrate(
   dispatchResult: DispatchResult,
   diff = "",
@@ -232,7 +296,7 @@ export function orchestrate(
   // statements of the same race on PR #281, three of them anchored to the very
   // same line. Cluster first, then present one entry per root cause with its
   // contributing rules as metadata, so the reader meets each defect once.
-  const clusters = clusterFindings(candidates);
+  const clusters = clusterFindings(candidates).map(withholdBesideRedacted);
   // Every surviving finding, exact duplicates already collapsed. This is the
   // set the COUNTS describe: clustering decides what is SHOWN, never how many
   // findings a run had or what severities they carried.
@@ -247,16 +311,30 @@ export function orchestrate(
   // had — members often disagree about which line of a construct to blame.
   // Prefer an anchorable member, keeping the severity ordering among those.
   const representativeOf = (cluster: (typeof clusters)[number]): Finding =>
-    cluster.members.find((member) => isCommentable(anchors, member.file, member.line)) ??
-    cluster.representative;
+    // A redacted cluster keeps the representative `withholdBesideRedacted`
+    // chose. Overriding it on anchorability would hand the slot to a withheld
+    // copy — which anchors identically, and carries neither the reserved rule
+    // name nor a message worth publishing.
+    cluster.representative.redactSource === true
+      ? cluster.representative
+      : cluster.members.find((member) => isCommentable(anchors, member.file, member.line)) ??
+        cluster.representative;
 
   const contributingRules = new Map<Finding, readonly string[]>();
   // The members a cluster did NOT promote still have to be rendered somewhere,
   // or a similarity heuristic silently deletes a finding (Codex review of
   // PR #23, P1). Every surface that shows a representative shows these too.
   const mergedMembers = new Map<Finding, readonly Finding[]>();
+  // Representatives whose cluster contains a redacted member. Selection above
+  // already promotes such a member, so this is normally the same answer stated
+  // twice — deliberately, because the two are independent: reordering the
+  // preference must not silently reattach the excerpt.
+  const redactedClusters = new Set<Finding>();
   for (const cluster of clusters) {
     const representative = representativeOf(cluster);
+    if (cluster.members.some((member) => member.redactSource === true)) {
+      redactedClusters.add(representative);
+    }
     contributingRules.set(representative, cluster.rules);
     mergedMembers.set(representative, cluster.members.filter((member) => member !== representative));
   }
@@ -371,7 +449,12 @@ export function orchestrate(
       finding,
       {
         ...(inlineEnabled
-          ? { snippet: hunkSnippet(diff, finding.file, finding.line, finding.endLine) }
+          ? (finding.redactSource === true || redactedClusters.has(finding)
+            // #139: the summary fallback renders this snippet in full, so a
+            // rejected inline write would publish the credential the finding
+            // deliberately omits.
+            ? {}
+            : { snippet: hunkSnippet(diff, finding.file, finding.line, finding.endLine) })
           : {}),
         ...(() => {
           const rules = contributingRules.get(finding);

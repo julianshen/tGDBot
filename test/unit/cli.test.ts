@@ -41,6 +41,7 @@ describe("parseCommandArgs", () => {
       // private repository starts telling npm what it depends on (PR #54).
       dependencyFacts: "off",
       structuralChecks: "off",
+      securityPass: "off",
       prIntent: "on",
       suggestions: "on",
       dryRun: false,
@@ -93,6 +94,7 @@ describe("parseArgs", () => {
       // private repository starts telling npm what it depends on (PR #54).
       dependencyFacts: "off",
       structuralChecks: "off",
+      securityPass: "off",
       prIntent: "on",
       suggestions: "on",
       dryRun: false,
@@ -140,6 +142,8 @@ describe("parseArgs", () => {
       "off",
       "--structural-checks",
       "on",
+      "--security-pass",
+      "on",
     ]);
 
     expect(result).toEqual({
@@ -150,6 +154,7 @@ describe("parseArgs", () => {
       advisor: "off",
       dependencyFacts: "on",
       structuralChecks: "on",
+      securityPass: "on",
       prIntent: "off",
       suggestions: "on",
       dryRun: true,

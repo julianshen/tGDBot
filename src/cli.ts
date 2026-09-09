@@ -82,6 +82,7 @@ import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./revi
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
 import { codexScanArtifactDigest, codexScanFailureReason, ingestCodexSecurityResults } from "./review/codex-security-results.js";
+import { detectCommittedSecrets, SECRETS_RULE_NAME } from "./review/security/secrets.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
@@ -1320,9 +1321,12 @@ export async function review(
   }
 
   const loadedRules = await loadRulesForReview(config, pr, loadRulesFn);
-  const loadedRuleSet = config.codexScanResults === undefined
+  const loadedRuleSet = (config.codexScanResults === undefined
     ? loadedRules.rules
-    : loadedRules.rules.filter((rule) => rule.name !== "codex-security");
+    : loadedRules.rules.filter((rule) => rule.name !== "codex-security"))
+    // Reported as a load error below AND excluded here: reporting alone would
+    // leave the rule dispatched under a name the host also publishes under.
+    .filter((rule) => rule.name !== SECRETS_RULE_NAME);
   const loadErrors = [...loadedRules.errors];
   if (config.codexScanResults !== undefined) {
     for (const reserved of loadedRules.rules.filter((rule) => rule.name === "codex-security")) {
@@ -1331,6 +1335,17 @@ export async function review(
         message: 'rule name "codex-security" is reserved while --codex-scan-results is set',
       });
     }
+  }
+  // Issue #139: the host owns this name unconditionally, not only when the
+  // pass is on. A user rule allowed to claim it while the pass is off would
+  // produce findings a later run attributes to the host detector — and the
+  // conversation policy for the name is host-owned, so `explain` would answer
+  // about the host's computation rather than about the rule that ran.
+  for (const reserved of loadedRules.rules.filter((rule) => rule.name === SECRETS_RULE_NAME)) {
+    loadErrors.push({
+      sourcePath: reserved.sourcePath,
+      message: `rule name "${SECRETS_RULE_NAME}" is reserved for the host security detector`,
+    });
   }
 
   // Task 8 review fix #1: surface load errors via console.error whenever
@@ -1345,7 +1360,14 @@ export async function review(
   }
 
   // AC-8.5: every rule failed to load -> exit 1 before any VCS write.
-  if (loadedRuleSet.length === 0 && config.codexScanResults === undefined) {
+  // A host detector needs no model rules to produce findings, so an enabled
+  // security pass is a reason to continue — the same exception the scan ingest
+  // already has. Without this, `--security-pass on --disable-builtin-rule` with
+  // no user rules aborted before the detector ran, making a host-only review
+  // impossible to configure (Codex review of PR #147).
+  const hostFindingSourceEnabled =
+    config.codexScanResults !== undefined || config.securityPass === "on";
+  if (loadedRuleSet.length === 0 && !hostFindingSourceEnabled) {
     console.error("tgd-review-agent: no rules could be loaded; aborting before posting a comment");
     return EXIT_FATAL;
   }
@@ -1702,6 +1724,25 @@ export async function review(
           ? {}
           : { agentDefinitions }),
       });
+  // Issue #139: host detectors CREATE findings rather than annotating them, so
+  // a pull request whose only defect is a committed credential still produces
+  // one. Runs after dispatch and before orchestration, so the findings flow
+  // through dedup, clustering, anchoring and publication like any other — which
+  // is what makes them addressable in conversation and countable in metrics.
+  if (config.securityPass === "on") {
+    try {
+      dispatchResult.findings.push(...detectCommittedSecrets(diff));
+      // Pushed whether or not it found anything: "ran and found nothing" and
+      // "did not run" are different facts, and only the second belongs absent
+      // from the summary's account of what ran.
+      dispatchResult.rulesRun.push(SECRETS_RULE_NAME);
+    } catch (error) {
+      dispatchResult.rulesFailed.push(SECRETS_RULE_NAME);
+      console.warn(
+        `tgd-review-agent: the ${SECRETS_RULE_NAME} detector failed (${redactedMessage(error)})`,
+      );
+    }
+  }
   if (config.codexScanResults !== undefined) {
     if (scanIngest !== undefined) {
       dispatchResult.findings.push(...scanIngest.findings);
