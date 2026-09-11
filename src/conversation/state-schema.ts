@@ -1333,6 +1333,10 @@ function findingReviewOptions(value: unknown, name: string): FindingReviewOption
   if (object.suggestions !== "on" && object.suggestions !== "off") throw new Error(`${name}.suggestions is invalid`);
   if (typeof object.disableBuiltinRule !== "boolean") throw new Error(`${name}.disableBuiltinRule must be boolean`);
   if (typeof object.trustLocalRules !== "boolean") throw new Error(`${name}.trustLocalRules must be boolean`);
+  // `"legacy"` is still ACCEPTED on read, though nothing writes it any more:
+  // state files predating #138 phase 4 carry it, and rejecting them would turn
+  // a deleted engine into a crash on every conversation resumed across the
+  // upgrade. Normalized to "direct" below — the engine it would run on now.
   if (object.dispatch !== "direct" && object.dispatch !== "legacy") throw new Error(`${name}.dispatch is invalid`);
   if (object.codexScanResults !== undefined && object.codexScanResults !== true) {
     throw new Error(`${name}.codexScanResults is invalid`);
@@ -1343,7 +1347,7 @@ function findingReviewOptions(value: unknown, name: string): FindingReviewOption
     disableBuiltinRule: object.disableBuiltinRule,
     trustLocalRules: object.trustLocalRules,
     rulesDir: text(object.rulesDir, `${name}.rulesDir`, 4_096),
-    dispatch: object.dispatch,
+    dispatch: "direct",
     ...(object.codexScanResults === true ? { codexScanResults: true as const } : {}),
     ...(object.model === undefined ? {} : { model: text(object.model, `${name}.model`, 256) }),
   };

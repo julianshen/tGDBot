@@ -182,16 +182,7 @@ trusted context, report the finding anyway and say the description asserts other
 // The failure signals are TWO, because neither alone covers every shape a
 // task can fail in (PR #123 review, two rounds). The subagent tool's OWN
 // "K/N succeeded" summary is produced from actual task exit codes and is
-// authoritative for a task that ERRORED — but it counts exit codes only, so
-// an exit-0 task returning prose or malformed JSON reads as "succeeded"
-// there; that shape is what the "rulesFailed" array catches, because the
-// prompt defines it as exactly "no parseable findings array" (a judgement
-// the orchestrator CAN make reliably from block content, unlike exit-code
-// accounting). The advisor runs when either signal fires.
-const ADVISOR_INSTRUCTION =
-  'After merging the task blocks, decide whether to call the "advisor" tool for a second opinion on your merged findings. Call it ONLY IF at least one of the following holds: (a) the merged "findings" array contains at least one finding; (b) the subagent result summary line reported any task that did NOT succeed (K is less than the number of dispatched tasks); or (c) any dispatched rule name from the list below appears in "rulesFailed". Any of these makes coverage uncertain, and that is exactly when a second opinion is most valuable. If the merged "findings" array is empty AND every dispatched task succeeded AND "rulesFailed" is empty, do NOT call the "advisor" tool at all; respond with the final JSON immediately. When you do call it and the advisor flags a finding as a false positive, remove it before responding.';
-
-// Review finding (code-review fix): the diff IS embedded once per rule
+/// Review finding (code-review fix): the diff IS embedded once per rule
 // here, and that duplication is NECESSARY, not an oversight — verified
 // against node_modules/pi-subagents/src/extension/schemas.ts. Each rule
 // becomes its own entry in the "subagent" tool's top-level PARALLEL
@@ -219,7 +210,16 @@ const ADVISOR_INSTRUCTION =
 // rather than silent.
 const DIFF_COST_WARNING_THRESHOLD_CHARS = 500_000; // ~125k tokens at ~4 chars/token
 
-function warnIfDiffCostRisk(
+/**
+ * Warns when the per-rule diff embedding makes a run expensive.
+ *
+ * Still relevant after the legacy engine's deletion: the direct engine also
+ * gives every rule its own fresh session with its own copy of the diff, so
+ * total prompt size scales the same O(rules x diff) way. Truncating would
+ * produce false negatives, so the cost is made VISIBLE rather than silently
+ * paid or silently avoided.
+ */
+export function warnIfDiffCostRisk(
   rules: EffectiveRule[],
   diff: string,
   packsByRule?: ReadonlyMap<string, ContextPackResult>,
@@ -359,102 +359,5 @@ export function buildTaskText(
   if (conversationContext !== undefined && conversationContext.text.length > 0) {
     parts.push(conversationContext.text);
   }
-  return parts.join("\n\n");
-}
-
-// Pure and SDK-independent, so it's directly testable (AC-5.2, AC-6.3)
-// without a session of any kind. The only side effect is the cost-risk
-// warning above, which mirrors the existing console.warn use elsewhere
-// in this module (parseDispatchResult) and does not affect the return
-// value.
-export function buildDispatchPrompt(
-  rules: EffectiveRule[],
-  diff: string,
-  useAdvisor: boolean,
-  conversationContext?: ReviewConversationContext,
-  /**
-   * Trusted-base context, keyed by rule name. Before this parameter existed
-   * the orchestrated path passed `undefined` here unconditionally, so
-   * `--dispatch legacy` could not carry context at all while `direct` could —
-   * a silent difference in what the two engines showed a reviewer.
-   */
-  packsByRule?: ReadonlyMap<string, ContextPackResult>,
-  /** Issue #59: embedded in every task text, exactly like the diff. */
-  prIntent?: PrIntent,
-): string {
-  warnIfDiffCostRisk(rules, diff, packsByRule, prIntent);
-
-  const ruleNames = rules.map((rule) => rule.name);
-
-  const taskSpecs = rules
-    .map((rule, index) => {
-      const modelRef = `${rule.provider}/${rule.model}`;
-      return [
-        `Task ${index + 1} — rule "${rule.name}":`,
-        `  agent: "reviewer"`,
-        `  model: "${modelRef}"`,
-        `  task: """`,
-        buildTaskText(rule, diff, packsByRule?.get(rule.name), conversationContext, prIntent),
-        `  """`,
-      ].join("\n");
-    })
-    .join("\n\n");
-
-  const parts = [
-    `You are orchestrating a code review. Call the "subagent" tool exactly ONCE, in its PARALLEL form (a top-level "tasks" array), with one task entry per rule below.`,
-    `Each task entry's "agent" field must be the literal string "reviewer", its "task" field must be that rule's task text below (verbatim, including the diff), and its "model" field must be that rule's exact "<provider>/<model>" string below.`,
-    // The orchestrating session is now PERSISTED (createRealDispatchSession),
-    // so `context: "fork"` no longer crashes — but "fresh" is still what we
-    // actually want: each rule's review is independent and needs no visibility
-    // into the parent conversation, and fresh is cheaper (no parent context
-    // carried into each child). This instruction keeps "fresh" as the preferred
-    // path; the persisted session is the hard-guarantee backstop if the LLM
-    // ignores it. Per pi-subagents' schema, an explicit top-level `context`
-    // overrides every child in the invocation.
-    `Set the subagent tool call's top-level "context" field to the literal string "fresh" — each rule's review is independent and needs no shared context.`,
-    taskSpecs,
-    // Attribution fix (found via a real multi-model run against
-    // hmchangw/chat#490): with fork/intercom fixed, BOTH parallel tasks
-    // reliably ran, but the orchestrator sometimes mis-attributed or dropped
-    // one. The subagent tool aggregates results as a "N/N succeeded" summary
-    // line followed by one "=== Task K: reviewer ===" block per task, in the
-    // SAME ORDER they were dispatched — but every block is headed "reviewer"
-    // (the agent name), so the ONLY reliable signal for which block belongs to
-    // which rule is position. Spell that mapping out explicitly rather than
-    // letting the orchestrator guess from a block's content.
-    `The subagent tool returns its result as a "K/N succeeded" summary line followed by one "=== Task <i>: reviewer ===" block per task, in the EXACT ORDER you dispatched them. Attribute strictly by that order: ${ruleNames
-      .map((name, index) => `Task ${index + 1}'s block is rule "${name}"`)
-      .join("; ")}. Never infer a block's rule from its content — only from its task position.`,
-    `Merge every task block's JSON findings array into one combined "findings" array, stamping each finding's "ruleName" with its task's rule name from the order mapping above.`,
-  ];
-
-  // TASKS.md Task 6, AC-6.3: only present when the advisor second-opinion
-  // pass is enabled — must NOT appear when useAdvisor is false.
-  if (useAdvisor) {
-    parts.push(ADVISOR_INSTRUCTION);
-  }
-
-  parts.push(
-    `Then respond with ONLY a final JSON object (no prose, no markdown fences) matching exactly this shape:`,
-    `{ "findings": [{ "file": string, "line": number | null, "endLine": number | null, "existingCode": string | null, "severity": "blocking" | "warning" | "suggestion", "category": string, "title": string, "message": string, "suggestion": string | null, "decision": "new" | "still-valid" | "addressed" | "disputed" | "needs-clarification", "question": string | null, "effort": "quick" | "heavy" | null, "references": string[] | null, "claim": { "kind": "no-other-references", "symbol": string } | null, "ruleName": string }], "rulesRun": string[], "rulesFailed": string[] }`,
-    // ADR-007/ADR-008: the orchestrator MERGES the subagents' findings and re-emits
-    // them, so every field it is not told to keep is silently dropped at this last
-    // hop. That is exactly what happened on the first live run: the reviewers were
-    // authoring `title` and `suggestion`, and the orchestrator threw both away —
-    // the comment fell back to a derived headline and never showed a Commit button.
-    // Copy them through VERBATIM; never rewrite a suggestion (it is literal code
-    // destined for the file, and a paraphrase would commit something the reviewer
-    // never proposed).
-    `Copy each finding's "title", "message", "suggestion", "endLine", "existingCode", "decision", "question", "effort", "references" and "claim" through EXACTLY as the task emitted them — verbatim, character for character. Do NOT rewrite, summarize, reformat, re-indent, or "improve" a "suggestion": it is literal replacement code that a human can commit with one click, so any edit you make would be committed as if the reviewer had proposed it. If a task omitted a field, use null.`,
-    // Attribution fix (see order-mapping note above): the old wording defined
-    // rulesFailed as tasks that "produced no usable output", which the
-    // orchestrator wrongly applied to a task that RAN and returned an empty or
-    // all-duplicate findings array — silently degrading a 2-model fan-out to
-    // 1-model coverage. A rule that ran and found nothing is a SUCCESS.
-    `A rule's task SUCCEEDED — put it in "rulesRun" — if its "=== Task <i> ===" block contains a parseable JSON findings array, INCLUDING an empty array []. A rule that ran and simply found no issues (or only issues another rule also found) is a SUCCESS, not a failure. Put a rule in "rulesFailed" ONLY if its task errored/crashed or its block has no parseable findings array at all. Every task counted in the "K/N succeeded" summary MUST appear in "rulesRun" by its rule name — never drop or omit a rule that ran. The rules are: ${ruleNames
-      .map((name) => `"${name}"`)
-      .join(", ")}.`,
-  );
-
   return parts.join("\n\n");
 }

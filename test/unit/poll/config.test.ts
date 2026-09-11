@@ -20,7 +20,7 @@ describe("poll command configuration", () => {
   it("resolves exactly one GitHub repository, adapter, state root, and shared review options", () => {
     const args = parseCommandArgs([
       "poll", "--repo", "Owner/Repo", "--state-dir", "/tmp/tgd-state",
-      "--model", "openai/gpt-5", "--dispatch", "direct", "--advisor", "off",
+      "--model", "openai/gpt-5", "--advisor", "off",
     ]);
     expect(args.command).toBe("poll");
     if (args.command !== "poll") throw new Error("expected poll");
@@ -37,6 +37,8 @@ describe("poll command configuration", () => {
     expect(config).toMatchObject({
       model: "openai/gpt-5",
       dispatch: "direct",
+      subagentNesting: "off",
+      agentsDir: ".tgd/agents",
       advisor: "off",
       rulesDir: ".review/rules",
       suggestions: "on",

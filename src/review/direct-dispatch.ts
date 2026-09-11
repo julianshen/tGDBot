@@ -43,18 +43,29 @@ import {
   getAgentDir,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSessionOptions, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import matter from "gray-matter";
 import type { EffectiveRule } from "../rules/types.js";
-import { buildTaskText } from "./dispatch-prompt.js";
+import { buildTaskText, warnIfDiffCostRisk } from "./dispatch-prompt.js";
 import { createSubmitFindingsTool, readSubmittedFindings, ruleDirName } from "./findings-file.js";
+import type { AgentDefinition } from "../agents/definition.js";
+import { sessionToolsFor } from "../agents/definition.js";
+import {
+  composeSystemPrompt,
+  effectiveModelPin,
+  readTaskMeta,
+  writeTaskMeta,
+  type TaskMeta,
+} from "../agents/resolve.js";
+import { createDelegateTool, type DelegationRunner } from "../agents/delegate.js";
+import { makeDelegationRunner } from "../agents/delegate-runner.js";
 import {
   classifyTaskFailure,
   extractFindingsArray,
   parseFindingsFromFinalOutput,
   referencesDeclaredBy,
 } from "./dispatch-results.js";
-import type { DispatchSession } from "./dispatch.js";
+import type { DispatchSession } from "./dispatch-session.js";
 import { resolveRpivAdvisorExtensionPath } from "./extensions.js";
 import {
   resolveEffectiveRules,
@@ -74,7 +85,35 @@ export type DirectSessionFactory = (
   cwd: string,
   /** Issue #138: where this rule's submitted findings.json is written. */
   outputDir: string,
+  /** Issue #138 phase 2/3: the persona, tool scope, and delegation wiring for this task. */
+  scope?: TaskScope,
 ) => Promise<DispatchSession>;
+
+/**
+ * Everything a task's session needs beyond its rule.
+ *
+ * Passed as ONE object rather than four positional parameters: the factory is
+ * a test seam, and every stub in the suite would otherwise have to be updated
+ * in lockstep each time nesting gains a field.
+ */
+/**
+ * The `delegate` tool as this module handles it: something to register, not
+ * something to call. Opaque on purpose — `createDelegateTool` owns its schema,
+ * and naming that schema here would make every stub session factory in the
+ * suite import typebox to satisfy a type it never uses.
+ */
+export type RegisteredDelegateTool = ReturnType<typeof createDelegateTool>;
+
+export interface TaskScope {
+  readonly agent?: AgentDefinition;
+  /**
+   * The `delegate` tool, already gated and budgeted by the caller. Typed
+   * loosely on purpose: its parameter schema is an implementation detail of
+   * `createDelegateTool`, and naming it here would make every stub session
+   * factory in the test suite import typebox.
+   */
+  readonly delegate?: RegisteredDelegateTool | undefined;
+}
 
 /** Creates the (single) advisor session for the --advisor pass. */
 export type AdvisorSessionFactory = (cwd: string) => Promise<DispatchSession>;
@@ -86,6 +125,15 @@ export interface DirectDispatchDeps {
   ruleTimeoutMs?: number;
   /** Override for tests. Default ADVISOR_PROMPT_TIMEOUT_MS. */
   advisorTimeoutMs?: number;
+  /**
+   * Issue #138 phase 3: spawns and harvests one delegated child.
+   *
+   * Absent means no reviewer gets the `delegate` tool, whatever the flag or
+   * the definition says — nesting needs a runner to be real, and a tool that
+   * accepts calls it cannot service is worse than no tool. `cli.ts` supplies
+   * the SDK-backed one; tests supply a stub.
+   */
+  runDelegation?: DelegationRunner;
 }
 
 // CodeRabbit review (PR #7): a hung provider call must not block Promise.all
@@ -125,13 +173,22 @@ function reviewerSystemPrompt(): string {
   return cachedReviewerSystemPrompt;
 }
 
-async function createRealDirectSession(rule: EffectiveRule, cwd: string, outputDir: string): Promise<DispatchSession> {
+async function createRealDirectSession(
+  rule: EffectiveRule,
+  cwd: string,
+  outputDir: string,
+  scope: TaskScope = {},
+): Promise<DispatchSession> {
   // Credential gate BEFORE any session exists: a rule pinned to a provider
   // this machine can't authenticate must fail with the classified reason,
   // not burn a session-construction round trip to discover it. The error
   // strings deliberately match PROVIDER_AUTH_ERROR_RE's vocabulary so
   // classifyTaskFailure names the cause in the PR comment.
-  const resolved = await resolveRuleSessionModel(rule.provider, rule.model);
+  // Issue #138 phase 2: the agent's pin is the persona's DEFAULT; the rule's
+  // own pin still wins, because it names one review rather than a class of
+  // them (#112's outward-from-specific order).
+  const pin = effectiveModelPin(rule, scope.agent);
+  const resolved = await resolveRuleSessionModel(pin.provider ?? rule.provider, pin.model ?? rule.model);
   if (!resolved.model) {
     throw new Error(resolved.error ?? `could not resolve model for rule "${rule.name}"`);
   }
@@ -149,14 +206,24 @@ async function createRealDirectSession(rule: EffectiveRule, cwd: string, outputD
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPrompt: reviewerSystemPrompt(),
+    // Issue #138 phase 2: the persona is APPENDED to the vendored reviewer
+    // contract, never substituted for it — ADR-003's read-only statement and
+    // the finding schema live in that text, and a definition file is
+    // user-editable.
+    systemPrompt: composeSystemPrompt(reviewerSystemPrompt(), scope.agent),
   });
   await loader.reload();
 
   const { session } = await createAgentSession({
     resourceLoader: loader,
     cwd,
-    tools: ["read", "grep", "find", "ls", "submit_findings"],
+    // Issue #138 phase 2: narrowed by the agent definition when there is one.
+    // `sessionToolsFor` intersects with ADR-003's set rather than trusting the
+    // file, so a definition can only ever subtract.
+    tools: [
+      ...sessionToolsFor(scope.agent),
+      ...(scope.delegate ? ["delegate"] : []),
+    ],
     customTools: [
       // Issue #138 phase 1: the findings file contract. A single host-mediated
       // tool whose write path is baked into the closure; the model supplies
@@ -167,6 +234,9 @@ async function createRealDirectSession(rule: EffectiveRule, cwd: string, outputD
         ruleName: rule.name,
         allowedReferences: referencesDeclaredBy(rule.body),
       }),
+      // Issue #138 phase 3. Built by the caller, which owns the gate, the
+      // budget, and the harvest array; this factory only registers it.
+      ...(scope.delegate ? [scope.delegate as unknown as ToolDefinition] : []),
     ],
     model: resolved.model,
     ...(resolved.thinkingLevel
@@ -267,7 +337,18 @@ export async function dispatchRulesDirect(
   input: ReviewDispatchInput,
   deps: DirectDispatchDeps = {},
 ): Promise<DispatchResult> {
-  const { rules, diff, useAdvisor, contextPacks, orchestratorModel, conversationContext, prIntent } = input;
+  const {
+    rules,
+    diff,
+    useAdvisor,
+    contextPacks,
+    orchestratorModel,
+    conversationContext,
+    prIntent,
+    agentsByRule,
+    nestingEnabled,
+    changedFiles,
+  } = input;
   const createSession = deps.createSession ?? createRealDirectSession;
   const ruleTimeoutMs = deps.ruleTimeoutMs ?? RULE_PROMPT_TIMEOUT_MS;
   const advisorTimeoutMs = deps.advisorTimeoutMs ?? ADVISOR_PROMPT_TIMEOUT_MS;
@@ -314,6 +395,12 @@ export async function dispatchRulesDirect(
     >;
     for (const name of unresolvedNames) ruleFailureReasons[name] = unresolved[name];
 
+    // The diff is embedded once per rule (fresh sessions), so a large diff
+    // times many rules is a real cost an operator should see before the
+    // provider bills for it. Inherited from the deleted orchestrating engine,
+    // which scaled exactly the same way.
+    warnIfDiffCostRisk(effective, diff, validatedContext.packsByRule, prIntent);
+
     // Issue #109: the real per-run prompt cost, reported on the result. The
     // diff is embedded once per rule by design (fresh child sessions), so the
     // honest unit is the sum of the task texts the engine actually built.
@@ -331,14 +418,75 @@ interface RuleOutcome {
 
     const runRule = async (rule: EffectiveRule): Promise<RuleOutcome> => {
       let session: DispatchSession | undefined;
+      const outputDir = path.join(findingsDir as string, ruleDirName(rule.name));
+      const agent = agentsByRule?.get(rule.name);
+      // Issue #138 phase 3: child findings land here, placed by the HOST when
+      // it harvests a child's file. The parent never touches this array —
+      // which is what keeps an LLM off the path between a child and the merge.
+      const harvested: Finding[] = [];
+      // The DEFAULT runner is built here rather than by the caller, because it
+      // needs this function's cwd and session factory — neither of which
+      // `cli.ts` has. Injecting one is a test override, not the only way to
+      // get one: without this, `--subagent-nesting on` would parse, pass every
+      // gate, and then silently do nothing.
+      const runDelegation: DelegationRunner | undefined =
+        deps.runDelegation ??
+        (nestingEnabled === true && agent?.delegate === true
+          ? makeDelegationRunner(rule, agent, {
+              // The child gets NO delegate tool: depth is fixed at one by
+              // construction, and an absent tool cannot be called.
+              createChildSession: (childRule, childCwd, childOut, childScope) =>
+                createSession(childRule, childCwd, childOut, { agent: childScope.agent }),
+              cwd: cwd as string,
+              diff,
+              timeoutMs: ruleTimeoutMs,
+              withTimeout,
+            })
+          : undefined);
+      const delegate =
+        nestingEnabled === true && agent?.delegate === true && runDelegation !== undefined
+          ? createDelegateTool({
+              parentRule: rule.name,
+              agent,
+              nestingEnabled: true,
+              changedFiles: changedFiles ?? [],
+              outputDir,
+              run: runDelegation,
+              harvested,
+            })
+          : undefined;
+      let lastTaskTextChars = 0;
+      // Every exit path returns THROUGH here, including the throwing ones:
+      // telemetry that only describes tasks that succeeded answers the least
+      // interesting half of "what did this run cost" (#109). It also merges
+      // the harvested child findings, so a parent that delegated and then
+      // failed still contributes what its child established.
+      const finish = async (outcome: RuleOutcome): Promise<RuleOutcome> => {
+        const merged =
+          harvested.length > 0
+            ? { ...outcome, findings: [...outcome.findings, ...harvested] }
+            : outcome;
+        await writeTaskMeta(outputDir, {
+          ruleName: rule.name,
+          ...(agent === undefined ? {} : { agent: agent.name }),
+          provider: rule.provider,
+          model: rule.model,
+          succeeded: merged.succeeded,
+          ...(merged.failureReason === undefined ? {} : { failureReason: merged.failureReason }),
+          findingCount: merged.findings.length,
+          taskTextChars: lastTaskTextChars,
+        });
+        return merged;
+      };
       try {
         session = await withTimeout(
-          createSession(rule, cwd as string, path.join(findingsDir as string, ruleDirName(rule.name))),
+          createSession(rule, cwd as string, outputDir, { agent, delegate }),
           ruleTimeoutMs,
           `rule "${rule.name}" session creation timed out after ${ruleTimeoutMs}ms`,
         );
         const taskText = buildTaskText(rule, diff, validatedContext.packsByRule?.get(rule.name), conversationContext, prIntent);
         taskTextChars += taskText.length;
+        lastTaskTextChars = taskText.length;
         await withTimeout(
           session.prompt(taskText),
           ruleTimeoutMs,
@@ -350,12 +498,12 @@ interface RuleOutcome {
         // the tool; when both exist, the file wins (the text is the same
         // array by contract, relayed by a lossier channel).
         const submitted = await readSubmittedFindings({
-          outputDir: path.join(findingsDir as string, ruleDirName(rule.name)),
+          outputDir,
           ruleName: rule.name,
           allowedReferences: referencesDeclaredBy(rule.body),
         });
         if (submitted !== undefined) {
-          return { ruleName: rule.name, succeeded: true, findings: submitted };
+          return await finish({ ruleName: rule.name, succeeded: true, findings: submitted });
         }
         const text = session.getLastAssistantText();
         // extractFindingsArray distinguishes "no parseable findings array"
@@ -376,15 +524,15 @@ interface RuleOutcome {
             `dispatchRulesDirect: rule "${rule.name}" produced no parseable findings array; ` +
               `it returned: ${excerpt}`,
           );
-          return { ruleName: rule.name, succeeded: false, findings: [], failureReason };
+          return await finish({ ruleName: rule.name, succeeded: false, findings: [], failureReason });
         }
-        return {
+        return await finish({
           ruleName: rule.name,
           succeeded: true,
           // The rule that ran is known here, so its declared citations can be
           // honoured — unlike the legacy orchestrator's merged output (#49).
           findings: parseFindingsFromFinalOutput(text, rule.name, referencesDeclaredBy(rule.body)),
-        };
+        });
       } catch (err) {
         const timedOut = err instanceof PromptTimeoutError;
         const message = (err as Error).message;
@@ -405,7 +553,7 @@ interface RuleOutcome {
         console.warn(
           `dispatchRulesDirect: rule "${rule.name}" (${rule.provider}/${rule.model}) failed: ${message}`,
         );
-        return { ruleName: rule.name, succeeded: false, findings: [], failureReason };
+        return await finish({ ruleName: rule.name, succeeded: false, findings: [], failureReason });
       }
     };
 
@@ -418,6 +566,14 @@ interface RuleOutcome {
         return rule === undefined ? [] : [rule];
       });
       outcomes.push(...(await Promise.all(waveRules.map(runRule))));
+    }
+
+    // Issue #138: collected BEFORE the staging directory is removed. Each task
+    // wrote its own file; nothing else will ever be able to read them.
+    const taskMeta: TaskMeta[] = [];
+    for (const outcome of outcomes) {
+      const meta = await readTaskMeta(path.join(findingsDir as string, ruleDirName(outcome.ruleName)));
+      if (meta !== undefined) taskMeta.push(meta);
     }
 
     const outcomeByName = new Map(outcomes.map((outcome) => [outcome.ruleName, outcome]));
@@ -496,6 +652,7 @@ interface RuleOutcome {
       // Issue #109: reported even when rules failed or were unresolved — the
       // task texts that WERE built are the cost that was actually paid.
       taskTextChars,
+      ...(taskMeta.length === 0 ? {} : { taskMeta }),
       ...(validatedContext.manifestHash === undefined
         ? {}
         : { contextManifestHash: validatedContext.manifestHash }),

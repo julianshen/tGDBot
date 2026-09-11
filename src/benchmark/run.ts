@@ -283,6 +283,8 @@ function findingTextChars(findings: readonly Finding[]): number {
  * moves with the CLI's defaults cannot compare a run against last month's
  * baseline.
  */
+const BENCHMARK_AGENTS_DIR = path.join(BENCHMARK_RULES_DIR, "..", "agents");
+
 function fixtureArgs(fixture: Fixture, model: string | undefined): CliArgs {
   return {
     pr: fixture.pr.id,
@@ -302,6 +304,15 @@ function fixtureArgs(fixture: Fixture, model: string | undefined): CliArgs {
     dryRun: true,
     trustLocalRules: true,
     dispatch: "direct",
+    // Pinned for the same reason `rulesDir` is: a baseline that moved when
+    // someone added a local agent definition would compare two different
+    // reviewers and call the difference a regression. `trustLocalRules` is on
+    // here, so this path is read directly — and it does not exist, which
+    // `loadAgentDefinitions` reports as "no definitions".
+    agentsDir: BENCHMARK_AGENTS_DIR,
+    // Off: nesting spends unbounded extra model calls, and a benchmark whose
+    // cost depends on a reviewer's judgement is not a baseline.
+    subagentNesting: "off",
     structuralChecks: "off",
     context: "off",
     allowDegradedContext: false,

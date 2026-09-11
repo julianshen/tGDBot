@@ -25,6 +25,10 @@ export interface SharedReviewOptions {
   structuralChecks: "on" | "off";
   /** Issue #139: the host security detectors. Off by default, like structural checks. */
   securityPass: "on" | "off";
+  /** Issue #138 phase 3: whether a permitted agent may request a host-mediated delegation. */
+  subagentNesting: "on" | "off";
+  /** Issue #138 phase 2: directory holding `*.agent.md` subagent definitions. */
+  agentsDir: string;
   /**
    * Issue #59: give the dispatched reviewer the PR's stated intent (title,
    * description, linked-reference titles/states) as untrusted evidence. Off
@@ -36,8 +40,18 @@ export interface SharedReviewOptions {
   dryRun: boolean;
   /** Opts into loading rules from the local filesystem instead of the trusted base branch. */
   trustLocalRules: boolean;
-  /** Selects direct deterministic rule dispatch or the temporary legacy orchestrator. */
-  dispatch: "direct" | "legacy";
+  /**
+   * Always `"direct"`. The legacy orchestrating engine and its `--dispatch`
+   * flag were deleted in #138 phase 4.
+   *
+   * The FIELD survives the flag deliberately. It is part of the dedup config
+   * hash and of persisted conversation state, so removing it would change
+   * every hash in the wild — costing a spurious re-review of every open pull
+   * request on upgrade — and make existing state files fail their own key
+   * validation. Pinned to the value nearly every run already used, which keeps
+   * those hashes byte-identical.
+   */
+  dispatch: "direct";
   /** Hard diff-size cost ceiling; absent means unlimited. */
   maxDiffChars?: number;
   /**
@@ -86,6 +100,11 @@ const DEFAULTS = {
   // means a clone. Opt in until that cost is measured rather than assumed.
   structuralChecks: "off" as const,
   securityPass: "off" as const,
+  // Nesting stays OFF by default: it is unproven (#138 gates it pending data),
+  // and every delegation is real model spend the operator did not ask for
+  // directly.
+  subagentNesting: "off" as const,
+  agentsDir: ".tgd/agents",
   // On by default: intent is bounded, boundary-tokened untrusted evidence,
   // and a reviewer that cannot read what the PR says it is doing reports
   // deliberate behaviour changes as regressions (issue #59).
@@ -118,13 +137,14 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "dependency-facts": { type: "string" },
       "structural-checks": { type: "string" },
       "security-pass": { type: "string" },
+  "subagent-nesting": { type: "string" },
+  "agents-dir": { type: "string" },
       "pr-intent": { type: "string" },
       suggestions: { type: "string" },
       model: { type: "string" },
       "dry-run": { type: "boolean" },
       "trust-local-rules": { type: "boolean" },
       "max-diff-chars": { type: "string" },
-      dispatch: { type: "string" },
       context: { type: "string" },
       "context-mapper": { type: "string" },
       "context-max-chars": { type: "string" },
@@ -203,10 +223,16 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     throw new Error(`Invalid --suggestions value: "${suggestions}" (expected "on" or "off")`);
   }
 
-  const dispatch = (values.dispatch as string | undefined) ?? DEFAULTS.dispatch;
-  if (dispatch !== "direct" && dispatch !== "legacy") {
-    throw new Error(`Invalid --dispatch value: "${dispatch}" (expected "direct" or "legacy")`);
+  const subagentNesting =
+    (values["subagent-nesting"] as string | undefined) ?? DEFAULTS.subagentNesting;
+  if (subagentNesting !== "on" && subagentNesting !== "off") {
+    throw new Error(
+      `Invalid --subagent-nesting value: "${subagentNesting}" (expected "on" or "off")`,
+    );
   }
+
+  const agentsDir = (values["agents-dir"] as string | undefined) ?? DEFAULTS.agentsDir;
+
 
   const model = values.model as string | undefined;
   if (model !== undefined) {
@@ -281,7 +307,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     vcs,
     model,
     maxDiffChars,
-    dispatch,
+    dispatch: DEFAULTS.dispatch,
     context,
     contextMapper,
     contextMaxChars,
@@ -294,6 +320,8 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     dependencyFacts,
     structuralChecks,
     securityPass,
+    subagentNesting,
+    agentsDir,
     prIntent,
     suggestions,
     dryRun: (values["dry-run"] as boolean | undefined) ?? DEFAULTS.dryRun,

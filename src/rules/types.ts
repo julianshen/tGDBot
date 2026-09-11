@@ -26,6 +26,16 @@ export interface RuleDefinition {
    * that did not run is not a rule with no findings.
    */
   appliesTo?: readonly string[];
+  /**
+   * Issue #138 phase 2: the subagent definition this rule runs as.
+   *
+   * Absent means the default reviewer persona, so every rule written before
+   * definitions existed behaves identically. A name that matches no loaded
+   * definition is a LOAD error rather than a silent fallback: falling back
+   * would run the rule with a persona and tool scope its author did not
+   * choose, and the narrowing case makes that a quiet widening.
+   */
+  agent?: string;
   dependsOn: readonly string[];
   parallelGroup?: string;
   body: string;

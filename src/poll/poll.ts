@@ -928,6 +928,11 @@ function reviewArgsFor(config: ResolvedPollConfig, reviewNumber: number): Review
     // setting, for the same reason it runs under the poll's dependency-facts
     // setting: an operator asked for one configuration, not another.
     securityPass: config.securityPass,
+    // Same reasoning as securityPass and dependencyFacts: a polled review runs
+    // the operator's configuration, including whether reviewers may delegate
+    // and where their definitions come from.
+    subagentNesting: config.subagentNesting,
+    agentsDir: config.agentsDir,
     prIntent: config.prIntent,
     suggestions: config.suggestions,
     dryRun: config.dryRun,

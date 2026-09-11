@@ -77,7 +77,6 @@ import {
 } from "./review/comment-marker.js";
 import type { InlineRecoveryState } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
-import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
@@ -120,6 +119,8 @@ import {
 import type { ContextPackResult } from "./context/context-pack.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
+import { loadAgentDefinitions, type AgentLoadResult } from "./agents/definition.js";
+import { resolveRuleAgents } from "./agents/resolve.js";
 import type { LoadResult } from "./rules/loader.js";
 import { scopeRulesToChangedFiles } from "./rules/scope.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
@@ -868,6 +869,59 @@ async function loadRulesForReview(
 }
 
 /**
+ * Issue #138 phase 2: this run's subagent definitions, under EXACTLY the trust
+ * stance rule files already have.
+ *
+ * This is the whole reason it is not a plain `loadAgentDefinitions(dir)` call.
+ * A definition sets a reviewer's model, its tool scope, and (phase 3) whether
+ * it may delegate — so reading one out of the pull request's own checkout would
+ * let a pull request widen the review that judges it, which is the attack
+ * ADR-002 fetches rule files from the BASE branch to prevent. The two artifacts
+ * are the same kind of thing and must not disagree about where they come from.
+ *
+ * Missing directory is not an error: definitions are opt-in, and
+ * `getRuleFilesFromBase` already resolves a 404 to `[]`.
+ */
+async function loadAgentDefinitionsForReview(
+  config: ResolvedConfig,
+  pr: PullRequestInfo,
+): Promise<AgentLoadResult> {
+  if (config.trustLocalRules) {
+    return loadAgentDefinitions(config.agentsDir);
+  }
+
+  const files = await config.vcsAdapter.getRuleFilesFromBase(
+    config.locator,
+    pr.baseSha,
+    config.agentsDir,
+  );
+  const tempAgentsDir = await mkdtemp(path.join(os.tmpdir(), "tgd-review-agent-agents-"));
+  try {
+    await Promise.all(
+      files.map(async (file) => {
+        const dest = resolveSafeRuleFilePath(tempAgentsDir, file.path);
+        if (dest === null) {
+          console.warn(
+            `tgd-review-agent: skipping agent definition with unsafe path "${file.path}" ` +
+              `(resolves outside the agents directory)`,
+          );
+          return;
+        }
+        await mkdir(path.dirname(dest), { recursive: true });
+        await writeFile(dest, file.content, "utf-8");
+      }),
+    );
+    return await loadAgentDefinitions(tempAgentsDir);
+  } finally {
+    await rm(tempAgentsDir, { recursive: true, force: true }).catch((err: unknown) => {
+      console.warn(
+        `tgd-review-agent: failed to remove temp agents directory ${tempAgentsDir} (${redactedMessage(err)})`,
+      );
+    });
+  }
+}
+
+/**
  * The one outbound request this tool makes to a third party, and only under
  * `--dependency-facts on`.
  *
@@ -955,23 +1009,11 @@ export async function review(
   const invocation: ReviewInvocation = deps.invocation ?? { kind: "normal" };
   const resolveConfigFn = deps.resolveConfig ?? resolveConfigReal;
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
-  // Task 3: both engines share one object-shaped CLI seam. The legacy adapter
-  // remains positional internally until Task 4 migrates its orchestration.
+  // One engine. `--dispatch legacy` and the orchestrating-LLM path it selected
+  // were deleted in #138 phase 4, along with the correction layer that existed
+  // only to repair that engine's probabilistic merge.
   const dispatchRulesFn =
-    deps.dispatchRules ??
-    (args.dispatch === "legacy"
-      ? (input: ReviewDispatchInput) =>
-          dispatchRulesReal(
-            input.rules,
-            input.diff,
-            input.useAdvisor,
-            undefined,
-            input.orchestratorModel,
-            input.conversationContext,
-            input.contextPacks,
-            input.prIntent,
-          )
-      : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
+    deps.dispatchRules ?? ((input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
   const runStructuralChecksFn = deps.runStructuralChecks ?? runStructuralChecksReal;
   const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? withPreparedWorkspaceReal;
@@ -1366,13 +1408,36 @@ export async function review(
   // applies to these files" is a legitimate outcome of a review, distinct from
   // "no rules could be loaded" above, and it is reported rather than aborted.
   const scopedRules = scopeRulesToChangedFiles(loadedRuleSet, changedFilesWithRenameSources(diff));
-  const rules = scopedRules.applicable;
+  const rulesBeforeAgents = scopedRules.applicable;
   if (scopedRules.skipped.length > 0) {
     console.log(
       `tgd-review-agent: ${scopedRules.skipped.length} rule(s) not dispatched — ` +
         `no changed path matches their applies_to (${scopedRules.skipped.join(", ")})`,
     );
   }
+
+  // Issue #138 phase 2: bind each rule to the subagent definition it names.
+  //
+  // Loaded from the REPOSITORY's agents dir, under the same trust stance rule
+  // files already have — `loadRulesForReview` decides whether repository-local
+  // rule files are honoured at all, and a definition is the same kind of
+  // artifact, so it follows that decision rather than inventing a second one.
+  const agentLoad = await loadAgentDefinitionsForReview(config, pr);
+  for (const error of agentLoad.errors) {
+    console.warn(`tgd-review-agent: ignoring agent definition ${error.sourcePath}: ${error.message}`);
+  }
+  const agentBindings = resolveRuleAgents(rulesBeforeAgents, agentLoad.agents);
+  // A rule naming an agent that does not exist is EXCLUDED, not silently run
+  // with the default persona: the point of the reference is a narrower tool
+  // scope and a chosen model, so falling back would widen precisely what the
+  // author wrote the file to narrow.
+  const unresolvedAgentRules = new Set(agentBindings.errors.map((error) => error.ruleName));
+  for (const error of agentBindings.errors) {
+    console.warn(`tgd-review-agent: ${error.message} (${error.sourcePath}); rule not dispatched`);
+  }
+  const rules = unresolvedAgentRules.size === 0
+    ? rulesBeforeAgents
+    : rulesBeforeAgents.filter((rule) => !unresolvedAgentRules.has(rule.name));
 
   // Issue #50: dependency facts the HOST parsed out of the changed manifests,
   // delivered as trusted context. Supplied for EVERY rule or for none — the
@@ -1695,6 +1760,12 @@ export async function review(
         diff,
         useAdvisor: config.advisor === "on",
         orchestratorModel: config.model,
+        // Issue #138 phase 2/3. `agentsByRule` is empty for a repository with
+        // no definitions, which is every repository that predates this — the
+        // dispatch path then behaves exactly as before.
+        ...(agentBindings.byRule.size === 0 ? {} : { agentsByRule: agentBindings.byRule }),
+        nestingEnabled: config.subagentNesting === "on",
+        changedFiles: changedFilesWithRenameSources(diff),
         ...(contextPacks === undefined ? {} : { contextPacks }),
         ...(loadedContext.conversationContext === undefined
           ? {}

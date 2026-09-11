@@ -1,7 +1,7 @@
 // Verifies review()'s DEFAULT dependency wiring — i.e. that
 // `deps.resolveConfig ?? resolveConfigReal` (and the loadRules/dispatchRules/
 // orchestrate equivalents) actually reference the real, correctly-imported
-// functions from config.ts/rules/loader.ts/review/dispatch.ts/
+// functions from config.ts/rules/loader.ts/review/direct-dispatch.ts/
 // review/orchestrate.ts, with no typo'd import or wrong-reference bug.
 //
 // test/unit/cli-review.test.ts exercises review()'s CONTROL FLOW via fully
@@ -61,10 +61,6 @@ vi.mock("../../src/rules/loader.js", () => ({
   loadRules: vi.fn(),
 }));
 
-vi.mock("../../src/review/dispatch.js", () => ({
-  dispatchRules: vi.fn(),
-}));
-
 vi.mock("../../src/review/direct-dispatch.js", () => ({
   dispatchRulesDirect: vi.fn(),
 }));
@@ -80,7 +76,6 @@ import path from "node:path";
 import { review } from "../../src/cli.js";
 import type { CliArgs } from "../../src/cli.js";
 import { loadRules } from "../../src/rules/loader.js";
-import { dispatchRules } from "../../src/review/dispatch.js";
 import { dispatchRulesDirect } from "../../src/review/direct-dispatch.js";
 import { orchestrate } from "../../src/review/orchestrate.js";
 import { parseBotMarker } from "../../src/review/comment-marker.js";
@@ -99,6 +94,8 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     vcs: "github",
     contextMapper: "tgd",
     rulesDir: ".review/rules",
+    agentsDir: ".tgd/agents",
+    subagentNesting: "off",
     disableBuiltinRule: false,
     advisor: "on",
     prIntent: "on",
@@ -229,10 +226,14 @@ describe("review — default dependency wiring", () => {
         orchestratorModel: undefined,
         // Issue #59: the PR's stated intent rides along as untrusted evidence.
         prIntent: { title: "Real wiring PR", description: "desc" },
+        // Issue #138: nesting off by default, and the diff's file list for the
+        // delegation gate. `agentsByRule` is absent because this fixture has
+        // no definitions — which is the shape every pre-#138 repository has.
+        nestingEnabled: false,
+        changedFiles: expect.any(Array),
       },
       {},
     );
-    expect(dispatchRules).not.toHaveBeenCalled(); // legacy engine untouched
     expect(orchestrate).toHaveBeenCalledTimes(1);
 
     logSpy.mockRestore();
@@ -278,29 +279,4 @@ describe("review — default dependency wiring", () => {
     logSpy.mockRestore();
   });
 
-  it("--dispatch legacy adapts the same object input to the legacy positional API", async () => {
-    vi.mocked(dispatchRules).mockClear();
-    vi.mocked(dispatchRulesDirect).mockClear();
-    vi.mocked(dispatchRules).mockResolvedValue({
-      findings: [],
-      rulesRun: ["rule-a"],
-      rulesFailed: [],
-    });
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
-
-    await review(makeArgs({ dispatch: "legacy", model: "x/y" }));
-
-    expect(dispatchRules).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.any(String),
-      true,
-      undefined, // createSession → real default
-      "x/y", // orchestratorModel
-      undefined, // conversationContext when none was loaded
-      undefined, // contextPacks — --context off prepares none
-      { title: "Real wiring PR", description: "desc" }, // prIntent (issue #59)
-    );
-    expect(dispatchRulesDirect).not.toHaveBeenCalled();
-    logSpy.mockRestore();
-  });
 });

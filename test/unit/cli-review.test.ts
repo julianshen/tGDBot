@@ -222,6 +222,8 @@ function makeArgs(overrides: Partial<CliArgs> = {}): CliArgs {
     vcs: "github",
     contextMapper: "tgd",
     rulesDir: ".review/rules",
+    agentsDir: ".tgd/agents",
+    subagentNesting: "off",
     disableBuiltinRule: false,
     advisor: "on",
     prIntent: "on",
@@ -1427,6 +1429,10 @@ describe("review", () => {
       orchestratorModel: undefined,
       // Issue #59: the PR's stated intent rides along as untrusted evidence.
       prIntent: { title: "Some PR", description: "Some description" },
+      // Issue #138: the delegation gate's inputs. Nesting is off by default,
+      // and `agentsByRule` is absent because this fixture defines no agents.
+      nestingEnabled: false,
+      changedFiles: ["x"],
     });
     expect(h.vcsAdapter.upsertComment).toHaveBeenCalledTimes(2);
 
@@ -3628,12 +3634,11 @@ async function seedConversationState(stateDir: string, options: {
 }
 
 function conversationHarness(options: {
-  dispatch?: "direct" | "legacy";
   botComment?: BotComment | null;
   threads?: readonly ReviewThreadSnapshot[];
 } = {}) {
   const h = makeHarness({
-    args: makeArgs({ dispatch: options.dispatch ?? "direct" }),
+    args: makeArgs({ dispatch: "direct" }),
     pr: makePr({ url: CONVERSATION_PR_URL }),
     botComment: options.botComment ?? null,
   });
@@ -3728,9 +3733,12 @@ describe("conversation-aware review", () => {
     });
   });
 
-  it("fetches current discussion even when no poll state exists and passes it to both dispatch modes", async () => {
-    for (const dispatch of ["direct", "legacy"] as const) {
-      const h = conversationHarness({ dispatch, threads: [relevant] });
+  // Was "passes it to both dispatch modes". There is one mode now (#138 phase
+  // 4), so the loop is gone; what it asserted — the conversation context
+  // reaches the dispatch input — is unchanged and still checked.
+  it("fetches current discussion even when no poll state exists and passes it to dispatch", async () => {
+    {
+      const h = conversationHarness({ threads: [relevant] });
       await seedConversationState(h.args.stateDir!, {
         memoryText: "ACTIVE_MEMORY prefer explicit types",
         directionText: "DIRECTION_NOW focus on auth",
@@ -4923,7 +4931,7 @@ describe("repository context", () => {
     // premise, and leaving the guard would deny an operator facts they asked
     // for on a reason that no longer holds.
     const h = makeHarness({
-      args: makeArgs({ context: "off", dependencyFacts: "on", dispatch: "legacy" }),
+      args: makeArgs({ context: "off", dependencyFacts: "on" }),
     });
     h.vcsAdapter.getDiff.mockResolvedValue([
       "diff --git a/package.json b/package.json",
@@ -5100,7 +5108,7 @@ describe("review — dependency facts under legacy dispatch", () => {
 
   it("asks the registry and reaches the rules, now that the engine carries packs", async () => {
     const h = makeHarness({
-      args: makeArgs({ dependencyFacts: "on", dispatch: "legacy" }),
+      args: makeArgs({ dependencyFacts: "on" }),
     });
     h.vcsAdapter.getDiff.mockResolvedValue(MANIFEST_DIFF);
     const fetchJson = vi.fn().mockResolvedValue({

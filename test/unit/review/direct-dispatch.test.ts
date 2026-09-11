@@ -18,7 +18,8 @@ import type {
   DirectSessionFactory,
 } from "../../../src/review/direct-dispatch.js";
 import { DispatchInputError } from "../../../src/review/dispatch-context.js";
-import type { DispatchResult, DispatchSession } from "../../../src/review/dispatch.js";
+import type { DispatchSession } from "../../../src/review/dispatch-session.js";
+import type { DispatchResult } from "../../../src/review/types.js";
 import { resolveRpivAdvisorExtensionPath } from "../../../src/review/extensions.js";
 import { ReviewWorkflowError } from "../../../src/review/workflow.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";

@@ -241,6 +241,16 @@ export interface DispatchResult {
    */
   ruleFailureReasons?: Record<string, string>;
 
+  /**
+   * Issue #138: one entry per dispatched task — rule, agent, model, outcome,
+   * finding count, prompt size.
+   *
+   * Surfaced on the RESULT rather than left on disk. The files are written into
+   * per-run staging that dispatch removes when it returns, so telemetry nobody
+   * reads before then is telemetry nobody can ever read. This is that read.
+   */
+  taskMeta?: readonly import("../agents/resolve.js").TaskMeta[];
+
   /** Present only when every dispatched rule used a pack from one validated manifest. */
   contextManifestHash?: string;
   /** Completeness reported by an externally produced security scan artifact. */
@@ -278,4 +288,21 @@ export interface ReviewDispatchInput {
    * task text byte-identical to the pre-#59 output.
    */
   prIntent?: PrIntent;
+  /**
+   * Issue #138 phase 2: the subagent definitions loaded for this run, and the
+   * rule-name -> agent binding resolved from them. Absent means every rule
+   * runs the default reviewer persona, which is what every pre-#138
+   * repository does.
+   */
+  agentsByRule?: ReadonlyMap<string, import("../agents/definition.js").AgentDefinition>;
+  /**
+   * Issue #138 phase 3: whether a permitted agent may request a host-mediated
+   * delegation. Off unless `--subagent-nesting on`.
+   */
+  nestingEnabled?: boolean;
+  /**
+   * Paths the diff touches, for the delegation gate. The host derives these;
+   * a reviewer may only deep-dive a file this pull request actually changes.
+   */
+  changedFiles?: readonly string[];
 }

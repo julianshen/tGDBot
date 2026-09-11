@@ -110,6 +110,15 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
     appliesTo = [...(candidates as string[])];
   }
 
+  // Issue #138 phase 2. Validated for SHAPE here and for EXISTENCE in
+  // resolveRuleAgents — the loader cannot see the agent set, and checking a
+  // cross-file reference from inside a single-file parser would mean either
+  // loading agents twice or letting rule loading depend on agent loading.
+  const agentValue = data.agent;
+  if (agentValue !== undefined && !isNonEmptyString(agentValue)) {
+    return { error: `frontmatter field "agent" must be a non-empty string` };
+  }
+
   const parallelGroupValue = data.parallel_group;
   if (
     parallelGroupValue !== undefined &&
@@ -127,6 +136,7 @@ function parseRuleFile(sourcePath: string, raw: string): ParsedRuleFile {
       name: data.name,
       ...(hasProvider ? { provider: data.provider as string, model: data.model as string } : {}),
       ...(appliesTo === undefined ? {} : { appliesTo: Object.freeze(appliesTo) }),
+      ...(agentValue === undefined ? {} : { agent: (agentValue as string).trim() }),
       dependsOn: Object.freeze([...(dependsOn as string[])]),
       ...(parallelGroupValue === undefined
         ? {}
