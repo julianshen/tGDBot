@@ -101,7 +101,20 @@ const PR_TARGET_RE = /(^|\s|:|\[|,)pull_request_target(\s|:|,|\]|$)/u;
  * genuinely mutable specs underneath.
  */
 const GIT_DEPENDENCY_RE =
-  /"\s*:\s*"(?:git\+|github:|gitlab:|bitbucket:)[^"]*"|"\s*:\s*"[^"]*\.git#[^"]*"/u;
+  /"\s*:\s*"((?:git\+|github:|gitlab:|bitbucket:)[^"]*|[^"]*\.git#[^"]*)"/u;
+
+/**
+ * A git dependency pinned to a full commit SHA is NOT a moving ref.
+ *
+ * Without this the detector told the author to pin to exactly the form
+ * already in front of them, which is the kind of finding that teaches readers
+ * the section is not worth reading (Codex review of PR #151). Same rule the
+ * action refs already follow.
+ */
+function isImmutableGitSpec(spec: string): boolean {
+  const fragment = spec.slice(spec.lastIndexOf("#") + 1);
+  return spec.includes("#") && IMMUTABLE_REF.test(fragment);
+}
 
 function classifyWorkflowLine(text: string): Hazard | undefined {
   const uses = USES_RE.exec(text);
@@ -151,18 +164,49 @@ function classifyWorkflowLine(text: string): Hazard | undefined {
  * repository that labels pull requests, which is the alarm fatigue that trains
  * people to skip the section.
  */
-function pullRequestTargetHazard(lines: ReadonlyMap<number, string>): number | undefined {
-  let triggerLine: number | undefined;
-  let checksOutHead = false;
+const HEAD_CHECKOUT_RE =
+  /^\s*ref:\s*["']?\$\{\{\s*github\.event\.pull_request\.head\.(?:sha|ref)\s*\}\}/u;
+
+function pullRequestTargetHazard(
+  lines: ReadonlyMap<number, string>,
+  headText: string | undefined,
+): number | undefined {
+  let addedTrigger: number | undefined;
+  let addedCheckout: number | undefined;
   for (const [line, text] of lines) {
-    if (PR_TARGET_RE.test(text)) triggerLine ??= line;
-    // `ref:` naming the pull request's head, in any of the spellings the
-    // documentation and the wild both use.
-    if (/^\s*ref:\s*["']?\$\{\{\s*github\.event\.pull_request\.head\.(sha|ref)\s*\}\}/u.test(text)) {
-      checksOutHead = true;
-    }
+    if (PR_TARGET_RE.test(text)) addedTrigger ??= line;
+    if (HEAD_CHECKOUT_RE.test(text)) addedCheckout ??= line;
   }
-  return triggerLine !== undefined && checksOutHead ? triggerLine : undefined;
+  // At least one HALF must be added by this pull request — otherwise the
+  // combination predates it and reporting it on every unrelated change to the
+  // workflow is the alarm fatigue added-lines-only exists to avoid.
+  if (addedTrigger === undefined && addedCheckout === undefined) return undefined;
+
+  // But the OTHER half may already be in the file. A pull request that adds
+  // the head `ref:` to a workflow that already uses `pull_request_target`
+  // introduces the exploitable combination just as surely as one that adds
+  // both, and an added-lines-only check saw one half and stayed silent
+  // (Codex review of PR #151).
+  const whole = headText === undefined ? [...lines.values()] : headText.split("\n");
+  const hasTrigger = addedTrigger !== undefined || whole.some((text) => PR_TARGET_RE.test(text));
+  const hasCheckout =
+    addedCheckout !== undefined || whole.some((text) => HEAD_CHECKOUT_RE.test(text));
+  if (!hasTrigger || !hasCheckout) return undefined;
+
+  // Anchored to the half this pull request ADDED: that is the line its author
+  // can act on, and the line a reviewer is looking at.
+  return addedTrigger ?? addedCheckout;
+}
+
+/**
+ * Workflow paths this diff touches, for the host to read at HEAD.
+ *
+ * Only workflows: they are the only files whose combined checks need more than
+ * the added lines, and reading every changed file would cost a provider call
+ * per file for nothing.
+ */
+export function changedWorkflowFiles(diff: string): readonly string[] {
+  return [...addedLinesByFile(diff).keys()].filter(isWorkflow);
 }
 
 /**
@@ -175,7 +219,16 @@ function pullRequestTargetHazard(lines: ReadonlyMap<number, string>): number | u
  *
  * Never throws: a detector that cannot run must not take the review with it.
  */
-export function detectSupplyChainHazards(diff: string): Finding[] {
+export function detectSupplyChainHazards(
+  diff: string,
+  /**
+   * Workflow contents at HEAD, by path. Optional: without it the combined
+   * `pull_request_target` check sees only added lines and misses a pull
+   * request that supplies one half of the pairing. The rest of the detector
+   * needs nothing beyond the diff.
+   */
+  headFiles: ReadonlyMap<string, string> = new Map(),
+): Finding[] {
   const findings: Finding[] = [];
   for (const [file, lines] of addedLinesByFile(diff)) {
     const workflow = isWorkflow(file);
@@ -201,7 +254,7 @@ export function detectSupplyChainHazards(diff: string): Finding[] {
     if (workflow) {
       // Whole-file, not per-line: the trigger and the checkout are different
       // lines, and either alone is unremarkable.
-      const line = pullRequestTargetHazard(lines);
+      const line = pullRequestTargetHazard(lines, headFiles.get(file));
       if (line !== undefined) {
         findings.push({
           file,
@@ -224,7 +277,8 @@ export function detectSupplyChainHazards(diff: string): Finding[] {
 
     if (path.basename(file.replace(/\\/gu, "/")) === "package.json") {
       for (const [line, text] of lines) {
-        if (!GIT_DEPENDENCY_RE.test(text)) continue;
+        const spec = GIT_DEPENDENCY_RE.exec(text)?.[1];
+        if (spec === undefined || isImmutableGitSpec(spec)) continue;
         findings.push({
           file,
           line,

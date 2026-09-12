@@ -93,6 +93,45 @@ describe("pull_request_target", () => {
     expect(finding?.message).toMatch(/secrets/u);
   });
 
+  it("reports a head checkout ADDED to a workflow that already had the trigger", () => {
+    // The half-and-half case. Added-lines-only saw one half and stayed silent,
+    // while the pull request introduced the exploitable combination just as
+    // surely as one adding both (Codex review of PR #151).
+    const diff = diffAdding(WORKFLOW, "          ref: ${{ github.event.pull_request.head.sha }}");
+    const head = new Map([[WORKFLOW, "on: pull_request_target\njobs:\n  x:\n    steps:\n      - uses: actions/checkout@" + "a".repeat(40)]]);
+
+    const findings = detectSupplyChainHazards(diff, head);
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.severity).toBe("blocking");
+  });
+
+  it("reports a trigger ADDED to a workflow that already checked out the head", () => {
+    const diff = diffAdding(WORKFLOW, "on: pull_request_target");
+    const head = new Map([[WORKFLOW, "          ref: ${{ github.event.pull_request.head.sha }}"]]);
+
+    expect(detectSupplyChainHazards(diff, head)).toHaveLength(1);
+  });
+
+  it("stays silent when the combination predates this pull request", () => {
+    // Neither half added. Reporting it on every unrelated change to the file
+    // is the alarm fatigue added-lines-only exists to avoid.
+    const diff = diffAdding(WORKFLOW, "      - run: echo hello");
+    const head = new Map([[WORKFLOW,
+      "on: pull_request_target\n          ref: ${{ github.event.pull_request.head.sha }}"]]);
+
+    expect(detectSupplyChainHazards(diff, head)).toEqual([]);
+  });
+
+  it("anchors the finding to the half this pull request added", () => {
+    // That is the line its author can act on, and the line a reviewer is
+    // looking at.
+    const diff = diffAdding(WORKFLOW, "      - run: setup", "on: pull_request_target");
+    const head = new Map([[WORKFLOW, "          ref: ${{ github.event.pull_request.head.sha }}"]]);
+
+    expect(detectSupplyChainHazards(diff, head)[0]?.line).toBe(3);
+  });
+
   it("stays silent on the trigger alone", () => {
     expect(detectSupplyChainHazards(diffAdding(WORKFLOW, "on: pull_request_target")))
       .toEqual([]);
@@ -146,6 +185,23 @@ describe("moving dependency refs", () => {
   it("reports a github: shorthand", () => {
     expect(detectSupplyChainHazards(diffAdding("package.json", '    "thing": "github:owner/repo",')))
       .toHaveLength(1);
+  });
+
+  it("accepts a git dependency pinned to a full commit SHA", () => {
+    // Immutable. Without this the detector told the author to pin to exactly
+    // the form already in front of them (Codex review of PR #151).
+    const sha = "b".repeat(40);
+    expect(detectSupplyChainHazards(diffAdding(
+      "package.json",
+      `    "thing": "git+https://github.com/o/r.git#${sha}",`,
+    ))).toEqual([]);
+  });
+
+  it("still reports a git dependency pinned to a tag", () => {
+    expect(detectSupplyChainHazards(diffAdding(
+      "package.json",
+      '    "thing": "git+https://github.com/o/r.git#v1.2.3",',
+    ))).toHaveLength(1);
   });
 
   it("stays silent on an ordinary semver range", () => {

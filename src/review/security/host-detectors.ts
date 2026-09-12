@@ -12,16 +12,34 @@ import type { Finding } from "../types.js";
 import type { RuleDefinition } from "../../rules/types.js";
 import { detectCommittedSecrets, SECRETS_POLICY, SECRETS_RULE_NAME } from "./secrets.js";
 import {
+  changedWorkflowFiles,
   detectSupplyChainHazards,
   SUPPLY_CHAIN_POLICY,
   SUPPLY_CHAIN_RULE_NAME,
 } from "./supply-chain.js";
 
+/**
+ * Files at HEAD a detector may consult, by repo-relative path.
+ *
+ * Supplied only for the paths a detector asked for — see `headFilesNeeded`.
+ * A detector must work without them: an empty map is the ordinary case when
+ * the provider could not be read, and it degrades to added-lines-only.
+ */
+export type HeadFiles = ReadonlyMap<string, string>;
+
 export interface HostDetector {
   /** The reserved rule name. The host owns it unconditionally, pass on or off. */
   readonly ruleName: string;
   /** Pure, and must never throw the review away. */
-  readonly detect: (diff: string) => Finding[];
+  readonly detect: (diff: string, headFiles: HeadFiles) => Finding[];
+  /**
+   * Paths whose HEAD contents this detector wants, given the diff.
+   *
+   * Separate from `detect` so the host does the reading — one provider call
+   * per path, bounded and logged in one place — rather than every detector
+   * growing its own I/O and its own failure handling.
+   */
+  readonly headFilesNeeded?: (diff: string) => readonly string[];
   /** The host-owned policy a conversation command resolves for these findings. */
   readonly policy: RuleDefinition;
   /**
@@ -48,6 +66,10 @@ export const HOST_SECURITY_DETECTORS: readonly HostDetector[] = Object.freeze([
   {
     ruleName: SUPPLY_CHAIN_RULE_NAME,
     detect: detectSupplyChainHazards,
+    // The `pull_request_target` check needs the whole workflow: a pull request
+    // that adds one half of the pairing to a file that already contains the
+    // other introduces the hazard, and added lines alone show only one half.
+    headFilesNeeded: changedWorkflowFiles,
     policy: SUPPLY_CHAIN_POLICY,
     withholdsCodeHunk: false,
   },

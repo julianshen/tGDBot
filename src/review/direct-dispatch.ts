@@ -77,6 +77,18 @@ import { planReviewWorkflow } from "./workflow.js";
 import { redactSecrets } from "../conversation/redact.js";
 
 /** Creates one rule's review session. Tests inject stubs; the real factory below is the only SDK toucher. */
+/**
+ * The persona a delegated child runs as, with `submit_findings` guaranteed.
+ *
+ * Returns the definition unchanged when it already allows the tool — including
+ * when it declares no `tools` at all, where the factory's own default already
+ * covers it.
+ */
+function withSubmitTool(definition: AgentDefinition | undefined): AgentDefinition | undefined {
+  if (definition === undefined || definition.tools.includes("submit_findings")) return definition;
+  return { ...definition, tools: Object.freeze([...definition.tools, "submit_findings"]) };
+}
+
 export type DirectSessionFactory = (
   rule: EffectiveRule,
   cwd: string,
@@ -430,8 +442,16 @@ interface RuleOutcome {
             ? makeDelegationRunner(rule, definition, {
                 // The child gets NO delegate tool: depth is fixed at one by
                 // construction, and an absent tool cannot be called.
+                //
+                // It DOES get `submit_findings`, whatever the persona's tool
+                // subset says. A persona narrowing to `tools: read, grep` — the
+                // configuration the README teaches — produced a child with no
+                // way to report, and the child path has no assistant-text
+                // fallback by design, so every such delegation silently
+                // returned nothing (Codex review of PR #151). A reviewer that
+                // cannot report is not a narrower reviewer; it is a broken one.
                 createChildSession: (childRule, childCwd, childOut, childScope) =>
-                  createSession(childRule, childCwd, childOut, childScope.agent),
+                  createSession(childRule, childCwd, childOut, withSubmitTool(childScope.agent)),
                 cwd: cwd as string,
                 diff,
                 timeoutMs: ruleTimeoutMs,

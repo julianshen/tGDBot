@@ -25,10 +25,29 @@ describe("a host fact needs a supported pattern and positive evidence", () => {
     expect(vector.evidence).toContain("Express");
   });
 
-  it("establishes public auth scope when no guard appears in the file", () => {
+  it("never establishes an auth scope, even for a bare public-looking route", () => {
+    // A registration line says a route EXISTS; it says nothing about who may
+    // reach it. An earlier version inferred `public` from the ABSENCE of an
+    // auth-shaped identifier — absence of evidence read as evidence of absence,
+    // producing a HOST-labelled fact that stage 5 trusted enough to raise a
+    // finding to `blocking` (Codex review of PR #151).
     const { authScope } = establishReachability({ file: "src/routes.ts", headText: express });
 
-    expect(authScope).toMatchObject({ value: "public", source: "host" });
+    expect(authScope.value).toBe("unknown");
+    expect(authScope.source).toBe("host");
+    expect(authScope.evidence).toMatch(/mounted behind authentication in another module/u);
+  });
+
+  it("still refuses the scope for a router mounted elsewhere", () => {
+    // The case that made the inference unsafe: this file is indistinguishable
+    // from one whose router is mounted behind an admin guard in another module.
+    const { vector, authScope } = establishReachability({
+      file: "src/admin-routes.ts",
+      headText: 'router.get("/users", listUsers);',
+    });
+
+    expect(vector.value).toBe("remote");
+    expect(authScope.value).toBe("unknown");
   });
 
   it.each([
@@ -82,26 +101,15 @@ describe("what the host refuses to claim", () => {
     expect(facts.authScope.source).toBe("host");
   });
 
-  it("withdraws the public claim when the file shows an authorization guard", () => {
-    // The host cannot say WHICH scope applies — that needs the framework's
-    // composition rules — so it says `unknown` rather than a claim the file it
-    // was read from contradicts.
-    const guarded = [
-      "const app = express();",
-      'app.get("/admin", requireAuth, (req, res) => res.json({}));',
-    ].join("\n");
-    const facts = establishReachability({ file: "src/routes.ts", headText: guarded });
-
-    expect(facts.vector.value).toBe("remote");
-    expect(facts.authScope.value).toBe("unknown");
-    expect(facts.authScope.evidence).toMatch(/authorization guard/u);
-  });
-
   it.each([
     "app.get('/x', passport.authenticate('jwt'), handler);",
     "app.get('/x', isAuthenticated, handler);",
     "app.get('/x', requireRole('admin'), handler);",
-  ])("withdraws it for %s", (line) => {
+    'app.get("/open", handler);',
+  ])("answers unknown for %s, guarded or not", (line) => {
+    // Guarded and unguarded reach the same answer, which is the point: the
+    // host does not resolve mounting composition, so it cannot tell them apart
+    // and must not pretend otherwise in either direction.
     expect(establishReachability({ file: "src/routes.ts", headText: line }).authScope.value)
       .toBe("unknown");
   });

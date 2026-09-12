@@ -849,7 +849,7 @@ Six facts, each with its own evidence and its own explicit `unknown`:
 | Fact | Question | Established by |
 |---|---|---|
 | `vector` | where must an attacker be | **host**, under a supported pattern |
-| `authScope` | who may reach it | **host**, under a supported pattern |
+| `authScope` | who may reach it | nobody yet — always `unknown` |
 | `attackerControl` | can an attacker choose the value | reviewer |
 | `preconditions` | what must already be true | reviewer |
 | `crossesBoundary` | does impact leave the attacker's own account | reviewer |
@@ -861,11 +861,24 @@ one marked `host`. This is the guarantee `hostCheck` already holds, for the same
 reason: it is the part a reader is meant to trust without re-deriving.
 
 **The host establishes a fact only under an explicitly supported pattern.**
-Today that is Express, Fastify and Koa route registrations, in the TS/JS family.
-Anything else — a Go handler, a framework not on the list, a file that could not
-be read — is `unknown`, and an authorization guard anywhere in the file
-*withdraws* a `public` claim rather than refining it, because the registration
-line alone no longer supports it.
+Today that is Express, Fastify and Koa route registrations, in the TS/JS family,
+and they establish `vector` only. Anything else — a Go handler, a framework not
+on the list, a file that could not be read — is `unknown`.
+
+**`authScope` is always `unknown` today, and that is deliberate.** A
+registration line shows that a route *exists*; it says nothing about who may
+reach it, because the router may be mounted behind authentication in another
+module. An earlier version inferred `public` from the *absence* of an
+auth-shaped identifier in the file — absence of evidence read as evidence of
+absence, producing a host-labelled fact the severity policy trusted enough to
+raise a finding to `blocking`. Establishing it honestly needs the mounting
+composition resolved, which is not built yet.
+
+The practical consequence: with `authScope` unknown, the severity policy
+**preserves whatever discovery assigned** rather than raising. The policy is
+implemented and tested, and goes live for a framework when a pattern that
+positively resolves its auth composition lands. Preserving is the conservative
+direction, and an unestablished auth scope must never raise a finding.
 
 **Unknown lowers confidence, never severity.** On a Go or Rust repository most
 reachability fields will legitimately be `unknown`, and the rating then stays at

@@ -79,25 +79,44 @@ describe("the host overwrites what it can establish", () => {
 });
 
 describe("severity comes out of the facts", () => {
-  it("raises a reachable, public, cross-boundary finding to blocking", async () => {
+  // With `authScope` always `unknown` today (see reachability.ts: a
+  // registration line shows a route exists, not who may reach it), every
+  // rating PRESERVES what discovery assigned. That is the conservative
+  // direction and the honest one — but it means the policy is dormant
+  // end-to-end until a pattern that positively resolves auth composition
+  // lands. `rateSeverity` itself is exercised directly in attack-path.test.ts.
+  it("keeps a warning at warning when the path cannot be fully established", async () => {
     const [rated] = await run([finding({ severity: "warning" })]);
+    expect(rated?.severity).toBe("warning");
+  });
+
+  it("keeps a blocking finding blocking rather than lowering it on partial facts", async () => {
+    // The direction that matters. A finding must never be DOWNGRADED because
+    // the host could not establish a field — that is a coverage gap read as a
+    // clean bill of health.
+    const [rated] = await run([finding({ severity: "blocking" })], {
+      analyze: async () => answers({ attackerControl: { value: "no", evidence: "constant input" } }),
+    });
     expect(rated?.severity).toBe("blocking");
   });
 
-  it("keeps discovery's severity when the host cannot establish the path", async () => {
-    // A Go repository today. Unknown must lower CONFIDENCE, never severity —
-    // a coverage gap is not a clean bill of health.
+  it("keeps discovery's severity when the host cannot establish the path at all", async () => {
+    // A Go repository today. Unknown must lower CONFIDENCE, never severity.
     const [rated] = await run([finding({ file: "internal/handler.go", severity: "warning" })], {
       head: async () => "package main",
     });
     expect(rated?.severity).toBe("warning");
   });
 
-  it("lowers a non-exploitable finding to suggestion", async () => {
-    const [rated] = await run([finding({ severity: "blocking" })], {
-      analyze: async () => answers({ attackerControl: { value: "no", evidence: "constant input" } }),
-    });
-    expect(rated?.severity).toBe("suggestion");
+  it("still records every fact, so the reader sees what was and was not established", async () => {
+    // The facts are the deliverable even while the rating is dormant: a reader
+    // who disputes a severity has specific rows to dispute.
+    const [rated] = await run([finding()]);
+
+    if (rated?.attackPath?.status !== "analyzed") throw new Error("unreachable");
+    expect(rated.attackPath.facts.vector.value).toBe("remote");
+    expect(rated.attackPath.facts.authScope.value).toBe("unknown");
+    expect(rated.attackPath.facts.attackerControl.value).toBe("yes");
   });
 });
 
@@ -161,15 +180,13 @@ describe("the pass is bounded", () => {
     expect(unanalyzed.every((f) => f.severity === "suggestion")).toBe(true);
   });
 
-  it("does re-rate a budgeted finding, even upward from suggestion", async () => {
-    // The counterpart, stated explicitly because the two are easy to confuse:
-    // the policy CAPS a self-only issue at what discovery said (branch 3) but
-    // SETS the severity of a remote, public, cross-boundary path (branch 4).
-    // That asymmetry is deliberate — discovery undercalling a real
-    // cross-boundary leak is exactly what the facts exist to correct.
+  it("attaches the analysis to a budgeted finding, whatever the rating comes out as", async () => {
+    // The budgeted/unbudgeted distinction is about whether the pass RAN, not
+    // about what it concluded. An earlier version asserted a rating here and
+    // conflated the two.
     const [rated] = await run([finding({ severity: "suggestion" })]);
 
-    expect(rated?.severity).toBe("blocking");
+    expect(rated?.attackPath?.status).toBe("analyzed");
   });
 });
 

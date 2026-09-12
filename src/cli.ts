@@ -89,9 +89,11 @@ import { analyzeAttackPaths as analyzeAttackPathsReal } from "./review/security/
 import { extractFileHunk } from "./review/diff-anchors.js";
 import {
   analysisBoundaryToken,
+  ANALYSIS_TIMEOUT_MS,
   buildAnalysisPrompt,
   createAnalysisSession,
   parseAnalysisResponse,
+  runAnalysisWithTimeout,
 } from "./review/security/analyzer-session.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
@@ -1747,7 +1749,23 @@ export async function review(
   if (config.securityPass === "on") {
     for (const detector of HOST_SECURITY_DETECTORS) {
       try {
-        dispatchResult.findings.push(...detector.detect(diff));
+        // The detector declares which paths it needs at HEAD; the host does
+        // the reading, so one provider failure is logged in one place rather
+        // than each detector growing its own I/O. An unreadable file is simply
+        // absent, and the detector degrades to added-lines-only.
+        const headFiles = new Map<string, string>();
+        for (const file of detector.headFilesNeeded?.(diff) ?? []) {
+          try {
+            const contents = await config.vcsAdapter.getFileAtRef(config.locator, pr.headSha, file);
+            if (contents !== undefined) headFiles.set(file, contents);
+          } catch (error) {
+            console.warn(
+              `tgd-review-agent: could not read ${file} at HEAD for ${detector.ruleName} ` +
+                `(${redactedMessage(error)})`,
+            );
+          }
+        }
+        dispatchResult.findings.push(...detector.detect(diff, headFiles));
         // Pushed whether or not it found anything: "ran and found nothing" and
         // "did not run" are different facts, and only the second belongs absent
         // from the summary's account of what ran.
@@ -1808,8 +1826,16 @@ export async function review(
         config.model,
         [],
       );
-      await session.prompt(buildAnalysisPrompt(finding, hunk, token));
-      return parseAnalysisResponse(session.getLastAssistantText());
+      // Bounded and aborted on expiry: an unbounded await on a stalled
+      // provider holds the whole review open, and the race alone does not
+      // cancel the request behind it.
+      return parseAnalysisResponse(
+        await runAnalysisWithTimeout(
+          session,
+          buildAnalysisPrompt(finding, hunk, token),
+          ANALYSIS_TIMEOUT_MS,
+        ),
+      );
     });
 
     try {

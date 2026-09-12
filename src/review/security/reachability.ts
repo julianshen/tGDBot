@@ -47,15 +47,6 @@ interface RoutePattern {
   readonly match: (line: string) => string | undefined;
   /** What the registration implies about who can reach it. */
   readonly vector: Vector;
-  /**
-   * The auth scope a BARE registration implies.
-   *
-   * `public` only where the framework's own registration carries no auth. A
-   * pattern whose framework has pluggable middleware cannot claim more than
-   * this from the registration line alone, which is why `authScope` is
-   * withdrawn below whenever an auth-shaped guard appears in the same file.
-   */
-  readonly authScope: AuthScope;
 }
 
 const TS_JS = Object.freeze([".ts", ".mts", ".cts", ".tsx", ".js", ".mjs", ".cjs", ".jsx"]);
@@ -78,7 +69,6 @@ const ROUTE_PATTERNS: readonly RoutePattern[] = Object.freeze([
       /\b(?:app|router)\s*\.\s*(?:get|post|put|patch|delete|head|options|all)\s*\(\s*["'`]/u
         .exec(line)?.[0],
     vector: "remote",
-    authScope: "public",
   },
   {
     framework: "Fastify",
@@ -87,7 +77,6 @@ const ROUTE_PATTERNS: readonly RoutePattern[] = Object.freeze([
       /\b(?:fastify|app|server)\s*\.\s*(?:get|post|put|patch|delete|head|options)\s*\(\s*["'`]/u
         .exec(line)?.[0],
     vector: "remote",
-    authScope: "public",
   },
   {
     framework: "Koa router",
@@ -95,22 +84,37 @@ const ROUTE_PATTERNS: readonly RoutePattern[] = Object.freeze([
     match: (line) =>
       /\brouter\s*\.\s*(?:get|post|put|patch|del|delete)\s*\(\s*["'`]/u.exec(line)?.[0],
     vector: "remote",
-    authScope: "public",
   },
 ]);
 
 /**
- * Text that withdraws an `authScope: public` claim.
+ * Why `authScope` is never established here.
  *
- * Not an attempt to determine WHAT the auth is — that needs the framework's
- * composition rules and often its runtime configuration. It answers the much
- * smaller question the host can actually answer: is there any sign of an
- * authorization decision in this file? If there is, the registration line no
- * longer supports "anyone can reach this", and the honest answer becomes
- * `unknown` rather than a claim contradicted by the file it was read from.
+ * A registration line says a route EXISTS; it says nothing about who may
+ * reach it. The router it is registered on may be mounted behind
+ * authentication in another module entirely, and a file containing a bare
+ * `router.get(...)` with no local auth hint looks identical whether the mount
+ * is public or admin-only.
+ *
+ * The first version of this module inferred `public` from the ABSENCE of an
+ * auth-shaped identifier in the file. That is absence of evidence read as
+ * evidence of absence — and it produced a HOST-labelled fact, which stage 5
+ * then trusted enough to raise a finding to `blocking` (Codex review of
+ * PR #151). It violated this module's own stated rule in its own first
+ * paragraph: a host fact is produced only under an explicitly supported
+ * pattern WITH POSITIVE EVIDENCE.
+ *
+ * Establishing it honestly needs the mounting composition resolved — which
+ * router is mounted where, under which middleware chain — and that is a
+ * per-framework capability this module does not have yet. Until it does, the
+ * answer is `unknown` with this reason, and stage 5 consequently preserves
+ * whatever severity discovery assigned. That is the conservative direction:
+ * an unestablished auth scope must never raise a finding.
  */
-const AUTH_HINT =
-  /\b(?:requireAuth|isAuthenticated|ensureAuthenticated|authenticate|authorize|authGuard|withAuth|passport\s*\.\s*authenticate|verifyToken|checkPermission|requireRole|requireAdmin|@UseGuards|preHandler\s*:)/u;
+const AUTH_SCOPE_NOT_ESTABLISHED =
+  "a route registration shows that a route exists, not who may reach it — the router may be " +
+  "mounted behind authentication in another module, and the host does not resolve mounting " +
+  "composition";
 
 export interface ReachabilityInput {
   /** The finding's file, repo-relative. */
@@ -186,30 +190,10 @@ export function establishReachability(input: ReachabilityInput): ReachabilityFac
     source: "host",
   };
 
-  // An auth-shaped guard anywhere in the file withdraws the `public` claim the
-  // bare registration would support. The host cannot say WHICH scope applies —
-  // that needs the framework's composition rules — so it says `unknown` rather
-  // than a claim the file itself contradicts.
-  if (AUTH_HINT.test(input.headText)) {
-    return {
-      vector,
-      authScope: unknownFact(
-        `${input.file} contains an authorization guard, so the route registration alone does ` +
-          `not establish who may reach this code`,
-        "host",
-      ),
-    };
-  }
-
-  return {
-    vector,
-    authScope: {
-      value: matched.pattern.authScope,
-      evidence:
-        `${vectorEvidence}, and no authorization guard appears in the file`,
-      source: "host",
-    },
-  };
+  // `vector` IS established — a registered HTTP route is reachable over the
+  // network wherever it is mounted, which is what `vector` asks. `authScope`
+  // is not, and never is here: see AUTH_SCOPE_NOT_ESTABLISHED.
+  return { vector, authScope: unknownFact(AUTH_SCOPE_NOT_ESTABLISHED, "host") };
 }
 
 /** The frameworks the host can currently establish a route for. For the README and the summary. */
