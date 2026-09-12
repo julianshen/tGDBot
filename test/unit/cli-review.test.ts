@@ -1392,6 +1392,46 @@ describe("review", () => {
       vi.restoreAllMocks();
     });
 
+    // Issue #138: a rule naming an agent definition that does not exist is
+    // EXCLUDED. It must not be excluded SILENTLY (Codex review of PR #149).
+    it("aborts rather than publishing a clean review when every rule is excluded", async () => {
+      // The worst thing this tool can produce is a false all-clear. Dropping
+      // the rules quietly let a review where nothing ran publish a
+      // finding-free comment at exit 0.
+      const h = scopedHarness([makeRule({ name: "needs-agent", agent: "missing" })]);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(1);
+
+      expect(h.dispatchRules).not.toHaveBeenCalled();
+      expect(h.vcsAdapter.upsertComment).not.toHaveBeenCalled();
+      expect(errorSpy.mock.calls.flat().join("\n")).toMatch(/agent definition/u);
+      errorSpy.mockRestore();
+    });
+
+    it("reports an excluded rule as a load error, runs the rest, and exits partial", async () => {
+      const h = scopedHarness([
+        makeRule({ name: "needs-agent", agent: "missing" }),
+        makeRule({ name: "fine" }),
+      ]);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      // EXIT_PARTIAL, not 0: `hasFailure` counts load errors, so a rule that
+      // did not run is visible in the exit code as well as the log. Exit 0
+      // alongside a silently-dropped rule is the false all-clear this
+      // accounting exists to prevent.
+      await expect(review(h.args, depsFrom(h))).resolves.toBe(2);
+
+      const dispatched = (h.dispatchRules.mock.calls[0]?.[0].rules ?? []).map((rule) => rule.name);
+      expect(dispatched).toEqual(["fine"]);
+      // Visible, not merely absent: a rule that did not run has to be
+      // accounted for somewhere a reader will look.
+      expect(errorSpy.mock.calls.flat().join("\n")).toMatch(/needs-agent/u);
+      errorSpy.mockRestore();
+    });
+
     it("still posts a review when no rule applies, rather than aborting", async () => {
       // "No rule applies to these files" is a legitimate outcome, distinct
       // from "no rules could be loaded" — which is fatal and stays fatal.

@@ -51,13 +51,17 @@ import { createSubmitFindingsTool, readSubmittedFindings, ruleDirName } from "./
 import type { AgentDefinition } from "../agents/definition.js";
 import { sessionToolsFor } from "../agents/definition.js";
 import {
+  applyAgentPin,
   composeSystemPrompt,
-  effectiveModelPin,
   readTaskMeta,
   writeTaskMeta,
   type TaskMeta,
 } from "../agents/resolve.js";
-import { createDelegateTool, type DelegationRunner } from "../agents/delegate.js";
+import {
+  createDelegateTool,
+  createDelegationBudget,
+  type DelegationRunner,
+} from "../agents/delegate.js";
 import { makeDelegationRunner } from "../agents/delegate-runner.js";
 import {
   classifyTaskFailure,
@@ -184,11 +188,12 @@ async function createRealDirectSession(
   // not burn a session-construction round trip to discover it. The error
   // strings deliberately match PROVIDER_AUTH_ERROR_RE's vocabulary so
   // classifyTaskFailure names the cause in the PR comment.
-  // Issue #138 phase 2: the agent's pin is the persona's DEFAULT; the rule's
-  // own pin still wins, because it names one review rather than a class of
-  // them (#112's outward-from-specific order).
-  const pin = effectiveModelPin(rule, scope.agent);
-  const resolved = await resolveRuleSessionModel(pin.provider ?? rule.provider, pin.model ?? rule.model);
+  // The agent's pin was already folded into the rule before default
+  // resolution (applyAgentPin), so this rule carries the right model whether it
+  // came from the rule file, the definition, or the deployment default. Doing
+  // it here instead would be too late: resolveEffectiveRules has filled every
+  // unpinned rule by now, so the agent's tier could never win.
+  const resolved = await resolveRuleSessionModel(rule.provider, rule.model);
   if (!resolved.model) {
     throw new Error(resolved.error ?? `could not resolve model for rule "${rule.name}"`);
   }
@@ -372,7 +377,13 @@ export async function dispatchRulesDirect(
     // operational reasons (for example an unreadable agent configuration).
     // Keep it inside the runtime fallback boundary so such failures retain
     // dispatchRulesDirect's never-throws provider/setup contract.
-    const { effective, unresolved } = await resolveEffectiveRules(rules, orchestratorModel);
+    // Issue #138 phase 2: agent pins are folded in HERE, before defaults are
+    // resolved — see applyAgentPin. After resolution every rule looks pinned
+    // and the agent's tier can never be selected.
+    const pinnedRules = agentsByRule === undefined
+      ? rules
+      : rules.map((rule) => applyAgentPin(rule, agentsByRule.get(rule.name)));
+    const { effective, unresolved } = await resolveEffectiveRules(pinnedRules, orchestratorModel);
     const effectiveByName = new Map(effective.map((rule) => [rule.name, rule]));
 
     // An empty temp cwd for every session: nothing project-local to discover,
@@ -416,6 +427,11 @@ interface RuleOutcome {
       readonly failureReason?: string;
     }
 
+    // ONE budget for the review, shared by every rule's tool. A counter per
+    // tool bounded the wrong noun: ten rules could make thirty delegations
+    // while the documentation promised three (CodeRabbit review of PR #149).
+    const delegationBudget = createDelegationBudget();
+
     const runRule = async (rule: EffectiveRule): Promise<RuleOutcome> => {
       let session: DispatchSession | undefined;
       const outputDir = path.join(findingsDir as string, ruleDirName(rule.name));
@@ -453,6 +469,7 @@ interface RuleOutcome {
               outputDir,
               run: runDelegation,
               harvested,
+              budget: delegationBudget,
             })
           : undefined;
       let lastTaskTextChars = 0;

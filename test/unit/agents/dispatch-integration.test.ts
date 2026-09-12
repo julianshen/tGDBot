@@ -66,6 +66,67 @@ describe("an agent definition reaches the session", () => {
   });
 });
 
+describe("the agent's model pin actually applies", () => {
+  // The headline phase-2 feature, and it was dead on arrival: model resolution
+  // fills every unpinned rule with the deployment default BEFORE the session
+  // factory runs, so a check performed there saw a rule that was always pinned
+  // and the agent's tier could never win (Codex review of PR #149).
+  const modelFor = async (
+    ruleOverrides: Partial<RuleDefinition>,
+    frontmatter: string,
+  ): Promise<string | undefined> => {
+    let seen: string | undefined;
+    const createSession: DirectSessionFactory = async (dispatched) => {
+      seen = `${dispatched.provider}/${dispatched.model}`;
+      return answering([]);
+    };
+
+    await dispatchRulesDirect(
+      {
+        rules: [rule(ruleOverrides)],
+        diff: DIFF,
+        useAdvisor: false,
+        agentsByRule: new Map([["rule-a", agent(frontmatter)]]),
+      },
+      { createSession },
+    );
+    return seen;
+  };
+
+  it("uses the agent's pin when the rule has none", async () => {
+    expect(await modelFor(
+      { provider: undefined, model: undefined },
+      "name: tiered\nprovider: openai\nmodel: gpt-5",
+    )).toBe("openai/gpt-5");
+  });
+
+  it("lets the rule's own pin win", async () => {
+    // A rule pin names ONE review; the agent's is the persona's default.
+    expect(await modelFor(
+      { provider: "anthropic", model: "claude-sonnet-5" },
+      "name: tiered\nprovider: openai\nmodel: gpt-5",
+    )).toBe("anthropic/claude-sonnet-5");
+  });
+
+  it("reports the agent's model in the telemetry too", async () => {
+    // `modelsUsed` and meta.json described a configuration nobody chose while
+    // the pin was ignored, which is worse than the wrong model alone: the
+    // record agreed with the mistake.
+    const createSession: DirectSessionFactory = async () => answering([]);
+    const result = await dispatchRulesDirect(
+      {
+        rules: [rule({ provider: undefined, model: undefined })],
+        diff: DIFF,
+        useAdvisor: false,
+        agentsByRule: new Map([["rule-a", agent("name: tiered\nprovider: openai\nmodel: gpt-5")]]),
+      },
+      { createSession },
+    );
+
+    expect(result.taskMeta?.[0]).toMatchObject({ provider: "openai", model: "gpt-5" });
+  });
+});
+
 describe("per-task telemetry (#109)", () => {
   // Read off the RESULT, not off disk. The staging directory dispatch writes
   // these into is removed when it returns, so a test that read the file

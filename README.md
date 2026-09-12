@@ -774,8 +774,9 @@ The host refuses a delegation that:
 - falls outside the agent's `path_scope`;
 - comes from an agent that did not declare `delegate`, or from a rule with no
   agent at all;
-- exceeds three delegations per review, counting failures — otherwise a failing
-  delegation is retryable without limit.
+- exceeds three delegations **for the whole review**, counting failures — the
+  budget is shared by every rule's tool, not one each, and a failure consumes it
+  so a failing delegation is not retryable without limit.
 
 Depth is fixed at one by construction: the child is created without the
 `delegate` tool, so it cannot call what it does not have.

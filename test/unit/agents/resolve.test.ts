@@ -3,11 +3,11 @@
 import { describe, expect, it } from "vitest";
 import { parseAgentFile, type AgentDefinition } from "../../../src/agents/definition.js";
 import {
+  applyAgentPin,
   composeSystemPrompt,
-  effectiveModelPin,
+  excludeRulesWithUnresolvedAgents,
   resolveRuleAgents,
 } from "../../../src/agents/resolve.js";
-import { excludeRulesWithUnresolvedAgents } from "../../../src/agents/resolve.js";
 import type { RuleDefinition } from "../../../src/rules/types.js";
 
 const agent = (frontmatter: string): AgentDefinition =>
@@ -94,24 +94,39 @@ describe("excluding a rule takes its dependency edges with it", () => {
 });
 
 describe("which model pin wins", () => {
+  // Folded into the RULE before default resolution, not consulted after it:
+  // `resolveEffectiveRules` fills every unpinned rule with the deployment
+  // default, so a check performed later sees a rule that is always pinned and
+  // the agent's tier can never win (Codex review of PR #149).
   it("prefers the rule's own pin", () => {
-    // A rule pin names ONE review; the agent's is the persona's default. #112
-    // resolves outward from the most specific.
+    // A rule pin names ONE review; the agent's is the persona's default.
     expect(
-      effectiveModelPin(
+      applyAgentPin(
         rule({ provider: "openai", model: "gpt-5" }),
         agent("name: docs\nprovider: anthropic\nmodel: claude-sonnet-5"),
       ),
-    ).toEqual({ provider: "openai", model: "gpt-5" });
+    ).toMatchObject({ provider: "openai", model: "gpt-5" });
   });
 
   it("falls back to the agent's", () => {
-    expect(effectiveModelPin(rule(), agent("name: docs\nprovider: anthropic\nmodel: claude-sonnet-5")))
-      .toEqual({ provider: "anthropic", model: "claude-sonnet-5" });
+    expect(applyAgentPin(rule(), agent("name: docs\nprovider: anthropic\nmodel: claude-sonnet-5")))
+      .toMatchObject({ provider: "anthropic", model: "claude-sonnet-5" });
   });
 
-  it("leaves both unset when neither pins", () => {
-    expect(effectiveModelPin(rule(), agent("name: docs"))).toEqual({});
+  it("leaves the rule unpinned when neither pins", () => {
+    // Unpinned must stay unpinned, so `resolveEffectiveRules` can still apply
+    // the deployment default — inventing a pin here would defeat it.
+    const pinned = applyAgentPin(rule(), agent("name: docs"));
+
+    expect(pinned.provider).toBeUndefined();
+    expect(pinned.model).toBeUndefined();
+  });
+
+  it("returns the same object when there is nothing to add", () => {
+    // Identity, not equality: rebuilding every rule for nothing would
+    // needlessly break reference-keyed maps downstream.
+    const unpinned = rule();
+    expect(applyAgentPin(unpinned, agent("name: docs"))).toBe(unpinned);
   });
 });
 

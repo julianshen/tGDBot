@@ -152,6 +152,29 @@ describe("detectCommittedSecrets", () => {
     expect(findings).toHaveLength(1);
   });
 
+  it("names BOTH formats when a line carries two", () => {
+    // One finding, both labels. Naming only the first told the author to
+    // rotate one credential, and WHICH one depended on the order of the
+    // pattern array (CodeRabbit review of PR #149).
+    const [finding] = detectCommittedSecrets(diffAdding(
+      "src/a.ts",
+      `const a = "${AWS_KEY}"; const b = "ghp_${"a".repeat(36)}";`,
+    ));
+
+    expect(finding?.title).toContain("an AWS access key id");
+    expect(finding?.title).toContain("a GitHub personal access token");
+  });
+
+  it("recognises a stateless GitHub installation token", () => {
+    // `ghs_APPID_JWT` — dots separate the JWT segments, so an alphanumeric
+    // body stopped at the first dot and a live installation token read as
+    // clean (CodeRabbit review of PR #149).
+    const token = `ghs_12345_${"a".repeat(20)}.${"b".repeat(20)}.${"c".repeat(20)}`;
+
+    expect(detectCommittedSecrets(diffAdding("src/a.ts", `const k = "${token}";`)))
+      .toHaveLength(1);
+  });
+
   it("attributes a finding to the head path of a renamed file", () => {
     const diff = [
       "diff --git a/old.ts b/new.ts",

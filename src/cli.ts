@@ -1349,7 +1349,28 @@ export async function review(
     // Reported as a load error below AND excluded here: reporting alone would
     // leave the rule dispatched under a name the host also publishes under.
     .filter((rule) => rule.name !== SECRETS_RULE_NAME);
-  const loadErrors = [...loadedRules.errors];
+  // Issue #138 phase 2: bind each rule to the subagent definition it names.
+  //
+  // Before the load-error accounting on purpose. A rule excluded here is a rule
+  // that will not run, and it has to be visible the same way a malformed rule
+  // file is: silently dropping them let a review where EVERY rule was excluded
+  // publish a clean, finding-free comment at exit 0 — a false all-clear, which
+  // is the worst thing this tool can produce (Codex review of PR #149).
+  //
+  // Definitions come from the BASE branch under the same trust stance rule
+  // files have; a definition read from the pull request's own checkout would
+  // let a pull request widen the review that judges it.
+  const agentLoad = await loadAgentDefinitionsForReview(config, pr);
+  const agentBindings = resolveRuleAgents(loadedRuleSet, agentLoad.agents);
+  const unresolvedAgentRules = new Set(agentBindings.errors.map((error) => error.ruleName));
+
+  const loadErrors = [...loadedRules.errors, ...agentLoad.errors];
+  for (const error of agentBindings.errors) {
+    // Reported as a LOAD error rather than a dispatch failure: nothing was
+    // dispatched, and the cause is a file the operator can fix.
+    loadErrors.push({ sourcePath: error.sourcePath, message: error.message });
+  }
+
   if (config.codexScanResults !== undefined) {
     for (const reserved of loadedRules.rules.filter((rule) => rule.name === "codex-security")) {
       loadErrors.push({
@@ -1389,8 +1410,16 @@ export async function review(
   // impossible to configure (Codex review of PR #147).
   const hostFindingSourceEnabled =
     config.codexScanResults !== undefined || config.securityPass === "on";
-  if (loadedRuleSet.length === 0 && !hostFindingSourceEnabled) {
-    console.error("tgd-review-agent: no rules could be loaded; aborting before posting a comment");
+  // Excluding a rule takes its dependency EDGES with it, or planReviewWorkflow
+  // rejects the dangling name and aborts dispatch for every remaining rule.
+  const dispatchableRules = excludeRulesWithUnresolvedAgents(loadedRuleSet, unresolvedAgentRules);
+  if (dispatchableRules.length === 0 && !hostFindingSourceEnabled) {
+    console.error(
+      unresolvedAgentRules.size > 0
+        ? "tgd-review-agent: every rule references an agent definition that could not be loaded; " +
+          "aborting before posting a comment"
+        : "tgd-review-agent: no rules could be loaded; aborting before posting a comment",
+    );
     return EXIT_FATAL;
   }
 
@@ -1407,7 +1436,7 @@ export async function review(
   // Deliberately NOT a fatal condition when it empties the set. "No rule
   // applies to these files" is a legitimate outcome of a review, distinct from
   // "no rules could be loaded" above, and it is reported rather than aborted.
-  const scopedRules = scopeRulesToChangedFiles(loadedRuleSet, changedFilesWithRenameSources(diff));
+  const scopedRules = scopeRulesToChangedFiles([...dispatchableRules], changedFilesWithRenameSources(diff));
   const rulesBeforeAgents = scopedRules.applicable;
   if (scopedRules.skipped.length > 0) {
     console.log(
@@ -1416,33 +1445,7 @@ export async function review(
     );
   }
 
-  // Issue #138 phase 2: bind each rule to the subagent definition it names.
-  //
-  // Loaded from the REPOSITORY's agents dir, under the same trust stance rule
-  // files already have — `loadRulesForReview` decides whether repository-local
-  // rule files are honoured at all, and a definition is the same kind of
-  // artifact, so it follows that decision rather than inventing a second one.
-  const agentLoad = await loadAgentDefinitionsForReview(config, pr);
-  for (const error of agentLoad.errors) {
-    console.warn(`tgd-review-agent: ignoring agent definition ${error.sourcePath}: ${error.message}`);
-  }
-  const agentBindings = resolveRuleAgents(rulesBeforeAgents, agentLoad.agents);
-  // A rule naming an agent that does not exist is EXCLUDED, not silently run
-  // with the default persona: the point of the reference is a narrower tool
-  // scope and a chosen model, so falling back would widen precisely what the
-  // author wrote the file to narrow.
-  const unresolvedAgentRules = new Set(agentBindings.errors.map((error) => error.ruleName));
-  for (const error of agentBindings.errors) {
-    console.warn(`tgd-review-agent: ${error.message} (${error.sourcePath}); rule not dispatched`);
-  }
-  // Excluding a rule must take its dependency EDGES with it, or
-  // `planReviewWorkflow` rejects the dangling name and aborts dispatch for
-  // every remaining rule — one bad `agent:` reference taking down the whole
-  // review (Codex review of PR #149).
-  // Copied back to a mutable array because `ReviewDispatchInput.rules` is one.
-  // Widening that field to readonly is the better change and a larger one; it
-  // touches every stub in the suite, and this PR is already deleting an engine.
-  const rules = [...excludeRulesWithUnresolvedAgents(rulesBeforeAgents, unresolvedAgentRules)];
+  const rules = rulesBeforeAgents;
 
   // Issue #50: dependency facts the HOST parsed out of the changed manifests,
   // delivered as trusted context. Supplied for EVERY rule or for none — the

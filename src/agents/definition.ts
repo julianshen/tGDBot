@@ -98,6 +98,16 @@ function isNonEmptyString(value: unknown): value is string {
 
 const NAME_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 
+/** Every frontmatter key a definition may carry. Anything else is a load error. */
+const KNOWN_FIELDS: ReadonlySet<string> = new Set([
+  "name",
+  "provider",
+  "model",
+  "tools",
+  "path_scope",
+  "delegate",
+]);
+
 interface ParsedAgentFile {
   agent?: AgentDefinition;
   error?: string;
@@ -112,6 +122,23 @@ export function parseAgentFile(sourcePath: string, raw: string): ParsedAgentFile
     return { error: `agent file has malformed YAML frontmatter: ${message}` };
   }
   const data = parsed.data as Record<string, unknown>;
+
+  // Unknown keys are a LOAD ERROR, not ignorable metadata, and this is the
+  // highest-consequence validation in the file. `path_scpoe: ["**/*.md"]`
+  // parses cleanly, leaves `pathScope` undefined, and `withinPathScope` then
+  // permits every file — a typo silently producing the WIDEST configuration
+  // from a file written to narrow. A misspelled `tools` grants the full
+  // default set the same way. Fail-closed is not available here (an unknown
+  // key could mean anything), so fail LOUDLY (CodeRabbit review of PR #149).
+  const unknown = Object.keys(data).find((key) => !KNOWN_FIELDS.has(key));
+  if (unknown !== undefined) {
+    return {
+      error:
+        `agent file has unknown frontmatter field "${unknown}" — known fields are ` +
+        `${[...KNOWN_FIELDS].join(", ")}. A misspelled field is silently ignored, and for ` +
+        `"tools" or "path_scope" that means the agent runs UNSCOPED`,
+    };
+  }
 
   if (!isNonEmptyString(data.name)) {
     return { error: `agent file is missing required frontmatter field "name"` };

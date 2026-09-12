@@ -170,6 +170,41 @@ describe("loading a directory", () => {
   });
 });
 
+// The highest-consequence validation in the loader: a typo must not silently
+// produce the WIDEST configuration from a file written to narrow.
+describe("unknown frontmatter fields are a load error", () => {
+  it("rejects a misspelled path_scope instead of running unscoped", () => {
+    // `path_scpoe` parses cleanly, leaves pathScope undefined, and
+    // withinPathScope then permits every file (CodeRabbit review of PR #149).
+    const { agent, error } = parseAgentFile(
+      "/a.agent.md",
+      agentFile("name: x\npath_scpoe: '**/*.md'"),
+    );
+
+    expect(agent).toBeUndefined();
+    expect(error).toMatch(/path_scpoe/u);
+  });
+
+  it("rejects a misspelled tools instead of granting the full set", () => {
+    expect(parsed("name: x\ntool: [read]")).toBeUndefined();
+  });
+
+  it("names the fields that ARE known, so the typo is findable", () => {
+    const { error } = parseAgentFile("/a.agent.md", agentFile("name: x\nnonsense: 1"));
+
+    expect(error).toMatch(/path_scope/u);
+    expect(error).toMatch(/tools/u);
+  });
+
+  it("still accepts every documented field together", () => {
+    // The guard must not reject the format the README teaches.
+    expect(parsed(
+      "name: x\nprovider: anthropic\nmodel: claude-sonnet-5\ntools: [read]\n" +
+      "path_scope: ['**/*.md']\ndelegate: true",
+    )).toMatchObject({ name: "x", delegate: true });
+  });
+});
+
 describe("shape validation", () => {
   it("requires a name", () => {
     expect(parsed("tools: [read]")).toBeUndefined();

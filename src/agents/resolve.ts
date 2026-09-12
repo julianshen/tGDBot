@@ -96,25 +96,30 @@ export function excludeRulesWithUnresolvedAgents<T extends RuleDefinition>(
 }
 
 /**
- * The model pin a rule should run on, given its agent.
+ * Fills in a rule's model pin from its agent, BEFORE default resolution.
  *
- * RULE WINS over agent. A rule pin is the more specific statement — it names
- * one review — and #112's resolution order already reads outward from the most
- * specific. The agent's pin is the persona's default, which is the whole point
- * of putting a model tier in a reusable definition: rules that say nothing
- * inherit it, rules that care override it.
+ * The timing is the entire point, and getting it wrong made the feature dead
+ * on arrival: `resolveEffectiveRules` fills every unpinned rule with the
+ * deployment default, so a check performed after it sees a rule that is always
+ * pinned and never reaches the agent's tier. The advertised model tier was
+ * silently ignored, and `modelsUsed` and the task telemetry then described a
+ * configuration nobody chose (Codex review of PR #149).
+ *
+ * RULE WINS over agent. A rule pin names ONE review; the agent's is the
+ * persona's default, which is the point of putting a tier in a reusable
+ * definition — rules that say nothing inherit it, rules that care override it.
+ * #112 resolves outward from the most specific, and this sits one step further
+ * out than a rule pin and one step in from the deployment default.
  */
-export function effectiveModelPin(
+export function applyAgentPin(
   rule: RuleDefinition,
   agent: AgentDefinition | undefined,
-): { provider?: string; model?: string } {
-  if (rule.provider !== undefined && rule.model !== undefined) {
-    return { provider: rule.provider, model: rule.model };
-  }
-  if (agent?.provider !== undefined && agent.model !== undefined) {
-    return { provider: agent.provider, model: agent.model };
-  }
-  return {};
+): RuleDefinition {
+  // Half a pin cannot occur — both loaders reject it — so testing one side is
+  // enough, and testing both would imply a state neither can produce.
+  if (rule.provider !== undefined && rule.model !== undefined) return rule;
+  if (agent?.provider === undefined || agent.model === undefined) return rule;
+  return { ...rule, provider: agent.provider, model: agent.model };
 }
 
 /**

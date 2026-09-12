@@ -12,6 +12,7 @@ import type { AgentDefinition } from "./definition.js";
 import type { DelegationOutcome, DelegationRequest, DelegationRunner } from "./delegate.js";
 import { buildDelegationDigest } from "./delegate.js";
 import { readSubmittedFindings } from "../review/findings-file.js";
+import { referencesDeclaredBy } from "../review/dispatch-results.js";
 import { parseDiffGitHeader } from "../review/diff-anchors.js";
 import type { Finding } from "../review/types.js";
 
@@ -121,7 +122,13 @@ export interface DelegationRunnerDeps {
     cwd: string,
     outputDir: string,
     scope: { readonly agent?: AgentDefinition },
-  ) => Promise<{ prompt(text: string): Promise<unknown> }>;
+    // `abort` is carried through deliberately: `withTimeout` only rejects the
+    // race, it does not cancel the provider request behind it. Without calling
+    // abort, a timed-out child kept running — and kept BILLING — after the
+    // parent had recorded the failure and the host had removed its staging
+    // directory, which defeats the bound the timeout exists to impose (Codex
+    // review of PR #149).
+  ) => Promise<{ prompt(text: string): Promise<unknown>; abort?(): Promise<void> }>;
   readonly cwd: string;
   readonly diff: string;
   readonly timeoutMs: number;
@@ -161,18 +168,41 @@ export function makeDelegationRunner(
       deps.timeoutMs,
       `delegated review of "${request.file}" timed out creating its session`,
     );
-    await deps.withTimeout(
-      session.prompt(buildChildTaskText(request, fileDiff, rule.body)) as Promise<unknown>,
-      deps.timeoutMs,
-      `delegated review of "${request.file}" timed out`,
-    );
+    try {
+      await deps.withTimeout(
+        session.prompt(buildChildTaskText(request, fileDiff, rule.body)) as Promise<unknown>,
+        deps.timeoutMs,
+        `delegated review of "${request.file}" timed out`,
+      );
+    } catch (err) {
+      // Abort BEFORE rethrowing, and never let the abort itself replace the
+      // original failure — the reason the child failed is the useful half.
+      if (session.abort) {
+        await session.abort().catch((abortError: unknown) => {
+          console.warn(
+            `delegate: failed to abort the delegated review of "${request.file}" ` +
+              `(${(abortError as Error).message})`,
+          );
+        });
+      }
+      throw err;
+    }
 
     // FILE ONLY — no assistant-text fallback. The parent's text path exists
     // because older reviewers predate the file contract; a child is created by
     // this host, in this release, with the tool always registered. Accepting
     // prose here would put a parse of model output back on the nested path for
     // no compatibility benefit.
-    const submitted = await readSubmittedFindings({ outputDir, ruleName: rule.name });
+    // `allowedReferences` matters as much here as on the parent path:
+    // `normalizeUnknownFinding` fails CLOSED when the set is absent, so
+    // omitting it silently stripped every citation a delegated finding had —
+    // including ones the submit tool had already validated on the way in
+    // (Codex review of PR #149).
+    const submitted = await readSubmittedFindings({
+      outputDir,
+      ruleName: rule.name,
+      allowedReferences: referencesDeclaredBy(rule.body),
+    });
     const findings: Finding[] = submitted ?? [];
     // Every child finding is pinned to the file the delegation was ABOUT. A
     // child shown one file has no basis for a finding elsewhere, and one that

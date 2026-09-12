@@ -42,7 +42,27 @@ import type { Finding } from "../review/types.js";
  * spend. Small on purpose; a deep dive that is needed everywhere is not a deep
  * dive.
  */
-export const MAX_DELEGATIONS_PER_TASK = 3;
+export const MAX_DELEGATIONS_PER_REVIEW = 3;
+
+/** Back-compat alias; the budget was per-task before it was per-review. */
+export const MAX_DELEGATIONS_PER_TASK = MAX_DELEGATIONS_PER_REVIEW;
+
+/**
+ * The running count, shared by every rule's tool in one review.
+ *
+ * A counter per tool meant a review with ten rules could make thirty
+ * delegations while the README promised three — the bound was on the wrong
+ * noun (CodeRabbit review of PR #149). Passed in by the caller rather than
+ * module-global, because a module-global would leak between concurrent reviews
+ * in the same process and is untestable without reaching into it.
+ */
+export interface DelegationBudget {
+  used: number;
+}
+
+export function createDelegationBudget(): DelegationBudget {
+  return { used: 0 };
+}
 
 /** Caps the parent-supplied question. Long enough to be specific, short enough not to be a second prompt. */
 const MAX_QUESTION_CHARS = 500;
@@ -114,12 +134,12 @@ export function gateDelegation(input: DelegationGateInput): DelegationGateResult
       message: "This reviewer is not permitted to delegate. Continue the review yourself.",
     };
   }
-  if (input.used >= MAX_DELEGATIONS_PER_TASK) {
+  if (input.used >= MAX_DELEGATIONS_PER_REVIEW) {
     return {
       allowed: false,
       rejection: "budget-exhausted",
       message:
-        `Delegation budget exhausted (${MAX_DELEGATIONS_PER_TASK} per review). ` +
+        `Delegation budget exhausted (${MAX_DELEGATIONS_PER_REVIEW} per review). ` +
         `Continue the review yourself.`,
     };
   }
@@ -133,6 +153,9 @@ export function gateDelegation(input: DelegationGateInput): DelegationGateResult
     };
   }
 
+  // Normalized again rather than trusted: `gateDelegation` is exported and
+  // tested directly, and a caller that skipped normalization must not get a
+  // laxer check than the tool path does.
   const file = normalizeGlobPath((input.request.file ?? "").replace(/\\/gu, "/").trim());
   if (file.length === 0) {
     return { allowed: false, rejection: "not-in-diff", message: "No file was named." };
@@ -190,26 +213,37 @@ export function createDelegateTool(options: {
   readonly run: DelegationRunner;
   /** Collects child findings for the host merge. The parent never sees this array. */
   readonly harvested: Finding[];
+  /** Shared across every rule's tool in one review — see DelegationBudget. */
+  readonly budget: DelegationBudget;
 }): ToolDefinition<typeof DELEGATE_SCHEMA> {
-  let used = 0;
+  let attempts = 0;
   return {
     name: "delegate",
     label: "Delegate a file-scoped deep dive",
     description:
       "Ask for a closer look at ONE file this pull request changes. A separate reviewer " +
       "examines it and its findings are recorded automatically. You receive a short summary " +
-      `for your own reasoning. At most ${MAX_DELEGATIONS_PER_TASK} per review.`,
+      `for your own reasoning. At most ${MAX_DELEGATIONS_PER_REVIEW} across the whole review, ` +
+      "shared with every other rule.",
     parameters: DELEGATE_SCHEMA,
     async execute(_toolCallId, params) {
+      // Normalized ONCE, so the gate and the runner examine the same string.
+      // The gate used to normalize internally and hand the runner the raw
+      // value, so `" src/a.ts "` passed the gate and then missed `fileSlice`'s
+      // exact comparison — burning budget on a request that could not succeed
+      // (CodeRabbit review of PR #149). The same class of defect as the
+      // quoted-path mismatch: one value, two spellings.
       const request: DelegationRequest = {
-        file: typeof params.file === "string" ? params.file : "",
+        file: typeof params.file === "string"
+          ? normalizeGlobPath(params.file.replace(/\\/gu, "/").trim())
+          : "",
         question: typeof params.question === "string" ? params.question.slice(0, MAX_QUESTION_CHARS) : "",
       };
       const gate = gateDelegation({
         nestingEnabled: options.nestingEnabled,
         agent: options.agent,
         changedFiles: options.changedFiles,
-        used,
+        used: options.budget.used,
         request,
       });
       if (!gate.allowed) {
@@ -226,9 +260,13 @@ export function createDelegateTool(options: {
       // Counted BEFORE the run, so a child that throws still consumes budget.
       // Otherwise a failing delegation is retryable without limit, which is
       // the same unbounded spend the budget exists to stop.
-      used += 1;
+      options.budget.used += 1;
 
-      const childDir = path.join(options.outputDir, `delegate-${used}`);
+      // Named by the PARENT's own attempt count, not the shared counter: the
+      // shared one makes directory names depend on what other rules did, which
+      // would be baffling in a staging listing.
+      attempts += 1;
+      const childDir = path.join(options.outputDir, `delegate-${attempts}`);
       let outcome: DelegationOutcome;
       try {
         outcome = await options.run(request, { parentRule: options.parentRule, outputDir: childDir });

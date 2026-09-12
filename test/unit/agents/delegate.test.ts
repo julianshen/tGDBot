@@ -7,8 +7,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildDelegationDigest,
   createDelegateTool,
+  createDelegationBudget,
   gateDelegation,
-  MAX_DELEGATIONS_PER_TASK,
+  MAX_DELEGATIONS_PER_REVIEW,
   type DelegationOutcome,
 } from "../../../src/agents/delegate.js";
 import { parseAgentFile } from "../../../src/agents/definition.js";
@@ -113,7 +114,7 @@ describe("the delegation gate", () => {
   });
 
   it("stops at the budget", () => {
-    expect(gate({ used: MAX_DELEGATIONS_PER_TASK })).toMatchObject({
+    expect(gate({ used: MAX_DELEGATIONS_PER_REVIEW })).toMatchObject({
       allowed: false,
       rejection: "budget-exhausted",
     });
@@ -161,6 +162,7 @@ describe("the delegate tool", () => {
       outputDir: "/staging/parent",
       run: run as never,
       harvested,
+      budget: createDelegationBudget(),
       ...overrides,
     });
 
@@ -203,11 +205,47 @@ describe("the delegate tool", () => {
     });
     const tool = makeTool(run as never, []);
 
-    for (let attempt = 0; attempt < MAX_DELEGATIONS_PER_TASK + 2; attempt += 1) {
+    for (let attempt = 0; attempt < MAX_DELEGATIONS_PER_REVIEW + 2; attempt += 1) {
       await call(tool, { file: "src/a.ts", question: "q" });
     }
 
-    expect(run).toHaveBeenCalledTimes(MAX_DELEGATIONS_PER_TASK);
+    expect(run).toHaveBeenCalledTimes(MAX_DELEGATIONS_PER_REVIEW);
+  });
+
+  it("shares one budget across every rule's tool", async () => {
+    // The bound is per REVIEW, not per rule. A counter per tool let ten rules
+    // make thirty delegations while the documentation promised three
+    // (CodeRabbit review of PR #149).
+    const run = vi.fn(async () => ({ findings: [], digest: "" }));
+    const budget = createDelegationBudget();
+    const first = makeTool(run as never, [], { budget });
+    const second = makeTool(run as never, [], { budget });
+
+    for (let i = 0; i < MAX_DELEGATIONS_PER_REVIEW; i += 1) {
+      await call(first, { file: "src/a.ts", question: "q" });
+    }
+    const afterExhaustion = await call(second, { file: "src/a.ts", question: "q" });
+
+    expect(run).toHaveBeenCalledTimes(MAX_DELEGATIONS_PER_REVIEW);
+    expect(afterExhaustion.details).toMatchObject({ rejection: "budget-exhausted" });
+  });
+
+  it("normalizes the path once, so the gate and the runner agree", async () => {
+    // A padded path passed the gate (which normalized internally) and then
+    // missed `fileSlice`'s exact comparison, burning budget on a request that
+    // could not succeed (CodeRabbit review of PR #149).
+    // Typed through the runner signature so the assertion reads the request
+    // the runner was actually handed, rather than an untyped tuple index.
+    const seen: string[] = [];
+    const run = vi.fn(async (request: { file: string }) => {
+      seen.push(request.file);
+      return { findings: [], digest: "" };
+    });
+    const tool = makeTool(run as never, []);
+
+    await call(tool, { file: "  src/a.ts  ", question: "q" });
+
+    expect(seen).toEqual(["src/a.ts"]);
   });
 
   it("survives a child that throws", async () => {
@@ -346,6 +384,56 @@ describe("the child's own narrowing", () => {
     expect(outcome.failureReason).toBe("child submitted no findings file");
   });
 
+  it("keeps a reference the parent rule declared", async () => {
+    // `normalizeUnknownFinding` fails CLOSED when `allowedReferences` is
+    // absent, so omitting it on the harvest silently stripped every citation a
+    // delegated finding had — including ones the submit tool had already
+    // validated on the way in (Codex review of PR #149).
+    const staging = await mkdtemp(path.join(os.tmpdir(), "tgd-delegate-refs-"));
+    const childDir = path.join(staging, "child");
+    await mkdir(childDir, { recursive: true });
+    await writeFile(
+      path.join(childDir, "findings.json"),
+      JSON.stringify([{
+        file: "src/a.ts",
+        line: 1,
+        severity: "warning",
+        category: "c",
+        message: "Cited.",
+        references: ["https://example.com/policy"],
+      }]),
+      "utf8",
+    );
+
+    const runner = makeDelegationRunner(
+      {
+        name: "parent",
+        // The URL must appear in the rule BODY — that is what makes it
+        // declared, and a citation no rule text contains is a fabrication.
+        body: "See https://example.com/policy for the rule.",
+        dependsOn: [],
+        sourcePath: "/r.md",
+        provider: "p",
+        model: "m",
+      },
+      DELEGATOR,
+      {
+        createChildSession: async () => ({ prompt: async () => undefined }),
+        cwd: "/tmp/cwd",
+        diff: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+x\n",
+        timeoutMs: 1000,
+        withTimeout: async (promise) => promise,
+      },
+    );
+
+    const outcome = await runner(
+      { file: "src/a.ts", question: "q" },
+      { parentRule: "parent", outputDir: childDir },
+    );
+
+    expect(outcome.findings[0]?.references).toEqual(["https://example.com/policy"]);
+  });
+
   it("drops a child finding that names a different file", async () => {
     // A child shown ONE file has no basis for a finding elsewhere. One that
     // reports another path is confused, or is being steered by the diff it was
@@ -381,6 +469,62 @@ describe("the child's own narrowing", () => {
     );
 
     expect(outcome.findings.map((finding) => finding.file)).toEqual(["src/a.ts"]);
+  });
+
+  it("aborts a child whose prompt times out", async () => {
+    // `withTimeout` only rejects the race; it does not cancel the provider
+    // request behind it. Without calling abort, the child kept running — and
+    // kept billing — after the parent had recorded the failure and the host
+    // had removed its staging directory (Codex review of PR #149).
+    const abort = vi.fn(async () => {});
+    const runner = makeDelegationRunner(
+      { name: "parent", body: "rule body", dependsOn: [], sourcePath: "/r.md", provider: "p", model: "m" },
+      DELEGATOR,
+      {
+        createChildSession: async () => ({
+          prompt: async () => {
+            throw new Error("delegated review timed out");
+          },
+          abort,
+        }),
+        cwd: "/tmp/cwd",
+        diff: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+x\n",
+        timeoutMs: 1000,
+        withTimeout: async (promise) => promise,
+      },
+    );
+
+    await expect(
+      runner({ file: "src/a.ts", question: "q" }, { parentRule: "parent", outputDir: "/tmp/x" }),
+    ).rejects.toThrow(/timed out/u);
+    expect(abort).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the original failure when the abort itself fails", async () => {
+    // The reason the child failed is the useful half; an abort error
+    // would replace a diagnosis with a symptom.
+    const runner = makeDelegationRunner(
+      { name: "parent", body: "rule body", dependsOn: [], sourcePath: "/r.md", provider: "p", model: "m" },
+      DELEGATOR,
+      {
+        createChildSession: async () => ({
+          prompt: async () => {
+            throw new Error("provider exploded");
+          },
+          abort: async () => {
+            throw new Error("abort also failed");
+          },
+        }),
+        cwd: "/tmp/cwd",
+        diff: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+x\n",
+        timeoutMs: 1000,
+        withTimeout: async (promise) => promise,
+      },
+    );
+
+    await expect(
+      runner({ file: "src/a.ts", question: "q" }, { parentRule: "parent", outputDir: "/tmp/x" }),
+    ).rejects.toThrow(/provider exploded/u);
   });
 
   it("refuses to review a file the diff does not contain", async () => {
