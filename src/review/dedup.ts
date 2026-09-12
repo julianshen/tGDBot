@@ -15,6 +15,12 @@ export type DedupDecision = "skip-no-new-commits" | "review";
  * computeReviewConfigHash) so a config change re-triggers a review even when the
  * head SHA hasn't moved.
  */
+/**
+ * The default agents directory, named here so the hash can EXCLUDE it: a
+ * repository that never sets `--agents-dir` must keep the hash it already has.
+ */
+const DEFAULT_AGENTS_DIR = ".tgd/agents";
+
 export interface ReviewConfigForDedup {
   advisor: "on" | "off";
   suggestions: "on" | "off";
@@ -23,12 +29,12 @@ export interface ReviewConfigForDedup {
   rulesDir: string;
   model?: string;
   /**
-   * Design-review P0: the dispatch engine changes how findings are produced,
-   * so switching it must re-trigger a review on an unchanged head. NOTE:
-   * adding this field changed every pre-existing hash — one extra (safe)
-   * re-review per open PR after upgrading, then hashes are stable again.
+   * Always "direct" since #138 phase 4 deleted the other engine. Kept in the
+   * hash rather than removed: dropping it would change every hash in the wild
+   * and cost a spurious re-review of every open pull request, to save one
+   * constant.
    */
-  dispatch: "direct" | "legacy";
+  dispatch: "direct";
   /**
    * PR #54 review: this decides whether a review can see registry facts at
    * all, so flipping it must re-trigger on an unchanged head. Optional so the
@@ -45,6 +51,14 @@ export interface ReviewConfigForDedup {
   structuralChecks?: "on" | "off";
   /** Issue #139: the host security detectors. */
   securityPass?: "on" | "off";
+  /**
+   * Issue #138: the subagent configuration. Both change what a reviewer IS —
+   * its persona, tool scope and model — so flipping either must re-trigger on
+   * an unchanged head. Optional, so older callers and their pinned hashes
+   * still typecheck.
+   */
+  subagentNesting?: "on" | "off";
+  agentsDir?: string;
   /**
    * Issue #59: whether the PR's stated intent reaches the reviewer. Read by
    * the CLI caller to decide whether the intent digest joins the fingerprint
@@ -161,6 +175,17 @@ export function computeReviewConfigHash(
     // an unrelated change moved the hash — enabling the feature appeared to do
     // nothing (Codex review of PR #147).
     ...(config.securityPass === "on" ? ["security-pass"] : []),
+    // #138, same guarded shape and the same reason as the two above. A
+    // definition sets a reviewer's persona, tool scope and model, so switching
+    // nesting on or pointing at a different definitions directory produces a
+    // materially different review — and without these, an unchanged head kept
+    // the old hash and skipped before definitions were even loaded, leaving
+    // results produced under the PREVIOUS configuration (Codex review of
+    // PR #149). Guarded so a repository using neither keeps its hash.
+    ...(config.subagentNesting === "on" ? ["subagent-nesting"] : []),
+    ...(config.agentsDir !== undefined && config.agentsDir !== DEFAULT_AGENTS_DIR
+      ? [`agents-dir:${config.agentsDir.replace(/\\/gu, "/")}`]
+      : []),
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,

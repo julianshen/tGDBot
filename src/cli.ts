@@ -120,7 +120,7 @@ import type { ContextPackResult } from "./context/context-pack.js";
 import type { RelatedWorkItem } from "./review/related-work.js";
 import { loadRules as loadRulesReal } from "./rules/loader.js";
 import { loadAgentDefinitions, type AgentLoadResult } from "./agents/definition.js";
-import { resolveRuleAgents } from "./agents/resolve.js";
+import { excludeRulesWithUnresolvedAgents, resolveRuleAgents } from "./agents/resolve.js";
 import type { LoadResult } from "./rules/loader.js";
 import { scopeRulesToChangedFiles } from "./rules/scope.js";
 import { parseRepositoryRef, parseReviewTarget } from "./target/review-target.js";
@@ -1435,9 +1435,14 @@ export async function review(
   for (const error of agentBindings.errors) {
     console.warn(`tgd-review-agent: ${error.message} (${error.sourcePath}); rule not dispatched`);
   }
-  const rules = unresolvedAgentRules.size === 0
-    ? rulesBeforeAgents
-    : rulesBeforeAgents.filter((rule) => !unresolvedAgentRules.has(rule.name));
+  // Excluding a rule must take its dependency EDGES with it, or
+  // `planReviewWorkflow` rejects the dangling name and aborts dispatch for
+  // every remaining rule — one bad `agent:` reference taking down the whole
+  // review (Codex review of PR #149).
+  // Copied back to a mutable array because `ReviewDispatchInput.rules` is one.
+  // Widening that field to readonly is the better change and a larger one; it
+  // touches every stub in the suite, and this PR is already deleting an engine.
+  const rules = [...excludeRulesWithUnresolvedAgents(rulesBeforeAgents, unresolvedAgentRules)];
 
   // Issue #50: dependency facts the HOST parsed out of the changed manifests,
   // delivered as trusted context. Supplied for EVERY rule or for none — the

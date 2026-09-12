@@ -142,7 +142,9 @@ describe("computeReviewConfigHash", () => {
     expect(computeReviewConfigHash(makeConfig({ trustLocalRules: true }))).not.toBe(base);
     expect(computeReviewConfigHash(makeConfig({ rulesDir: "other/rules" }))).not.toBe(base);
     expect(computeReviewConfigHash(makeConfig({ model: "openai-codex/gpt-5.6-terra" }))).not.toBe(base);
-    expect(computeReviewConfigHash(makeConfig({ dispatch: "legacy" }))).not.toBe(base);
+    // `dispatch` no longer varies — #138 phase 4 left one engine, and the
+    // field is pinned to "direct". It stays IN the hash (removing it would
+    // change every hash in the wild), so there is nothing left to flip here.
   });
 
   it("normalizes rulesDir separators so the same logical dir hashes identically across OSes", () => {
@@ -297,5 +299,43 @@ describe("security pass in the config hash", () => {
     // must not re-review every open head on upgrade.
     expect(computeReviewConfigHash(makeConfig({ securityPass: "off" })))
       .toBe(computeReviewConfigHash(makeConfig()));
+  });
+});
+
+// Issue #138: a definition sets a reviewer's persona, tool scope and model, so
+// changing either of these produces a materially different review.
+describe("subagent configuration in the config hash", () => {
+  it("changes the hash when nesting is turned on", () => {
+    // Without this, an unchanged head kept the old hash and skipped before
+    // definitions were even loaded — so results produced under the PREVIOUS
+    // configuration stood, and enabling the feature appeared to do nothing
+    // (Codex review of PR #149). The same defect as securityPass above, in a
+    // new field: the analogy was available and I did not draw it.
+    expect(computeReviewConfigHash(makeConfig({ subagentNesting: "on" })))
+      .not.toBe(computeReviewConfigHash(makeConfig({ subagentNesting: "off" })));
+  });
+
+  it("changes the hash when the definitions directory changes", () => {
+    expect(computeReviewConfigHash(makeConfig({ agentsDir: "other/agents" })))
+      .not.toBe(computeReviewConfigHash(makeConfig({ agentsDir: ".tgd/agents" })));
+  });
+
+  it("leaves the hash alone for a repository using neither", () => {
+    // An unused feature must not re-review every open head on upgrade. The
+    // DEFAULT directory has to be excluded by value, not merely by absence:
+    // the CLI always supplies it, so every real config carries it.
+    const baseline = computeReviewConfigHash(makeConfig());
+
+    expect(computeReviewConfigHash(makeConfig({ subagentNesting: "off" }))).toBe(baseline);
+    expect(computeReviewConfigHash(makeConfig({ agentsDir: ".tgd/agents" }))).toBe(baseline);
+    expect(computeReviewConfigHash(makeConfig({ subagentNesting: "off", agentsDir: ".tgd/agents" })))
+      .toBe(baseline);
+  });
+
+  it("normalizes backslashes in the directory, like rulesDir", () => {
+    // A Windows-shaped path and its POSIX spelling are the same directory, and
+    // hashing them differently would re-review on a change of operating system.
+    expect(computeReviewConfigHash(makeConfig({ agentsDir: "custom\\agents" })))
+      .toBe(computeReviewConfigHash(makeConfig({ agentsDir: "custom/agents" })));
   });
 });

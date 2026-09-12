@@ -60,6 +60,42 @@ export function resolveRuleAgents(
 }
 
 /**
+ * Drops rules whose `agent:` could not be bound, AND the edges pointing at them.
+ *
+ * The edges are the whole reason this is a function rather than a `filter`.
+ * `planReviewWorkflow` rejects a dependency on a rule it cannot see, so
+ * excluding a rule while leaving its name in another rule's `dependsOn`
+ * aborted dispatch for EVERY remaining rule — one bad reference taking down
+ * the whole review, which is considerably worse than the silent fallback the
+ * exclusion exists to avoid (Codex review of PR #149).
+ *
+ * Dropping the edge is what a dependency already means: the README is explicit
+ * that dependencies establish ORDER rather than gating success, and a failed
+ * prerequisite does not suppress the rules after it either. Exactly the fix
+ * `scopeRulesToChangedFiles` already carries for scoped-out prerequisites.
+ *
+ * Returns the input array unchanged when nothing is excluded, so the common
+ * path rebuilds nothing.
+ */
+export function excludeRulesWithUnresolvedAgents<T extends RuleDefinition>(
+  rules: readonly T[],
+  excluded: ReadonlySet<string>,
+): readonly T[] {
+  if (excluded.size === 0) return rules;
+  return rules
+    .filter((rule) => !excluded.has(rule.name))
+    .map((rule) =>
+      rule.dependsOn.some((dependency) => excluded.has(dependency))
+        ? {
+          ...rule,
+          dependsOn: Object.freeze(
+            rule.dependsOn.filter((dependency) => !excluded.has(dependency)),
+          ),
+        }
+        : rule);
+}
+
+/**
  * The model pin a rule should run on, given its agent.
  *
  * RULE WINS over agent. A rule pin is the more specific statement — it names
