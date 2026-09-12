@@ -190,6 +190,39 @@ describe("the pass is bounded", () => {
   });
 });
 
+describe("a published reason never carries the provider's own words", () => {
+  it("publishes a classified phrase, not the raw error", async () => {
+    // `renderAttackPath` puts this reason in the inline comment, which is
+    // world-readable on a public repository. Provider errors echo request
+    // identifiers, model names and prompt fragments (Codex review of PR #151).
+    const out = await run([finding()], {
+      analyze: async () => {
+        throw new Error("429 from api.example.com req_id=abc123 key=sk_live_SECRET");
+      },
+    });
+
+    if (out[0]?.attackPath?.status !== "not-analyzed") throw new Error("unreachable");
+    const reason = out[0].attackPath.reason;
+    expect(reason).not.toContain("req_id");
+    expect(reason).not.toContain("api.example.com");
+    expect(reason).not.toContain("sk_live");
+    expect(reason).toMatch(/did not complete/u);
+  });
+
+  it("names a timeout, which the host itself worded", async () => {
+    // Worth distinguishing: it tells a reader something actionable, and the
+    // message came from this codebase rather than a provider.
+    const out = await run([finding()], {
+      analyze: async () => {
+        throw new Error("the attack-path analysis timed out after 120000ms");
+      },
+    });
+
+    if (out[0]?.attackPath?.status !== "not-analyzed") throw new Error("unreachable");
+    expect(out[0].attackPath.reason).toMatch(/timed out/u);
+  });
+});
+
 describe("failure never takes the review with it", () => {
   it("records a failed analysis as not-analyzed and keeps the finding", async () => {
     const out = await run([finding({ severity: "warning" })], {
@@ -201,7 +234,8 @@ describe("failure never takes the review with it", () => {
     expect(out).toHaveLength(1);
     expect(out[0]?.severity).toBe("warning");
     if (out[0]?.attackPath?.status !== "not-analyzed") throw new Error("unreachable");
-    expect(out[0].attackPath.reason).toMatch(/provider exploded/u);
+    // Classified, not the provider's words — see the block above.
+    expect(out[0].attackPath.reason).toMatch(/did not complete/u);
   });
 
   it("survives a head read that throws", async () => {

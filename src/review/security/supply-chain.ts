@@ -89,8 +89,55 @@ const USES_RE = /^\s*(?:-\s*)?uses:\s*["']?([^"'\s@]+)@([^"'\s#]+)/u;
 /** `permissions: write-all` or a bare `write-all` value under it. */
 const WRITE_ALL_RE = /^\s*permissions:\s*write-all\s*$/u;
 
-/** A workflow trigger line naming `pull_request_target`. */
-const PR_TARGET_RE = /(^|\s|:|\[|,)pull_request_target(\s|:|,|\]|$)/u;
+/**
+ * Whether a workflow is actually TRIGGERED by `pull_request_target`.
+ *
+ * Matching the name anywhere was a false positive at `blocking` severity — the
+ * worst kind a host detector can produce. A comment mentioning the trigger, or
+ * `run: echo pull_request_target`, blocked a safe workflow change (Codex
+ * review of PR #151).
+ *
+ * Scanned rather than parsed: a YAML parser is a dependency this detector does
+ * not need, and the shapes a trigger declaration takes are few. It must be
+ * either the `on:` key's own value, or a key inside the `on:` block —
+ *
+ *     on: pull_request_target
+ *     on: [push, pull_request_target]
+ *     on:
+ *       pull_request_target:
+ *         types: [opened]
+ *
+ * — and the block ends at the next top-level key, which is what stops a `jobs:`
+ * step being read as a trigger.
+ */
+function triggersOnPullRequestTarget(lines: readonly string[]): boolean {
+  const NAME = /(?:^|[\s[,])pull_request_target(?:[\s\]:,]|$)/u;
+  let inOnBlock = false;
+  for (const raw of lines) {
+    // A comment is never a declaration, whatever it says.
+    const line = raw.replace(/#.*$/u, "");
+    if (line.trim().length === 0) continue;
+
+    const inlineOn = /^on\s*:(.*)$/u.exec(line);
+    if (inlineOn) {
+      const value = inlineOn[1] as string;
+      if (NAME.test(value)) return true;
+      // `on:` with nothing after it opens a block; `on: push` does not.
+      inOnBlock = value.trim().length === 0;
+      continue;
+    }
+    // Any other top-level key closes the block.
+    if (/^\S/u.test(line)) {
+      inOnBlock = false;
+      continue;
+    }
+    // Inside the block, a trigger is a key of its own.
+    if (inOnBlock && /^\s+pull_request_target\s*:/u.test(line)) return true;
+    // A YAML sequence item under `on:` — `  - pull_request_target`.
+    if (inOnBlock && /^\s+-\s*pull_request_target\s*$/u.test(line)) return true;
+  }
+  return false;
+}
 
 /**
  * Git-URL and branch-pinned dependency specs in a package.json line.
@@ -174,7 +221,12 @@ function pullRequestTargetHazard(
   let addedTrigger: number | undefined;
   let addedCheckout: number | undefined;
   for (const [line, text] of lines) {
-    if (PR_TARGET_RE.test(text)) addedTrigger ??= line;
+    // Judged against the WHOLE file, not the line alone: `on:` may be above
+    // the added line, and a trigger declaration is a property of its position
+    // in the document. The added line still has to be part of the declaration,
+    // which `triggersOnPullRequestTarget` establishes over the added lines in
+    // isolation as a conservative approximation.
+    if (triggersOnPullRequestTarget([text])) addedTrigger ??= line;
     if (HEAD_CHECKOUT_RE.test(text)) addedCheckout ??= line;
   }
   // At least one HALF must be added by this pull request — otherwise the
@@ -188,7 +240,9 @@ function pullRequestTargetHazard(
   // both, and an added-lines-only check saw one half and stayed silent
   // (Codex review of PR #151).
   const whole = headText === undefined ? [...lines.values()] : headText.split("\n");
-  const hasTrigger = addedTrigger !== undefined || whole.some((text) => PR_TARGET_RE.test(text));
+  // The HEAD file is the authority on whether the workflow is triggered this
+  // way; the added-line check above is only about which half is new.
+  const hasTrigger = triggersOnPullRequestTarget(whole) || addedTrigger !== undefined;
   const hasCheckout =
     addedCheckout !== undefined || whole.some((text) => HEAD_CHECKOUT_RE.test(text));
   if (!hasTrigger || !hasCheckout) return undefined;

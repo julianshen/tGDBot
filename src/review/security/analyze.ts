@@ -25,6 +25,7 @@ import {
 } from "./attack-path.js";
 import { establishReachability } from "./reachability.js";
 import { RESERVED_HOST_RULE_NAMES } from "./host-detectors.js";
+import { redactedMessage } from "../../conversation/redact.js";
 
 /**
  * How many findings one review will pay an analysis call for.
@@ -52,6 +53,23 @@ const SEVERITY_RANK: Readonly<Record<Finding["severity"], number>> = {
   warning: 1,
   suggestion: 2,
 };
+
+/**
+ * A publishable reason for a failed analysis.
+ *
+ * Bounded and CLASSIFIED rather than the provider's own words. The timeout is
+ * named because the host wrote that message and it tells a reader something
+ * actionable; everything else collapses to one phrase, because a provider
+ * error can carry request identifiers, model names, prompt fragments and
+ * account details, and a review comment is world-readable.
+ */
+function classifyAnalysisFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/timed out/iu.test(message)) {
+    return "the attack-path analysis timed out before it could answer";
+  }
+  return "the attack-path analysis did not complete; the reason is in this run's logs";
+}
 
 /**
  * Security findings from DISCOVERY, worst first, so a small budget is spent
@@ -118,10 +136,17 @@ export async function analyzeAttackPaths(input: AnalyzeInput): Promise<Finding[]
     try {
       facts = parseAttackPathFacts(await input.analyze(finding));
     } catch (error) {
-      analyzed.set(finding, {
-        status: "not-analyzed",
-        reason: `the attack-path analysis failed (${(error as Error).message})`,
-      });
+      // The reason is PUBLISHED — `renderAttackPath` puts it in the inline
+      // comment — so it must not be the raw provider message. Provider and SDK
+      // errors echo request details, and this comment is world-readable on a
+      // public repository. Same stance `ruleFailureReasons` already takes: a
+      // classified phrase reaches the reader, the raw error reaches stderr
+      // (Codex review of PR #151).
+      console.warn(
+        `analyzeAttackPaths: the analysis of a finding in ${finding.file} failed ` +
+          `(${redactedMessage(error)})`,
+      );
+      analyzed.set(finding, { status: "not-analyzed", reason: classifyAnalysisFailure(error) });
       continue;
     }
 

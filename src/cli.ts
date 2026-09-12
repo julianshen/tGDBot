@@ -1780,10 +1780,26 @@ export async function review(
       }
     }
   }
-  // Issue #139 stages 3-5: the attack-path pass. After discovery AND the host
-  // detectors, so every security finding this review produced is a candidate,
-  // and before orchestration, so a re-rated severity flows through dedup,
-  // clustering and publication like any other.
+  if (config.codexScanResults !== undefined) {
+    if (scanIngest !== undefined) {
+      dispatchResult.findings.push(...scanIngest.findings);
+      dispatchResult.rulesRun.push("codex-security");
+      dispatchResult.scanCoverage = scanIngest.coverage;
+    } else {
+      dispatchResult.rulesFailed.push("codex-security");
+      dispatchResult.ruleFailureReasons = {
+        ...dispatchResult.ruleFailureReasons,
+        "codex-security": codexScanFailureReason(scanIngestError),
+      };
+    }
+  }
+
+  // Issue #139 stages 3-5: the attack-path pass. After discovery, the host
+  // detectors AND the imported scan ingest, so every security finding this
+  // review carries is a candidate — imported findings are `category:
+  // "security"` and were silently skipped when this ran before the ingest
+  // (Codex review of PR #151). Before orchestration, so a re-rated severity
+  // flows through dedup, clustering and publication like any other.
   //
   // Gated on there being candidates at all — `analyzeAttackPaths` returns
   // immediately when there are none, so an ordinary review pays nothing.
@@ -1821,21 +1837,31 @@ export async function review(
     const analyzeFindingFn = deps.analyzeFinding ?? (async (finding: Finding) => {
       const hunk = extractFileHunk(diff, finding.file);
       const token = analysisBoundaryToken(finding, hunk);
-      const session = await createAnalysisSession(
-        await mkdtemp(path.join(os.tmpdir(), "tgd-attack-path-")),
-        config.model,
-        [],
-      );
-      // Bounded and aborted on expiry: an unbounded await on a stalled
-      // provider holds the whole review open, and the race alone does not
-      // cancel the request behind it.
-      return parseAnalysisResponse(
-        await runAnalysisWithTimeout(
-          session,
-          buildAnalysisPrompt(finding, hunk, token),
-          ANALYSIS_TIMEOUT_MS,
-        ),
-      );
+      // Removed in a `finally`, like the dispatcher's own session cwd. `poll`
+      // is a long-running process, and up to ten of these per review with no
+      // cleanup leaks filesystem entries for as long as it runs (Codex review
+      // of PR #151).
+      const sessionCwd = await mkdtemp(path.join(os.tmpdir(), "tgd-attack-path-"));
+      try {
+        const session = await createAnalysisSession(sessionCwd, config.model, []);
+        // Bounded and aborted on expiry: an unbounded await on a stalled
+        // provider holds the whole review open, and the race alone does not
+        // cancel the request behind it.
+        return parseAnalysisResponse(
+          await runAnalysisWithTimeout(
+            session,
+            buildAnalysisPrompt(finding, hunk, token),
+            ANALYSIS_TIMEOUT_MS,
+          ),
+        );
+      } finally {
+        // Never let a cleanup failure mask the analysis result or its error.
+        await rm(sessionCwd, { recursive: true, force: true }).catch((error: unknown) => {
+          console.warn(
+            `tgd-review-agent: failed to remove ${sessionCwd} (${redactedMessage(error)})`,
+          );
+        });
+      }
     });
 
     try {
@@ -1852,20 +1878,6 @@ export async function review(
       );
     }
   }
-  if (config.codexScanResults !== undefined) {
-    if (scanIngest !== undefined) {
-      dispatchResult.findings.push(...scanIngest.findings);
-      dispatchResult.rulesRun.push("codex-security");
-      dispatchResult.scanCoverage = scanIngest.coverage;
-    } else {
-      dispatchResult.rulesFailed.push("codex-security");
-      dispatchResult.ruleFailureReasons = {
-        ...dispatchResult.ruleFailureReasons,
-        "codex-security": codexScanFailureReason(scanIngestError),
-      };
-    }
-  }
-
   // Issue #114: quote relocation must run BEFORE every consumer of a
   // finding's location — structural checks verify claims at file/line, and
   // clarification persistence anchors an inline question there. Running the

@@ -132,6 +132,43 @@ describe("pull_request_target", () => {
     expect(detectSupplyChainHazards(diff, head)[0]?.line).toBe(3);
   });
 
+  it.each([
+    ["a comment mentioning it", "      # careful with pull_request_target here"],
+    ["a run step echoing it", "      - run: echo pull_request_target"],
+    ["a job name containing it", "  pull_request_target_helper:"],
+  ])("does not treat %s as a trigger", (_label, line) => {
+    // A false positive at `blocking` severity is the worst kind a host
+    // detector can produce: it blocks a safe workflow change (Codex review of
+    // PR #151).
+    const head = new Map([[WORKFLOW,
+      "on: push\njobs:\n  x:\n    steps:\n          ref: ${{ github.event.pull_request.head.sha }}"]]);
+
+    expect(detectSupplyChainHazards(diffAdding(WORKFLOW, line), head)).toEqual([]);
+  });
+
+  it("recognises the trigger as a key inside the on: block", () => {
+    const diff = diffAdding(WORKFLOW, "          ref: ${{ github.event.pull_request.head.sha }}");
+    const head = new Map([[WORKFLOW, "on:\n  pull_request_target:\n    types: [opened]\n"]]);
+
+    expect(detectSupplyChainHazards(diff, head)).toHaveLength(1);
+  });
+
+  it("recognises the trigger as a sequence item under on:", () => {
+    const diff = diffAdding(WORKFLOW, "          ref: ${{ github.event.pull_request.head.sha }}");
+    const head = new Map([[WORKFLOW, "on:\n  - push\n  - pull_request_target\n"]]);
+
+    expect(detectSupplyChainHazards(diff, head)).toHaveLength(1);
+  });
+
+  it("does not read a jobs: key as a trigger once the on: block has closed", () => {
+    // The block ends at the next top-level key. Without that, every step under
+    // `jobs:` is a candidate trigger.
+    const diff = diffAdding(WORKFLOW, "          ref: ${{ github.event.pull_request.head.sha }}");
+    const head = new Map([[WORKFLOW, "on:\n  push:\njobs:\n  pull_request_target:\n"]]);
+
+    expect(detectSupplyChainHazards(diff, head)).toEqual([]);
+  });
+
   it("stays silent on the trigger alone", () => {
     expect(detectSupplyChainHazards(diffAdding(WORKFLOW, "on: pull_request_target")))
       .toEqual([]);
