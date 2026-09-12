@@ -12,7 +12,7 @@ import {
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
-import type { DispatchSession } from "../review/dispatch.js";
+import type { DispatchSession } from "../review/dispatch-session.js";
 import { resolveRuleSessionModel } from "../review/orchestrator-model.js";
 import { redactedMessage } from "./redact.js";
 

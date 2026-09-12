@@ -5,8 +5,8 @@
 // classification. Split out of dispatch.ts (design-review #8) — pure and
 // synchronous, no SDK, no I/O beyond console.warn.
 import { parseStructuralClaim } from "./structural-check.js";
-import type { EffectiveRule, RuleDefinition } from "../rules/types.js";
-import type { DispatchResult, Finding, FindingDecision } from "./types.js";
+import type { EffectiveRule } from "../rules/types.js";
+import type { Finding, FindingDecision } from "./types.js";
 
 // One dispatched task's structured outcome, read from the subagent tool's
 // details.results[i] (order = dispatch order = rule order). `model` is
@@ -29,9 +29,6 @@ function stripCodeFences(text: string): string {
   return fenced ? fenced[1].trim() : trimmed;
 }
 
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
-}
 
 const VALID_SEVERITIES = new Set(["blocking", "warning", "suggestion"]);
 export const FINDING_DECISIONS = [
@@ -255,87 +252,12 @@ export function normalizeUnknownFinding(
   return finding;
 }
 
-function isValidFinding(value: unknown): value is Finding {
-  return normalizeUnknownFinding(value) !== undefined;
-}
 
-function normalizeFinding(finding: Finding): Finding {
-  const normalized = normalizeUnknownFinding(finding);
-  if (normalized !== undefined) return normalized;
-  // UNREACHABLE today, and deliberately kept. looksLikeDispatchResult has
-  // already validated every finding through this same normalization, and the
-  // allowed-reference set affects which citations survive rather than whether
-  // the finding is valid — so normalization cannot fail here, and no test can
-  // drive this branch (verified by removing it: nothing failed).
-  //
-  // It stays because the hazard it guards is a security one: should those two
-  // validations ever diverge, the raw finding would carry citations that never
-  // went through the declared-URL check, which is precisely what #49 exists to
-  // prevent. Cheap insurance at a boundary, not a tested path.
-  if (finding.references === undefined) return finding;
-  const { references, ...withoutReferences } = finding;
-  void references;
-  return withoutReferences;
-}
 
-function looksLikeDispatchResult(value: unknown): value is DispatchResult {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    Array.isArray(candidate.findings) &&
-    candidate.findings.every(isValidFinding) &&
-    isStringArray(candidate.rulesRun) &&
-    isStringArray(candidate.rulesFailed)
-  );
-}
 
-export function fallbackResult(
-  rules: RuleDefinition[],
-  reason = "the review orchestrator did not complete — see the CI logs for the cause",
-): DispatchResult {
-  // Review finding: without a reason here, every ORCHESTRATOR-level failure
-  // (prompt() threw, malformed final JSON, setup failed, unreconcilable results)
-  // still rendered the bare "- rule-name" list this change exists to kill. Stamp
-  // a generic-but-honest reason so the whole class is covered, not just the
-  // per-task branch the smoke test happened to hit.
-  const ruleFailureReasons: Record<string, string> = Object.create(null) as Record<string, string>;
-  for (const rule of rules) ruleFailureReasons[rule.name] = reason;
-  return { findings: [], rulesRun: [], rulesFailed: rules.map((rule) => rule.name), ruleFailureReasons };
-}
 
 // Never throws — a single bad/malformed LLM response must not crash the
 // whole run (SPEC.md boundary, AC-5.4).
-export function parseDispatchResult(text: string | undefined, rules: RuleDefinition[]): DispatchResult {
-  if (!text) {
-    console.warn("dispatchRules: session produced no final assistant message");
-    return fallbackResult(rules);
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(stripCodeFences(text));
-  } catch (err) {
-    console.warn(`dispatchRules: could not parse final message as JSON (${(err as Error).message})`);
-    return fallbackResult(rules);
-  }
-
-  if (!looksLikeDispatchResult(parsed)) {
-    console.warn("dispatchRules: final message JSON did not match the DispatchResult shape");
-    return fallbackResult(rules);
-  }
-
-  // No citations survive here. This is the legacy orchestrator's MERGED output,
-  // where `ruleName` is supplied by the model and reconcileWithCapturedResults
-  // explicitly does not detect misattribution — so selecting an allowlist from
-  // that name would let a finding attributed to rule B cite rule B's URLs even
-  // though rule A produced it, defeating the per-rule provenance the feature
-  // rests on (PR #54 review). Citations come from paths that know the true
-  // rule: direct dispatch, and recovered task output.
-  return {
-    ...parsed,
-    findings: parsed.findings.map((finding) => normalizeFinding(finding)),
-  };
-}
 
 // Like isValidFinding but WITHOUT requiring ruleName — a dispatched task's raw
 // finalOutput follows FINDING_JSON_CONTRACT (`[{file,line,severity,category,
@@ -424,111 +346,12 @@ export function parseFindingsFromFinalOutput(
  * know what any subagent actually proposed), no suggestion is committable. The
  * finding itself is always kept — losing a one-click fix is a fair price.
  */
-export function suggestionProvenanceKeys(
-  captured: CapturedTaskResult[],
-  rules: RuleDefinition[],
-): Set<string> {
-  const keys = new Set<string>();
-  captured.forEach((c, i) => {
-    const rule = rules[i];
-    if (!rule || !c.finalOutput) return;
-    // Recovered from the captured task output, so the producing rule is known
-    // and its declared citations can be honoured (PR #54 review).
-    for (const finding of parseFindingsFromFinalOutput(
-      c.finalOutput,
-      rule.name,
-      referencesDeclaredBy(rule.body),
-    )) {
-      if (typeof finding.suggestion === "string") {
-        keys.add(provenanceKey(finding.file, finding.line, finding.suggestion));
-      }
-      // Issue #114: the reviewer's verbatim excerpt gets the same provenance
-      // rule as a suggestion, bound to the full captured finding identity
-      // MINUS the location: rule, file, severity, category, message, title
-      // and the excerpt itself. The line/endLine are deliberately excluded —
-      // they may be exactly the miscount the quote exists to correct — while
-      // everything else must match, or a swapped excerpt would relocate
-      // another finding's comment onto this one's code (PR #130 review,
-      // three rounds). A failed task's output is not trustworthy and
-      // contributes no quote.
-      // The FULL success predicate, not the exit code alone: a task that
-      // errored, timed out or detached mid-run has output reconcile would
-      // never trust, and its quote must not authenticate anything
-      // (PR #130 review).
-      if (typeof finding.existingCode === "string" && taskSucceeded(c)) {
-        keys.add(quoteProvenanceKey(rule.name, finding.file, finding, finding.existingCode));
-      }
-    }
-  });
-  return keys;
-}
 
-function provenanceKey(file: string, line: number | undefined, suggestion: string): string {
-  return JSON.stringify([file, line ?? null, suggestion]);
-}
 
-function quoteProvenanceKey(
-  ruleName: string,
-  file: string,
-  finding: Pick<Finding, "severity" | "category" | "message" | "title">,
-  excerpt: string,
-): string {
-  return JSON.stringify([
-    ruleName,
-    file,
-    finding.severity,
-    finding.category,
-    finding.message,
-    finding.title ?? null,
-    excerpt,
-  ]);
-}
 
 /** Strips any suggestion or quote the orchestrator cannot prove a subagent made. */
-export function enforceSuggestionProvenance(result: DispatchResult, allowed: Set<string>): DispatchResult {
-  let dropped = 0;
-  let quotesDropped = 0;
-  const findings = result.findings.map((f) => {
-    let out = f;
-    if (typeof out.suggestion === "string") {
-      if (allowed.has(provenanceKey(out.file, out.line, out.suggestion))) {
-        // Kept.
-      } else {
-        dropped += 1;
-        out = { ...out, suggestion: undefined, endLine: undefined };
-      }
-    }
-    // Issue #114: the orchestrator relays the reviewer's excerpt under the
-    // legacy engine, and a reformatted, substituted, or cross-rule
-    // misattributed quote would relocate the comment to the wrong code (or
-    // discard a valid anchor). An excerpt the attributed rule did not emit is
-    // dropped — the finding falls back to the model's line, exactly as if no
-    // quote had been returned.
-    if (typeof out.existingCode === "string" && !allowed.has(quoteProvenanceKey(out.ruleName, out.file, out, out.existingCode))) {
-      quotesDropped += 1;
-      out = { ...out, existingCode: undefined };
-    }
-    return out;
-  });
-  if (dropped > 0) {
-    console.warn(
-      `dispatchRules: dropped ${dropped} committable suggestion(s) that no dispatched reviewer ` +
-        `actually produced for that file/line (orchestrator provenance check)`,
-    );
-  }
-  if (quotesDropped > 0) {
-    console.warn(
-      `dispatchRules: dropped ${quotesDropped} verbatim excerpt(s) that no dispatched reviewer ` +
-        `actually produced (orchestrator provenance check, #114)`,
-    );
-  }
-  return { ...result, findings };
-}
 
 // A task ran successfully iff it exited 0 with no error/timeout/detach.
-function taskSucceeded(c: CapturedTaskResult): boolean {
-  return c.exitCode === 0 && !c.error && !c.timedOut && !c.detached;
-}
 
 // Errors that mean "this rule's provider isn't usable on this machine" — by far
 // the most common real cause (the zero-config smoke test hit exactly this: the
@@ -612,66 +435,3 @@ export function classifyTaskFailure(c: CapturedTaskResult, rule: EffectiveRule):
 // orchestrator tagged one rule's findings with another rule's name. And with
 // advisor on, a genuine whole-rule drop leaves that rule's findings lost (only
 // its accounting is corrected) — accepted to never undo advisor filtering.
-export function reconcileWithCapturedResults(
-  orchestrator: DispatchResult,
-  captured: CapturedTaskResult[],
-  rules: EffectiveRule[],
-  recoverFindings: boolean,
-): DispatchResult {
-  if (captured.length !== rules.length) return orchestrator;
-  const orderTrustworthy = captured.every((c, i) => {
-    if (!c.model) return true; // nothing to cross-check — rely on dispatch order
-    // Gemini review: normalize the thinking suffix on BOTH sides. A rule may
-    // itself pin `model: claude-opus-4-5:high` while the captured model omits
-    // (or differs in) the suffix — a raw startsWith would then fail and
-    // silently SKIP reconciliation, the exact degradation the cross-check
-    // exists to prevent. Same suffix set as orchestrator-model.ts's
-    // THINKING_SUFFIX_RE (pi-subagents strips these when resolving fuzzily);
-    // update both together if pi's thinking levels ever change.
-    const stripThinking = (spec: string): string =>
-      spec.replace(/:(?:none|off|minimal|low|medium|high|max)$/i, "");
-    return stripThinking(c.model).startsWith(
-      stripThinking(`${rules[i].provider}/${rules[i].model}`),
-    );
-  });
-  if (!orderTrustworthy) return orchestrator;
-
-  const rulesRun: string[] = [];
-  const rulesFailed: string[] = [];
-  // Null-prototype: a rule literally named "__proto__" would otherwise not set an
-  // own property, and the later lookup would return Object.prototype (truthy) and
-  // render "[object Object]" as the reason.
-  const ruleFailureReasons: Record<string, string> = Object.create(null) as Record<string, string>;
-  const recovered: Finding[] = [];
-  captured.forEach((c, i) => {
-    const rule = rules[i];
-    if (!taskSucceeded(c)) {
-      rulesFailed.push(rule.name);
-      ruleFailureReasons[rule.name] = classifyTaskFailure(c, rule);
-      // Smoke-test finding: this was previously silent — a rule failed and NOTHING,
-      // not even stderr, said why. The RAW error goes to the CI logs; only the
-      // classified reason above reaches the PR comment. (On a public repo the logs
-      // are readable too — but GitHub masks registered secrets there, and a comment
-      // is pushed into every reviewer's face while a log line is not.)
-      const raw = c.error ?? classifyTaskFailure(c, rule);
-      console.warn(
-        `dispatchRules: rule "${rule.name}" (${rule.provider}/${rule.model}) failed: ${raw}`,
-      );
-      return;
-    }
-    rulesRun.push(rule.name);
-    if (!recoverFindings) return;
-    const orchestratorHasFindings = orchestrator.findings.some((f) => f.ruleName === rule.name);
-    if (!orchestratorHasFindings && c.finalOutput) {
-      recovered.push(...parseFindingsFromFinalOutput(
-        c.finalOutput,
-        rule.name,
-        referencesDeclaredBy(rule.body),
-      ));
-    }
-  });
-
-  const runSet = new Set(rulesRun);
-  const kept = orchestrator.findings.filter((f) => runSet.has(f.ruleName));
-  return { findings: [...kept, ...recovered], rulesRun, rulesFailed, ruleFailureReasons };
-}

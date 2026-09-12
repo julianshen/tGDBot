@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import type { ContextPackResult } from "../../../src/context/context-pack.js";
-import { buildDispatchPrompt, buildTaskText, FINDING_OBJECT_CONTRACT } from "../../../src/review/dispatch-prompt.js";
+import { buildTaskText, warnIfDiffCostRisk, FINDING_OBJECT_CONTRACT } from "../../../src/review/dispatch-prompt.js";
 import type { ReviewConversationContext } from "../../../src/review/types.js";
 import type { EffectiveRule } from "../../../src/rules/types.js";
 import { readFileSync } from "node:fs";
@@ -133,14 +133,12 @@ describe("buildTaskText conversation context", () => {
     digest: "f".repeat(64),
   };
 
-  it("inserts the same conversation context after the untrusted diff on both prompt paths", () => {
+  it("inserts the conversation context after the untrusted diff", () => {
     const rule = makeRule();
     const diff = "diff --git a/x.ts b/x.ts\n+keep";
     const direct = buildTaskText(rule, diff, undefined, conversation);
-    const legacy = buildDispatchPrompt([rule], diff, false, conversation);
     const token = boundaryToken(direct);
 
-    expect(legacy).toContain(direct);
     expect(direct.indexOf(`[UNTRUSTED_DIFF:${token}]`)).toBeLessThan(
       direct.indexOf("UNTRUSTED_REVIEW_DISCUSSION"),
     );
@@ -148,7 +146,6 @@ describe("buildTaskText conversation context", () => {
       direct.indexOf("ADVISORY_LOCAL_MEMORY"),
     );
     expect(direct).toContain(conversation.text);
-    expect(legacy).toContain(conversation.text);
   });
 
   it("retries the outer boundary when conversation context contains the prior token", () => {
@@ -173,21 +170,16 @@ describe("buildTaskText conversation context", () => {
 });
 
 describe("finding decision contract", () => {
-  it("names optional decision and question fields on both reviewer and orchestrator shapes", () => {
-    const rule = makeRule();
-    const task = buildTaskText(rule, "diff");
-    const orchestrator = buildDispatchPrompt([rule], "diff", false);
+  it("names optional decision and question fields on the reviewer shape", () => {
+    const prompt = buildTaskText(makeRule(), "diff");
 
-    for (const prompt of [task, orchestrator]) {
-      expect(prompt).toContain('"decision"');
-      expect(prompt).toContain('"question"');
-      expect(prompt).toContain("new");
-      expect(prompt).toContain("still-valid");
-      expect(prompt).toContain("addressed");
-      expect(prompt).toContain("disputed");
-      expect(prompt).toContain("needs-clarification");
-    }
-    expect(orchestrator).toMatch(/copy each finding's.*"decision".*"question"/i);
+    expect(prompt).toContain('"decision"');
+    expect(prompt).toContain('"question"');
+    expect(prompt).toContain("new");
+    expect(prompt).toContain("still-valid");
+    expect(prompt).toContain("addressed");
+    expect(prompt).toContain("disputed");
+    expect(prompt).toContain("needs-clarification");
   });
 });
 
@@ -286,7 +278,7 @@ describe("the message contract states a length budget", () => {
   });
 });
 
-describe("buildDispatchPrompt trusted-base context", () => {
+describe("buildTaskText trusted-base context", () => {
   it("embeds each rule's pack in its own task text", () => {
     const rules = [
       { ...makeRule(), name: "correctness" },
@@ -297,7 +289,14 @@ describe("buildDispatchPrompt trusted-base context", () => {
       ["security", makePack("SECURITY CONTEXT BODY")],
     ]);
 
-    const prompt = buildDispatchPrompt(rules, "diff --git a/x b/x", false, undefined, packs);
+    // One task text per rule, concatenated for the assertions below: the
+    // orchestrator prompt that used to do this concatenation was deleted with
+    // the legacy engine (#138 phase 4), but the PROPERTY it was asserting —
+    // each rule sees its own pack and no other rule's — belongs to
+    // `buildTaskText` and survives it.
+    const prompt = rules
+      .map((rule) => buildTaskText(rule, "diff --git a/x b/x", packs.get(rule.name)))
+      .join("\n");
 
     expect(prompt).toContain("CORRECTNESS CONTEXT BODY");
     expect(prompt).toContain("SECURITY CONTEXT BODY");
@@ -309,13 +308,7 @@ describe("buildDispatchPrompt trusted-base context", () => {
 
   it("puts the pack in the trusted section, never in the untrusted diff", () => {
     const rule = makeRule();
-    const prompt = buildDispatchPrompt(
-      [rule],
-      "diff --git a/x b/x",
-      false,
-      undefined,
-      new Map([[rule.name, makePack("TRUSTED BASE EVIDENCE")]]),
-    );
+    const prompt = buildTaskText(rule, "diff --git a/x b/x", makePack("TRUSTED BASE EVIDENCE"));
     const token = boundaryToken(prompt);
 
     expect(enclosed(prompt, "TRUSTED_CONTEXT", token)).toContain("TRUSTED BASE EVIDENCE");
@@ -327,22 +320,18 @@ describe("buildDispatchPrompt trusted-base context", () => {
       { ...makeRule(), name: "with-context" },
       { ...makeRule(), name: "without-context" },
     ];
-    const prompt = buildDispatchPrompt(
-      rules,
-      "diff",
-      false,
-      undefined,
-      new Map([["with-context", makePack("ONLY FOR THE FIRST RULE")]]),
-    );
+    const packs = new Map([["with-context", makePack("ONLY FOR THE FIRST RULE")]]);
+    const prompt = rules
+      .map((rule) => buildTaskText(rule, "diff", packs.get(rule.name)))
+      .join("\n");
 
     // One TRUSTED_CONTEXT section for the one rule that has a pack.
     expect(prompt.match(/\[TRUSTED_CONTEXT:/g)).toHaveLength(1);
   });
 
-  it("produces the prompt it always did when no packs are supplied", () => {
-    const rules = [makeRule()];
-    expect(buildDispatchPrompt(rules, "diff", false, undefined, new Map()))
-      .toBe(buildDispatchPrompt(rules, "diff", false));
+  it("produces the task text it always did when no pack is supplied", () => {
+    const rule = makeRule();
+    expect(buildTaskText(rule, "diff", undefined)).toBe(buildTaskText(rule, "diff"));
   });
 
   it("counts pack size in the cost warning, not just the diff", () => {
@@ -358,7 +347,7 @@ describe("buildDispatchPrompt trusted-base context", () => {
     try {
       // The diff alone is nowhere near the threshold; the packs are what push
       // this run over it, and the warning has to see them.
-      buildDispatchPrompt(rules, diff, false, undefined, new Map([["one", pack]]));
+      warnIfDiffCostRisk(rules, diff, new Map([["one", pack]]));
     } finally {
       console.warn = original;
     }
@@ -384,7 +373,7 @@ describe("buildDispatchPrompt trusted-base context", () => {
     const original = console.warn;
     console.warn = (message: string) => void warnings.push(message);
     try {
-      buildDispatchPrompt(rules, diff, false, undefined, new Map([[rules[0]!.name, pack]]));
+      warnIfDiffCostRisk(rules, diff, new Map([[rules[0]!.name, pack]]));
     } finally {
       console.warn = original;
     }
@@ -402,7 +391,7 @@ describe("buildDispatchPrompt trusted-base context", () => {
     const original = console.warn;
     console.warn = (message: string) => void warnings.push(message);
     try {
-      buildDispatchPrompt([makeRule()], "d".repeat(100), false, undefined, new Map());
+      warnIfDiffCostRisk([makeRule()], "d".repeat(100), new Map());
     } finally {
       console.warn = original;
     }
@@ -471,12 +460,16 @@ describe("buildTaskText — untrusted PR intent section", () => {
     expect(enclosed(text, "UNTRUSTED_DIFF", token)).toBe("diff body");
   });
 
-  it("carries the section through the legacy orchestrator prompt for every rule", () => {
+  it("carries the section into every rule's own task text", () => {
+    // The orchestrator prompt that used to concatenate these was deleted with
+    // the legacy engine (#138 phase 4). The property it asserted — every
+    // dispatched rule receives the intent, not just the first — belongs to the
+    // per-rule task text and is asserted there now.
     const rules = [{ ...makeRule(), name: "one" }, { ...makeRule(), name: "two" }];
-    const prompt = buildDispatchPrompt(rules, "diff body", false, undefined, undefined, intent);
+    const texts = rules.map((rule) => buildTaskText(rule, "diff body", undefined, undefined, intent));
 
-    expect(prompt.match(/\[UNTRUSTED_PR_INTENT:/g)).toHaveLength(rules.length);
-    expect(prompt).toContain("Title: Fix the retry budget");
+    expect(texts.every((text) => /\[UNTRUSTED_PR_INTENT:/u.test(text))).toBe(true);
+    expect(texts.every((text) => text.includes("Title: Fix the retry budget"))).toBe(true);
   });
 
   it("counts intent size in the per-rule cost warning", () => {
@@ -485,7 +478,7 @@ describe("buildTaskText — untrusted PR intent section", () => {
     const original = console.warn;
     console.warn = (message: string) => void warnings.push(message);
     try {
-      buildDispatchPrompt([makeRule()], "d".repeat(100), false, undefined, undefined, bigIntent);
+      warnIfDiffCostRisk([makeRule()], "d".repeat(100), undefined, bigIntent);
     } finally {
       console.warn = original;
     }
@@ -572,9 +565,10 @@ describe("finding contract — existingCode (#114)", () => {
     expect(FINDING_OBJECT_CONTRACT).toMatch(/zero or multiple locations/);
   });
 
-  it("the orchestrator copy-through list includes existingCode", () => {
-    const prompt = buildDispatchPrompt([makeRule()], "diff", true);
-    expect(prompt).toContain('"existingCode"');
-    expect(prompt).toMatch(/"existingCode", "decision"/);
+  it("the per-rule contract asks for existingCode by name", () => {
+    // Replaces an assertion about the orchestrator's copy-through list, which
+    // was deleted with the orchestrator: there is no relay left to copy fields
+    // through, so the only place the field can be lost is the rule contract.
+    expect(buildTaskText(makeRule(), "diff")).toContain('"existingCode"');
   });
 });

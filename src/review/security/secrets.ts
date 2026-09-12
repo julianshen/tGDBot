@@ -75,7 +75,14 @@ const PATTERNS: readonly SecretPattern[] = [
   // under a check the README advertises as covering GitHub tokens. Open-ended
   // length because a refresh token runs far past thirty-six characters, and a
   // `{36}` body followed by `\b` cannot match one.
-  { label: "a GitHub OAuth or app token", pattern: /\bgh[ousr]_[A-Za-z0-9]{36,}\b/u },
+  { label: "a GitHub OAuth or app token", pattern: /\bgh[our]_[A-Za-z0-9]{36,}\b/u },
+  // `ghs_` is separate because its shape diverged: GitHub's stateless
+  // installation tokens are `ghs_APPID_JWT`, ~520 characters with dots
+  // separating the JWT segments. An alphanumeric-only body stops at the first
+  // dot and then fails `\b`, so a live installation token read as clean. No
+  // `\b` terminator for the same reason the Google key has none: a token
+  // ending in `.` or `-` has no word/non-word transition to close on.
+  { label: "a GitHub installation token", pattern: /\bghs_[A-Za-z0-9._-]{36,}/u },
   { label: "a GitHub fine-grained token", pattern: /\bgithub_pat_[A-Za-z0-9_]{22,}\b/u },
   // A trailing `-` is legal in the suffix, and `\b` needs a word/non-word
   // transition — so a key ending in `-` inside quotes matched nothing at all.
@@ -100,6 +107,15 @@ const PATTERNS: readonly SecretPattern[] = [
 ];
 
 /**
+ * "a, b and c" — the labels already read as noun phrases ("an AWS access key
+ * id"), so they only need joining.
+ */
+function formatList(labels: readonly string[]): string {
+  if (labels.length === 1) return labels[0] as string;
+  return `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1] as string}`;
+}
+
+/**
  * Credentials introduced by this pull request.
  *
  * ADDED lines only. A secret already present at the base was not introduced
@@ -114,8 +130,13 @@ export function detectCommittedSecrets(diff: string): Finding[] {
   const findings: Finding[] = [];
   for (const [file, lines] of addedLinesByFile(diff)) {
     for (const [line, text] of lines) {
-      for (const { label, pattern } of PATTERNS) {
-        if (!pattern.test(text)) continue;
+      // EVERY matching format, not the first. One finding per line is still
+      // right — a line is one mistake — but naming only the first meant a line
+      // carrying an AWS key and a GitHub token told the author to rotate one
+      // of them, and which one depended on the order of this array.
+      const matched = PATTERNS.filter(({ pattern }) => pattern.test(text)).map((p) => p.label);
+      if (matched.length > 0) {
+        const label = formatList(matched);
         findings.push({
           file,
           line,
@@ -139,9 +160,6 @@ export function detectCommittedSecrets(diff: string): Finding[] {
           // model. The message omitting it is not sufficient on its own.
           redactSource: true,
         });
-        // One finding per line: a line matching two formats is one mistake, and
-        // reporting it twice would make the count say otherwise.
-        break;
       }
     }
   }

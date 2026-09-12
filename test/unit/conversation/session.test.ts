@@ -7,7 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
-import type { DispatchSession } from "../../../src/review/dispatch.js";
+import type { DispatchSession } from "../../../src/review/dispatch-session.js";
 
 const hoisted = vi.hoisted(() => {
   const resourceLoaderInstances: { options: Record<string, unknown> }[] = [];

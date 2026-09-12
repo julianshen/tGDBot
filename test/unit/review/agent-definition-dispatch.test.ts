@@ -26,7 +26,7 @@ function makeRule(overrides: Partial<RuleDefinition> = {}): RuleDefinition {
 }
 
 const baseDefs: AgentDefinition[] = [
-  { name: "docs-reviewer", tools: ["read"], body: "Focus on documentation.", sourcePath: "/agents/docs.agent.md" },
+  { name: "docs-reviewer", tools: ["read"], body: "Focus on documentation.", delegate: false, sourcePath: "/agents/docs.agent.md" },
 ];
 
 describe("dispatchRulesDirect — agent definitions (#138 phase 2)", () => {
@@ -92,7 +92,7 @@ describe("dispatchRulesDirect — agent definitions (#138 phase 2)", () => {
     };
 
     const modelDefs: AgentDefinition[] = [
-      { name: "cheap-reviewer", tools: ["read"], provider: "openai", model: "gpt-4.1-mini", body: "", sourcePath: "/c.md" },
+      { name: "cheap-reviewer", tools: ["read"], provider: "openai", model: "gpt-4.1-mini", body: "", delegate: false, sourcePath: "/c.md" },
     ];
 
     await dispatchRulesDirect(

@@ -16,12 +16,13 @@ describe("parseCommandArgs", () => {
   it("parses poll with its required repository and shared flags", () => {
     expect(parseCommandArgs([
       "poll", "--repo", "owner/repo", "--model", "openai/gpt-5",
-      "--dispatch", "direct", "--advisor", "off", "--state-dir", "/tmp/tgd-state",
+      "--advisor", "off", "--state-dir", "/tmp/tgd-state",
     ])).toMatchObject({
       command: "poll",
       repo: "owner/repo",
       model: "openai/gpt-5",
       dispatch: "direct",
+      subagentNesting: "off",
       advisor: "off",
       stateDir: "/tmp/tgd-state",
     });
@@ -47,6 +48,7 @@ describe("parseCommandArgs", () => {
       dryRun: false,
       trustLocalRules: false,
       dispatch: "direct",
+      subagentNesting: "off",
       maxDiffChars: undefined,
       context: "auto",
       contextMapper: "tgd",
@@ -100,6 +102,7 @@ describe("parseArgs", () => {
       dryRun: false,
       trustLocalRules: false,
       dispatch: "direct",
+      subagentNesting: "off",
       maxDiffChars: undefined,
       context: "auto",
       contextMapper: "tgd",
@@ -127,8 +130,8 @@ describe("parseArgs", () => {
       "on",
       "--dry-run",
       "--trust-local-rules",
-      "--dispatch",
-      "legacy",
+      "--subagent-nesting",
+      "on",
       "--context",
       "require",
       "--context-mapper",
@@ -159,7 +162,8 @@ describe("parseArgs", () => {
       suggestions: "on",
       dryRun: true,
       trustLocalRules: true,
-      dispatch: "legacy",
+      dispatch: "direct",
+      subagentNesting: "on",
       context: "require",
       contextMapper: "graphify",
       contextMaxChars: 12_000,
@@ -168,20 +172,39 @@ describe("parseArgs", () => {
     });
   });
 
-  // Design-review P0: --dispatch selects the engine (direct is the default).
-  describe("--dispatch", () => {
-    it("defaults to direct", () => {
+  // #138 phase 4: one engine. The FIELD survives the deleted flag because it
+  // is part of the dedup config hash and of persisted conversation state —
+  // dropping it would change every hash in the wild and cost a spurious
+  // re-review of every open pull request.
+  describe("the dispatch engine", () => {
+    it("is always direct", () => {
       expect(parseArgs(["review", "--pr", "42"]).dispatch).toBe("direct");
     });
 
-    it("accepts legacy", () => {
-      expect(parseArgs(["review", "--pr", "42", "--dispatch", "legacy"]).dispatch).toBe("legacy");
+    it("no longer accepts --dispatch at all", () => {
+      // Including "direct": a flag that silently accepts the only remaining
+      // value would keep scripts working while quietly meaning nothing.
+      expect(() => parseArgs(["review", "--pr", "42", "--dispatch", "legacy"])).toThrow();
+      expect(() => parseArgs(["review", "--pr", "42", "--dispatch", "direct"])).toThrow();
+    });
+  });
+
+  // #138 phase 3.
+  describe("--subagent-nesting", () => {
+    it("defaults off", () => {
+      // Unproven, and every delegation is real model spend the operator did
+      // not ask for directly.
+      expect(parseArgs(["review", "--pr", "42"]).subagentNesting).toBe("off");
+    });
+
+    it("accepts on", () => {
+      expect(parseArgs(["review", "--pr", "42", "--subagent-nesting", "on"]).subagentNesting)
+        .toBe("on");
     });
 
     it("rejects anything else with an error naming the flag", () => {
-      expect(() => parseArgs(["review", "--pr", "42", "--dispatch", "turbo"])).toThrow(
-        /--dispatch/,
-      );
+      expect(() => parseArgs(["review", "--pr", "42", "--subagent-nesting", "maybe"]))
+        .toThrow(/--subagent-nesting/u);
     });
   });
 
