@@ -286,4 +286,14 @@ export interface ReviewDispatchInput {
    * is unset or loads nothing.
    */
   agentDefinitions?: readonly AgentDefinition[];
+  /**
+   * Issue #138 phase 3: whether a persona declaring `delegate: true` may
+   * request a host-mediated deep dive. Off unless `--subagent-nesting on`.
+   */
+  subagentNesting?: "on" | "off";
+  /**
+   * Paths the diff touches, for the delegation gate. The host derives these; a
+   * reviewer may only deep-dive a file this pull request actually changes.
+   */
+  changedFiles?: readonly string[];
 }

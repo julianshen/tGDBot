@@ -435,7 +435,6 @@ tgd-review-agent review \
                                   # request. A bundled popular-package list and registry download
                                   # counts are not consulted.
                                   # A manifest that cannot be read is named as unexamined.
-                                  # Carried by BOTH dispatch engines.
                                   # See examples/rules/dependency-currency.md
   --model <provider>/<model>     # optional: the DEFAULT model. Runs the review's orchestrating
                                   # session AND any rule that doesn't pin its own provider/model
@@ -454,12 +453,14 @@ tgd-review-agent review \
                                   # and the diff exceeds it, the run SKIPS with a visible notice
                                   # (exit 0, nothing posted) instead of silently spending. Absent =
                                   # unlimited. The status line then carries reason: "diff-too-large".
-  --dispatch direct|legacy       # default: direct. "direct" runs one reviewer session per rule via
-                                  # the pi SDK's public API and merges findings deterministically in
-                                  # code — no orchestrating LLM on the data path, so attribution and
-                                  # accounting are exact by construction. "legacy" is the previous
-                                  # LLM-orchestrated pi-subagents fan-out, kept for one release as an
-                                  # escape hatch.
+  --agents-dir <path>            # optional ABSOLUTE path to a directory of `*.agent.md` reviewer
+                                  # personas. A rule opts into one with `agent: <name>` in its own
+                                  # frontmatter. See "Reviewer personas" below.
+  --subagent-nesting on|off      # default: off. Lets a persona declaring `delegate: true` ask the
+                                  # HOST for a file-scoped second look at ONE file the PR changes.
+                                  # The host spawns and harvests it; the parent never handles the
+                                  # child's findings. Unproven and billed per delegation, so it
+                                  # stays opt-in. See "Reviewer personas" below.
   --context off|auto|require     # default: auto. Gives every rule a TRUSTED-BASE map of the code
                                   # the diff is changing — the knowledge-graph neighbourhood of the
                                   # changed files, the domain flows touching them — so a reviewer can
@@ -679,6 +680,108 @@ map can drop whole evidence entries and report the omission counts while a list
 of dependency facts cannot be cut mid-claim. The repository map keeps a floor of
 4000 characters, so a very large dependency section is the one case where the
 combined text exceeds the ceiling.
+
+## Reviewer personas
+
+A **subagent definition** is a reviewer persona as a reusable file: a model
+tier, a tool scope, and prose. It is not a delegation protocol. The host still
+resolves rules, compiles waves, and spawns one session per task — "subagent"
+here means *an agent session scoped by a definition file*, an ownership
+boundary and nothing more.
+
+There is **no orchestrating LLM anywhere on the data path**, and that is the
+property everything below is arranged to protect.
+
+Definitions live in `--agents-dir` as `*.agent.md`:
+
+```markdown
+---
+name: docs
+tools: read, grep          # optional: a SUBSET of read/grep/find/ls/submit_findings
+provider: anthropic        # optional, and only with `model`
+model: claude-sonnet-5
+path_scope: ["**/*.md"]    # optional: bounds host-mediated path requests
+delegate: false            # optional: may request a nested deep dive
+---
+
+You review documentation changes. Prefer precision about what a reader will
+actually do over stylistic preference.
+```
+
+A rule opts in by name:
+
+```yaml
+---
+name: docs-review
+agent: docs
+---
+```
+
+### What a definition can and cannot do
+
+**It can only narrow.** `tools` is validated against the read-only set, so a
+file asking for `bash` is a load error rather than a shell. An unknown tool
+name is an error too, never a silent drop — a typo'd `grpe` would otherwise
+produce a reviewer missing grep with no explanation anywhere.
+
+**An unknown frontmatter key is a load error.** `path_scpoe` parses cleanly,
+leaves the scope undefined, and would then permit everything: a typo producing
+the *widest* configuration from a file written to narrow.
+
+**Its model pin applies only to unpinned rules.** A rule's own `provider`/`model`
+is the more specific statement and keeps its pin; a persona's tier fills in for
+rules that inherited the deployment default.
+
+**An unknown `agent:` reference is a warning, not a failure.** The rule runs
+with the standard persona and the run says so — additive, never a cliff.
+
+### `path_scope` is not a filesystem sandbox
+
+It bounds the paths a reviewer may name in a **host-mediated request** — today,
+a `delegate` target. It does not sandbox the reviewer's own `read`/`grep`
+tools, and the reason it does not need to is worth stating plainly: every
+reviewer session runs in an empty temporary directory with the repository never
+mounted. A reviewer works from the embedded diff and the host-built context
+packs, so `read` reaches nothing to scope in the first place.
+
+That means a docs-scoped reviewer and an unscoped one have identical *reach*
+today — zero. `path_scope` earns its keep only once nesting is on, which is
+where a path is genuinely acted on.
+
+### Host-mediated nesting (`--subagent-nesting on`)
+
+A persona declaring `delegate: true` may ask for a closer look at one file. It
+cannot perform one. The parent names a file and a question; the host decides
+whether that is allowed, builds the child's prompt itself, spawns the child,
+harvests its `findings.json`, and merges it. The parent receives a short digest
+— titles and locations — for its own reasoning.
+
+Nothing the parent says afterwards can add, remove, or edit a child finding.
+That asymmetry is the whole design: if the child's findings came back as text
+for the parent to relay, an LLM would be back on the data path between a
+reviewer and the merge, which is the exact relay that produced the legacy
+engine's whole-rule drops and misattribution.
+
+The host refuses a delegation that:
+
+- names a file this pull request does not change (checked before the persona's
+  own scope, and not configurable);
+- falls outside the persona's `path_scope`;
+- comes from a persona that did not declare `delegate`, or from a rule with no
+  persona at all;
+- exceeds three delegations **for the whole review** — the budget is shared by
+  every rule's tool, not one each, and a failure consumes it so a failing
+  delegation is not retryable without limit.
+
+The parent's question is enclosed in a content-derived boundary token, so a
+question containing what looks like a closing marker cannot step outside the
+section the child was told to treat as data.
+
+Depth is fixed at one by construction: the child is created without the
+`delegate` tool, so it cannot call what it does not have.
+
+Off by default. It is unproven, and every delegation is real model spend the
+operator did not ask for directly.
 
 ## Host security detectors
 

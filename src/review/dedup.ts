@@ -28,7 +28,7 @@ export interface ReviewConfigForDedup {
    * adding this field changed every pre-existing hash — one extra (safe)
    * re-review per open PR after upgrading, then hashes are stable again.
    */
-  dispatch: "direct" | "legacy";
+  dispatch: "direct";
   /**
    * PR #54 review: this decides whether a review can see registry facts at
    * all, so flipping it must re-trigger on an unchanged head. Optional so the
@@ -45,6 +45,8 @@ export interface ReviewConfigForDedup {
   structuralChecks?: "on" | "off";
   /** Issue #139: the host security detectors. */
   securityPass?: "on" | "off";
+  /** Issue #138 phase 3: whether a permitted persona may delegate. */
+  subagentNesting?: "on" | "off";
   /**
    * Issue #59: whether the PR's stated intent reaches the reviewer. Read by
    * the CLI caller to decide whether the intent digest joins the fingerprint
@@ -166,6 +168,12 @@ export function computeReviewConfigHash(
     // an unrelated change moved the hash — enabling the feature appeared to do
     // nothing (Codex review of PR #147).
     ...(config.securityPass === "on" ? ["security-pass"] : []),
+    // #138 phase 3, guarded for the same reason as the entries above: a
+    // repository that never enables nesting keeps its hash and pays no
+    // spurious re-review on upgrade. Turning it on changes what a review can
+    // DO, so it must re-review an unchanged head — otherwise enabling the
+    // feature appears to do nothing until an unrelated commit moves the hash.
+    ...(config.subagentNesting === "on" ? ["subagent-nesting"] : []),
     // Appending this field intentionally changes every legacy config hash:
     // each open review runs once after upgrade, then remains stable again.
     relatedWorkFingerprint ?? null,

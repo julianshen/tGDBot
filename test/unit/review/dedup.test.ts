@@ -142,7 +142,9 @@ describe("computeReviewConfigHash", () => {
     expect(computeReviewConfigHash(makeConfig({ trustLocalRules: true }))).not.toBe(base);
     expect(computeReviewConfigHash(makeConfig({ rulesDir: "other/rules" }))).not.toBe(base);
     expect(computeReviewConfigHash(makeConfig({ model: "openai-codex/gpt-5.6-terra" }))).not.toBe(base);
-    expect(computeReviewConfigHash(makeConfig({ dispatch: "legacy" }))).not.toBe(base);
+    // `dispatch` no longer varies — #138 phase 4 left one engine, and the
+    // field is pinned to "direct". It stays IN the hash (removing it would
+    // change every hash in the wild), so there is nothing left to flip here.
   });
 
   it("normalizes rulesDir separators so the same logical dir hashes identically across OSes", () => {

@@ -151,15 +151,6 @@ const NOT_PERSISTED: Partial<Record<keyof Finding, string>> = {
  * not at risk in the same way. Listed explicitly so a new field forces the
  * question rather than defaulting to silence.
  */
-const NOT_COPIED_THROUGH: Partial<Record<keyof Finding, string>> = {
-  redactSource: "never present in reviewer output, so there is nothing to copy through",
-  hostCheck: "never emitted by a task in the first place — see NOT_IN_RULE_CONTRACT",
-  file: "structural; the aggregator carries it, not the prose of it",
-  line: "structural, as above",
-  severity: "a closed vocabulary, not free text",
-  category: "a short label the orchestrator has no reason to rewrite",
-  ruleName: "stamped by the dispatcher, never authored by the rule",
-};
 
 /** Fields the builtin reviewer agent is deliberately never asked to produce. */
 const NOT_IN_REVIEWER_AGENT: Partial<Record<keyof Finding, string>> = {
@@ -257,25 +248,13 @@ describe("every Finding field is described to the model", () => {
     }
   });
 
-  // The aggregator re-declares the schema and separately instructs the
-  // orchestrator which fields to copy through verbatim; a field missing from
-  // either is dropped on the legacy dispatch path.
-  it("appears in the aggregator schema", () => {
-    // The aggregator re-declares the schema on one line, and separately lists
-    // the fields to copy through verbatim. Both are checked: a field missing
-    // from the schema is never requested, and one missing from the copy-through
-    // list is requested and then discarded in the merge.
-    const prompt = sourceText("review/dispatch-prompt.ts");
-    const schema = schemaLine(prompt, '"rulesRun": string[]');
-    const copyThrough = schemaLine(prompt, "through EXACTLY as the task emitted them");
-
-    for (const field of FIELDS) {
-      if (NOT_IN_RULE_CONTRACT[field] && NOT_COPIED_THROUGH[field]) continue;
-      expect(schema, `the aggregator schema omits ${field}`).toContain(`"${field}"`);
-      if (NOT_COPIED_THROUGH[field]) continue;
-      expect(copyThrough, `the aggregator never copies ${field} through`).toContain(`"${field}"`);
-    }
-  });
+  // The aggregator test that stood here is gone with the aggregator (#138
+  // phase 4). It asserted that the orchestrating LLM's merge prompt re-declared
+  // every field AND listed it as copy-through-verbatim, because a field missing
+  // from either was dropped in the relay. There is no relay now: a finding
+  // travels from its own rule's session to the host merge as a file, so the
+  // only place a field can be lost is the per-rule contract above, which is
+  // still checked.
 
   it("appears in the builtin reviewer agent contract", () => {
     const schema = schemaLine(sourceText("review/builtin-agents/reviewer.md"), '"severity"');
@@ -292,7 +271,6 @@ describe("every Finding field is described to the model", () => {
     const excepted = [
       ...Object.keys(NOT_IN_RULE_CONTRACT),
       ...Object.keys(NOT_IN_REVIEWER_AGENT),
-      ...Object.keys(NOT_COPIED_THROUGH),
       ...Object.keys(NOT_FROM_REVIEWER),
       ...Object.keys(NOT_PERSISTED),
     ];

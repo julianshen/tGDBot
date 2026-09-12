@@ -37,7 +37,7 @@ export interface SharedReviewOptions {
   /** Opts into loading rules from the local filesystem instead of the trusted base branch. */
   trustLocalRules: boolean;
   /** Selects direct deterministic rule dispatch or the temporary legacy orchestrator. */
-  dispatch: "direct" | "legacy";
+  dispatch: "direct";
   /** Hard diff-size cost ceiling; absent means unlimited. */
   maxDiffChars?: number;
   /**
@@ -61,6 +61,8 @@ export interface SharedReviewOptions {
   contextDir?: string;
   /** Issue #138 phase 2: absolute path to agent definition files (.agent.md). */
   agentsDir?: string;
+  /** Issue #138 phase 3: whether a permitted persona may request a nested deep dive. */
+  subagentNesting: "on" | "off";
   stateDir?: string;
   /** Codex Security artifact produced by a separate, sandboxed job. */
   codexScanResults?: string;
@@ -83,6 +85,10 @@ const DEFAULTS = {
   rulesDir: ".review/rules",
   disableBuiltinRule: false,
   advisor: "on" as const,
+  // Nesting stays OFF by default: it is unproven (#138 gates it pending data),
+  // and every delegation is real model spend the operator did not ask for
+  // directly.
+  subagentNesting: "off" as const,
   dependencyFacts: "off" as const,
   // Off for v1: it needs a base worktree, which on a cold managed workspace
   // means a clone. Opt in until that cost is measured rather than assumed.
@@ -126,13 +132,13 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       "dry-run": { type: "boolean" },
       "trust-local-rules": { type: "boolean" },
       "max-diff-chars": { type: "string" },
-      dispatch: { type: "string" },
       context: { type: "string" },
       "context-mapper": { type: "string" },
       "context-max-chars": { type: "string" },
       "allow-degraded-context": { type: "boolean" },
       "context-dir": { type: "string" },
       "agents-dir": { type: "string" },
+      "subagent-nesting": { type: "string" },
       "state-dir": { type: "string" },
       "codex-scan-results": { type: "string" },
     },
@@ -206,11 +212,6 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     throw new Error(`Invalid --suggestions value: "${suggestions}" (expected "on" or "off")`);
   }
 
-  const dispatch = (values.dispatch as string | undefined) ?? DEFAULTS.dispatch;
-  if (dispatch !== "direct" && dispatch !== "legacy") {
-    throw new Error(`Invalid --dispatch value: "${dispatch}" (expected "direct" or "legacy")`);
-  }
-
   const model = values.model as string | undefined;
   if (model !== undefined) {
     const slash = model.indexOf("/");
@@ -272,6 +273,14 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
   // Issue #138 phase 2: where agent definition files (.agent.md) live.
   // Absent means no agent definitions are loaded — rules run with the
   // standard reviewer persona. When present, must be an absolute path.
+  const subagentNesting =
+    (values["subagent-nesting"] as string | undefined) ?? DEFAULTS.subagentNesting;
+  if (subagentNesting !== "on" && subagentNesting !== "off") {
+    throw new Error(
+      `Invalid --subagent-nesting value: "${subagentNesting}" (expected "on" or "off")`,
+    );
+  }
+
   const agentsDir = values["agents-dir"] as string | undefined;
   if (agentsDir !== undefined && (agentsDir.length === 0 || !path.isAbsolute(agentsDir))) {
     throw new Error(`Invalid --agents-dir value: "${agentsDir}" (expected an absolute path)`);
@@ -292,7 +301,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
     vcs,
     model,
     maxDiffChars,
-    dispatch,
+    dispatch: DEFAULTS.dispatch,
     context,
     contextMapper,
     contextMaxChars,
@@ -300,6 +309,7 @@ export function parseCommandArgs(argv: string[]): CommandArgs {
       (values["allow-degraded-context"] as boolean | undefined) ?? DEFAULTS.allowDegradedContext,
     contextDir,
     agentsDir,
+    subagentNesting,
     rulesDir: (values["rules-dir"] as string | undefined) ?? DEFAULTS.rulesDir,
     disableBuiltinRule: (values["disable-builtin-rule"] as boolean | undefined) ?? DEFAULTS.disableBuiltinRule,
     advisor,

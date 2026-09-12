@@ -43,19 +43,26 @@ import {
   getAgentDir,
   SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import type { CreateAgentSessionOptions } from "@earendil-works/pi-coding-agent";
+import type { CreateAgentSessionOptions, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import matter from "gray-matter";
 import type { EffectiveRule } from "../rules/types.js";
-import { buildTaskText } from "./dispatch-prompt.js";
+import { buildTaskText, warnIfDiffCostRisk } from "./dispatch-prompt.js";
 import { createSubmitFindingsTool, readSubmittedFindings, ruleDirName } from "./findings-file.js";
 import { resolveAgentDefinition, type AgentDefinition } from "./agent-definition.js";
+import {
+  createDelegateTool,
+  createDelegationBudget,
+  type DelegationRunner,
+  type RegisteredDelegateTool,
+} from "../agents/delegate.js";
+import { makeDelegationRunner } from "../agents/delegate-runner.js";
 import {
   classifyTaskFailure,
   extractFindingsArray,
   parseFindingsFromFinalOutput,
   referencesDeclaredBy,
 } from "./dispatch-results.js";
-import type { DispatchSession } from "./dispatch.js";
+import type { DispatchSession } from "./dispatch-session.js";
 import { resolveRpivAdvisorExtensionPath } from "./extensions.js";
 import {
   resolveEffectiveRules,
@@ -77,6 +84,8 @@ export type DirectSessionFactory = (
   outputDir: string,
   /** Issue #138 phase 2: resolved persona, if the rule named one. */
   definition?: AgentDefinition,
+  /** Issue #138 phase 3: the gated, budgeted delegate tool, when nesting is on. */
+  delegate?: RegisteredDelegateTool,
 ) => Promise<DispatchSession>;
 
 /** Creates the (single) advisor session for the --advisor pass. */
@@ -91,6 +100,15 @@ export interface DirectDispatchDeps {
   advisorTimeoutMs?: number;
   /** Issue #138 phase 2: loaded agent definitions, resolved per rule. */
   readonly agentDefinitions?: readonly AgentDefinition[];
+  /**
+   * Issue #138 phase 3: spawns and harvests one delegated child.
+   *
+   * A TEST override. The real runner is built inside dispatch, which is the
+   * only place holding the cwd and session factory it needs — an injected-only
+   * seam would make `--subagent-nesting on` parse, pass every gate, and then
+   * silently withhold the tool.
+   */
+  runDelegation?: DelegationRunner;
 }
 
 // CodeRabbit review (PR #7): a hung provider call must not block Promise.all
@@ -152,6 +170,8 @@ async function createRealDirectSession(
   cwd: string,
   outputDir: string,
   definition?: AgentDefinition,
+  /** Issue #138 phase 3: built by the caller, which owns the gate and budget. */
+  delegate?: RegisteredDelegateTool,
 ): Promise<DispatchSession> {
   // Credential gate BEFORE any session exists: a rule pinned to a provider
   // this machine can't authenticate must fail with the classified reason,
@@ -186,7 +206,10 @@ async function createRealDirectSession(
   const { session } = await createAgentSession({
     resourceLoader: loader,
     cwd,
-    tools: [...(definition?.tools ?? ["read", "grep", "find", "ls", "submit_findings"])],
+    tools: [
+      ...(definition?.tools ?? ["read", "grep", "find", "ls", "submit_findings"]),
+      ...(delegate ? ["delegate"] : []),
+    ],
     customTools: [
       // Issue #138 phase 1: the findings file contract. A single host-mediated
       // tool whose write path is baked into the closure; the model supplies
@@ -197,6 +220,9 @@ async function createRealDirectSession(
         ruleName: rule.name,
         allowedReferences: referencesDeclaredBy(rule.body),
       }),
+      // Issue #138 phase 3. Registered only when the caller built one, which
+      // it does only when the flag, the definition, and a runner all agree.
+      ...(delegate ? [delegate as unknown as ToolDefinition] : []),
     ],
     model: resolved.model,
     ...(resolved.thinkingLevel
@@ -359,9 +385,33 @@ interface RuleOutcome {
       readonly failureReason?: string;
     }
 
+    // The diff is embedded once per rule (fresh sessions), so a large diff
+    // times many rules is a real cost an operator should see before the
+    // provider bills for it. Inherited from the deleted orchestrating engine,
+    // which scaled exactly the same way.
+    warnIfDiffCostRisk(effective, diff, validatedContext.packsByRule, prIntent);
+
     const agentDefinitions = deps.agentDefinitions ?? input.agentDefinitions ?? [];
+    // ONE budget for the review, shared by every rule's tool. A counter per
+    // tool bounds the wrong noun: ten rules could make thirty delegations
+    // while the documentation promises three.
+    const delegationBudget = createDelegationBudget();
+
     const runRule = async (rule: EffectiveRule): Promise<RuleOutcome> => {
       let session: DispatchSession | undefined;
+      const outputDir = path.join(findingsDir as string, ruleDirName(rule.name));
+      // Issue #138 phase 3: child findings land here, placed by the HOST when
+      // it harvests a child's file. The parent never touches this array, which
+      // is what keeps an LLM off the path between a child and the merge.
+      const harvested: Finding[] = [];
+      // Every exit path returns THROUGH here, including the throwing ones: a
+      // parent that delegated and then failed still contributes what its child
+      // established, and the child's findings reached the host by file rather
+      // than through the parent's prose.
+      const withHarvest = (outcome: RuleOutcome): RuleOutcome =>
+        harvested.length === 0
+          ? outcome
+          : { ...outcome, findings: [...outcome.findings, ...harvested] };
       try {
         const definition = resolveAgentDefinition(rule.agent, agentDefinitions);
         if (rule.agent !== undefined && definition === undefined) {
@@ -370,8 +420,38 @@ interface RuleOutcome {
               `running with the standard persona`,
           );
         }
+        // The DEFAULT runner is built here rather than by the caller, because
+        // it needs this function's cwd and session factory — neither of which
+        // `cli.ts` has.
+        const nesting = input.subagentNesting === "on" && definition?.delegate === true;
+        const runDelegation: DelegationRunner | undefined =
+          deps.runDelegation ??
+          (nesting
+            ? makeDelegationRunner(rule, definition, {
+                // The child gets NO delegate tool: depth is fixed at one by
+                // construction, and an absent tool cannot be called.
+                createChildSession: (childRule, childCwd, childOut, childScope) =>
+                  createSession(childRule, childCwd, childOut, childScope.agent),
+                cwd: cwd as string,
+                diff,
+                timeoutMs: ruleTimeoutMs,
+                withTimeout,
+              })
+            : undefined);
+        const delegate = nesting && runDelegation !== undefined
+          ? createDelegateTool({
+              parentRule: rule.name,
+              agent: definition,
+              nestingEnabled: true,
+              changedFiles: input.changedFiles ?? [],
+              outputDir,
+              run: runDelegation,
+              harvested,
+              budget: delegationBudget,
+            })
+          : undefined;
         session = await withTimeout(
-          createSession(rule, cwd as string, path.join(findingsDir as string, ruleDirName(rule.name)), definition),
+          createSession(rule, cwd as string, outputDir, definition, delegate),
           ruleTimeoutMs,
           `rule "${rule.name}" session creation timed out after ${ruleTimeoutMs}ms`,
         );
@@ -393,7 +473,7 @@ interface RuleOutcome {
           allowedReferences: referencesDeclaredBy(rule.body),
         });
         if (submitted !== undefined) {
-          return { ruleName: rule.name, succeeded: true, findings: submitted };
+          return withHarvest({ ruleName: rule.name, succeeded: true, findings: submitted });
         }
         const text = session.getLastAssistantText();
         // extractFindingsArray distinguishes "no parseable findings array"
@@ -414,15 +494,15 @@ interface RuleOutcome {
             `dispatchRulesDirect: rule "${rule.name}" produced no parseable findings array; ` +
               `it returned: ${excerpt}`,
           );
-          return { ruleName: rule.name, succeeded: false, findings: [], failureReason };
+          return withHarvest({ ruleName: rule.name, succeeded: false, findings: [], failureReason });
         }
-        return {
+        return withHarvest({
           ruleName: rule.name,
           succeeded: true,
           // The rule that ran is known here, so its declared citations can be
           // honoured — unlike the legacy orchestrator's merged output (#49).
           findings: parseFindingsFromFinalOutput(text, rule.name, referencesDeclaredBy(rule.body)),
-        };
+        });
       } catch (err) {
         const timedOut = err instanceof PromptTimeoutError;
         const message = (err as Error).message;
@@ -443,7 +523,7 @@ interface RuleOutcome {
         console.warn(
           `dispatchRulesDirect: rule "${rule.name}" (${rule.provider}/${rule.model}) failed: ${message}`,
         );
-        return { ruleName: rule.name, succeeded: false, findings: [], failureReason };
+        return withHarvest({ ruleName: rule.name, succeeded: false, findings: [], failureReason });
       }
     };
 

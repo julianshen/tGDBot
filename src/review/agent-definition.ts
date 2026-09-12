@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import matter from "gray-matter";
+import { globToRegExp, normalizeGlobPath } from "../rules/glob.js";
 
 export interface AgentDefinition {
   readonly name: string;
@@ -36,6 +37,19 @@ export interface AgentDefinition {
   readonly tools: readonly string[];
   readonly provider?: string;
   readonly model?: string;
+  /**
+   * Issue #138 phase 3: globs bounding every path this persona may name in a
+   * HOST-MEDIATED request — today, a `delegate` target.
+   *
+   * Deliberately NOT a filesystem sandbox over the reviewer's own read tools.
+   * Every reviewer session runs in an empty temp cwd with the repository never
+   * mounted, so `read`/`grep`/`find`/`ls` reach nothing to scope; a persona
+   * works from the embedded diff and the host-built context packs. Presenting
+   * this as a sandbox would claim a property it does not deliver.
+   */
+  readonly pathScope?: readonly string[];
+  /** Issue #138 phase 3: whether this persona may request a nested deep dive. */
+  readonly delegate: boolean;
   /** Additional system-prompt instructions, prepended to the reviewer base. */
   readonly body: string;
   readonly sourcePath: string;
@@ -54,6 +68,11 @@ export const ALLOWED_DEFINITION_TOOLS = new Set([
   "read", "grep", "find", "ls", "submit_findings",
 ]);
 
+/** Every frontmatter key a definition may carry. Anything else is a load error. */
+const KNOWN_DEFINITION_FIELDS: ReadonlySet<string> = new Set([
+  "name", "tools", "provider", "model", "path_scope", "delegate",
+]);
+
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
@@ -70,6 +89,22 @@ function parseAgentDefinitionFile(
     return { error: `agent definition has malformed YAML frontmatter: ${message}` };
   }
   const data = parsed.data as Record<string, unknown>;
+
+  // An unknown key is a LOAD ERROR, not ignorable metadata. `path_scpoe`
+  // parses cleanly, leaves `pathScope` undefined, and `withinPathScope` then
+  // permits every file — a typo producing the WIDEST configuration from a file
+  // written to narrow. A misspelled `tools` grants the full default set the
+  // same way. Fail-closed is unavailable (an unknown key could mean anything),
+  // so fail LOUDLY (CodeRabbit review of PR #149).
+  const unknownField = Object.keys(data).find((key) => !KNOWN_DEFINITION_FIELDS.has(key));
+  if (unknownField !== undefined) {
+    return {
+      error:
+        `agent definition has unknown frontmatter field "${unknownField}" — known fields are ` +
+        `${[...KNOWN_DEFINITION_FIELDS].join(", ")}. A misspelled field is silently ignored, and ` +
+        `for "tools" or "path_scope" that means the persona runs UNSCOPED`,
+    };
+  }
 
   if (!isNonEmptyString(data.name)) {
     return { error: `agent definition is missing required frontmatter field "name"` };
@@ -121,12 +156,42 @@ function parseAgentDefinitionFile(
     };
   }
 
+  // Issue #138 phase 3. Compiled here so an unusable pattern names the file,
+  // rather than becoming a scope that silently matches nothing — which, for a
+  // scope, fails CLOSED and would strand the persona with no way to see why.
+  let pathScope: string[] | undefined;
+  if (data.path_scope !== undefined) {
+    const candidates = Array.isArray(data.path_scope) ? data.path_scope : [data.path_scope];
+    if (candidates.length === 0 || !candidates.every(isNonEmptyString)) {
+      return { error: `frontmatter field "path_scope" must be a non-empty string or an array of them` };
+    }
+    for (const candidate of candidates as string[]) {
+      try {
+        globToRegExp(candidate);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          error: `frontmatter field "path_scope" contains an unusable pattern "${candidate}": ${message}`,
+        };
+      }
+    }
+    pathScope = [...(candidates as string[])];
+  }
+
+  if (data.delegate !== undefined && typeof data.delegate !== "boolean") {
+    return { error: `frontmatter field "delegate" must be a boolean` };
+  }
+
   const body = parsed.content.trim();
 
   return {
     definition: {
       name: data.name,
       tools: Object.freeze(tools),
+      ...(pathScope === undefined ? {} : { pathScope: Object.freeze(pathScope) }),
+      // Absent means NO. A capability that defaults on is one an author
+      // acquires without asking for it.
+      delegate: data.delegate === true,
       ...(hasProvider ? { provider: data.provider as string, model: data.model as string } : {}),
       body,
       sourcePath,
@@ -232,8 +297,33 @@ export function fingerprintAgentDefinitions(definitions: readonly AgentDefinitio
       tools: [...definition.tools],
       provider: definition.provider ?? null,
       model: definition.model ?? null,
+      // #138 phase 3: both change what a review DOES, so editing either must
+      // retrigger on an unchanged head — the same reason `body` is here.
+      pathScope: definition.pathScope === undefined ? null : [...definition.pathScope],
+      delegate: definition.delegate,
       body: definition.body,
     }))
     .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   return createHash("sha256").update(JSON.stringify(canonical), "utf8").digest("hex");
+}
+
+/**
+ * Whether `candidate` falls inside a persona's declared path scope.
+ *
+ * No scope means no restriction. An empty scope cannot occur — the loader
+ * rejects it — so this never has to decide whether "declared but empty" means
+ * everything or nothing, which is the ambiguity that makes fail-open scope bugs.
+ */
+export function withinPathScope(
+  definition: AgentDefinition | undefined,
+  candidate: string,
+): boolean {
+  const scope = definition?.pathScope;
+  if (scope === undefined) return true;
+  // `normalizeGlobPath`, not a local normalization: `applies_to` matching
+  // already uses it, and a scope check that normalized even slightly
+  // differently would accept a path the rest of the system reads as another —
+  // a scope BYPASS, not a cosmetic inconsistency.
+  const normalized = normalizeGlobPath(candidate.replace(/\\/gu, "/"));
+  return scope.some((glob) => globToRegExp(glob).test(normalized));
 }

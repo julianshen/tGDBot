@@ -77,7 +77,6 @@ import {
 } from "./review/comment-marker.js";
 import type { InlineRecoveryState } from "./review/comment-marker.js";
 import { dispatchRulesDirect as dispatchRulesDirectReal } from "./review/direct-dispatch.js";
-import { dispatchRules as dispatchRulesReal } from "./review/dispatch.js";
 import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./review/orchestrate.js";
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
@@ -962,21 +961,11 @@ export async function review(
   const loadRulesFn = deps.loadRules ?? loadRulesReal;
   // Task 3: both engines share one object-shaped CLI seam. The legacy adapter
   // remains positional internally until Task 4 migrates its orchestration.
+  // One engine. `--dispatch legacy` and the orchestrating-LLM path it selected
+  // were deleted in #138 phase 4, along with the correction layer that existed
+  // only to repair that engine's probabilistic merge.
   const dispatchRulesFn =
-    deps.dispatchRules ??
-    (args.dispatch === "legacy"
-      ? (input: ReviewDispatchInput) =>
-          dispatchRulesReal(
-            input.rules,
-            input.diff,
-            input.useAdvisor,
-            undefined,
-            input.orchestratorModel,
-            input.conversationContext,
-            input.contextPacks,
-            input.prIntent,
-          )
-      : (input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
+    deps.dispatchRules ?? ((input: ReviewDispatchInput) => dispatchRulesDirectReal(input, {}));
   const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
   const runStructuralChecksFn = deps.runStructuralChecks ?? runStructuralChecksReal;
   const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? withPreparedWorkspaceReal;
@@ -1723,6 +1712,14 @@ export async function review(
         ...(agentDefinitions === undefined || agentDefinitions.length === 0
           ? {}
           : { agentDefinitions }),
+        // Issue #138 phase 3: the delegation gate's inputs. A reviewer may only
+        // deep-dive a file this pull request actually changes, and that check
+        // is the host's — not configurable and not the persona's to relax.
+        // Defaulted explicitly rather than forwarded as `undefined`: a
+        // programmatically-built config may omit it, and a field whose absence
+        // and "off" mean the same thing should say "off".
+        subagentNesting: config.subagentNesting ?? "off",
+        changedFiles: changedFilesWithRenameSources(diff),
       });
   // Issue #139: host detectors CREATE findings rather than annotating them, so
   // a pull request whose only defect is a committed credential still produces
