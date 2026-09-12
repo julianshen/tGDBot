@@ -1,6 +1,7 @@
 import type { ContextPackResult } from "../context/context-pack.js";
 import type { PrIntent } from "./pr-intent.js";
 import type { StructuralCheck, StructuralClaim } from "./structural-check.js";
+import type { AttackPathResult } from "./security/attack-path.js";
 import type { RuleDefinition } from "../rules/types.js";
 import type { AgentDefinition } from "./agent-definition.js";
 
@@ -140,6 +141,22 @@ export interface Finding {
    * `suggestion` a validated field rather than free text in `message`.
    */
   hostCheck?: StructuralCheck;
+
+  /**
+   * Issue #139 stage 3: the attack path this security finding rests on.
+   *
+   * Host-attached, and never parsed from reviewer output as a whole — the
+   * stage builds it from a bounded second pass and stamps every fact's
+   * `source` itself. A reviewer emitting this key has it dropped like any
+   * other unknown field, for the same reason `hostCheck` is unforgeable: it is
+   * the part of a security finding a reader is meant to trust without
+   * re-deriving, and severity is computed from it.
+   *
+   * Present only on `category: "security"` findings, and only when the pass
+   * ran. A `not-analyzed` result is a RESULT — "we looked and could not say"
+   * must not render as "we never looked".
+   */
+  attackPath?: AttackPathResult;
 
   /**
    * Issue #139: never quote this finding's source line anywhere published.

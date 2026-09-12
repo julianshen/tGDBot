@@ -8,6 +8,7 @@
 //
 // Both are plain string builders: pure, synchronous, no I/O.
 import { describeCheck, describeCheckCompact } from "./structural-check.js";
+import { ATTACK_PATH_FIELDS, explainSeverity } from "./security/attack-path.js";
 import { crossFileGroups } from "./finding-clusters.js";
 import type { Finding, ScanCoverage } from "./types.js";
 import type { HunkSnippet } from "./diff-anchors.js";
@@ -424,6 +425,13 @@ export function renderInlineComment(
   const hostCheck = renderHostCheck(finding);
   if (hostCheck) parts.push("", hostCheck);
 
+  // Issue #139 stage 3. Beneath the host check and in the same register: the
+  // facts a severity was derived from, each labelled with who established it,
+  // so a reader who disputes the label has a specific row to dispute rather
+  // than a number to argue with.
+  const attackPath = renderAttackPath(finding);
+  if (attackPath) parts.push("", attackPath);
+
   const citations = emitsReferences(finding) ? renderReferences(finding) : undefined;
   if (citations) parts.push("", citations);
   if (options.alsoReported && options.alsoReported.length > 0) {
@@ -837,6 +845,44 @@ function compactReferenceBullets(finding: Finding, indent: string): string[] {
  * renders nothing at all — publishing the reviewer's raw assertion beside
  * host-authored prose is the confusion the reviewer/host split exists to avoid.
  */
+/**
+ * The attack-path facts, as a table under the finding.
+ *
+ * `host` and `reviewer` rows are marked differently and never interchangeably,
+ * for the reason `hostCheck` gives about itself: a reader is invited to trust
+ * a host row without re-deriving it, so it must be unmistakably not the
+ * reviewer talking about itself.
+ *
+ * An `unknown` row is RENDERED, not omitted. A table that silently dropped
+ * what could not be established would read as a complete analysis with fewer
+ * concerns, which is the false-clean-bill-of-health failure this stage exists
+ * to avoid.
+ */
+function renderAttackPath(finding: Finding): string | undefined {
+  const result = finding.attackPath;
+  if (result === undefined) return undefined;
+  if (result.status === "not-analyzed") {
+    // "We looked and could not say" must not render like "we never looked".
+    return `> **Attack path:** not analyzed — ${sanitizeInline(result.reason)}`;
+  }
+
+  const rows = ATTACK_PATH_FIELDS.map((field) => {
+    const fact = result.facts[field];
+    const origin = fact.source === "host" ? "host-established" : "reviewer";
+    return `> | \`${field}\` | \`${sanitizeInline(String(fact.value))}\` | ${origin} | ${sanitizeInline(fact.evidence)} |`;
+  });
+
+  return [
+    "> **Attack path**",
+    ">",
+    "> | Fact | Value | Established by | Evidence |",
+    "> | --- | --- | --- | --- |",
+    ...rows,
+    ">",
+    `> ${sanitizeInline(explainSeverity(finding.severity, result.facts))}`,
+  ].join("\n");
+}
+
 function hostCheckBullets(finding: Finding, indent: string, compact: boolean): string[] {
   if (finding.claim === undefined || finding.hostCheck === undefined) return [];
   return [`${indent}- ${compact

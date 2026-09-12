@@ -46,7 +46,9 @@ import {
   createPreparedClarification,
   transitionClarification,
 } from "../../../src/conversation/clarification.js";
-import { extractFileHunk, poll } from "../../../src/poll/poll.js";
+import { poll } from "../../../src/poll/poll.js";
+// Relocated to diff-anchors when the security pass needed it too (#139).
+import { extractFileHunk } from "../../../src/review/diff-anchors.js";
 import { createPiSessionStub } from "../../fixtures/pi-session-stub.js";
 import { createFastConversationStateStore } from "../../helpers/fast-state-store.js";
 import type { ConversationSessionFactory } from "../../../src/conversation/session.js";

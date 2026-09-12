@@ -81,7 +81,18 @@ import { dedupeKey, orchestrate as orchestrateReal, renderSummary } from "./revi
 import type { OrchestrationResult } from "./review/orchestrate.js";
 import type { DispatchResult, Finding, PendingRunMetrics, ReviewDispatchInput, RunMetrics } from "./review/types.js";
 import { codexScanArtifactDigest, codexScanFailureReason, ingestCodexSecurityResults } from "./review/codex-security-results.js";
-import { detectCommittedSecrets, SECRETS_RULE_NAME } from "./review/security/secrets.js";
+import {
+  HOST_SECURITY_DETECTORS,
+  RESERVED_HOST_RULE_NAMES,
+} from "./review/security/host-detectors.js";
+import { analyzeAttackPaths as analyzeAttackPathsReal } from "./review/security/analyze.js";
+import { extractFileHunk } from "./review/diff-anchors.js";
+import {
+  analysisBoundaryToken,
+  buildAnalysisPrompt,
+  createAnalysisSession,
+  parseAnalysisResponse,
+} from "./review/security/analyzer-session.js";
 import { summarizeExistingDiscussion } from "./review/existing-discussion.js";
 import type { DiscussionMemory, ExistingReviewIssue } from "./review/existing-discussion.js";
 import { extractRelatedWork, reconcileRelatedWork, relatedWorkFingerprint, safeRelatedWorkIdentifier } from "./review/related-work.js";
@@ -258,6 +269,12 @@ export interface ReviewDependencies {
    * host-authored fact is the one output a reader does not re-derive (#78).
    */
   prepareStructuralWorkspace?: typeof withPreparedWorkspaceReal;
+  /** Issue #139: the attack-path pass. Injected whole so tests never open a session. */
+  analyzeAttackPaths?: typeof analyzeAttackPathsReal;
+  /** Issue #139: answers one finding's six facts. Default opens a bounded, tool-less session. */
+  analyzeFinding?: (finding: Finding) => Promise<unknown>;
+  /** Issue #139: reads a file at HEAD, for host-established reachability. */
+  readHeadFile?: (file: string) => Promise<string | undefined>;
   now?: () => string;
 }
 
@@ -969,6 +986,7 @@ export async function review(
   const prepareContextFn = deps.prepareContext ?? prepareReviewContextReal;
   const runStructuralChecksFn = deps.runStructuralChecks ?? runStructuralChecksReal;
   const prepareStructuralWorkspaceFn = deps.prepareStructuralWorkspace ?? withPreparedWorkspaceReal;
+  const analyzeAttackPathsFn = deps.analyzeAttackPaths ?? analyzeAttackPathsReal;
   const orchestrateFn = deps.orchestrate ?? orchestrateReal;
   const fetchJsonFn = deps.fetchJson ?? fetchJsonReal;
   const createStore = deps.createStateStore ?? createConversationStateStore;
@@ -1315,7 +1333,7 @@ export async function review(
     : loadedRules.rules.filter((rule) => rule.name !== "codex-security"))
     // Reported as a load error below AND excluded here: reporting alone would
     // leave the rule dispatched under a name the host also publishes under.
-    .filter((rule) => rule.name !== SECRETS_RULE_NAME);
+    .filter((rule) => !RESERVED_HOST_RULE_NAMES.has(rule.name));
   const loadErrors = [...loadedRules.errors];
   if (config.codexScanResults !== undefined) {
     for (const reserved of loadedRules.rules.filter((rule) => rule.name === "codex-security")) {
@@ -1330,10 +1348,10 @@ export async function review(
   // produce findings a later run attributes to the host detector — and the
   // conversation policy for the name is host-owned, so `explain` would answer
   // about the host's computation rather than about the rule that ran.
-  for (const reserved of loadedRules.rules.filter((rule) => rule.name === SECRETS_RULE_NAME)) {
+  for (const reserved of loadedRules.rules.filter((rule) => RESERVED_HOST_RULE_NAMES.has(rule.name))) {
     loadErrors.push({
       sourcePath: reserved.sourcePath,
-      message: `rule name "${SECRETS_RULE_NAME}" is reserved for the host security detector`,
+      message: `rule name "${reserved.name}" is reserved for the host security detectors`,
     });
   }
 
@@ -1727,16 +1745,84 @@ export async function review(
   // through dedup, clustering, anchoring and publication like any other — which
   // is what makes them addressable in conversation and countable in metrics.
   if (config.securityPass === "on") {
+    for (const detector of HOST_SECURITY_DETECTORS) {
+      try {
+        dispatchResult.findings.push(...detector.detect(diff));
+        // Pushed whether or not it found anything: "ran and found nothing" and
+        // "did not run" are different facts, and only the second belongs absent
+        // from the summary's account of what ran.
+        dispatchResult.rulesRun.push(detector.ruleName);
+      } catch (error) {
+        // Isolated per detector: one that throws must not take the others with
+        // it, the same wave-isolation stance rule dispatch already holds.
+        dispatchResult.rulesFailed.push(detector.ruleName);
+        console.warn(
+          `tgd-review-agent: the ${detector.ruleName} detector failed (${redactedMessage(error)})`,
+        );
+      }
+    }
+  }
+  // Issue #139 stages 3-5: the attack-path pass. After discovery AND the host
+  // detectors, so every security finding this review produced is a candidate,
+  // and before orchestration, so a re-rated severity flows through dedup,
+  // clustering and publication like any other.
+  //
+  // Gated on there being candidates at all — `analyzeAttackPaths` returns
+  // immediately when there are none, so an ordinary review pays nothing.
+  if (config.securityPass === "on") {
+    // The HEAD revision, read one file at a time through the provider rather
+    // than from a worktree. A worktree would mean a second repository-lock
+    // acquisition in the same run as the structural checks', and a nested
+    // acquisition waits out the four-hour ceiling on its own pid (#144). One
+    // file per analyzed candidate is at most `MAX_ANALYZED_CANDIDATES` reads.
+    //
+    // HEAD, not base: a pull request that ADDS a handler creates a path the
+    // base tree does not contain, so a base-only analysis would miss exactly
+    // the attack surface this rates.
+    const headFiles = new Map<string, string | undefined>();
+    const readHeadFileFn = deps.readHeadFile ?? (async (file: string) => {
+      if (headFiles.has(file)) return headFiles.get(file);
+      let contents: string | undefined;
+      try {
+        contents = await config.vcsAdapter.getFileAtRef(config.locator, pr.headSha, file);
+      } catch (error) {
+        // "Could not read" and "not there" lead to the same place here — an
+        // `unknown` fact naming the gap — but the reason is worth logging,
+        // because a systematic read failure looks exactly like a repository
+        // with no supported frameworks.
+        console.warn(
+          `tgd-review-agent: could not read ${file} at HEAD for reachability ` +
+            `(${redactedMessage(error)})`,
+        );
+        contents = undefined;
+      }
+      headFiles.set(file, contents);
+      return contents;
+    });
+
+    const analyzeFindingFn = deps.analyzeFinding ?? (async (finding: Finding) => {
+      const hunk = extractFileHunk(diff, finding.file);
+      const token = analysisBoundaryToken(finding, hunk);
+      const session = await createAnalysisSession(
+        await mkdtemp(path.join(os.tmpdir(), "tgd-attack-path-")),
+        config.model,
+        [],
+      );
+      await session.prompt(buildAnalysisPrompt(finding, hunk, token));
+      return parseAnalysisResponse(session.getLastAssistantText());
+    });
+
     try {
-      dispatchResult.findings.push(...detectCommittedSecrets(diff));
-      // Pushed whether or not it found anything: "ran and found nothing" and
-      // "did not run" are different facts, and only the second belongs absent
-      // from the summary's account of what ran.
-      dispatchResult.rulesRun.push(SECRETS_RULE_NAME);
+      dispatchResult.findings = await analyzeAttackPathsFn({
+        findings: dispatchResult.findings,
+        analyze: analyzeFindingFn,
+        readHeadFile: readHeadFileFn,
+      });
     } catch (error) {
-      dispatchResult.rulesFailed.push(SECRETS_RULE_NAME);
+      // The pass REFINES severities; a review without it is the review this
+      // tool produced before #139 and is still worth publishing.
       console.warn(
-        `tgd-review-agent: the ${SECRETS_RULE_NAME} detector failed (${redactedMessage(error)})`,
+        `tgd-review-agent: the attack-path pass failed (${redactedMessage(error)})`,
       );
     }
   }

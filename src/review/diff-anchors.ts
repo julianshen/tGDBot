@@ -1015,3 +1015,49 @@ export function quoteGitPathOperand(prefix: "a" | "b", filePath: string): string
   }
   return `${quoted}"`;
 }
+
+function normalizedDiffHeaderPath(line: string): string | undefined {
+  const raw = line.slice(4).trim();
+  if (raw === "/dev/null") return undefined;
+  let decoded = raw;
+  if (raw.startsWith('"')) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (typeof parsed !== "string") return undefined;
+      decoded = parsed;
+    } catch {
+      return undefined;
+    }
+  }
+  return decoded.startsWith("a/") || decoded.startsWith("b/") ? decoded.slice(2) : decoded;
+}
+
+/**
+ * The one file's section of a unified diff, or the WHOLE diff when the file is
+ * not in it.
+ *
+ * The fallback is deliberate and belongs to the conversation path this was
+ * written for: showing too much context there costs tokens, not correctness.
+ * A caller that needs narrowing to be a guarantee — the delegation runner —
+ * uses `fileSlice`, which answers `undefined` instead.
+ *
+ * Lived in `poll.ts` until the security pass needed it too; `cli.ts` importing
+ * from `poll.ts` is the wrong direction, and a diff utility belongs with the
+ * other diff utilities.
+ */
+export function extractFileHunk(diff: string, file: string): string {
+  if (file.length === 0) return diff;
+  const sections = diff.split(/\n(?=diff --git )/u);
+  for (const section of sections) {
+    const lines = section.split("\n");
+    const oldPath = lines.find((line) => line.startsWith("--- "));
+    const newPath = lines.find((line) => line.startsWith("+++ "));
+    if (
+      (oldPath !== undefined && normalizedDiffHeaderPath(oldPath) === file) ||
+      (newPath !== undefined && normalizedDiffHeaderPath(newPath) === file)
+    ) {
+      return section;
+    }
+  }
+  return diff;
+}

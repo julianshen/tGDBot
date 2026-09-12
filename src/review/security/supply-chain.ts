@@ -1,0 +1,246 @@
+// Issue #139, `security:supply-chain`. The second HOST detector, and a host
+// check for the same reason the first is one: these defects are decidable from
+// the text. A workflow with `pull_request_target` plus a mutable action ref, a
+// dependency pinned to a branch, `permissions: write-all` — none of them needs
+// a model to have an opinion, and a model asked for one will sometimes
+// disagree with the evidence in front of it.
+//
+// Being a host check also removes them from the per-review model budget
+// entirely, which is the difference between a security pass that runs on every
+// review and one an operator turns off because of the bill.
+//
+// Same discipline as `secrets.ts`:
+//
+//   - it reports only what it can DECIDE, from an added line and its file's
+//     path. A workflow whose risk depends on what a called action does is not
+//     reported, because the detector cannot read that action.
+//   - `suggestion` is never used. A fired detector has found something that is
+//     not correct as written, and `suggestion` asserts the opposite.
+//   - a line it cannot classify produces nothing, rather than a hedge.
+//
+// Unlike secrets, these findings are SAFE TO QUOTE: a mutable action ref is
+// public information and the author needs to see which one. So no
+// `redactSource` here — and that difference is deliberate rather than an
+// oversight, because a detector that redacted everything would make its own
+// findings harder to act on for no gain.
+import path from "node:path";
+import { addedLinesByFile } from "../diff-anchors.js";
+import type { Finding } from "../types.js";
+import type { RuleDefinition } from "../../rules/types.js";
+
+/** The reserved rule name these findings carry. */
+export const SUPPLY_CHAIN_RULE_NAME = "security:supply-chain";
+
+/**
+ * The policy `poll.ts` resolves for a conversation command on one of these.
+ *
+ * Without it, `explain` answers "the trusted rule is no longer active" about a
+ * finding the host produced moments earlier, because the lookup searches the
+ * loaded rules and this name is never dispatched. Same shape and reason as
+ * `SECRETS_POLICY`.
+ */
+export const SUPPLY_CHAIN_POLICY: RuleDefinition = Object.freeze({
+  name: SUPPLY_CHAIN_RULE_NAME,
+  dependsOn: Object.freeze([]),
+  body:
+    "This finding was computed by the host: a line added by this pull request matches a known " +
+    "supply-chain or CI hazard. Explain what the hazard is and what a safe version looks like, " +
+    "using the recorded finding and the current code. Do not invent scanner evidence and do not " +
+    "claim the referenced action or dependency was inspected — the host matched a pattern in the " +
+    "workflow or manifest text and nothing more.",
+  sourcePath: "<host:security-supply-chain>",
+});
+
+/** Whether a path is a GitHub Actions workflow — the only files the CI checks apply to. */
+function isWorkflow(file: string): boolean {
+  const normalized = file.replace(/\\/gu, "/");
+  return (
+    /(^|\/)\.github\/workflows\//u.test(normalized) &&
+    [".yml", ".yaml"].includes(path.extname(normalized).toLowerCase())
+  );
+}
+
+/** Whether a path is a GitHub Actions composite/action definition. */
+function isActionDefinition(file: string): boolean {
+  const normalized = file.replace(/\\/gu, "/").toLowerCase();
+  return normalized.endsWith("/action.yml") || normalized.endsWith("/action.yaml") ||
+    normalized === "action.yml" || normalized === "action.yaml";
+}
+
+/**
+ * A 40-character hex SHA is the only immutable way to name an action version.
+ *
+ * Tags and branches are both mutable: `@v4` moves when the publisher moves it,
+ * and a compromised or transferred repository can move it somewhere else. This
+ * is not a hypothetical — it is the shape of the `tj-actions/changed-files`
+ * incident, where a tag was repointed at malicious code.
+ */
+const IMMUTABLE_REF = /^[0-9a-f]{40}$/u;
+
+interface Hazard {
+  readonly title: string;
+  readonly message: string;
+  readonly severity: Finding["severity"];
+}
+
+/** `uses: owner/repo@ref` on an added line, with the ref captured. */
+const USES_RE = /^\s*(?:-\s*)?uses:\s*["']?([^"'\s@]+)@([^"'\s#]+)/u;
+
+/** `permissions: write-all` or a bare `write-all` value under it. */
+const WRITE_ALL_RE = /^\s*permissions:\s*write-all\s*$/u;
+
+/** A workflow trigger line naming `pull_request_target`. */
+const PR_TARGET_RE = /(^|\s|:|\[|,)pull_request_target(\s|:|,|\]|$)/u;
+
+/**
+ * Git-URL and branch-pinned dependency specs in a package.json line.
+ *
+ * Bounded deliberately: only the forms where the RESOLVED code can change
+ * without the manifest changing. A caret range is not reported — it is
+ * ordinary practice, the lockfile pins it, and reporting it would bury the
+ * genuinely mutable specs underneath.
+ */
+const GIT_DEPENDENCY_RE =
+  /"\s*:\s*"(?:git\+|github:|gitlab:|bitbucket:)[^"]*"|"\s*:\s*"[^"]*\.git#[^"]*"/u;
+
+function classifyWorkflowLine(text: string): Hazard | undefined {
+  const uses = USES_RE.exec(text);
+  if (uses) {
+    const [, action, ref] = uses as unknown as [string, string, string];
+    // A local action (`./.github/actions/x`) has no ref to move — it is the
+    // repository's own code, reviewed by this very pull request.
+    if (action.startsWith("./") || action.startsWith("docker://")) return undefined;
+    if (IMMUTABLE_REF.test(ref)) return undefined;
+    return {
+      severity: "warning",
+      title: `This workflow pins \`${action}\` to a mutable ref`,
+      message:
+        `\`${action}@${ref}\` names a tag or branch, not a commit. Both can be repointed by ` +
+        `anyone who can push to that repository, so the code this workflow runs can change ` +
+        `without this repository changing — which is how the \`tj-actions/changed-files\` ` +
+        `compromise reached its downstream users. Pin the 40-character commit SHA and keep the ` +
+        `human-readable version in a trailing comment.`,
+    };
+  }
+
+  if (WRITE_ALL_RE.test(text)) {
+    return {
+      severity: "warning",
+      title: "This workflow grants `write-all` permissions",
+      message:
+        "`permissions: write-all` gives every step in this workflow write access to the whole " +
+        "repository, including contents, packages and actions. Any compromised dependency in " +
+        "any step inherits it. Declare the specific permissions the job needs instead; the " +
+        "common case is `contents: read`.",
+    };
+  }
+
+  return undefined;
+}
+
+/**
+ * `pull_request_target` combined with an explicit checkout of the PR's head.
+ *
+ * Reported TOGETHER rather than separately because `pull_request_target` alone
+ * is legitimate — it is the documented way to label or comment on a pull
+ * request from a fork. The hazard is the combination: that trigger runs with
+ * the base repository's secrets and a writable token, and checking out the
+ * PR's own code under it executes an attacker's changes with them.
+ *
+ * Two separate warnings would report the safe use of the trigger on every
+ * repository that labels pull requests, which is the alarm fatigue that trains
+ * people to skip the section.
+ */
+function pullRequestTargetHazard(lines: ReadonlyMap<number, string>): number | undefined {
+  let triggerLine: number | undefined;
+  let checksOutHead = false;
+  for (const [line, text] of lines) {
+    if (PR_TARGET_RE.test(text)) triggerLine ??= line;
+    // `ref:` naming the pull request's head, in any of the spellings the
+    // documentation and the wild both use.
+    if (/^\s*ref:\s*["']?\$\{\{\s*github\.event\.pull_request\.head\.(sha|ref)\s*\}\}/u.test(text)) {
+      checksOutHead = true;
+    }
+  }
+  return triggerLine !== undefined && checksOutHead ? triggerLine : undefined;
+}
+
+/**
+ * Supply-chain and CI hazards introduced by this pull request.
+ *
+ * ADDED lines only, for the same reason `secrets.ts` reports only added lines:
+ * a hazard already present at the base was not introduced here, and reporting
+ * it on every unrelated pull request that touches the file is alarm fatigue.
+ * It is a real problem, but it is not this review's finding to make.
+ *
+ * Never throws: a detector that cannot run must not take the review with it.
+ */
+export function detectSupplyChainHazards(diff: string): Finding[] {
+  const findings: Finding[] = [];
+  for (const [file, lines] of addedLinesByFile(diff)) {
+    const workflow = isWorkflow(file);
+    const action = isActionDefinition(file);
+
+    if (workflow || action) {
+      for (const [line, text] of lines) {
+        const hazard = classifyWorkflowLine(text);
+        if (hazard === undefined) continue;
+        findings.push({
+          file,
+          line,
+          severity: hazard.severity,
+          category: "security",
+          ruleName: SUPPLY_CHAIN_RULE_NAME,
+          title: hazard.title,
+          message: hazard.message,
+          decision: "new",
+        });
+      }
+    }
+
+    if (workflow) {
+      // Whole-file, not per-line: the trigger and the checkout are different
+      // lines, and either alone is unremarkable.
+      const line = pullRequestTargetHazard(lines);
+      if (line !== undefined) {
+        findings.push({
+          file,
+          line,
+          severity: "blocking",
+          category: "security",
+          ruleName: SUPPLY_CHAIN_RULE_NAME,
+          title: "This workflow runs pull request code with the base repository's secrets",
+          message:
+            "`pull_request_target` runs in the context of the BASE repository — with its secrets " +
+            "and a writable `GITHUB_TOKEN` — and this workflow also checks out the pull " +
+            "request's own head. Any contributor who can open a pull request can therefore run " +
+            "arbitrary code with those credentials. Either use `pull_request`, which runs " +
+            "without them, or keep `pull_request_target` and do not check out or execute the " +
+            "pull request's code.",
+          decision: "new",
+        });
+      }
+    }
+
+    if (path.basename(file.replace(/\\/gu, "/")) === "package.json") {
+      for (const [line, text] of lines) {
+        if (!GIT_DEPENDENCY_RE.test(text)) continue;
+        findings.push({
+          file,
+          line,
+          severity: "warning",
+          category: "security",
+          ruleName: SUPPLY_CHAIN_RULE_NAME,
+          title: "This dependency resolves to a moving git ref",
+          message:
+            "A dependency specified as a git URL or a branch resolves to whatever that ref " +
+            "points at when it is installed, so the code entering the build can change without " +
+            "this manifest changing, and the registry's integrity checks do not apply to it. " +
+            "Depend on a published version, or pin the git dependency to a full commit SHA.",
+          decision: "new",
+        });
+      }
+    }
+  }
+  return findings;
+}

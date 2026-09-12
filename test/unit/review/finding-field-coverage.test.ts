@@ -77,6 +77,7 @@ const schemaLine = (text: string, marker: string): string => {
  * `needs-clarification`) so the value is one a real reviewer could emit.
  */
 const COMPLETE: Required<Finding> = {
+  attackPath: { status: "not-analyzed", reason: "the security pass did not run" },
   // Host-set, so a real reviewer never emits it — but `Required<Finding>` is
   // the point of this fixture: a new field must be classified below rather
   // than defaulting to silence.
@@ -109,6 +110,7 @@ const FIELDS = Object.keys(COMPLETE) as (keyof Finding)[];
 
 /** Fields a REVIEWING rule is deliberately never asked to produce. */
 const NOT_IN_RULE_CONTRACT: Partial<Record<keyof Finding, string>> = {
+  attackPath: "host-attached (#139): the stage builds it from its own bounded pass and stamps every fact's source, so the per-rule contract must not invite a reviewer to supply one",
   redactSource: "host-set; the contract must not invite a reviewer to control whether its own source line is quoted",
   ruleName: "stamped by the dispatcher from the rule that actually ran — a rule naming itself would be unverifiable",
   hostCheck: "computed by the host from the base tree (#75); a rule able to emit it could forge its own verification, which is the one part of a finding a reader is invited to trust without re-deriving",
@@ -122,6 +124,7 @@ const NOT_IN_RULE_CONTRACT: Partial<Record<keyof Finding, string>> = {
  * that list cannot arrive from reviewer output however the model spells it.
  */
 const NOT_FROM_REVIEWER: Partial<Record<keyof Finding, string>> = {
+  attackPath: "host-attached; a reviewer emitting this key has it dropped, for the same reason hostCheck is unforgeable",
   hostCheck: "host-computed; accepting it from reviewer output would let a finding fabricate its own verification",
   redactSource: "host-set; a reviewer that could set it would suppress its own excerpt, and one that could clear it would expose a redacted finding's source line",
 };
@@ -137,6 +140,7 @@ const NOT_FROM_REVIEWER: Partial<Record<keyof Finding, string>> = {
  * finding's identity. Both are recomputed per review, cheaply, from scratch.
  */
 const NOT_PERSISTED: Partial<Record<keyof Finding, string>> = {
+  attackPath: "recomputed by the security pass when it runs; a stale attack path is worse than none, since severity was derived from it",
   claim: "recomputed per review; meaningless without the check that answers it",
   hostCheck: "derived from one base commit; a persisted verification would go stale silently",
   redactSource: "a rendering decision of the run that produced the finding, recomputed with it; persisting it would let a stale flag decide whether a later review quotes a line",
@@ -154,6 +158,7 @@ const NOT_PERSISTED: Partial<Record<keyof Finding, string>> = {
 
 /** Fields the builtin reviewer agent is deliberately never asked to produce. */
 const NOT_IN_REVIEWER_AGENT: Partial<Record<keyof Finding, string>> = {
+  attackPath: "host-attached; the agent answers the six facts through the analysis pass, never by emitting this field",
   redactSource: "host-set; the agent must not be told it can control whether its source line is quoted",
   hostCheck: "host-computed, as above",
   ruleName: "stamped by the dispatcher, as above",
@@ -303,6 +308,7 @@ describe("every Finding field reaches the reader", () => {
 
   /** Fields an inline comment deliberately does not print. */
   const NOT_IN_INLINE_BODY: Partial<Record<keyof Finding, string>> = {
+  attackPath: "rendered as its own table by renderAttackPath, not as a metadata value",
   redactSource: "a rendering DECISION, not content: it suppresses the excerpt rather than appearing in one",
     claim: "shown through the host check that answers it (#75) — printing the raw assertion as well would present the reviewer's word alongside the host's, which is the confusion the split avoids",
     file: "the comment is anchored to the file; repeating the path would be noise",
