@@ -118,7 +118,8 @@ import type {
 import { loadRules } from "../rules/loader.js";
 import type { RuleDefinition } from "../rules/types.js";
 import { CODEX_SECURITY_POLICY } from "../review/codex-security-results.js";
-import { SECRETS_POLICY, SECRETS_RULE_NAME } from "../review/security/secrets.js";
+import { hostDetectorFor } from "../review/security/host-detectors.js";
+import { extractFileHunk } from "../review/diff-anchors.js";
 import type {
   ConversationAdapter,
   ReviewActivityEvent,
@@ -1154,9 +1155,9 @@ async function planConversationReply(input: {
   // the RESERVED NAME rather than on `redactSource`, because `FindingSnapshot`
   // does not carry that field — and the name is host-owned, so it cannot be
   // claimed by a rule or forged in reviewer output.
-  const hostComputedFinding = resolution.ledger.finding.ruleName === SECRETS_RULE_NAME;
-  if (hostComputedFinding) {
-    currentRule = SECRETS_POLICY;
+  const hostDetector = hostDetectorFor(resolution.ledger.finding.ruleName);
+  if (hostDetector !== undefined) {
+    currentRule = hostDetector.policy;
   } else if (importedScanFinding) {
     currentRule = CODEX_SECURITY_POLICY;
   } else {
@@ -1181,14 +1182,20 @@ async function planConversationReply(input: {
     const actionInput = {
       ledger: resolution.ledger,
       currentRule,
-      // A host-computed finding's hunk contains the credential the finding
+      // A SECRETS finding's hunk contains the credential the finding
       // deliberately does not quote. Sending it lets the model repeat it into
       // a reply that only Markdown-sanitizes on the way out, so the prompt's
       // "do not quote" becomes the only thing standing between a secret and a
       // world-readable comment (Codex review of PR #147). Withheld instead:
       // the explanation is about the FORMAT and why committing one matters,
       // which the ledger finding and the policy already carry.
-      currentCodeHunk: hostComputedFinding ? "" : extractFileHunk(diff, resolution.ledger.finding.file),
+      //
+      // Per-detector, not "any host finding": a supply-chain finding's hunk is
+      // a workflow line the author needs to see, and withholding it would make
+      // that explanation worse to protect something it does not contain.
+      currentCodeHunk: hostDetector?.withholdsCodeHunk === true
+        ? ""
+        : extractFileHunk(diff, resolution.ledger.finding.file),
       model,
       createSession: options.deps.createSession,
     };
@@ -1843,39 +1850,6 @@ async function loadActiveRules(
   } catch (error) {
     return { rules: [], error: error instanceof Error ? error : new Error(String(error)) };
   }
-}
-
-function normalizedDiffHeaderPath(line: string): string | undefined {
-  const raw = line.slice(4).trim();
-  if (raw === "/dev/null") return undefined;
-  let decoded = raw;
-  if (raw.startsWith('"')) {
-    try {
-      const parsed = JSON.parse(raw) as unknown;
-      if (typeof parsed !== "string") return undefined;
-      decoded = parsed;
-    } catch {
-      return undefined;
-    }
-  }
-  return decoded.startsWith("a/") || decoded.startsWith("b/") ? decoded.slice(2) : decoded;
-}
-
-export function extractFileHunk(diff: string, file: string): string {
-  if (file.length === 0) return diff;
-  const sections = diff.split(/\n(?=diff --git )/u);
-  for (const section of sections) {
-    const lines = section.split("\n");
-    const oldPath = lines.find((line) => line.startsWith("--- "));
-    const newPath = lines.find((line) => line.startsWith("+++ "));
-    if (
-      (oldPath !== undefined && normalizedDiffHeaderPath(oldPath) === file) ||
-      (newPath !== undefined && normalizedDiffHeaderPath(newPath) === file)
-    ) {
-      return section;
-    }
-  }
-  return diff;
 }
 
 async function finalizeClarificationIfAnswered(

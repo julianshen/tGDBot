@@ -788,9 +788,20 @@ operator did not ask for directly.
 `--security-pass on` runs detectors the **host** computes, rather than rules a
 model answers. Off by default.
 
-Today that is one detector, `security:secrets`: a line **added** by this pull
-request matching a known credential format — an AWS access key id, a Stripe
-live key, a GitHub token, a Google API key, a Slack token, a private-key header.
+Two detectors run:
+
+- **`security:secrets`** — a line **added** by this pull request matching a
+  known credential format: an AWS access key id, a Stripe live key, a GitHub
+  token, a Google API key, a Slack token, a private-key header.
+- **`security:supply-chain`** — a mutable GitHub Actions ref (a tag or branch
+  rather than a commit SHA), `pull_request_target` combined with a checkout of
+  the pull request's own head, `permissions: write-all`, and dependencies that
+  resolve to a moving git ref.
+
+They are host checks rather than rules because these defects are decidable from
+the text. A model asked for an opinion on them will sometimes disagree with the
+evidence in front of it, and being host checks keeps them out of the model
+budget entirely.
 
 Three properties are worth knowing before you turn it on.
 
@@ -810,11 +821,88 @@ something that is not. `sk_test_` keys are ignored for the same reason.
 here. Reporting it on every unrelated change that touches the file is alarm
 fatigue, and it is a real problem that is not this review's finding to make.
 
-Findings carry the reserved rule name `security:secrets`, appear under "Rules
-run", and are addressable by the conversation commands like any other. A user
-rule may not claim that name: the loader reports it as a load error and does not
+Findings carry their detector's reserved rule name, appear under "Rules run",
+and are addressable by the conversation commands like any other. A user rule may
+not claim one of those names: the loader reports it as a load error and does not
 dispatch it, because the host publishes under it and owns the policy that
 `explain` answers from.
+
+One difference between the two is deliberate. A secrets finding's surrounding
+code is **withheld** from the conversation model, because it contains the
+credential the finding refuses to quote. A supply-chain finding's is not — a
+mutable action ref is public information the author needs to see, and
+withholding it would make the explanation worse to protect something it does not
+contain.
+
+## Attack paths, and severity derived from them
+
+With `--security-pass on`, every **security finding a rule discovered** gets a
+second, bounded pass that establishes the attack path it rests on — and its
+severity is then computed from those facts rather than asserted.
+
+The difference this is for: *"SQL built by concatenation"* and *"SQL built by
+concatenation, reachable from an unauthenticated handler, with no parameterisation
+between"* are different claims, and only the second earns a blocking label.
+
+Six facts, each with its own evidence and its own explicit `unknown`:
+
+| Fact | Question | Established by |
+|---|---|---|
+| `vector` | where must an attacker be | **host**, under a supported pattern |
+| `authScope` | who may reach it | nobody yet — always `unknown` |
+| `attackerControl` | can an attacker choose the value | reviewer |
+| `preconditions` | what must already be true | reviewer |
+| `crossesBoundary` | does impact leave the attacker's own account | reviewer |
+| `impactSurface` | what is damaged | reviewer |
+
+**A reviewer cannot forge host provenance.** The parser stamps every incoming
+fact `reviewer`, unconditionally; only the host reachability stage constructs
+one marked `host`. This is the guarantee `hostCheck` already holds, for the same
+reason: it is the part a reader is meant to trust without re-deriving.
+
+**The host establishes a fact only under an explicitly supported pattern.**
+Today that is Express, Fastify and Koa route registrations, in the TS/JS family,
+and they establish `vector` only. Anything else — a Go handler, a framework not
+on the list, a file that could not be read — is `unknown`.
+
+**`authScope` is always `unknown` today, and that is deliberate.** A
+registration line shows that a route *exists*; it says nothing about who may
+reach it, because the router may be mounted behind authentication in another
+module. An earlier version inferred `public` from the *absence* of an
+auth-shaped identifier in the file — absence of evidence read as evidence of
+absence, producing a host-labelled fact the severity policy trusted enough to
+raise a finding to `blocking`. Establishing it honestly needs the mounting
+composition resolved, which is not built yet.
+
+The practical consequence: with `authScope` unknown, the severity policy
+**preserves whatever discovery assigned** rather than raising. The policy is
+implemented and tested, and goes live for a framework when a pattern that
+positively resolves its auth composition lands. Preserving is the conservative
+direction, and an unestablished auth scope must never raise a finding.
+
+**Unknown lowers confidence, never severity.** On a Go or Rust repository most
+reachability fields will legitimately be `unknown`, and the rating then stays at
+whatever discovery said. A coverage gap must never read as a clean bill of
+health — the failure the dependency facts and `hostCheck: not-checked` were both
+written to avoid.
+
+The pass is bounded: security findings only, the ten most severe of them, one
+model call each, and nothing at all when a review found none. Findings beyond
+the budget are published as `not-analyzed` **with the reason**, because "we
+looked and could not say", "we never looked", and "there were more than we rate"
+are three different facts.
+
+Host-detector findings are **excluded** from re-rating. A committed credential
+is `blocking` because the host matched a provider's own format; letting a
+model's reachability guess downgrade it would be a guess overruling a
+computation.
+
+Two discovery rules ship as examples rather than built-ins, in
+`examples/rules/security/`: `sink-reachability` (attacker-controlled values
+reaching dangerous sinks) and `authz-boundary` (missing ownership and tenant
+checks). Copy them into your rules directory to turn discovery on; they are
+prompts, so they read Go, Java, Rust and Python as readily as TypeScript. Only
+the host-verified half of the evidence is language-limited.
 
 ## Checking a finding's structural claim
 

@@ -125,3 +125,107 @@ describe("dispatchRulesDirect — agent definitions (#138 phase 2)", () => {
     expect(captured[0]?.definition?.tools).toEqual(["read"]);
   });
 });
+
+// Issue #139's review turned up a defect in #138's merged code: a persona
+// narrowing its tools produced a delegated child with no way to report.
+describe("a delegated child can always report", () => {
+  it("gets submit_findings even when the persona narrowed its tools", async () => {
+    // `tools: read, grep` is the configuration the README teaches. The child
+    // path has no assistant-text fallback by design, so a child without the
+    // reporting tool returned nothing — silently, on every delegation
+    // (Codex review of PR #151).
+    const seen: (readonly string[] | undefined)[] = [];
+    const narrow: AgentDefinition = {
+      name: "deep",
+      tools: ["read", "grep"],
+      delegate: true,
+      body: "Look closely.",
+      sourcePath: "/agents/deep.agent.md",
+    };
+
+    const createSession: DirectSessionFactory = async (_rule, _cwd, _out, definition, delegate) => {
+      seen.push(definition?.tools);
+      if (delegate === undefined) {
+        return { async prompt() {}, getLastAssistantText: () => "[]" };
+      }
+      const tool = delegate as unknown as { execute: (...args: never[]) => Promise<unknown> };
+      return {
+        async prompt() {
+          await tool.execute(
+            "call-1" as never,
+            { file: "src/a.ts", question: "look" } as never,
+            undefined as never,
+            undefined as never,
+            undefined as never,
+          );
+        },
+        getLastAssistantText: () => "[]",
+      };
+    };
+
+    await dispatchRulesDirect(
+      {
+        rules: [makeRule({ agent: "deep" })],
+        diff: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+x\n",
+        useAdvisor: false,
+        changedFiles: ["src/a.ts"],
+        subagentNesting: "on",
+        agentDefinitions: [narrow],
+      },
+      { createSession },
+    );
+
+    // The PARENT keeps its narrowed set; the CHILD gains the reporting tool.
+    expect(seen[0]).toEqual(["read", "grep"]);
+    expect(seen[1]).toContain("submit_findings");
+    expect(seen[1]).toContain("read");
+  });
+
+  it("does not duplicate the tool for a persona that already allows it", async () => {
+    // Asserted through the dispatch path rather than by exporting the helper:
+    // a tool listed twice is the kind of thing a session factory might reject,
+    // and the public behaviour is what matters.
+    const seen: (readonly string[] | undefined)[] = [];
+    const permissive: AgentDefinition = {
+      name: "deep",
+      tools: ["read", "submit_findings"],
+      delegate: true,
+      body: "Look closely.",
+      sourcePath: "/a.agent.md",
+    };
+
+    const createSession: DirectSessionFactory = async (_rule, _cwd, _out, definition, delegate) => {
+      seen.push(definition?.tools);
+      if (delegate === undefined) {
+        return { async prompt() {}, getLastAssistantText: () => "[]" };
+      }
+      const tool = delegate as unknown as { execute: (...args: never[]) => Promise<unknown> };
+      return {
+        async prompt() {
+          await tool.execute(
+            "call-1" as never,
+            { file: "src/a.ts", question: "look" } as never,
+            undefined as never,
+            undefined as never,
+            undefined as never,
+          );
+        },
+        getLastAssistantText: () => "[]",
+      };
+    };
+
+    await dispatchRulesDirect(
+      {
+        rules: [makeRule({ agent: "deep" })],
+        diff: "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+x\n",
+        useAdvisor: false,
+        changedFiles: ["src/a.ts"],
+        subagentNesting: "on",
+        agentDefinitions: [permissive],
+      },
+      { createSession },
+    );
+
+    expect(seen[1]).toEqual(["read", "submit_findings"]);
+  });
+});
