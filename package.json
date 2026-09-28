@@ -23,7 +23,7 @@
   "license": "UNLICENSED",
   "dependencies": {
     "@ast-grep/napi": "0.45.2",
-    "@earendil-works/pi-coding-agent": "0.84.1",
+    "@earendil-works/pi-coding-agent": "0.87.1",
     "@juicesharp/rpiv-advisor": "2.4.0",
     "gray-matter": "4.0.3",
     "pi-subagents": "0.47.1",
